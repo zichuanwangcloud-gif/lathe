@@ -130,12 +130,12 @@ D1 说"按任务类型分级"，落地时的关键细化：**判定时机放在 
 
 ```
 1. 起隔离栈（per-task compose project：动态端口 + 独立 DB schema）
-2. 在【改动前】的代码上跑复现脚本  ──► 必须 FAIL   (repro_fail)
-   └─ 如果 PASS 或跑不起来 ⇒ agent 没能理解这个 bug
+2. 在【改动前】的代码上跑复现脚本  ──► 必须失败   (repro_fail)
+   └─ 如果通过或跑不起来 ⇒ agent 没能理解这个 bug
       ⇒ 不许继续，转 blocked_spec 回帖说明"无法复现，请补充步骤"
 3. 应用改动
-4. 重跑同一复现脚本            ──► 必须 PASS   (repro_pass)
-5. 跑受影响范围的回归测试        ──► 必须 PASS   (regression)
+4. 重跑同一复现脚本            ──► 必须通过   (repro_pass)
+5. 跑受影响范围的回归测试        ──► 必须通过   (regression)
 6. 拆栈，回收
 ```
 
@@ -193,7 +193,7 @@ Linear: issue 指派给用户
           └─► Runner:
               triaging     判明确度 + 定位范围
               implementing 建 worktree/分支 → claude CLI headless 实现
-              verifying    起隔离栈 → 红(改前FAIL) → 应用 → 绿(改后PASS) → 回归
+              verifying    起隔离栈 → 红(改前失败) → 应用 → 绿(改后通过) → 回归
               pr_open      推分支 → 开 PR → 回帖 Linear（含验证证据）
   ...人 review...
   PR 评论 → review_feedback → implementing(--resume 原 session) → 重新验证
@@ -221,3 +221,10 @@ Linear: issue 指派给用户
 - [ ] P2 租户隔离安全模型：共享节点上跑不同租户的代码
 - [ ] 准入档位实测校准（抽样真实 issue 统计明确率，见 01-decisions §2）
 - [ ] `light` 档是否也强制要求新增测试
+- [ ] **每任务的上下文基线成本需要压缩**。实测：在装了插件的环境里，一句
+      「回答两个字」的 `claude -p` 就吃掉 32937 input tokens、$0.16 —— 绝大部分
+      是插件与技能定义（devagent、pi-kit 等）被注入进上下文。Lathe 是无人值守
+      批量跑，这笔基线会乘以任务数。
+      → Runner 应用 `--setting-sources` 显式控制加载哪些配置源，只带上目标仓库
+      真正需要的 CLAUDE.md 与 skills，把个人插件排除在外。这既省钱也让任务
+      执行可复现（不受某台机器装了什么插件影响）。
