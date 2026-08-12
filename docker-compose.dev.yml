@@ -1,0 +1,22 @@
+# Lathe 本地开发基础设施
+# 端口刻意避开宿主机上已有的 postgres 容器（5432）
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lathe-postgres-dev
+    environment:
+      POSTGRES_USER: lathe
+      POSTGRES_PASSWORD: lathe
+      POSTGRES_DB: lathe
+    ports:
+      - "55432:5432"
+    volumes:
+      - lathe-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lathe -d lathe"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  lathe-pgdata:

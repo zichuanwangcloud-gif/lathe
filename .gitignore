@@ -1,0 +1,32 @@
+# 二进制
+/lathe
+/lathe-runner
+/bin/
+
+# 内嵌 UI 构建产物
+/web/dist/
+/web/node_modules/
+
+# 本地配置与密钥
+config.local.yaml
+.env
+.env.local
+
+# 运行时数据
+/data/
+/logs/
+*.log
+
+# 任务工作区（Lathe 自己创建的 worktree 根）
+/workspaces/
+
+# Go
+*.test
+*.out
+coverage.*
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
