@@ -28,11 +28,29 @@ type TaskEnqueuer interface {
 
 // LinearWebhook 处理来自 Linear 的 webhook。
 type LinearWebhook struct {
-	Secret string
-	// UserID 是绑定用户的 Linear ID：只有指派给他的 issue 才接单（D2）。
-	UserID     string
+	// SecretFunc 取签名密钥，UserIDFunc 取接单判定用的 Linear 用户 ID。
+	//
+	// 用函数而非固定字符串：凭据可在设置页里随时修改，
+	// 每次请求现取才能让修改即刻生效，无需重启。
+	SecretFunc func() string
+	UserIDFunc func() string
+
 	Deliveries DeliveryClaimer
 	Tasks      TaskEnqueuer
+}
+
+func (h *LinearWebhook) secret() string {
+	if h.SecretFunc == nil {
+		return ""
+	}
+	return h.SecretFunc()
+}
+
+func (h *LinearWebhook) userID() string {
+	if h.UserIDFunc == nil {
+		return ""
+	}
+	return h.UserIDFunc()
 }
 
 // ServeHTTP 实现 http.Handler。
@@ -51,7 +69,7 @@ func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ev, err := linear.ParseWebhook(h.Secret, body, r.Header.Get(linear.HeaderSignature))
+	ev, err := linear.ParseWebhook(h.secret(), body, r.Header.Get(linear.HeaderSignature))
 	if err != nil {
 		// 验签失败一律 401，不透露具体原因
 		slog.Warn("webhook 验签失败", "err", err, "remote", r.RemoteAddr)
@@ -82,7 +100,7 @@ func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// D2：只处理「指派给绑定用户」的事件；其余一律确认后忽略
-	if !ev.IsAssignedTo(h.UserID) {
+	if !ev.IsAssignedTo(h.userID()) {
 		_ = h.Deliveries.FinishDelivery(ctx, deliveryID, "")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "非指派给本用户的事件"})
 		return

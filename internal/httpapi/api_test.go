@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
@@ -19,18 +17,7 @@ const apiTestToken = "test-admin-token"
 func apiFixture(t *testing.T) (*API, *store.Store, *task.Machine, int64) {
 	t.Helper()
 
-	dsn := os.Getenv("LATHE_TEST_DSN")
-	if dsn == "" {
-		dsn = "postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	st, err := store.Open(ctx, dsn)
-	if err != nil {
-		t.Skipf("跳过数据库测试（先 make dev-infra && make migrate）: %v", err)
-	}
-	t.Cleanup(st.Close)
+	st := testStoreForAPI(t)
 
 	var userID, repoID int64
 	email := "api-" + t.Name() + "@example.com"

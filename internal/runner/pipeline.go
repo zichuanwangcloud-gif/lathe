@@ -26,6 +26,15 @@ type GitHubAPI interface {
 	CreatePR(ctx context.Context, p github.PRParams) (*github.PullRequest, error)
 }
 
+// Clients 按需提供各集成的客户端。
+//
+// 凭据可在界面上随时修改，因此客户端不能在启动时固定 —— 每次执行
+// 任务时现取，改完凭据无需重启即可生效。
+type Clients interface {
+	Linear(ctx context.Context) (LinearAPI, error)
+	GitHub(ctx context.Context) (GitHubAPI, error)
+}
+
 // AgentDriver 驱动 agent 执行。
 type AgentDriver interface {
 	Run(ctx context.Context, p agent.RunParams) (*agent.Result, error)
@@ -45,8 +54,7 @@ type Pipeline struct {
 	Worktrees *WorktreeManager
 	Verifier  *Verifier
 	Agent     AgentDriver
-	Linear    LinearAPI
-	GitHub    GitHubAPI
+	Clients   Clients
 	Notifier  Notifier
 	NewID     NewSessionID
 
@@ -79,14 +87,24 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		actor = "system"
 	}
 
+	// 凭据可能在任务排队期间被改过，因此每次执行都现取客户端
+	lin, err := p.Clients.Linear(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 Linear 客户端失败（请在设置里配置并验证凭据）: %w", err)
+	}
+	gh, err := p.Clients.GitHub(ctx)
+	if err != nil {
+		return fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
+	}
+
 	// ---------- 分诊 ----------
 	if _, err := p.Tasks.Transition(ctx, tk.ID, task.StateTriaging, actor, nil); err != nil {
 		return err
 	}
 
-	issue, err := p.Linear.Issue(ctx, params.IssueID)
+	issue, err := lin.Issue(ctx, params.IssueID)
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, nil, "拉取 issue 失败", err)
+		return p.fail(ctx, lin, tk.ID, params, nil, "拉取 issue 失败", err)
 	}
 
 	triageSession := p.newID()
@@ -96,18 +114,18 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		PermissionMode: "plan", // 分诊只读不写
 	})
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, nil, "分诊执行失败", err)
+		return p.fail(ctx, lin, tk.ID, params, nil, "分诊执行失败", err)
 	}
 
 	verdict, err := ParseTriageVerdict(triageRes.Text)
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, nil, "分诊结果无法解析", err)
+		return p.fail(ctx, lin, tk.ID, params, nil, "分诊结果无法解析", err)
 	}
 
 	if !verdict.Actionable {
 		// 单子不明确：回帖提问并停下，不猜（产品边界）
 		body := fmt.Sprintf("**Lathe 暂不能自动处理这个 issue**\n\n%s\n\n补充后重新指派给我即可。", verdict.Question)
-		if _, cerr := p.Linear.Comment(ctx, params.IssueID, body); cerr != nil {
+		if _, cerr := lin.Comment(ctx, params.IssueID, body); cerr != nil {
 			slog.Warn("回帖失败", "task", tk.ID, "err", cerr)
 		}
 		_, err := p.Tasks.Transition(ctx, tk.ID, task.StateBlockedSpec, actor, &task.TransitionOpts{
@@ -124,7 +142,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		Kind: kind, IssueKey: issue.Identifier, Title: issue.Title,
 	})
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, nil, "创建工作区失败", err)
+		return p.fail(ctx, lin, tk.ID, params, nil, "创建工作区失败", err)
 	}
 
 	implSession := p.newID()
@@ -146,26 +164,26 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		PermissionMode: p.PermissionMode,
 	})
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, wt, "实现执行失败", err)
+		return p.fail(ctx, lin, tk.ID, params, wt, "实现执行失败", err)
 	}
 	if implRes.IsError {
-		return p.fail(ctx, tk.ID, params, wt, "实现未成功完成",
+		return p.fail(ctx, lin, tk.ID, params, wt, "实现未成功完成",
 			fmt.Errorf("agent 返回 %s（%s）", implRes.Subtype, implRes.TerminalReason))
 	}
 
 	changed, err := p.Worktrees.HasChanges(ctx, wt)
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, wt, "检查改动失败", err)
+		return p.fail(ctx, lin, tk.ID, params, wt, "检查改动失败", err)
 	}
 	if !changed {
-		return p.fail(ctx, tk.ID, params, wt, "agent 没有产生任何改动",
+		return p.fail(ctx, lin, tk.ID, params, wt, "agent 没有产生任何改动",
 			errors.New("工作区无改动，视为未完成任务"))
 	}
 
 	commitMsg := fmt.Sprintf("%s(%s): %s\n\n%s",
 		kind, strings.ToLower(issue.Identifier), issue.Title, truncate(implRes.Text, 1000))
 	if err := p.Worktrees.Commit(ctx, wt, commitMsg); err != nil {
-		return p.fail(ctx, tk.ID, params, wt, "提交改动失败", err)
+		return p.fail(ctx, lin, tk.ID, params, wt, "提交改动失败", err)
 	}
 
 	// ---------- 验证 ----------
@@ -178,7 +196,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 
 	steps, err := DetectLightProfile(wt.Path, p.ExcludeDirs...)
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, wt, "无法确定验证步骤", err)
+		return p.fail(ctx, lin, tk.ID, params, wt, "无法确定验证步骤", err)
 	}
 	report := p.Verifier.RunLight(ctx, wt.Path, steps)
 	if !report.Passed() {
@@ -186,15 +204,15 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		if f := report.FirstFailure(); f != nil {
 			reason = fmt.Sprintf("验证未通过：%s", f.Step.Name)
 		}
-		return p.fail(ctx, tk.ID, params, wt, reason, errors.New(report.Summary()))
+		return p.fail(ctx, lin, tk.ID, params, wt, reason, errors.New(report.Summary()))
 	}
 
 	// ---------- 开 PR ----------
 	if err := p.Worktrees.Push(ctx, wt, params.Repo); err != nil {
-		return p.fail(ctx, tk.ID, params, wt, "推送分支失败", err)
+		return p.fail(ctx, lin, tk.ID, params, wt, "推送分支失败", err)
 	}
 
-	pr, err := p.GitHub.CreatePR(ctx, github.PRParams{
+	pr, err := gh.CreatePR(ctx, github.PRParams{
 		ProviderRepo: params.Repo.ProviderRepo,
 		Head:         wt.Branch,
 		Base:         wt.BaseBranch,
@@ -202,7 +220,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		Body:         github.BuildPRBody(issue.Identifier, issue.URL, report.Summary(), implRes.Text),
 	})
 	if err != nil {
-		return p.fail(ctx, tk.ID, params, wt, "创建 PR 失败", err)
+		return p.fail(ctx, lin, tk.ID, params, wt, "创建 PR 失败", err)
 	}
 
 	if _, err := p.Tasks.Transition(ctx, tk.ID, task.StatePROpen, actor, &task.TransitionOpts{
@@ -214,7 +232,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 
 	body := fmt.Sprintf("**Lathe 已完成并开出 PR**\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
 		pr.URL, report.Summary())
-	if _, err := p.Linear.Comment(ctx, params.IssueID, body); err != nil {
+	if _, err := lin.Comment(ctx, params.IssueID, body); err != nil {
 		slog.Warn("回帖失败", "task", tk.ID, "err", err)
 	}
 
@@ -225,7 +243,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 // fail 执行 D4 失败三件套：回帖 + 保留现场 + 推送通知；不自动重试。
 //
 // 刻意不回收 worktree：现场留给人直接 cd 进去接着干。
-func (p *Pipeline) fail(ctx context.Context, taskID int64, params ExecuteParams, wt *Worktree, stage string, cause error) error {
+func (p *Pipeline) fail(ctx context.Context, lin LinearAPI, taskID int64, params ExecuteParams, wt *Worktree, stage string, cause error) error {
 	reason := fmt.Sprintf("%s: %v", stage, cause)
 	slog.Error("任务失败", "task", taskID, "stage", stage, "err", cause)
 
@@ -234,8 +252,10 @@ func (p *Pipeline) fail(ctx context.Context, taskID int64, params ExecuteParams,
 	if wt != nil {
 		body += fmt.Sprintf("\n工作区已保留在 `%s`（分支 `%s`），可直接进去接手。\n", wt.Path, wt.Branch)
 	}
-	if _, err := p.Linear.Comment(ctx, params.IssueID, body); err != nil {
-		slog.Warn("失败回帖也失败了", "task", taskID, "err", err)
+	if lin != nil {
+		if _, err := lin.Comment(ctx, params.IssueID, body); err != nil {
+			slog.Warn("失败回帖也失败了", "task", taskID, "err", err)
+		}
 	}
 
 	// 2) 保留现场：不调用 Worktrees.Remove

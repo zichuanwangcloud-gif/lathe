@@ -21,6 +21,9 @@ type Config struct {
 	// 节点身份（lathe-runner 用）
 	NodeName string
 
+	// DataDir 存放运行时数据（凭据主密钥等）。
+	DataDir string
+
 	// 工作区
 	WorkspaceRoot string // Lathe 创建 worktree 的根目录
 	PnpmStore     string // 共享 pnpm store，避免每任务装一份依赖
@@ -29,7 +32,13 @@ type Config struct {
 	ClaudeBin    string        // claude CLI 路径
 	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
 
-	// 集成（P0 用静态 token；OAuth / GitHub App 留到 P2）
+	// AdminEmail 是 P0 单用户模式下自动创建的用户标识。
+	AdminEmail string
+
+	// 集成凭据的环境变量兜底值。
+	//
+	// 优先级低于界面配置：界面里配了就以界面为准，这样改完即刻生效；
+	// 保留环境变量是为了让既有部署方式不受影响。
 	LinearToken         string
 	LinearWebhookSecret string
 	GitHubToken         string
@@ -64,6 +73,8 @@ func Load() (Config, error) {
 			SSLMode:  env("LATHE_DB_SSLMODE", "disable"),
 		},
 		NodeName:            env("LATHE_NODE_NAME", hostnameOr("local")),
+		DataDir:             env("LATHE_DATA_DIR", "/opt/lathe/data"),
+		AdminEmail:          env("LATHE_ADMIN_EMAIL", "admin@lathe.local"),
 		WorkspaceRoot:       env("LATHE_WORKSPACE_ROOT", "/opt/lathe/workspaces"),
 		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
@@ -94,6 +105,9 @@ func (c Config) Validate() error {
 	}
 	if c.WorkspaceRoot == "" {
 		return fmt.Errorf("config: WorkspaceRoot 不能为空")
+	}
+	if c.DataDir == "" || !strings.HasPrefix(c.DataDir, "/") {
+		return fmt.Errorf("config: DataDir 必须是绝对路径，得到 %q", c.DataDir)
 	}
 	if !strings.HasPrefix(c.WorkspaceRoot, "/") {
 		return fmt.Errorf("config: WorkspaceRoot 必须是绝对路径，得到 %q", c.WorkspaceRoot)

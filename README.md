@@ -41,28 +41,34 @@ make run          # 起控制面
 # 1. 基础设施与建表
 make dev-infra && make build && ./bin/lathe migrate up
 
-# 2. 凭据（写进 .env.local，已在 .gitignore 里）
-export LATHE_LINEAR_TOKEN=lin_api_xxx          # Linear → Settings → API
-export LATHE_LINEAR_WEBHOOK_SECRET=xxx         # 建 webhook 时 Linear 给
-export LATHE_LINEAR_USER_ID=xxx                # 你的 Linear user id，只接指派给你的单
-export LATHE_GITHUB_TOKEN=$(gh auth token)
+# 2. 起服务（管理令牌是你自定义的口令，用于登录管理界面）
+LATHE_ADMIN_TOKEN=$(openssl rand -hex 32) ./bin/lathe serve
 
-# 3. 配置用户与仓库（P0 单用户单仓，取 repos 表第一条）
-psql "$DSN" -c "INSERT INTO users (email) VALUES ('you@example.com')"
-psql "$DSN" -c "INSERT INTO repos (user_id, provider_repo) VALUES (1, 'Clouditera/CloudRouter')"
-
-# 4. 起服务，把 Linear webhook 指到 /webhooks/linear
-./bin/lathe serve
+# 3. 打开 http://localhost:8200 ，在「设置」页配置凭据：
+#    - Linear API 令牌：Linear → Settings → Security & access → Personal API keys
+#    - GitHub 令牌：GitHub → Settings → Developer settings → Personal access tokens
+#    - Linear Webhook 密钥：建 webhook 时 Linear 生成
+#    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
+#    接单判定直接使用，无需手工填写。
+#
+# 4. 在「仓库配置」页设置目标仓库与分支策略，把 Linear webhook 指到
+#    /webhooks/linear
 ```
+
+凭据以 AES-256-GCM 加密后入库，主密钥保存在数据库之外（`LATHE_SECRET_KEY`
+环境变量，或 `$LATHE_DATA_DIR/secret.key`，首次运行自动生成、权限 0600），
+因此拿到数据库转储也解不出凭据。
+
+也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等），优先级低于界面配置。
 
 流程：指派 issue 给自己 → webhook 接单 → 分诊 → 实现 → light 档验证 → 开 PR → 回帖。
 失败则回帖说明原因、**保留 worktree 现场**、推送通知，不自动重试。
 
 ## 状态
 
-**P0 已完成**（单机 / 单用户 / 串行 / light 档验证），121 项测试。
+**P0 已完成**（单机 / 单用户 / 串行 / light 档验证）+ 管理界面，168 项测试。
 
 后续见 [docs/02-design.md](docs/02-design.md) §8：
 P1 验证基建（per-task compose 隔离 + 红-绿复现证明）→ P2 多租户 → P3 多节点。
 
-未完成：真实 Linear 连通性验证（待凭据）、Web UI、heavy 档验证。
+未完成：heavy 档验证（红-绿复现证明）、多用户、多节点。

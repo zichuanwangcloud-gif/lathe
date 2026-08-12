@@ -52,6 +52,14 @@ export const api = {
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   updateRepo: (id, body) =>
     request(`/api/repos/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+
+  integrations: () => request('/api/integrations'),
+  saveIntegration: (kind, token) =>
+    request(`/api/integrations/${kind}`, { method: 'PUT', body: JSON.stringify({ token }) }),
+  verifyIntegration: (kind) =>
+    request(`/api/integrations/${kind}/verify`, { method: 'POST' }),
+  deleteIntegration: (kind) =>
+    request(`/api/integrations/${kind}`, { method: 'DELETE' }),
 }
 
 // 状态的中文名与配色，全站统一。

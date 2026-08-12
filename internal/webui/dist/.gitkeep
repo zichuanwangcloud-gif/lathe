@@ -1,2 +1,0 @@
-此目录由 make ui 填充（从 web/dist 复制）。
-go:embed 要求目标目录存在，故保留本文件，使未构建界面时 go build 仍可通过。

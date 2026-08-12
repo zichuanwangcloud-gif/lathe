@@ -1,4 +1,4 @@
-.PHONY: help build test lint run migrate dev-infra dev-infra-down ui ui-dev clean
+.PHONY: help all build test lint run migrate dev-infra dev-infra-down ui ui-deps ui-dev clean
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
@@ -10,10 +10,15 @@ help: ## 显示可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 ui: ## 构建管理界面并同步到内嵌目录
-	cd web && pnpm install --prefer-offline && node_modules/.bin/vite build
+	# 依赖已在 pnpm-lock.yaml 锁定；此处不跑 pnpm install，因为 pnpm 会
+	# 因 esbuild 的安装脚本停在交互确认上。首次构建请手动执行 make ui-deps。
+	cd web && node_modules/.bin/vite build
 	rm -rf $(UI_EMBED)
 	cp -r $(UI_SRC) $(UI_EMBED)
 	@echo "→ 界面已同步到 $(UI_EMBED)"
+
+ui-deps: ## 安装前端依赖（首次或依赖变更后执行）
+	cd web && pnpm install --ignore-scripts
 
 ui-dev: ## 前端热重载（需另起 make run）
 	cd web && node_modules/.bin/vite

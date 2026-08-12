@@ -74,7 +74,11 @@ func post(t *testing.T, h http.Handler, body string, opts ...func(*http.Request)
 }
 
 func newHandler(c *fakeClaimer, e *fakeEnqueuer) *LinearWebhook {
-	return &LinearWebhook{Secret: testSecret, UserID: "user-me", Deliveries: c, Tasks: e}
+	return &LinearWebhook{
+		SecretFunc: func() string { return testSecret },
+		UserIDFunc: func() string { return "user-me" },
+		Deliveries: c, Tasks: e,
+	}
 }
 
 const assignedBody = `{"action":"update","type":"Issue","data":{"id":"uuid-1","identifier":"CR-777","assigneeId":"user-me"},"updatedFrom":{"assigneeId":null}}`

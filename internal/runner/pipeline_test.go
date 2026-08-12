@@ -77,6 +77,27 @@ func (f *fakeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, 
 	return &agent.Result{Success: true, Text: "done"}, nil
 }
 
+// fakeClients 让流水线在测试里拿到固定的假客户端。
+type fakeClients struct {
+	lin LinearAPI
+	gh  GitHubAPI
+	err error
+}
+
+func (f *fakeClients) Linear(ctx context.Context) (LinearAPI, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.lin, nil
+}
+
+func (f *fakeClients) GitHub(ctx context.Context) (GitHubAPI, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.gh, nil
+}
+
 type fakeNotifier struct{ msgs []string }
 
 func (f *fakeNotifier) Notify(ctx context.Context, m string) error {
@@ -182,8 +203,10 @@ func newPipeline(t *testing.T, m *task.Machine, lin *fakeLinear, gh *fakeGitHub,
 	}
 	return &Pipeline{
 		Tasks: m, Worktrees: wm,
-		Verifier: NewVerifier(3*time.Minute, ""),
-		Agent:    ag, Linear: lin, GitHub: gh, Notifier: no,
+		Verifier:       NewVerifier(3*time.Minute, ""),
+		Agent:          ag,
+		Clients:        &fakeClients{lin: lin, gh: gh},
+		Notifier:       no,
 		PermissionMode: "acceptEdits",
 	}
 }
@@ -540,4 +563,55 @@ func TestNewUUIDFormat(t *testing.T) {
 		}
 		seen[u] = true
 	}
+}
+
+// 凭据未配置时应给出可操作的提示，而不是含糊的失败。
+func TestPipelineMissingCredentials(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, &fakeAgent{}, &fakeNotifier{})
+	p.Clients = &fakeClients{err: errors.New("creds: 凭据未配置（linear）")}
+
+	err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+	})
+	if err == nil {
+		t.Fatal("缺凭据应报错")
+	}
+	if !strings.Contains(err.Error(), "设置里配置") {
+		t.Errorf("错误应指引去设置页配置凭据，得到: %v", err)
+	}
+}
+
+// 客户端在每次 Execute 时现取 —— 这是「改完凭据无需重启」的基础。
+func TestPipelineFetchesClientsPerExecution(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	clients := &countingClients{fakeClients: fakeClients{lin: lin, gh: &fakeGitHub{}}}
+
+	p := newPipeline(t, m, lin, &fakeGitHub{}, &fakeAgent{
+		results: []*agent.Result{{Success: true, Text: `{"actionable":false,"kind":"fix","reason":"缺复现"}`}},
+	}, &fakeNotifier{})
+	p.Clients = clients
+
+	if err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+	}); err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+
+	if clients.linearCalls == 0 {
+		t.Error("应在执行时现取 Linear 客户端，而非使用启动时固定的实例")
+	}
+}
+
+type countingClients struct {
+	fakeClients
+	linearCalls int
+}
+
+func (c *countingClients) Linear(ctx context.Context) (LinearAPI, error) {
+	c.linearCalls++
+	return c.fakeClients.Linear(ctx)
 }

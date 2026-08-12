@@ -11,15 +11,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/Clouditera/lathe/internal/config"
+	"github.com/Clouditera/lathe/internal/creds"
 	"github.com/Clouditera/lathe/internal/httpapi"
 	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/integration/linear"
 	"github.com/Clouditera/lathe/internal/runner"
+	"github.com/Clouditera/lathe/internal/secret"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
 	"github.com/Clouditera/lathe/internal/webui"
@@ -92,9 +93,37 @@ func serve(cfg config.Config) error {
 	}
 	defer st.Close()
 
-	pipeline, err := buildPipeline(cfg, st)
+	// 凭据加密存储：主密钥在数据库之外，拿到库转储也解不出凭据
+	key, keySource, err := secret.LoadKey(filepath.Join(cfg.DataDir, "secret.key"))
 	if err != nil {
 		return err
+	}
+	sealer, err := secret.New(key)
+	if err != nil {
+		return err
+	}
+	slog.Info("凭据加密已就绪", "key_source", keySource)
+
+	secrets := st.NewSecrets(sealer)
+	userID, err := ensureUser(ctx, st, cfg)
+	if err != nil {
+		return err
+	}
+
+	provider := creds.NewProvider(secrets, userID, creds.EnvFallback{
+		LinearToken:         cfg.LinearToken,
+		LinearWebhookSecret: cfg.LinearWebhookSecret,
+		GitHubToken:         cfg.GitHubToken,
+		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
+	})
+
+	pipeline, err := buildPipeline(cfg, st, creds.NewClients(provider))
+	if err != nil {
+		return err
+	}
+
+	if ready, missing := provider.Ready(ctx); !ready {
+		slog.Warn("凭据尚不完整，请在设置页配置后再触发任务", "缺少", missing)
 	}
 
 	// P0 串行队列：一次只跑一个任务，彻底绕开端口冲突与 DB 隔离问题
@@ -113,8 +142,9 @@ func serve(cfg config.Config) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", httpapi.Health)
 	mux.Handle("POST /webhooks/linear", &httpapi.LinearWebhook{
-		Secret:     cfg.LinearWebhookSecret,
-		UserID:     os.Getenv("LATHE_LINEAR_USER_ID"),
+		// 用函数取值而非固定字符串：凭据可在界面里改，改完即刻生效
+		SecretFunc: func() string { return provider.WebhookSecret(context.Background()) },
+		UserIDFunc: func() string { return provider.LinearUserID(context.Background()) },
 		Deliveries: st,
 		Tasks:      q,
 	})
@@ -127,6 +157,26 @@ func serve(cfg config.Config) error {
 		ConfigStatus: configStatus(cfg),
 	}
 	apiSrv.Routes(mux)
+
+	credAPI := &httpapi.CredentialAPI{
+		Secrets:  secrets,
+		UserID:   userID,
+		Verifier: creds.Verifier{},
+		Auth:     auth,
+		OnChange: provider.Invalidate,
+		EnvConfigured: func(kind string) bool {
+			switch kind {
+			case store.KindLinear:
+				return cfg.LinearToken != ""
+			case store.KindLinearWebhook:
+				return cfg.LinearWebhookSecret != ""
+			case store.KindGitHub:
+				return cfg.GitHubToken != ""
+			}
+			return false
+		},
+	}
+	credAPI.Routes(mux)
 
 	if webui.Available() {
 		mux.Handle("/", webui.Handler())
@@ -163,22 +213,12 @@ func serve(cfg config.Config) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
-func buildPipeline(cfg config.Config, st *store.Store) (*runner.Pipeline, error) {
-	if cfg.LinearToken == "" {
-		return nil, errors.New("未配置 LATHE_LINEAR_TOKEN")
-	}
-	if cfg.GitHubToken == "" {
-		return nil, errors.New("未配置 LATHE_GITHUB_TOKEN")
-	}
-
-	lin, err := linear.NewClient(cfg.LinearToken)
-	if err != nil {
-		return nil, err
-	}
-	ghc, err := github.NewClient(cfg.GitHubToken)
-	if err != nil {
-		return nil, err
-	}
+// buildPipeline 装配流水线。
+//
+// 刻意不在此校验 Linear/GitHub 凭据：凭据现在可在界面里配置，
+// 缺凭据不该阻止服务启动 —— 否则新用户连配置页都打不开。
+// 真正需要凭据时（执行任务）才会报错，并指引去设置页。
+func buildPipeline(cfg config.Config, st *store.Store, clients runner.Clients) (*runner.Pipeline, error) {
 	wm, err := runner.NewWorktreeManager(cfg.WorkspaceRoot)
 	if err != nil {
 		return nil, err
@@ -189,8 +229,7 @@ func buildPipeline(cfg config.Config, st *store.Store) (*runner.Pipeline, error)
 		Worktrees:      wm,
 		Verifier:       runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
 		Agent:          agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
-		Linear:         lin,
-		GitHub:         ghc,
+		Clients:        clients,
 		Notifier:       logNotifier{},
 		PermissionMode: "acceptEdits",
 	}, nil
@@ -228,4 +267,20 @@ type logNotifier struct{}
 func (logNotifier) Notify(ctx context.Context, msg string) error {
 	slog.Warn("【通知】" + msg)
 	return nil
+}
+
+// ensureUser 取得（或创建）P0 单用户模式下的用户记录。
+//
+// 凭据、仓库配置都挂在 user 上；P0 只有一个用户，首次启动自动建好，
+// 免得新用户还要先手工往表里插一条才能用界面。
+func ensureUser(ctx context.Context, st *store.Store, cfg config.Config) (int64, error) {
+	var id int64
+	err := st.Pool().QueryRow(ctx, `
+		INSERT INTO users (email) VALUES ($1)
+		ON CONFLICT (email) DO UPDATE SET updated_at = now()
+		RETURNING id`, cfg.AdminEmail).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("初始化用户失败: %w", err)
+	}
+	return id, nil
 }
