@@ -72,7 +72,41 @@ func (m *WorktreeManager) EnsureMirror(ctx context.Context, providerRepo, cloneU
 	if _, err := m.git(ctx, "", "clone", "--mirror", "--quiet", cloneURL, mirror); err != nil {
 		return "", fmt.Errorf("runner: 克隆 mirror %s 失败: %w", providerRepo, err)
 	}
+
+	// ★安全：clone --mirror 会设 remote.origin.mirror=true，此时 git push
+	// 变成镜像推送 —— 会把本地所有 ref 一并推上远端，包括 dev/test/main。
+	// 这与「永不推受保护分支」直接冲突，必须在克隆后立刻解除。
+	if _, err := m.git(ctx, mirror, "config", "--unset-all", "remote.origin.mirror"); err != nil {
+		return "", fmt.Errorf("runner: 解除 mirror 推送模式失败（不解除会导致镜像推送覆盖受保护分支）: %w", err)
+	}
+	if _, err := m.git(ctx, mirror, "config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"); err != nil {
+		return "", fmt.Errorf("runner: 设置 fetch refspec 失败: %w", err)
+	}
 	return mirror, nil
+}
+
+// Push 把任务分支推到远端。
+//
+// 两道防线：
+//  1. 先校验分支不在受保护列表里；
+//  2. 用完整显式 refspec 推送，杜绝任何"顺带推别的 ref"的可能。
+func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfig) error {
+	if wt == nil {
+		return fmt.Errorf("runner: 工作区为空")
+	}
+	if err := repo.ValidatePushTarget(wt.Branch); err != nil {
+		return err
+	}
+	// 基线分支同样不能成为推送目标（防止配置错误把任务分支命名成 dev）
+	if base, err := repo.BaseBranch(KindFix); err == nil && wt.Branch == base {
+		return ErrProtectedBranch{Branch: wt.Branch, Repo: repo.ProviderRepo}
+	}
+
+	refspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", wt.Branch, wt.Branch)
+	if _, err := m.git(ctx, wt.Path, "push", "--set-upstream", "origin", refspec); err != nil {
+		return fmt.Errorf("runner: 推送分支 %s 失败: %w", wt.Branch, err)
+	}
+	return nil
 }
 
 // Worktree 是一个已创建的任务工作区。
