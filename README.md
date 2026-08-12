@@ -28,13 +28,41 @@ Go 1.25 · pgx + sqlc · PostgreSQL · Vue 3 SPA（`go:embed`）· `claude` CLI 
 ## 开发
 
 ```bash
-make dev-infra    # 起 Postgres
+make dev-infra    # 起 Postgres（端口 55432，避开常见占用）
 make migrate      # 建表
 make build        # 编译
 make test         # 测试
 make run          # 起控制面
 ```
 
+## P0 跑起来
+
+```bash
+# 1. 基础设施与建表
+make dev-infra && make build && ./bin/lathe migrate up
+
+# 2. 凭据（写进 .env.local，已在 .gitignore 里）
+export LATHE_LINEAR_TOKEN=lin_api_xxx          # Linear → Settings → API
+export LATHE_LINEAR_WEBHOOK_SECRET=xxx         # 建 webhook 时 Linear 给
+export LATHE_LINEAR_USER_ID=xxx                # 你的 Linear user id，只接指派给你的单
+export LATHE_GITHUB_TOKEN=$(gh auth token)
+
+# 3. 配置用户与仓库（P0 单用户单仓，取 repos 表第一条）
+psql "$DSN" -c "INSERT INTO users (email) VALUES ('you@example.com')"
+psql "$DSN" -c "INSERT INTO repos (user_id, provider_repo) VALUES (1, 'Clouditera/CloudRouter')"
+
+# 4. 起服务，把 Linear webhook 指到 /webhooks/linear
+./bin/lathe serve
+```
+
+流程：指派 issue 给自己 → webhook 接单 → 分诊 → 实现 → light 档验证 → 开 PR → 回帖。
+失败则回帖说明原因、**保留 worktree 现场**、推送通知，不自动重试。
+
 ## 状态
 
-P0（单机 / 单用户 / 串行 / light 档验证）开发中。见 docs/02-design.md §8 分期。
+**P0 已完成**（单机 / 单用户 / 串行 / light 档验证），121 项测试。
+
+后续见 [docs/02-design.md](docs/02-design.md) §8：
+P1 验证基建（per-task compose 隔离 + 红-绿复现证明）→ P2 多租户 → P3 多节点。
+
+未完成：真实 Linear 连通性验证（待凭据）、Web UI、heavy 档验证。

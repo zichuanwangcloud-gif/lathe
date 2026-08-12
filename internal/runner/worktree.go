@@ -85,6 +85,35 @@ func (m *WorktreeManager) EnsureMirror(ctx context.Context, providerRepo, cloneU
 	return mirror, nil
 }
 
+// HasChanges 报告工作区是否有未提交的改动。
+//
+// agent 跑完却没有任何改动，说明它实际上没干活 —— 这是一种失败，
+// 不能当成"改动为空的成功"放过去。
+func (m *WorktreeManager) HasChanges(ctx context.Context, wt *Worktree) (bool, error) {
+	out, err := m.git(ctx, wt.Path, "status", "--porcelain")
+	if err != nil {
+		return false, fmt.Errorf("runner: 检查工作区改动失败: %w", err)
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// Commit 把工作区全部改动提交。
+//
+// 提交由流水线负责而非 agent：agent 的 prompt 明确禁止它执行 git 操作，
+// 这样提交信息格式统一，也避免 agent 意外 push。
+func (m *WorktreeManager) Commit(ctx context.Context, wt *Worktree, message string) error {
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("runner: 提交信息为空")
+	}
+	if _, err := m.git(ctx, wt.Path, "add", "-A"); err != nil {
+		return fmt.Errorf("runner: 暂存改动失败: %w", err)
+	}
+	if _, err := m.git(ctx, wt.Path, "commit", "-q", "-m", message); err != nil {
+		return fmt.Errorf("runner: 提交失败: %w", err)
+	}
+	return nil
+}
+
 // Push 把任务分支推到远端。
 //
 // 两道防线：

@@ -32,8 +32,8 @@ func TestDetectLightProfileGoOnly(t *testing.T) {
 	if len(steps) != 2 {
 		t.Fatalf("应得到 build + lint 两步，得到 %d: %+v", len(steps), steps)
 	}
-	if strings.Join(steps[0].Cmd, " ") != "go build ./..." {
-		t.Errorf("首步应为 go build，得到 %v", steps[0].Cmd)
+	if strings.Join(steps[0].Cmd, " ") != "go build -buildvcs=false ./..." {
+		t.Errorf("首步应为 go build -buildvcs=false（worktree 里 VCS 戳记会失败），得到 %v", steps[0].Cmd)
 	}
 	if strings.Join(steps[1].Cmd, " ") != "go vet ./..." {
 		t.Errorf("次步应为 go vet，得到 %v", steps[1].Cmd)

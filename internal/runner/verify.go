@@ -150,7 +150,11 @@ func DetectLightProfile(root string, exclude ...string) ([]Step, error) {
 	}
 	for _, d := range goDirs {
 		steps = append(steps,
-			Step{Name: StepBuild, Cmd: []string{"go", "build", "./..."}, Dir: d},
+			// -buildvcs=false：Lathe 的工作区都是 git worktree，go build 默认会
+			// 尝试给二进制打 VCS 戳记，而在 worktree 里这一步常以
+			// "error obtaining VCS status: exit status 128" 失败。验证只关心
+			// 能不能编译，戳记既无关又脆弱。
+			Step{Name: StepBuild, Cmd: []string{"go", "build", "-buildvcs=false", "./..."}, Dir: d},
 			Step{Name: StepLint, Cmd: []string{"go", "vet", "./..."}, Dir: d},
 		)
 	}
