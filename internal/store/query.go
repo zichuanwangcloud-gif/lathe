@@ -1,0 +1,299 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// TaskRow 是任务列表里的一行（含展示所需的关联字段）。
+type TaskRow struct {
+	ID             int64      `json:"id"`
+	LinearIssueKey string     `json:"linearIssueKey"`
+	State          string     `json:"state"`
+	TaskKind       *string    `json:"taskKind"`
+	VerifyTier     *string    `json:"verifyTier"`
+	BranchName     *string    `json:"branchName"`
+	PRURL          *string    `json:"prUrl"`
+	FailureReason  *string    `json:"failureReason"`
+	WorktreePath   *string    `json:"worktreePath"`
+	ProviderRepo   string     `json:"providerRepo"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+	AgentSessionID *string    `json:"agentSessionId"`
+	LeaseExpiresAt *time.Time `json:"leaseExpiresAt"`
+}
+
+// ListTasksParams 是任务列表的过滤条件。
+type ListTasksParams struct {
+	// States 为空表示不过滤。
+	States []string
+	Limit  int
+	Offset int
+}
+
+// ListTasks 按更新时间倒序返回任务列表。
+func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, int, error) {
+	if p.Limit <= 0 || p.Limit > 200 {
+		p.Limit = 50
+	}
+	if p.Offset < 0 {
+		p.Offset = 0
+	}
+
+	// 空数组在 SQL 里用 NULL 表示"不过滤"，避免拼接动态 SQL
+	var states any
+	if len(p.States) > 0 {
+		states = p.States
+	}
+
+	var total int
+	if err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM tasks
+		WHERE ($1::text[] IS NULL OR state = ANY($1))`, states).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: 统计任务数失败: %w", err)
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT t.id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
+		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
+		       r.provider_repo, t.created_at, t.updated_at,
+		       t.agent_session_id, t.lease_expires_at
+		FROM tasks t
+		JOIN repos r ON r.id = t.repo_id
+		WHERE ($1::text[] IS NULL OR t.state = ANY($1))
+		ORDER BY t.updated_at DESC
+		LIMIT $2 OFFSET $3`, states, p.Limit, p.Offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: 查询任务列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TaskRow, 0, p.Limit)
+	for rows.Next() {
+		var t TaskRow
+		if err := rows.Scan(
+			&t.ID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
+			&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
+			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
+			&t.AgentSessionID, &t.LeaseExpiresAt,
+		); err != nil {
+			return nil, 0, fmt.Errorf("store: 读取任务行失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, total, rows.Err()
+}
+
+// EventRow 是状态轨迹里的一条事件。
+type EventRow struct {
+	ID        int64          `json:"id"`
+	FromState *string        `json:"fromState"`
+	ToState   string         `json:"toState"`
+	Actor     string         `json:"actor"`
+	Payload   map[string]any `json:"payload"`
+	At        time.Time      `json:"at"`
+}
+
+// VerificationRow 是一条验证步骤结果。
+type VerificationRow struct {
+	ID         int64     `json:"id"`
+	Tier       string    `json:"tier"`
+	Step       string    `json:"step"`
+	Status     string    `json:"status"`
+	DurationMS *int64    `json:"durationMs"`
+	LogRef     *string   `json:"logRef"`
+	At         time.Time `json:"at"`
+}
+
+// TaskDetail 是任务详情页所需的全部数据。
+type TaskDetail struct {
+	Task          TaskRow           `json:"task"`
+	Events        []EventRow        `json:"events"`
+	Verifications []VerificationRow `json:"verifications"`
+}
+
+// TaskDetail 读取单个任务的完整信息。
+func (s *Store) TaskDetail(ctx context.Context, id int64) (*TaskDetail, error) {
+	var t TaskRow
+	err := s.pool.QueryRow(ctx, `
+		SELECT t.id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
+		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
+		       r.provider_repo, t.created_at, t.updated_at,
+		       t.agent_session_id, t.lease_expires_at
+		FROM tasks t JOIN repos r ON r.id = t.repo_id
+		WHERE t.id = $1`, id,
+	).Scan(
+		&t.ID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
+		&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
+		&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
+		&t.AgentSessionID, &t.LeaseExpiresAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: 读取任务 %d 失败: %w", id, err)
+	}
+
+	detail := &TaskDetail{Task: t, Events: []EventRow{}, Verifications: []VerificationRow{}}
+
+	evRows, err := s.pool.Query(ctx, `
+		SELECT id, from_state, to_state, actor, payload, at
+		FROM task_events WHERE task_id = $1 ORDER BY at, id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("store: 读取状态轨迹失败: %w", err)
+	}
+	defer evRows.Close()
+	for evRows.Next() {
+		var e EventRow
+		if err := evRows.Scan(&e.ID, &e.FromState, &e.ToState, &e.Actor, &e.Payload, &e.At); err != nil {
+			return nil, fmt.Errorf("store: 读取事件失败: %w", err)
+		}
+		detail.Events = append(detail.Events, e)
+	}
+	if err := evRows.Err(); err != nil {
+		return nil, err
+	}
+
+	vRows, err := s.pool.Query(ctx, `
+		SELECT id, tier, step, status, duration_ms, log_ref, at
+		FROM verifications WHERE task_id = $1 ORDER BY at, id`, id)
+	if err != nil {
+		return nil, fmt.Errorf("store: 读取验证结果失败: %w", err)
+	}
+	defer vRows.Close()
+	for vRows.Next() {
+		var v VerificationRow
+		if err := vRows.Scan(&v.ID, &v.Tier, &v.Step, &v.Status, &v.DurationMS, &v.LogRef, &v.At); err != nil {
+			return nil, fmt.Errorf("store: 读取验证行失败: %w", err)
+		}
+		detail.Verifications = append(detail.Verifications, v)
+	}
+	return detail, vRows.Err()
+}
+
+// Stats 是看板顶部的汇总指标。
+type Stats struct {
+	ByState map[string]int `json:"byState"`
+	Total   int            `json:"total"`
+	// Active 是仍在流转中的任务数（非终态）。
+	Active int `json:"active"`
+	// SuccessRate 是已终结任务里走到 pr_open/merged 的比例，无终结任务时为 -1。
+	SuccessRate float64 `json:"successRate"`
+}
+
+// Stats 汇总任务状态分布。
+func (s *Store) Stats(ctx context.Context) (*Stats, error) {
+	rows, err := s.pool.Query(ctx, `SELECT state, count(*) FROM tasks GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("store: 统计任务状态失败: %w", err)
+	}
+	defer rows.Close()
+
+	st := &Stats{ByState: map[string]int{}, SuccessRate: -1}
+	terminal := map[string]bool{"merged": true, "failed": true, "cancelled": true}
+	var settled, succeeded int
+
+	for rows.Next() {
+		var state string
+		var n int
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, fmt.Errorf("store: 读取状态统计失败: %w", err)
+		}
+		st.ByState[state] = n
+		st.Total += n
+		if terminal[state] {
+			settled += n
+			if state == "merged" {
+				succeeded += n
+			}
+		} else {
+			st.Active += n
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// pr_open 已产出可合并的结果，计入成功
+	if n, ok := st.ByState["pr_open"]; ok {
+		settled += n
+		succeeded += n
+		st.Active -= n
+	}
+	if settled > 0 {
+		st.SuccessRate = float64(succeeded) / float64(settled)
+	}
+	return st, nil
+}
+
+// RepoRow 是仓库配置。
+type RepoRow struct {
+	ID                int64    `json:"id"`
+	ProviderRepo      string   `json:"providerRepo"`
+	DefaultBranch     string   `json:"defaultBranch"`
+	HotfixBase        string   `json:"hotfixBase"`
+	ProtectedBranches []string `json:"protectedBranches"`
+	BranchPattern     string   `json:"branchPattern"`
+	DepStrategy       string   `json:"depStrategy"`
+	GateMode          string   `json:"gateMode"`
+}
+
+// ListRepos 返回全部仓库配置。
+func (s *Store) ListRepos(ctx context.Context) ([]RepoRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, provider_repo, default_branch, hotfix_base,
+		       protected_branches, branch_pattern, dep_strategy, gate_mode
+		FROM repos ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := []RepoRow{}
+	for rows.Next() {
+		var r RepoRow
+		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
+			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode); err != nil {
+			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpdateRepoParams 是可通过界面修改的仓库配置项。
+type UpdateRepoParams struct {
+	DefaultBranch     string
+	HotfixBase        string
+	ProtectedBranches []string
+	BranchPattern     string
+	GateMode          string
+}
+
+// UpdateRepo 更新仓库配置。
+func (s *Store) UpdateRepo(ctx context.Context, id int64, p UpdateRepoParams) (*RepoRow, error) {
+	var r RepoRow
+	err := s.pool.QueryRow(ctx, `
+		UPDATE repos SET
+			default_branch     = COALESCE(NULLIF($2,''), default_branch),
+			hotfix_base        = COALESCE(NULLIF($3,''), hotfix_base),
+			protected_branches = COALESCE($4, protected_branches),
+			branch_pattern     = COALESCE(NULLIF($5,''), branch_pattern),
+			gate_mode          = COALESCE(NULLIF($6,''), gate_mode)
+		WHERE id = $1
+		RETURNING id, provider_repo, default_branch, hotfix_base,
+		          protected_branches, branch_pattern, dep_strategy, gate_mode`,
+		id, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
+	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
+		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode)
+	if err != nil {
+		return nil, fmt.Errorf("store: 更新仓库 %d 失败: %w", id, err)
+	}
+	return &r, nil
+}
+
+func nilIfEmpty(s []string) any {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}

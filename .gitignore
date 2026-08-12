@@ -30,3 +30,7 @@ coverage.*
 .vscode/
 *.swp
 .DS_Store
+
+# 界面构建产物的内嵌副本由 make ui 生成
+/internal/webui/dist/*
+!/internal/webui/dist/.gitkeep

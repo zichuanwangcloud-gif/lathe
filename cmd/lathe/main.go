@@ -22,6 +22,7 @@ import (
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
+	"github.com/Clouditera/lathe/internal/webui"
 )
 
 func main() {
@@ -101,6 +102,14 @@ func serve(cfg config.Config) error {
 	q := newQueue(st, task.NewMachine(st.Pool()), pipeline, cfg)
 	go q.work(ctx)
 
+	adminToken := os.Getenv("LATHE_ADMIN_TOKEN")
+	auth := httpapi.NewAuth(adminToken)
+	if !auth.Enabled() {
+		// 不因此拒绝启动：webhook 链路不依赖管理界面，
+		// 但必须让人知道界面为什么打不开
+		slog.Warn("未配置 LATHE_ADMIN_TOKEN，管理界面与 API 已禁用（webhook 仍正常工作）")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", httpapi.Health)
 	mux.Handle("POST /webhooks/linear", &httpapi.LinearWebhook{
@@ -109,6 +118,24 @@ func serve(cfg config.Config) error {
 		Deliveries: st,
 		Tasks:      q,
 	})
+
+	apiSrv := &httpapi.API{
+		Store:        st,
+		Tasks:        task.NewMachine(st.Pool()),
+		Queue:        q,
+		Auth:         auth,
+		ConfigStatus: configStatus(cfg),
+	}
+	apiSrv.Routes(mux)
+
+	if webui.Available() {
+		mux.Handle("/", webui.Handler())
+	} else {
+		slog.Warn("管理界面未构建进二进制，执行 make ui 后重新编译")
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "管理界面未构建：请执行 make ui && make build", http.StatusNotImplemented)
+		})
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -167,6 +194,31 @@ func buildPipeline(cfg config.Config, st *store.Store) (*runner.Pipeline, error)
 		Notifier:       logNotifier{},
 		PermissionMode: "acceptEdits",
 	}, nil
+}
+
+// configStatus 生成给管理界面的配置状态。
+//
+// 只报告「配没配、从哪个环境变量读」，绝不包含凭据内容本身。
+func configStatus(cfg config.Config) func() map[string]any {
+	return func() map[string]any {
+		item := func(v string) map[string]any {
+			return map[string]any{"configured": v != ""}
+		}
+		return map[string]any{
+			"linear":        item(cfg.LinearToken),
+			"linearWebhook": item(cfg.LinearWebhookSecret),
+			"linearUser":    item(os.Getenv("LATHE_LINEAR_USER_ID")),
+			"github":        item(cfg.GitHubToken),
+			"runtime": map[string]any{
+				"node":          cfg.NodeName,
+				"workspaceRoot": cfg.WorkspaceRoot,
+				"pnpmStore":     cfg.PnpmStore,
+				"claudeBin":     cfg.ClaudeBin,
+				"agentTimeout":  cfg.AgentTimeout.String(),
+				"mode":          "P0 串行（单机单用户）",
+			},
+		}
+	}
 }
 
 // logNotifier 是 P0 的占位通知实现：先写日志。
