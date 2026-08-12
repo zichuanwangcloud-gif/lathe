@@ -55,7 +55,7 @@ CREATE TABLE repos (
   default_branch    text        NOT NULL DEFAULT 'dev', -- fix/feature 的分叉基线
   hotfix_base       text        NOT NULL DEFAULT 'main',-- hotfix 的分叉基线
   protected_branches text[]     NOT NULL DEFAULT '{dev,test,main}',
-  branch_pattern    text        NOT NULL DEFAULT 'fix/{key}-{slug}',
+  branch_pattern    text        NOT NULL DEFAULT '{kind}/{key}-{slug}',
   verify_profile_ref text,                              -- 验证配置（见 §5）
   dep_strategy      text        NOT NULL DEFAULT 'pnpm-store',
   gate_mode         text        NOT NULL DEFAULT 'direct',
