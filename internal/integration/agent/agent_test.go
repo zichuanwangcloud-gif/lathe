@@ -172,6 +172,16 @@ func TestBuildArgs(t *testing.T) {
 			p:        RunParams{Prompt: "x", PermissionMode: "acceptEdits", ExtraArgs: []string{"--max-turns", "20"}},
 			contains: []string{"--permission-mode", "acceptEdits", "--max-turns", "20"},
 		},
+		{
+			name:     "收敛配置源\u4e3a仓库自身",
+			p:        RunParams{Prompt: "x", SettingSources: "project"},
+			contains: []string{"--setting-sources", "project"},
+		},
+		{
+			name:   "未指定则不带该参数",
+			p:      RunParams{Prompt: "x"},
+			absent: []string{"--setting-sources"},
+		},
 	}
 
 	for _, tc := range cases {

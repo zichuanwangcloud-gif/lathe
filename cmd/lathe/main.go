@@ -274,6 +274,7 @@ func buildPipeline(cfg config.Config, st *store.Store, clients runner.Clients) (
 		Verifications:  st,
 		Gates:          runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode: "acceptEdits",
+		SettingSources: cfg.SettingSources,
 	}, nil
 }
 

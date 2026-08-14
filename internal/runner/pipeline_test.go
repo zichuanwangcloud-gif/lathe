@@ -254,6 +254,7 @@ func TestPipelineHappyPath(t *testing.T) {
 	verifs := &fakeVerifications{}
 	p := newPipeline(t, m, lin, gh, ag, no)
 	p.Verifications = verifs
+	p.SettingSources = "project"
 
 	err := p.Execute(context.Background(), ExecuteParams{
 		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
@@ -336,6 +337,12 @@ func TestPipelineHappyPath(t *testing.T) {
 	// 两次调用应使用不同会话
 	if ag.calls[0].SessionID == ag.calls[1].SessionID {
 		t.Error("分诊与实现不应共用会话")
+	}
+	// §9：所有 agent 调用都应收敛配置源，把个人插件排除在上下文之外
+	for i, c := range ag.calls {
+		if c.SettingSources != "project" {
+			t.Errorf("第 %d 次 agent 调用未收敛配置源: %q", i, c.SettingSources)
+		}
 	}
 
 	if len(lin.comments) != 1 || !strings.Contains(lin.comments[0], "pull/42") {

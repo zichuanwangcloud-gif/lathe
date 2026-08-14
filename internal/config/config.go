@@ -32,6 +32,9 @@ type Config struct {
 	// Agent 执行
 	ClaudeBin    string        // claude CLI 路径
 	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
+	// SettingSources 传给 claude --setting-sources。默认 "project"：只加载
+	// 目标仓库自己的配置，排除执行者个人环境的插件（§9 上下文基线成本）。
+	SettingSources string
 
 	// 验证双通道（docs/02-design.md §6.2）：light/heavy 各自独立配额，
 	// 不共用一个数字 —— 资源画像差一个量级。任务worker总数 = 两者之和。
@@ -113,6 +116,7 @@ func Load() (Config, error) {
 		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
 		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
+		SettingSources:      env("LATHE_SETTING_SOURCES", "project"),
 		LightSlots:          envInt("LATHE_LIGHT_SLOTS", 2),
 		HeavySlots:          envInt("LATHE_HEAVY_SLOTS", 1),
 		LinearToken:         env("LATHE_LINEAR_TOKEN", ""),

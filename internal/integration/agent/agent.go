@@ -129,6 +129,14 @@ type RunParams struct {
 	// PermissionMode 传给 --permission-mode。无人值守通常用 acceptEdits
 	// 或 bypassPermissions；留空则用 CLI 默认。
 	PermissionMode string
+	// SettingSources 传给 --setting-sources（user,project,local 的子集）。
+	//
+	// 无人值守批量跑应收敛为 "project"：只加载目标仓库自己的配置与
+	// CLAUDE.md，把执行者个人环境里的插件与技能定义排除在外。
+	// 实测一句「回答两个字」在装了插件的环境要吃掉 32937 input tokens
+	// （docs/02-design.md §9）—— 这笔基线会乘以任务数，且让任务执行
+	// 结果依赖某台机器装了什么插件，不可复现。
+	SettingSources string
 	// ExtraArgs 追加原样传给 CLI 的参数。
 	ExtraArgs []string
 
@@ -232,6 +240,9 @@ func (d *Driver) buildArgs(p RunParams) []string {
 
 	if p.PermissionMode != "" {
 		args = append(args, "--permission-mode", p.PermissionMode)
+	}
+	if p.SettingSources != "" {
+		args = append(args, "--setting-sources", p.SettingSources)
 	}
 	args = append(args, p.ExtraArgs...)
 

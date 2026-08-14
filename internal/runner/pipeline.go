@@ -76,6 +76,9 @@ type Pipeline struct {
 
 	// PermissionMode 传给 agent；无人值守通常用 acceptEdits。
 	PermissionMode string
+	// SettingSources 传给 agent 的 --setting-sources（§9：收敛上下文
+	// 基线成本，只加载目标仓库自己的配置，排除个人插件）。
+	SettingSources string
 	// ExcludeDirs 是仓库级的验证扫描排除目录（如 CloudRouter 的 upstream）。
 	ExcludeDirs []string
 }
@@ -128,6 +131,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		Prompt:         TriagePrompt(issue.Context()),
 		SessionID:      triageSession,
 		PermissionMode: "plan", // 分诊只读不写
+		SettingSources: p.SettingSources,
 	})
 	if err != nil {
 		return p.fail(ctx, lin, tk.ID, params, nil, "分诊执行失败", err)
@@ -178,6 +182,7 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		Dir:            wt.Path,
 		SessionID:      implSession,
 		PermissionMode: p.PermissionMode,
+		SettingSources: p.SettingSources,
 	})
 	if err != nil {
 		return p.fail(ctx, lin, tk.ID, params, wt, "实现执行失败", err)
