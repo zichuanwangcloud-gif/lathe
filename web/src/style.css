@@ -145,3 +145,28 @@ pre {
   padding: 10px 14px;
   margin-bottom: 16px;
 }
+
+/* 认证类页面（登录、注册、找回密码、改密）共用的居中卡片布局。
+   从 App.vue 的 scoped 样式提到这里 —— 现在有五个页面要用它。 */
+.login-wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+.login-card {
+  width: min(420px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.login-card h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+.login-card p { margin: 0; }
+
+/* 认证卡片底部的辅助链接（去注册 / 忘记密码 / 回登录） */
+.auth-links {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}

@@ -99,10 +99,11 @@ func (q *queue) runOne(ctx context.Context, j job) {
 	slog.Info("任务处理完成", "issue", j.IssueKey, "task", tk.ID)
 }
 
-// resolveRepo 查出该用户配置的仓库。
+// resolveRepo 查出要操作的仓库。
 //
-// P0 单用户单仓：取第一条 repos 记录。多仓路由（按 issue 的 team/project
-// 映射到不同仓库）留到 P2 随 Web UI 配置一起做。
+// 当前单仓：取第一条 repos 记录。账号体系的第一步数据仍然共享，所有任务都
+// 落在同一份仓库配置上；按用户隔离与按 issue 的 team/project 路由到不同仓库
+// 都留到第二步（见 docs/02-design.md §8）。
 func (q *queue) resolveRepo(ctx context.Context, j job) (userID, repoID int64, cfg runner.RepoConfig, cloneURL string, err error) {
 	var (
 		providerRepo  string

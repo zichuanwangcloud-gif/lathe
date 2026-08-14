@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -32,8 +33,31 @@ type Config struct {
 	ClaudeBin    string        // claude CLI 路径
 	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
 
-	// AdminEmail 是 P0 单用户模式下自动创建的用户标识。
+	// AdminEmail 是内置超级管理员的邮箱。
 	AdminEmail string
+
+	// AdminPassword 是内置超管的初始口令。
+	//
+	// 留空时启动逻辑随机生成一个并打印到日志里（只打印这一次）。
+	// 刻意不写进 Redacted —— 它是货真价实的口令。
+	AdminPassword string
+
+	// BaseURL 是本实例的对外访问地址，例如 https://lathe.example.com。
+	//
+	// 密码重置邮件里的链接必须用它拼，而不能从请求的 Host 头推导：
+	// 发起「忘记密码」的请求是未认证的，Host 头可被任意伪造，据此拼出的
+	// 链接会把重置令牌送到攻击者的域名上。
+	BaseURL string
+
+	// CookieSecure 显式覆盖会话 Cookie 的 Secure 标志。
+	// 留空表示按 BaseURL 的协议推断，见 SecureCookies。
+	CookieSecure string
+
+	// TrustedProxy 决定是否信任 X-Forwarded-For 里的客户端地址。
+	//
+	// 默认不信任：无条件读 XFF 会让按 IP 的限流被一行请求头绕过。
+	// 只有确实部署在反向代理后面时才打开。
+	TrustedProxy bool
 
 	// 集成凭据的环境变量兜底值。
 	//
@@ -75,6 +99,10 @@ func Load() (Config, error) {
 		NodeName:            env("LATHE_NODE_NAME", hostnameOr("local")),
 		DataDir:             env("LATHE_DATA_DIR", "/opt/lathe/data"),
 		AdminEmail:          env("LATHE_ADMIN_EMAIL", "admin@lathe.local"),
+		AdminPassword:       env("LATHE_ADMIN_PASSWORD", ""),
+		BaseURL:             strings.TrimRight(env("LATHE_BASE_URL", ""), "/"),
+		CookieSecure:        env("LATHE_COOKIE_SECURE", ""),
+		TrustedProxy:        env("LATHE_TRUSTED_PROXY", "") == "true",
 		WorkspaceRoot:       env("LATHE_WORKSPACE_ROOT", "/opt/lathe/workspaces"),
 		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
@@ -115,14 +143,62 @@ func (c Config) Validate() error {
 	if c.AgentTimeout <= 0 {
 		return fmt.Errorf("config: AgentTimeout 必须为正，得到 %v", c.AgentTimeout)
 	}
+	// BaseURL 可以不配（此时由 HTTPAddr 兜底并告警），但配了就必须是
+	// 能直接放进邮件正文的绝对地址 —— 拼错的链接要在启动时炸，
+	// 而不是等用户点开重置邮件才发现打不开。
+	if c.BaseURL != "" {
+		u, err := url.Parse(c.BaseURL)
+		if err != nil {
+			return fmt.Errorf("config: BaseURL 无法解析: %w", err)
+		}
+		if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("config: BaseURL 必须是 http:// 或 https:// 开头的绝对地址，得到 %q", c.BaseURL)
+		}
+	}
+	if c.CookieSecure != "" && c.CookieSecure != "true" && c.CookieSecure != "false" {
+		return fmt.Errorf("config: LATHE_COOKIE_SECURE 只能是 true 或 false，得到 %q", c.CookieSecure)
+	}
 	return nil
 }
 
+// PublicURL 返回用于拼接外链的基地址。
+//
+// 未配 BaseURL 时退回本机地址：能让单机自用跑通，但邮件里的链接外网点不开，
+// 所以调用方应当在此时告警。
+func (c Config) PublicURL() string {
+	if c.BaseURL != "" {
+		return c.BaseURL
+	}
+	addr := c.HTTPAddr
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	return "http://" + addr
+}
+
+// SecureCookies 报告会话 Cookie 是否应带 Secure 标志。
+//
+// 默认按 BaseURL 的协议推断：一个配置项同时说明「我的对外地址」与
+// 「我是不是 HTTPS」。TLS 卸载在反代上、BaseURL 却写了 http 这类情况，
+// 用 LATHE_COOKIE_SECURE 显式覆盖。
+func (c Config) SecureCookies() bool {
+	switch c.CookieSecure {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return strings.HasPrefix(c.BaseURL, "https://")
+}
+
 // Redacted 返回可安全写入日志的配置摘要，密钥一律脱敏。
+//
+// BaseURL 原样输出：它不是密钥，且启动时看到它很有用 ——
+// 「重置邮件里的链接指向哪」正是最容易配错的一项。
 func (c Config) Redacted() string {
 	return fmt.Sprintf(
-		"Config{HTTPAddr:%s DB:%s@%s:%d/%s Node:%s Workspace:%s Claude:%s Timeout:%v Linear:%s GitHub:%s}",
-		c.HTTPAddr, c.Database.User, c.Database.Host, c.Database.Port, c.Database.Name,
+		"Config{HTTPAddr:%s BaseURL:%s DB:%s@%s:%d/%s Node:%s Workspace:%s Claude:%s Timeout:%v Linear:%s GitHub:%s}",
+		c.HTTPAddr, c.PublicURL(), c.Database.User, c.Database.Host, c.Database.Port, c.Database.Name,
 		c.NodeName, c.WorkspaceRoot, c.ClaudeBin, c.AgentTimeout,
 		mask(c.LinearToken), mask(c.GitHubToken),
 	)

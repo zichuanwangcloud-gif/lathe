@@ -176,7 +176,7 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := a.Tasks.Transition(r.Context(), id, task.StateQueued, "user:admin", &task.TransitionOpts{
+	if _, err := a.Tasks.Transition(r.Context(), id, task.StateQueued, actorOf(r), &task.TransitionOpts{
 		Payload: map[string]any{"reason": "manual_retry"},
 	}); err != nil {
 		transitionError(w, err)
@@ -196,7 +196,7 @@ func (a *API) cancelTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := a.Tasks.Transition(r.Context(), id, task.StateCancelled, "user:admin", &task.TransitionOpts{
+	if _, err := a.Tasks.Transition(r.Context(), id, task.StateCancelled, actorOf(r), &task.TransitionOpts{
 		Payload: map[string]any{"reason": "manual_cancel"},
 	}); err != nil {
 		transitionError(w, err)

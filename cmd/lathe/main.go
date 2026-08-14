@@ -1,6 +1,7 @@
 // Command lathe 是 Lathe 的控制面：HTTP API、任务状态机、串行执行队列。
 //
-// P0 形态：单机、单用户、串行。多用户与多节点见 docs/02-design.md §8。
+// 当前形态：单机、串行、多用户共享数据。按用户隔离数据与多节点
+// 见 docs/02-design.md §8。
 package main
 
 import (
@@ -15,10 +16,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Clouditera/lathe/internal/auth"
 	"github.com/Clouditera/lathe/internal/config"
 	"github.com/Clouditera/lathe/internal/creds"
 	"github.com/Clouditera/lathe/internal/httpapi"
 	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/Clouditera/lathe/internal/mail"
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/secret"
 	"github.com/Clouditera/lathe/internal/store"
@@ -105,10 +108,18 @@ func serve(cfg config.Config) error {
 	slog.Info("凭据加密已就绪", "key_source", keySource)
 
 	secrets := st.NewSecrets(sealer)
-	userID, err := ensureUser(ctx, st, cfg)
+	users := st.NewUsers()
+	sessions := st.NewSessions()
+
+	admin, err := ensureSuperadmin(ctx, users, cfg)
 	if err != nil {
 		return err
 	}
+	// 第一步：数据仍然共享，凭据与仓库配置全部挂在内置管理员名下。
+	// 按用户隔离（owner_id 全链路）是第二步的事。
+	userID := admin.ID
+
+	go gcSessions(ctx, sessions)
 
 	provider := creds.NewProvider(secrets, userID, creds.EnvFallback{
 		LinearToken:         cfg.LinearToken,
@@ -131,12 +142,15 @@ func serve(cfg config.Config) error {
 	q := newQueue(st, task.NewMachine(st.Pool()), pipeline, cfg)
 	go q.work(ctx)
 
-	adminToken := os.Getenv("LATHE_ADMIN_TOKEN")
-	auth := httpapi.NewAuth(adminToken)
-	if !auth.Enabled() {
-		// 不因此拒绝启动：webhook 链路不依赖管理界面，
-		// 但必须让人知道界面为什么打不开
-		slog.Warn("未配置 LATHE_ADMIN_TOKEN，管理界面与 API 已禁用（webhook 仍正常工作）")
+	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
+	// （脚本调用，同时是把自己锁在门外时的应急入口）
+	auth := httpapi.NewAuth(os.Getenv("LATHE_ADMIN_TOKEN")).
+		WithStore(users, sessions, admin, cfg.SecureCookies())
+	auth.TrustProxy = cfg.TrustedProxy
+
+	if cfg.BaseURL == "" {
+		slog.Warn("未设置 LATHE_BASE_URL，密码重置邮件里的链接将指向本机地址，外网用户点不开",
+			"链接前缀", cfg.PublicURL())
 	}
 
 	mux := http.NewServeMux()
@@ -157,6 +171,32 @@ func serve(cfg config.Config) error {
 		ConfigStatus: configStatus(cfg),
 	}
 	apiSrv.Routes(mux)
+
+	accountAPI := &httpapi.AccountAPI{
+		Users:      users,
+		Sessions:   sessions,
+		Resets:     st.NewResets(),
+		Auth:       auth,
+		Mail:       mail.NewSender(secrets.LoadSMTP),
+		BaseURL:    cfg.PublicURL(),
+		TrustProxy: cfg.TrustedProxy,
+	}
+	accountAPI.Routes(mux)
+
+	smtpAPI := &httpapi.SMTPAPI{
+		Secrets:  secrets,
+		Verifier: mail.Verifier{},
+		Auth:     auth,
+	}
+	smtpAPI.Routes(mux)
+
+	adminAPI := &httpapi.AdminAPI{
+		Users:    users,
+		Sessions: sessions,
+		Resets:   st.NewResets(),
+		Auth:     auth,
+	}
+	adminAPI.Routes(mux)
 
 	credAPI := &httpapi.CredentialAPI{
 		Secrets:  secrets,
@@ -254,7 +294,7 @@ func configStatus(cfg config.Config) func() map[string]any {
 				"pnpmStore":     cfg.PnpmStore,
 				"claudeBin":     cfg.ClaudeBin,
 				"agentTimeout":  cfg.AgentTimeout.String(),
-				"mode":          "P0 串行（单机单用户）",
+				"mode":          "P0 串行（单机，多用户共享数据）",
 			},
 		}
 	}
@@ -269,18 +309,64 @@ func (logNotifier) Notify(ctx context.Context, msg string) error {
 	return nil
 }
 
-// ensureUser 取得（或创建）P0 单用户模式下的用户记录。
+// ensureSuperadmin 取得（或创建）内置超级管理员。
 //
-// 凭据、仓库配置都挂在 user 上；P0 只有一个用户，首次启动自动建好，
-// 免得新用户还要先手工往表里插一条才能用界面。
-func ensureUser(ctx context.Context, st *store.Store, cfg config.Config) (int64, error) {
-	var id int64
-	err := st.Pool().QueryRow(ctx, `
-		INSERT INTO users (email) VALUES ($1)
-		ON CONFLICT (email) DO UPDATE SET updated_at = now()
-		RETURNING id`, cfg.AdminEmail).Scan(&id)
+// 口令刻意不在迁移里播种：SQL 算不出 bcrypt，而把一个已知明文的哈希写死在
+// 迁移文件里，等于把默认口令发布到公开仓库 —— must_change_password 拦不住
+// 「抢在管理员第一次登录之前登进来」，那恰恰是服务刚起、没人盯着的窗口。
+//
+// 每次启动都跑，幂等：顺带把被误停用的超管救回来，这正是「内置账号」的意义。
+func ensureSuperadmin(ctx context.Context, users *store.Users, cfg config.Config) (*store.User, error) {
+	u, err := users.EnsureAdmin(ctx, cfg.AdminEmail)
 	if err != nil {
-		return 0, fmt.Errorf("初始化用户失败: %w", err)
+		return nil, err
 	}
-	return id, nil
+	if u.PasswordHash != "" {
+		return u, nil
+	}
+
+	// 没有口令 —— 全新安装，或从 P0 升级上来的那条老记录
+	pw, generated := cfg.AdminPassword, false
+	if pw == "" {
+		pw, generated = auth.RandomPassword(), true
+	}
+	hash, err := auth.Hash(pw)
+	if err != nil {
+		return nil, fmt.Errorf("生成管理员口令失败: %w", err)
+	}
+	if err := users.SetPassword(ctx, u.ID, hash, true); err != nil {
+		return nil, err
+	}
+
+	if generated {
+		// 只在自动生成时打印。管理员自己用 LATHE_ADMIN_PASSWORD 指定的口令
+		// 不该再被日志复述一遍 —— 日志往往会被收集转发。
+		slog.Warn("已为内置管理员生成初始口令，请立即登录并修改（此口令只显示这一次）",
+			"email", u.Email, "password", pw)
+	} else {
+		slog.Info("已用 LATHE_ADMIN_PASSWORD 设置内置管理员的初始口令", "email", u.Email)
+	}
+
+	return users.ByID(ctx, u.ID)
+}
+
+// gcSessions 定期清理过期会话与过期的密码重置令牌。
+func gcSessions(ctx context.Context, sessions *store.Sessions) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n, err := sessions.GC(ctx)
+			if err != nil {
+				slog.Warn("清理过期会话失败", "err", err)
+				continue
+			}
+			if n > 0 {
+				slog.Info("已清理过期会话与重置令牌", "rows", n)
+			}
+		}
+	}
 }

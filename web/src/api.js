@@ -1,12 +1,19 @@
 // API 客户端。
 //
-// 所有接口都要求登录：401 统一抛出可识别的错误，由 App 切到登录页。
+// 401 统一抛出可识别的错误，由路由守卫切到登录页；
+// 409 且带 mustChangePassword 表示账号还没改初始密码，交给注入的钩子跳转。
 
 export class UnauthorizedError extends Error {
   constructor() {
     super('未登录')
     this.name = 'UnauthorizedError'
   }
+}
+
+// 强制改密的跳转钩子由 main.js 注入 —— api.js 不该认识 router。
+let onPasswordChangeRequired = () => {}
+export function setPasswordChangeHandler(fn) {
+  onPasswordChangeRequired = fn
 }
 
 async function request(path, options = {}) {
@@ -20,6 +27,8 @@ async function request(path, options = {}) {
   const text = await resp.text()
   const data = text ? JSON.parse(text) : {}
 
+  if (resp.status === 409 && data.mustChangePassword) onPasswordChangeRequired()
+
   if (!resp.ok) {
     const err = new Error(data.error || `请求失败（HTTP ${resp.status}）`)
     err.status = resp.status
@@ -30,8 +39,21 @@ async function request(path, options = {}) {
 
 export const api = {
   me: () => request('/api/me'),
-  login: (token) => request('/api/login', { method: 'POST', body: JSON.stringify({ token }) }),
+  login: (email, password) =>
+    request('/api/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
   logout: () => request('/api/logout', { method: 'POST' }),
+  register: (email, password) =>
+    request('/api/register', { method: 'POST', body: JSON.stringify({ email, password }) }),
+
+  changePassword: (currentPassword, newPassword) =>
+    request('/api/password/change', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+  forgotPassword: (email) =>
+    request('/api/password/forgot', { method: 'POST', body: JSON.stringify({ email }) }),
+  resetPassword: (token, password) =>
+    request('/api/password/reset', { method: 'POST', body: JSON.stringify({ token, password }) }),
 
   tasks: (params = {}) => {
     const q = new URLSearchParams()
@@ -60,6 +82,24 @@ export const api = {
     request(`/api/integrations/${kind}/verify`, { method: 'POST' }),
   deleteIntegration: (kind) =>
     request(`/api/integrations/${kind}`, { method: 'DELETE' }),
+
+  smtp: () => request('/api/smtp'),
+  saveSmtp: (body) => request('/api/smtp', { method: 'PUT', body: JSON.stringify(body) }),
+  verifySmtp: (testTo) =>
+    request('/api/smtp/verify', { method: 'POST', body: JSON.stringify({ testTo }) }),
+  deleteSmtp: () => request('/api/smtp', { method: 'DELETE' }),
+
+  users: () => request('/api/admin/users'),
+  enableUser: (id) => request(`/api/admin/users/${id}/enable`, { method: 'POST' }),
+  disableUser: (id) => request(`/api/admin/users/${id}/disable`, { method: 'POST' }),
+  setUserRole: (id, role) =>
+    request(`/api/admin/users/${id}/role`, { method: 'POST', body: JSON.stringify({ role }) }),
+  resetUserPassword: (id, password) =>
+    request(`/api/admin/users/${id}/password`, {
+      method: 'POST',
+      body: JSON.stringify({ password: password || '' }),
+    }),
+  deleteUser: (id) => request(`/api/admin/users/${id}`, { method: 'DELETE' }),
 }
 
 // 状态的中文名与配色，全站统一。

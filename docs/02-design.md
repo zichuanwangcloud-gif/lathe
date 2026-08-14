@@ -79,9 +79,25 @@ Linear webhook 会重投递。用 `webhook_deliveries(delivery_id PK)` 去重表
 ## 4. 数据模型
 
 ```sql
-users(id, email, created_at)
-integrations(id, user_id, kind, -- linear_oauth | github_app | cloudrouter
-             external_account_id, token_ref, scopes, expires_at)
+users(id, email, created_at,
+      password_hash,          -- bcrypt cost 12；NULL = 尚未设置，任何情况下不当作空口令
+      role,                   -- admin | member
+      disabled_at,            -- NULL = 启用
+      must_change_password,   -- 初始口令未改前，除改密外一律挡住
+      last_login_at,
+      webhook_slug)           -- 每用户专属 webhook 回调地址；第一步只生成不使用
+sessions(id, user_id, expires_at, created_at)
+      -- id 是会话令牌的 sha256，明文只存在于 Cookie 里
+password_reset_tokens(token_hash, user_id, expires_at, used_at, created_at)
+      -- 同样只存哈希；单次消费，认领语义同 webhook_deliveries
+smtp_settings(id=1, host, port, username, password_enc, from_addr, from_name,
+              tls_mode,       -- starttls | tls | none
+              verified_at, verify_error)
+      -- 单行全局表。SMTP 是「系统怎么发信」而非「某人的凭据」，
+      -- 因此不挂 user_id，也不并入 integrations
+integrations(id, user_id, kind, -- linear | linear_webhook | github
+                                -- 预留：linear_oauth | github_app | cloudrouter
+             external_account_id, token_ref, secret_enc, scopes, expires_at)
 repos(id, user_id, provider_repo, default_branch, -- e.g. dev
       branch_pattern,        -- fix/{key}-{slug}
       verify_profile_ref,    -- 见 §5
@@ -208,10 +224,17 @@ Linear: issue 指派给用户
 
 | 阶段 | 范围 |
 |---|---|
-| **P0 闭环** | 单机单用户串行。状态机 + 持久化 + 幂等；`direct` 档；`light` 验证；失败三件套；worktree 自动回收。**刻意不做**：多用户、多节点、并发、Web UI |
+| **P0 闭环** | 单机单账号串行。状态机 + 持久化 + 幂等；`direct` 档；`light` 验证；失败三件套；worktree 自动回收。**刻意不做**：多节点、并发、Web UI |
 | **P1 验证基建** | per-task compose 隔离；红-绿复现证明；§5.1 档位路由；单机双通道并发 |
-| **P2 产品化** | Linear OAuth + GitHub App + CloudRouter 绑定；Web UI（任务看板/仓库配置/准入档位设置）；租户配额 |
+| **P1.5 账号体系（第一步已交付）** | 平台账号：开放注册、邮箱口令登录、两级角色、SMTP 找回密码、用户管理与统计。**数据仍共享**，凭据与仓库配置挂在内置管理员名下 |
+| **P1.5 数据隔离（第二步）** | 全链路 `owner_id`：任务/仓库/凭据按用户隔离；每用户专属 webhook 回调地址（`users.webhook_slug` 已预留）；每用户绑自己的 Linear/GitHub |
+| **P2 产品化** | Linear OAuth + GitHub App + CloudRouter 绑定；租户配额 |
 | **P3 横向扩展** | 节点注册 + 心跳 + 能力声明；能力路由调度；跨节点仓库缓存与依赖 store |
+
+> **「登录 Lathe」与「Lathe 代表你操作 Linear/GitHub」是两件正交的事。**
+> 早期版本把它们混成了一条「多用户 = OAuth」，导致 P0 那行写着「刻意不做多用户」
+> 却又在 §4 里给 `users` 建了表。现在拆开：平台账号（P1.5）用本地邮箱口令，
+> 外部系统授权（P2）走 OAuth / GitHub App，两者并存互不替代。
 
 ---
 

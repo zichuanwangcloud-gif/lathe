@@ -1,69 +1,45 @@
 <script setup>
-import { ref, onMounted, provide } from 'vue'
-import { api, UnauthorizedError } from './api'
+import { onMounted, provide } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { api } from './api'
+import { auth, refresh, clear, isAdmin } from './auth'
 
-const authed = ref(false)
-const authEnabled = ref(true)
-const loading = ref(true)
-const token = ref('')
-const loginError = ref('')
-
-async function checkAuth() {
-  try {
-    const me = await api.me()
-    authed.value = me.authenticated
-    authEnabled.value = me.authEnabled
-  } catch {
-    authed.value = false
-  } finally {
-    loading.value = false
-  }
-}
-
-async function login() {
-  loginError.value = ''
-  try {
-    await api.login(token.value)
-    token.value = ''
-    await checkAuth()
-  } catch (e) {
-    loginError.value = e instanceof UnauthorizedError ? '令牌不正确' : e.message
-  }
-}
+const route = useRoute()
+const router = useRouter()
 
 async function logout() {
   await api.logout()
-  authed.value = false
+  clear()
+  router.push({ name: 'login' })
 }
 
-// 任意子组件遇到 401 时调用，统一切回登录页
-provide('onUnauthorized', () => { authed.value = false })
+// 任意子组件遇到 401 时调用，统一切回登录页。
+// 保留这个 provide 是为了让四个既有视图（看板、详情、仓库、设置）一行不用改。
+provide('onUnauthorized', () => {
+  clear()
+  router.push({ name: 'login' })
+})
 
-onMounted(checkAuth)
+onMounted(() => {
+  if (!auth.ready) refresh()
+})
 </script>
 
 <template>
-  <div v-if="loading" class="empty">加载中…</div>
+  <div v-if="!auth.ready" class="empty">加载中…</div>
 
-  <!-- 未配置管理令牌：说清楚怎么开，而不是只说不可用 -->
-  <div v-else-if="!authEnabled" class="login-wrap">
+  <!-- 鉴权不可用（多半是没跑迁移）：说清楚怎么修，而不是只说不可用 -->
+  <div v-else-if="!auth.authEnabled" class="login-wrap">
     <div class="card login-card">
       <h1>Lathe</h1>
-      <p class="dim">管理界面未启用。</p>
-      <p class="dim">设置环境变量后重启控制面：</p>
-      <pre>LATHE_ADMIN_TOKEN=&lt;自定义一个强口令&gt;</pre>
+      <p class="dim">账号体系尚未就绪。</p>
+      <p class="dim">先应用数据库迁移，再重启控制面：</p>
+      <pre>./bin/lathe migrate up</pre>
     </div>
   </div>
 
-  <div v-else-if="!authed" class="login-wrap">
-    <form class="card login-card" @submit.prevent="login">
-      <h1>Lathe</h1>
-      <p class="dim">输入管理令牌（LATHE_ADMIN_TOKEN）</p>
-      <input v-model="token" type="password" placeholder="管理令牌" autofocus />
-      <div v-if="loginError" class="error-banner">{{ loginError }}</div>
-      <button class="primary" type="submit" :disabled="!token">登录</button>
-    </form>
-  </div>
+  <!-- 公开页自带居中布局，不套导航外壳 -->
+  <RouterView v-else-if="route.meta.public" />
 
   <div v-else class="shell">
     <header class="topbar">
@@ -72,31 +48,22 @@ onMounted(checkAuth)
         <nav class="row">
           <RouterLink to="/">任务看板</RouterLink>
           <RouterLink to="/repos">仓库配置</RouterLink>
-          <RouterLink to="/settings">设置</RouterLink>
+          <RouterLink v-if="isAdmin()" to="/users">用户管理</RouterLink>
+          <RouterLink v-if="isAdmin()" to="/settings">设置</RouterLink>
         </nav>
       </div>
-      <button @click="logout">退出</button>
+      <div class="row">
+        <span class="dim">{{ auth.user?.email }}</span>
+        <span v-if="isAdmin()" class="badge ok">管理员</span>
+        <RouterLink to="/change-password" class="dim">修改密码</RouterLink>
+        <button @click="logout">退出</button>
+      </div>
     </header>
     <main><RouterView /></main>
   </div>
 </template>
 
 <style scoped>
-.login-wrap {
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  padding: 20px;
-}
-.login-card {
-  width: min(420px, 100%);
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.login-card h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
-.login-card p { margin: 0; }
-
 .shell { min-height: 100vh; }
 
 .topbar {
