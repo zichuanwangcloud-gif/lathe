@@ -83,6 +83,9 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 | `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
 | `LATHE_COOKIE_SECURE` | 覆盖会话 Cookie 的 Secure 标志，默认按 BaseURL 的协议推断 |
 | `LATHE_TRUSTED_PROXY` | 设为 `true` 才信任 `X-Forwarded-For`（限流按它取客户端 IP） |
+| `LATHE_LIGHT_SLOTS` | light 档验证并发上限，默认 2 |
+| `LATHE_HEAVY_SLOTS` | heavy 档验证并发上限，默认 1 |
+| `LATHE_SETTING_SOURCES` | agent 加载的配置源，默认 `project`（排除个人插件，见 §9） |
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。
@@ -93,12 +96,26 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 
 也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等），优先级低于界面配置。
 
-流程：指派 issue 给自己 → webhook 接单 → 分诊 → 实现 → light 档验证 → 开 PR → 回帖。
+流程：指派 issue 给自己 → webhook 接单 → 分诊 → 实现（fix/feature 必须交复现/验收
+测试）→ 按 diff 定档验证（light 构建检查 / heavy 红-绿-回归）→ 开 PR → 回帖。
 失败则回帖说明原因、**保留 worktree 现场**、推送通知，不自动重试。
 
 ## 状态
 
-**P0 已完成**（单机 / 串行 / light 档验证）+ 管理界面 + 账号体系。
+**P0 已完成**（单机闭环 / light 档验证）+ 管理界面 + 账号体系（第一步）。
+
+**P1 验证基建已交付 3/4**：
+
+- ✅ **§5.1 档位路由**：diff 产出后按实际改动面定档（只碰前端展示层 → light；
+  碰到后端/migration/计费或跨前后端 → heavy），仓库配置可强制覆盖（设置页）
+- ✅ **heavy 档红-绿复现证明**：agent 交的复现/验收测试先在基线 worktree 上跑，
+  必须失败（红），改动后必须通过（绿），受影响模块回归必须通过；红立不起来
+  ⇒ 转 blocked_spec 回帖请人补充复现步骤，绝不开 PR。每步落 `verifications` 表，
+  任务详情页可查
+- ✅ **单机双通道并发**：light/heavy 各自独立配额（默认 2/1，
+  `LATHE_LIGHT_SLOTS` / `LATHE_HEAVY_SLOTS`），闸门在验证阶段按定档结果准入
+- ⬜ per-task compose 隔离栈：红绿阶段目前在 git worktree 里跑（进程组隔离），
+  待目标仓库声明服务栈后补
 
 账号体系分两步交付，**当前是第一步**：注册登录、找回密码、角色与用户管理都可用，
 但**数据仍然共享** —— 任务、仓库配置、Linear/GitHub 凭据都挂在内置管理员名下，
@@ -106,7 +123,6 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 webhook 回调地址（`users.webhook_slug` 已在迁移里预留）。
 
 后续见 [docs/02-design.md](docs/02-design.md) §8：
-P1 验证基建（per-task compose 隔离 + 红-绿复现证明）→ P1.5 数据隔离 →
-P2 OAuth 绑定与配额 → P3 多节点。
+P1.5 数据隔离 → P2 OAuth 绑定与配额 → P3 多节点。
 
-未完成：heavy 档验证（红-绿复现证明）、按用户隔离数据、多节点。
+未完成：per-task compose 隔离、按用户隔离数据、多节点。
