@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,19 @@ const gitTimeout = 15 * time.Minute
 // 与 P3 多节点上完全一致 —— 每个节点维护自己的 mirror 缓存即可。
 type WorktreeManager struct {
 	root string
+	// mirrorLocks 串行化同一 mirror 上的 git 管理操作（fetch / worktree
+	// add / remove）。P1 双通道并发后，两个任务可能同时操作同一仓库的
+	// mirror，而 git 对 ref 与 worktree 注册文件的锁竞争会以难懂的错
+	// 失败 —— 那是偶发故障，不是任务本身的问题，不该让任务买单。
+	mirrorLocks sync.Map // mirrorPath -> *sync.Mutex
+}
+
+// lockMirror 锁住某 mirror 的管理操作，返回解锁函数。
+func (m *WorktreeManager) lockMirror(mirror string) func() {
+	v, _ := m.mirrorLocks.LoadOrStore(mirror, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // NewWorktreeManager 构造管理器。root 必须是绝对路径。
@@ -57,6 +71,11 @@ func (m *WorktreeManager) EnsureMirror(ctx context.Context, providerRepo, cloneU
 		return "", fmt.Errorf("runner: 仓库 %s 缺少 clone URL", providerRepo)
 	}
 	mirror := m.MirrorPath(providerRepo)
+
+	// clone/fetch 都会写 mirror 的 ref 空间，与 worktree 注册一样
+	// 属于要串行化的管理操作。锁粒度是单个 mirror，不同仓库互不阻塞。
+	unlock := m.lockMirror(mirror)
+	defer unlock()
 
 	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err == nil {
 		// 已存在：只更新
@@ -167,6 +186,9 @@ func (m *WorktreeManager) CreateDetached(ctx context.Context, providerRepo, base
 		return nil, fmt.Errorf("runner: 仓库 %s 尚无 mirror，无法建基线工作区", providerRepo)
 	}
 
+	unlock := m.lockMirror(mirror)
+	defer unlock()
+
 	path := filepath.Join(m.root, ".verify", name)
 	if _, err := os.Stat(path); err == nil {
 		// 上次崩溃留下的残骸：先清掉再建，不让一次意外卡死后续所有任务
@@ -211,6 +233,9 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 		return nil, err
 	}
 
+	unlock := m.lockMirror(mirror)
+	defer unlock()
+
 	// 基线分支必须真实存在，否则 worktree add 会报出难懂的错
 	if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", base+"^{commit}"); err != nil {
 		return nil, fmt.Errorf("runner: 基线分支 %q 在仓库 %s 中不存在", base, p.Repo.ProviderRepo)
@@ -241,6 +266,9 @@ func (m *WorktreeManager) Remove(ctx context.Context, wt *Worktree, force bool) 
 		args = append(args, "--force")
 	}
 	args = append(args, wt.Path)
+
+	unlock := m.lockMirror(wt.Mirror)
+	defer unlock()
 
 	if _, err := m.git(ctx, wt.Mirror, args...); err != nil {
 		return fmt.Errorf("runner: 回收工作区 %s 失败: %w", wt.Path, err)

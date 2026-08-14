@@ -272,6 +272,7 @@ func buildPipeline(cfg config.Config, st *store.Store, clients runner.Clients) (
 		Clients:        clients,
 		Notifier:       logNotifier{},
 		Verifications:  st,
+		Gates:          runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode: "acceptEdits",
 	}, nil
 }

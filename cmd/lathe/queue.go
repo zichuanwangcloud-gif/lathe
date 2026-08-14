@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/Clouditera/lathe/internal/config"
 	"github.com/Clouditera/lathe/internal/runner"
@@ -23,11 +24,14 @@ type job struct {
 	IssueKey string
 }
 
-// queue 是 P0 的串行执行队列。
+// queue 是任务执行队列。
 //
-// 刻意串行：一次只跑一个任务，彻底绕开端口冲突与数据库隔离问题
-// （见 docs/02-design.md §8，并发留到 P1）。按每单 2 小时估算，
-// 无人值守串行一天可消化约 12 单，正好覆盖当前峰值吞吐。
+// P1 起支持并发（docs/02-design.md §8）：worker 数 = light + heavy 槽位
+// 之和。真正的资源闸门不在派发这里，而在验证阶段 —— 档位要等 diff
+// 产出后才可判定（§5.1），因此实现阶段可以并发，验证按定档结果在
+// 各自通道里排队（§6.2 双通道限流）。同一 issue 的重复任务由数据库
+// 的部分唯一索引挡住；同一仓库 mirror 的 git 管理操作由 runner 内部
+// 的互斥串行化。
 type queue struct {
 	store    *store.Store
 	tasks    *task.Machine
@@ -53,18 +57,34 @@ func (q *queue) Enqueue(ctx context.Context, issueID, issueKey string) error {
 	}
 }
 
-// work 串行消费队列，直到 ctx 结束。
+// work 启动 worker 协程池消费队列，直到 ctx 结束。
 func (q *queue) work(ctx context.Context) {
-	slog.Info("执行队列已启动（P0 串行模式）", "depth", queueDepth)
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("执行队列停止")
-			return
-		case j := <-q.ch:
-			q.runOne(ctx, j)
-		}
+	workers := q.cfg.LightSlots + q.cfg.HeavySlots
+	if workers < 1 {
+		workers = 1
 	}
+	slog.Info("执行队列已启动", "workers", workers,
+		"light_slots", q.cfg.LightSlots, "heavy_slots", q.cfg.HeavySlots, "depth", queueDepth)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case j := <-q.ch:
+					q.runOne(ctx, j)
+				}
+			}
+		}(i)
+	}
+
+	<-ctx.Done()
+	slog.Info("执行队列停止，等待在途任务收尾")
+	wg.Wait()
 }
 
 func (q *queue) runOne(ctx context.Context, j job) {

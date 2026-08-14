@@ -69,6 +69,11 @@ type Pipeline struct {
 	// Verifications 记录验证步骤；为 nil 时只回帖不落库（测试用）。
 	Verifications VerificationRecorder
 
+	// Gates 是验证阶段的双通道闸门（§6.2）；为 nil 时不限流。
+	// 档位在 diff 产出后才可判定（§5.1），因此闸门落在验证阶段而非
+	// 派发时：实现可以并发，真正稀缺的验证资源按档位排队。
+	Gates *VerifyGates
+
 	// PermissionMode 传给 agent；无人值守通常用 acceptEdits。
 	PermissionMode string
 	// ExcludeDirs 是仓库级的验证扫描排除目录（如 CloudRouter 的 upstream）。
@@ -215,6 +220,14 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 	}); err != nil {
 		return err
 	}
+
+	// 双通道限流：light/heavy 各自独立配额（§6.2）。等不到槽位且
+	// ctx 结束时按失败处理 —— 现场保留，人可重新入队。
+	release, err := p.Gates.Acquire(ctx, tier)
+	if err != nil {
+		return p.fail(ctx, lin, tk.ID, params, wt, "等待验证槽位超时", err)
+	}
+	defer release()
 
 	steps, err := DetectLightProfile(wt.Path, p.ExcludeDirs...)
 	if err != nil {

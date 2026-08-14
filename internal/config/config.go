@@ -33,6 +33,12 @@ type Config struct {
 	ClaudeBin    string        // claude CLI 路径
 	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
 
+	// 验证双通道（docs/02-design.md §6.2）：light/heavy 各自独立配额，
+	// 不共用一个数字 —— 资源画像差一个量级。任务worker总数 = 两者之和。
+	// §6.3 的动态水位推导（按内存/磁盘余量调整）留到多节点时再做。
+	LightSlots int // light 档验证并发上限，默认 2
+	HeavySlots int // heavy 档验证并发上限，默认 1
+
 	// AdminEmail 是内置超级管理员的邮箱。
 	AdminEmail string
 
@@ -107,6 +113,8 @@ func Load() (Config, error) {
 		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
 		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
+		LightSlots:          envInt("LATHE_LIGHT_SLOTS", 2),
+		HeavySlots:          envInt("LATHE_HEAVY_SLOTS", 1),
 		LinearToken:         env("LATHE_LINEAR_TOKEN", ""),
 		LinearWebhookSecret: env("LATHE_LINEAR_WEBHOOK_SECRET", ""),
 		GitHubToken:         env("LATHE_GITHUB_TOKEN", ""),
