@@ -14,6 +14,12 @@ const GATE_MODES = [
   { value: 'manual', label: 'manual — 逐单确认', desc: '每单都要人工点确认才动手。' },
 ]
 
+const VERIFY_TIERS = [
+  { value: '', label: '自动 — 按改动面判定', desc: 'diff 只碰前端展示层/文案 → light；碰到后端、migration、计费或跨前后端 → heavy。' },
+  { value: 'light', label: '强制 light', desc: '只做构建 + lint + 类型检查。纯展示层仓库（如官网）适用。' },
+  { value: 'heavy', label: '强制 heavy', desc: '必须给出红-绿复现证明：复现测试在改动前失败、改动后通过，回归通过。' },
+]
+
 async function load() {
   try {
     const r = await api.repos()
@@ -50,6 +56,7 @@ async function save(repo) {
       protectedBranches,
       branchPattern: repo.branchPattern,
       gateMode: repo.gateMode,
+      verifyTierOverride: repo.verifyTierOverride || '',
     })
     saved.value = repo.id
     setTimeout(() => (saved.value = null), 2000)
@@ -110,6 +117,16 @@ VALUES (1, 'Clouditera/CloudRouter');</pre>
         </select>
         <small class="faint">
           {{ GATE_MODES.find((m) => m.value === repo.gateMode)?.desc }}
+        </small>
+      </label>
+
+      <label class="full">
+        <span>验证档位</span>
+        <select v-model="repo.verifyTierOverride">
+          <option v-for="t in VERIFY_TIERS" :key="t.value" :value="t.value">{{ t.label }}</option>
+        </select>
+        <small class="faint">
+          {{ VERIFY_TIERS.find((t) => t.value === (repo.verifyTierOverride || ''))?.desc }}
         </small>
       </label>
     </div>

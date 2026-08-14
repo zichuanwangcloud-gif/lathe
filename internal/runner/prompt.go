@@ -46,13 +46,26 @@ func TriagePrompt(issueContext string) string {
 }
 
 // ImplementPrompt 生成实现阶段的 prompt。
+//
+// 测试要求不是可选项：流水线的验证是红-绿复现证明（docs/02-design.md
+// §5.3/§5.4），agent 交出的测试就是红绿判定的唯一依据 —— 没有新增或
+// 修改测试文件的 diff，在 heavy 档根本无法给出「修复有效」的证明。
 func ImplementPrompt(issueContext string, kind TaskKind, branch string) string {
 	var extra string
-	if kind == KindFix {
+	switch kind {
+	case KindFix, KindHotfix:
 		extra = `
-这是一个 bug 修复。请优先做到：
+这是一个 bug 修复。要求：
 - 先定位根因，再动手；不要只处理表象
-- 尽可能补一个能覆盖此 bug 的测试`
+- **必须先写一个能复现该 bug 的测试**（Go 写在 *_test.go，前端写在 *.test.* / *.spec.*）：
+  先跑它确认在现状下失败（bug 复现），再修代码让它通过
+- 该测试会随 PR 一起提交，成为仓库的回归测试`
+	case KindFeature:
+		extra = `
+这是一个需求。要求：
+- 把 issue 里的验收标准逐条转成测试（Go 写在 *_test.go，前端写在 *.test.* / *.spec.*）
+- 这些测试在当前代码上应该失败（功能尚不存在），实现后必须通过
+- 若 issue 没有可测试的验收标准，停下来说明缺什么，不要自己猜`
 	}
 
 	return fmt.Sprintf(`你在一个自动化编码流水线里实现一个任务。

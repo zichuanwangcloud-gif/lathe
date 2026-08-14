@@ -271,6 +271,7 @@ func buildPipeline(cfg config.Config, st *store.Store, clients runner.Clients) (
 		Agent:          agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
 		Clients:        clients,
 		Notifier:       logNotifier{},
+		Verifications:  st,
 		PermissionMode: "acceptEdits",
 	}, nil
 }

@@ -217,6 +217,8 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		ProtectedBranches []string `json:"protectedBranches"`
 		BranchPattern     string   `json:"branchPattern"`
 		GateMode          string   `json:"gateMode"`
+		// 指针区分「未传」（不动）与「空串」（清回自动档）
+		VerifyTierOverride *string `json:"verifyTierOverride"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
@@ -233,6 +235,16 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.VerifyTierOverride != nil {
+		switch *body.VerifyTierOverride {
+		case "", "light", "heavy":
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "验证档位须为 light / heavy，或留空表示按改动面自动判定",
+			})
+			return
+		}
+	}
 	// 受保护分支列表清空等于关掉最后一道闸门，必须拒绝
 	if body.ProtectedBranches != nil && len(body.ProtectedBranches) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -242,11 +254,12 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repo, err := a.Store.UpdateRepo(r.Context(), id, store.UpdateRepoParams{
-		DefaultBranch:     body.DefaultBranch,
-		HotfixBase:        body.HotfixBase,
-		ProtectedBranches: body.ProtectedBranches,
-		BranchPattern:     body.BranchPattern,
-		GateMode:          body.GateMode,
+		DefaultBranch:      body.DefaultBranch,
+		HotfixBase:         body.HotfixBase,
+		ProtectedBranches:  body.ProtectedBranches,
+		BranchPattern:      body.BranchPattern,
+		GateMode:           body.GateMode,
+		VerifyTierOverride: body.VerifyTierOverride,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})

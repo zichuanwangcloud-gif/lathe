@@ -138,6 +138,46 @@ func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfi
 	return nil
 }
 
+// ChangedFiles 列出任务分支相对基线的改动文件（新增/修改，相对路径）。
+//
+// 删除的文件被排除：档位路由与复现测试识别都只关心"现在存在什么"，
+// 删掉的文件既不能跑也不能拷。
+func (m *WorktreeManager) ChangedFiles(ctx context.Context, wt *Worktree) ([]string, error) {
+	out, err := m.git(ctx, wt.Path, "diff", "--name-only", "--diff-filter=AM", wt.BaseBranch+"...HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("runner: 列出改动文件失败: %w", err)
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.TrimSpace(line); f != "" {
+			files = append(files, f)
+		}
+	}
+	return files, nil
+}
+
+// CreateDetached 在基线分支上建一个临时工作区（detached HEAD，不建分支），
+// 供 heavy 档红阶段复现用：在【改动前】的代码上跑 agent 带来的复现测试。
+//
+// 工作区放在 root 下的隐藏目录 .verify/ 里，与任务工作区（issue 编号命名）
+// 隔开，也不会被验证步骤的目录扫描走进去。调用方必须负责 Remove(force=true)。
+func (m *WorktreeManager) CreateDetached(ctx context.Context, providerRepo, base, name string) (*Worktree, error) {
+	mirror := m.MirrorPath(providerRepo)
+	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err != nil {
+		return nil, fmt.Errorf("runner: 仓库 %s 尚无 mirror，无法建基线工作区", providerRepo)
+	}
+
+	path := filepath.Join(m.root, ".verify", name)
+	if _, err := os.Stat(path); err == nil {
+		// 上次崩溃留下的残骸：先清掉再建，不让一次意外卡死后续所有任务
+		_, _ = m.git(ctx, mirror, "worktree", "remove", "--force", path)
+	}
+	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "--detach", path, base); err != nil {
+		return nil, fmt.Errorf("runner: 创建基线工作区失败（基线 %s）: %w", base, err)
+	}
+	return &Worktree{Path: path, Branch: "(detached)", BaseBranch: base, Mirror: mirror}, nil
+}
+
 // Worktree 是一个已创建的任务工作区。
 type Worktree struct {
 	Path       string // 工作区绝对路径

@@ -45,6 +45,14 @@ type Notifier interface {
 	Notify(ctx context.Context, message string) error
 }
 
+// VerificationRecorder 把每个验证步骤落库（verifications 表）。
+//
+// heavy 档的 repro_fail → repro_pass 是「红-绿证明」的可审计落痕，
+// 任务详情页直接展示。store.Store 实现此接口。
+type VerificationRecorder interface {
+	InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64) error
+}
+
 // NewSessionID 生成会话 ID。抽成字段便于测试注入确定值。
 type NewSessionID func() string
 
@@ -57,6 +65,9 @@ type Pipeline struct {
 	Clients   Clients
 	Notifier  Notifier
 	NewID     NewSessionID
+
+	// Verifications 记录验证步骤；为 nil 时只回帖不落库（测试用）。
+	Verifications VerificationRecorder
 
 	// PermissionMode 传给 agent；无人值守通常用 acceptEdits。
 	PermissionMode string
@@ -187,9 +198,20 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 	}
 
 	// ---------- 验证 ----------
-	tier := string(TierLight)
+	// §5.1：档位在 diff 产出后按实际改动面判定，而非接单时按单子文本猜。
+	// 判定是确定性规则，理由落进任务事件供人复核。
+	changedFiles, err := p.Worktrees.ChangedFiles(ctx, wt)
+	if err != nil {
+		return p.fail(ctx, lin, tk.ID, params, wt, "列出改动文件失败", err)
+	}
+	tier, tierReasons := ClassifyTier(changedFiles, OverrideTier(params.Repo.VerifyTierOverride))
+	tierStr := string(tier)
 	if _, err := p.Tasks.Transition(ctx, tk.ID, task.StateVerifying, actor, &task.TransitionOpts{
-		VerifyTier: &tier,
+		VerifyTier: &tierStr,
+		Payload: map[string]any{
+			"tier_reasons":  tierReasons,
+			"changed_files": len(changedFiles),
+		},
 	}); err != nil {
 		return err
 	}
@@ -198,13 +220,44 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 	if err != nil {
 		return p.fail(ctx, lin, tk.ID, params, wt, "无法确定验证步骤", err)
 	}
-	report := p.Verifier.RunLight(ctx, wt.Path, steps)
+
+	var report Report
+	if tier == TierHeavy {
+		report, err = p.runHeavy(ctx, tk.ID, params.Repo.ProviderRepo, wt, steps, changedFiles)
+		if err != nil {
+			return p.fail(ctx, lin, tk.ID, params, wt, "heavy 档验证执行失败", err)
+		}
+	} else {
+		report = p.Verifier.RunLight(ctx, wt.Path, steps)
+	}
+	p.persistVerifications(ctx, tk.ID, report)
+
+	// heavy 档的红阶段立不起来（bug 没复现/复现跑不起来）不是任务失败，
+	// 是单子没说清 —— §5.3 规定转 blocked_spec 回帖请人补充复现步骤。
+	if red := redStepFailure(report); red != nil {
+		body := fmt.Sprintf("**Lathe 无法证明这个修复有效，已暂停**\n\n%s\n\n复现测试在改动前的代码上没有失败 —— 可能是 bug 描述与实际不符，或复现条件缺失。请补充复现步骤后重新指派给我。\n\n```\n%s```",
+			red.Err, report.Summary())
+		if _, cerr := lin.Comment(ctx, params.IssueID, body); cerr != nil {
+			slog.Warn("回帖失败", "task", tk.ID, "err", cerr)
+		}
+		_, err := p.Tasks.Transition(ctx, tk.ID, task.StateBlockedSpec, actor, &task.TransitionOpts{
+			FailureReason: strPtr(red.Err.Error()),
+			Payload:       map[string]any{"reason": "repro_not_red"},
+		})
+		return err
+	}
+
 	if !report.Passed() {
 		reason := "验证未通过"
+		cause := report.Summary()
 		if f := report.FirstFailure(); f != nil {
-			reason = fmt.Sprintf("验证未通过：%s", f.Step.Name)
+			reason = fmt.Sprintf("验证未通过（%s 档）：%s", tier, f.Step.Name)
+			// 把首个失败的具体错误放最前 —— 回帖时人先看到原因再看摘要
+			if f.Err != nil {
+				cause = f.Err.Error() + "\n\n" + report.Summary()
+			}
 		}
-		return p.fail(ctx, lin, tk.ID, params, wt, reason, errors.New(report.Summary()))
+		return p.fail(ctx, lin, tk.ID, params, wt, reason, errors.New(cause))
 	}
 
 	// ---------- 开 PR ----------
@@ -238,6 +291,75 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 
 	slog.Info("任务完成", "task", tk.ID, "issue", issue.Identifier, "pr", pr.URL)
 	return nil
+}
+
+// runHeavy 跑 heavy 档验证：建基线工作区 → 识别复现测试 → 红-绿-回归。
+//
+// 基线工作区用完即拆（defer Remove force）：它是验证的临时道具，
+// 不是失败三件套要保留的现场 —— 现场指任务工作区本身。
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string) (Report, error) {
+	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
+	if err != nil {
+		return Report{}, err
+	}
+	defer func() {
+		if rerr := p.Worktrees.Remove(ctx, base, true); rerr != nil {
+			slog.Warn("回收基线工作区失败", "task", taskID, "err", rerr)
+		}
+	}()
+
+	repro, err := IdentifyReproTests(wt.Path, changedFiles)
+	if err != nil {
+		return Report{}, err
+	}
+	regression := DetectRegression(wt.Path, changedFiles, p.ExcludeDirs...)
+
+	return p.Verifier.RunHeavy(ctx, HeavyParams{
+		TaskPath:   wt.Path,
+		BasePath:   base.Path,
+		Light:      lightSteps,
+		Repro:      repro,
+		Regression: regression,
+	}), nil
+}
+
+// redStepFailure 在 heavy 报告里找「红阶段没立起来」的那一步。
+// 找到说明 §5.3 的 blocked_spec 路径成立；返回 nil 表示不涉及。
+//
+// 例外：ErrNoReproTests 是 agent 没交复现测试的契约违例，属于任务
+// 失败（走 D4 三件套），不该回帖问提单人要复现步骤。
+func redStepFailure(rep Report) *StepResult {
+	if rep.Tier != TierHeavy {
+		return nil
+	}
+	for i := range rep.Results {
+		s := &rep.Results[i]
+		if s.Step.Name == StepReproFail && s.Status != StatusPassed {
+			if errors.Is(s.Err, ErrNoReproTests) {
+				return nil
+			}
+			if s.Err == nil {
+				s.Err = errors.New("复现测试在改动前的代码上没有失败")
+			}
+			return s
+		}
+	}
+	return nil
+}
+
+// persistVerifications 把报告的每一步落库。落库失败只告警不中断 ——
+// 证据缺失不该把一个已验证通过的改动挡在 PR 之外（结论仍在 PR 与回帖里）。
+func (p *Pipeline) persistVerifications(ctx context.Context, taskID int64, rep Report) {
+	if p.Verifications == nil {
+		return
+	}
+	for _, s := range rep.Results {
+		if err := p.Verifications.InsertVerification(ctx, taskID,
+			string(rep.Tier), string(s.Step.Name), string(s.Status),
+			s.Duration.Milliseconds()); err != nil {
+			slog.Warn("验证步骤落库失败", "task", taskID, "step", s.Step.Name, "err", err)
+		}
+	}
 }
 
 // fail 执行 D4 失败三件套：回帖 + 保留现场 + 推送通知；不自动重试。

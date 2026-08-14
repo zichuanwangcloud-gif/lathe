@@ -36,6 +36,9 @@ type RepoConfig struct {
 	HotfixBase        string   // hotfix 的分叉基线，通常是 main
 	ProtectedBranches []string // 禁止直接推送的分支
 	BranchPattern     string   // 如 {kind}/{key}-{slug}
+	// VerifyTierOverride 强制验证档位（light|heavy）；空表示按 §5.1 规则
+	// 在 diff 产出后自动判定。对应 repos.verify_tier_override。
+	VerifyTierOverride string
 }
 
 // DefaultRepoConfig 返回符合 CloudRouter 约定的默认配置。

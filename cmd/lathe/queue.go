@@ -111,21 +111,24 @@ func (q *queue) resolveRepo(ctx context.Context, j job) (userID, repoID int64, c
 		hotfixBase    string
 		protected     []string
 		pattern       string
+		tierOverride  string
 	)
 	err = q.store.Pool().QueryRow(ctx, `
-		SELECT user_id, id, provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern
+		SELECT user_id, id, provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
+		       COALESCE(verify_tier_override, '')
 		FROM repos ORDER BY id LIMIT 1`,
-	).Scan(&userID, &repoID, &providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern)
+	).Scan(&userID, &repoID, &providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride)
 	if err != nil {
 		return 0, 0, cfg, "", fmt.Errorf("读取仓库配置失败（P0 需先在 repos 表插入一条记录）: %w", err)
 	}
 
 	cfg = runner.RepoConfig{
-		ProviderRepo:      providerRepo,
-		DefaultBranch:     defaultBranch,
-		HotfixBase:        hotfixBase,
-		ProtectedBranches: protected,
-		BranchPattern:     pattern,
+		ProviderRepo:       providerRepo,
+		DefaultBranch:      defaultBranch,
+		HotfixBase:         hotfixBase,
+		ProtectedBranches:  protected,
+		BranchPattern:      pattern,
+		VerifyTierOverride: tierOverride,
 	}
 	return userID, repoID, cfg, "git@github.com:" + providerRepo + ".git", nil
 }

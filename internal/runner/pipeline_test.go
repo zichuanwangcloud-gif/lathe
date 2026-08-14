@@ -105,6 +105,16 @@ func (f *fakeNotifier) Notify(ctx context.Context, m string) error {
 	return nil
 }
 
+// fakeVerifications 记录落库的验证步骤，供断言红-绿证据链完整。
+type fakeVerifications struct {
+	rows []string // "tier/step/status"
+}
+
+func (f *fakeVerifications) InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64) error {
+	f.rows = append(f.rows, tier+"/"+step+"/"+status)
+	return nil
+}
+
 // ---------------------------------------------------------------- 夹具
 
 // goSourceRepo 造一个含可构建 go 模块的仓库，让 light 档验证有真东西可跑。
@@ -213,6 +223,9 @@ func newPipeline(t *testing.T, m *task.Machine, lin *fakeLinear, gh *fakeGitHub,
 
 // ---------------------------------------------------------------- 主链路
 
+// 主链路即 heavy 档红-绿证明的端到端：agent 交的 diff 碰了 .go 文件，
+// 按 §5.1 归 heavy；复现测试被拷进基线工作区必须失败（红），在任务
+// 工作区必须通过（绿），回归必须通过 —— 证据链落库后才有资格开 PR。
 func TestPipelineHappyPath(t *testing.T) {
 	_, m, taskID, repo, src := pipelineFixture(t)
 
@@ -221,18 +234,26 @@ func TestPipelineHappyPath(t *testing.T) {
 	ag := &fakeAgent{
 		results: []*agent.Result{
 			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"有现象和期望行为","question":""}`},
-			{Success: true, Text: "改了导入按钮的事件绑定"},
+			{Success: true, Text: "补了 greet 函数与复现测试"},
 		},
 		mutate: []func(string) error{
 			nil, // 分诊不改文件
 			func(dir string) error {
+				// 复现测试：引用基线上还不存在的 greet() —— 拷进基线
+				// 工作区会编译失败，红由此立起来（§5.4：功能确实不存在）
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644); err != nil {
+					return err
+				}
 				return os.WriteFile(filepath.Join(dir, "fix.go"),
-					[]byte("package main\n\nfunc fixed() {}\n"), 0o644)
+					[]byte("package main\n\nfunc greet() string { return \"hello\" }\n"), 0o644)
 			},
 		},
 	}
 	no := &fakeNotifier{}
+	verifs := &fakeVerifications{}
 	p := newPipeline(t, m, lin, gh, ag, no)
+	p.Verifications = verifs
 
 	err := p.Execute(context.Background(), ExecuteParams{
 		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
@@ -258,8 +279,25 @@ func TestPipelineHappyPath(t *testing.T) {
 	if final.AgentSessionID == nil || *final.AgentSessionID == "" {
 		t.Error("会话 ID 应已落库（review 二轮要靠它 --resume）")
 	}
-	if final.VerifyTier == nil || *final.VerifyTier != "light" {
-		t.Errorf("验证档位不符: %v", final.VerifyTier)
+	if final.VerifyTier == nil || *final.VerifyTier != "heavy" {
+		t.Errorf("验证档位不符（.go 改动应归 heavy）: %v", final.VerifyTier)
+	}
+
+	// 红-绿证据链必须完整落库：repro_fail 通过（红立起来了）、
+	// repro_pass 通过（绿）、回归通过
+	for _, want := range []string{
+		"heavy/repro_fail/passed", "heavy/repro_pass/passed", "heavy/regression/passed",
+	} {
+		found := false
+		for _, row := range verifs.rows {
+			if row == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("证据链缺 %s，实际落库: %v", want, verifs.rows)
+		}
 	}
 
 	// 状态轨迹必须完整且可重放
@@ -397,6 +435,106 @@ func TestPipelineVerificationFailurePreservesScene(t *testing.T) {
 
 	if len(gh.params) != 0 {
 		t.Error("验证不过绝不能开 PR")
+	}
+}
+
+// §5.3 核心规则：复现测试在【改动前】的代码上通过了 = bug 没复现 =
+// agent 没能理解这个 bug。不许继续，转 blocked_spec 回帖请人补充，
+// 绝不能开 PR。
+func TestPipelineHeavyRedNotProven(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix"}`},
+			{Success: true, Text: "加了测试与小改动"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				// 这个「复现」测的是基线上已存在的行为 —— 在红阶段会通过
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestMainRuns(t *testing.T) { main() }\n"), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc touched() {}\n"), 0o644)
+			},
+		},
+	}
+	no := &fakeNotifier{}
+	p := newPipeline(t, m, lin, gh, ag, no)
+
+	err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+	})
+	if err != nil {
+		t.Fatalf("blocked_spec 是正常出口，不应返回错误: %v", err)
+	}
+
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StateBlockedSpec {
+		t.Errorf("状态 = %s，期望 blocked_spec（bug 没复现，回帖等人补充）", final.State)
+	}
+	if len(gh.params) != 0 {
+		t.Error("红没立起来绝不能开 PR")
+	}
+	if len(lin.comments) != 1 || !strings.Contains(lin.comments[0], "复现") {
+		t.Errorf("应回帖说明无法复现并请人补充，实际: %v", lin.comments)
+	}
+	// 工作区要留着：人补充后任务还会回来继续
+	if final.WorktreePath == nil {
+		t.Error("工作区路径应已落库，供人接手或任务恢复")
+	}
+	if len(no.msgs) != 0 {
+		t.Errorf("blocked_spec 不是失败，不应推送失败通知: %v", no.msgs)
+	}
+}
+
+// agent 没交复现/验收测试（违反 §5.3 输出契约）是任务失败，不是单子
+// 不清 —— 应走 D4 三件套，而不是回帖问提单人要复现步骤。
+func TestPipelineHeavyNoReproTestIsFailure(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix"}`},
+			{Success: true, Text: "改了代码但没写测试"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc untested() {}\n"), 0o644)
+			},
+		},
+	}
+	no := &fakeNotifier{}
+	p := newPipeline(t, m, lin, gh, ag, no)
+
+	err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+	})
+	if err == nil {
+		t.Fatal("没交复现测试应判为失败")
+	}
+
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StateFailed {
+		t.Errorf("状态 = %s，期望 failed（而非 blocked_spec）", final.State)
+	}
+	if final.FailureReason == nil || !strings.Contains(*final.FailureReason, "测试文件") {
+		t.Errorf("失败原因应指明缺少复现测试: %v", final.FailureReason)
+	}
+	if len(gh.params) != 0 {
+		t.Error("不应开 PR")
+	}
+	if len(no.msgs) != 1 {
+		t.Errorf("应推送失败通知: %v", no.msgs)
 	}
 }
 

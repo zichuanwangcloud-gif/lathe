@@ -235,13 +235,16 @@ type RepoRow struct {
 	BranchPattern     string   `json:"branchPattern"`
 	DepStrategy       string   `json:"depStrategy"`
 	GateMode          string   `json:"gateMode"`
+	// VerifyTierOverride 强制验证档位；空串表示按 §5.1 自动判定
+	VerifyTierOverride string `json:"verifyTierOverride"`
 }
 
 // ListRepos 返回全部仓库配置。
 func (s *Store) ListRepos(ctx context.Context) ([]RepoRow, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base,
-		       protected_branches, branch_pattern, dep_strategy, gate_mode
+		       protected_branches, branch_pattern, dep_strategy, gate_mode,
+		       COALESCE(verify_tier_override, '')
 		FROM repos ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -252,7 +255,8 @@ func (s *Store) ListRepos(ctx context.Context) ([]RepoRow, error) {
 	for rows.Next() {
 		var r RepoRow
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
-			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode); err != nil {
+			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
+			&r.VerifyTierOverride); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
@@ -267,6 +271,10 @@ type UpdateRepoParams struct {
 	ProtectedBranches []string
 	BranchPattern     string
 	GateMode          string
+	// VerifyTierOverride 是"light"|"heavy"|""（自动）。注意空串语义：
+	// 该字段允许被显式清空回自动档，因此不能用 NULLIF COALESCE 的
+	// "空即不动"惯例 —— 调用方传 nil 表示不修改。
+	VerifyTierOverride *string
 }
 
 // UpdateRepo 更新仓库配置。
@@ -278,13 +286,21 @@ func (s *Store) UpdateRepo(ctx context.Context, id int64, p UpdateRepoParams) (*
 			hotfix_base        = COALESCE(NULLIF($3,''), hotfix_base),
 			protected_branches = COALESCE($4, protected_branches),
 			branch_pattern     = COALESCE(NULLIF($5,''), branch_pattern),
-			gate_mode          = COALESCE(NULLIF($6,''), gate_mode)
+			gate_mode          = COALESCE(NULLIF($6,''), gate_mode),
+			verify_tier_override = CASE
+				WHEN $7::text IS NULL THEN verify_tier_override
+				WHEN $7::text = '' THEN NULL
+				ELSE $7::text
+			END
 		WHERE id = $1
 		RETURNING id, provider_repo, default_branch, hotfix_base,
-		          protected_branches, branch_pattern, dep_strategy, gate_mode`,
+		          protected_branches, branch_pattern, dep_strategy, gate_mode,
+		          COALESCE(verify_tier_override, '')`,
 		id, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
+		p.VerifyTierOverride,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
-		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode)
+		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
+		&r.VerifyTierOverride)
 	if err != nil {
 		return nil, fmt.Errorf("store: 更新仓库 %d 失败: %w", id, err)
 	}
