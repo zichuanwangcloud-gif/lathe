@@ -46,6 +46,10 @@ type User struct {
 	MustChangePassword bool
 	LastLoginAt        *time.Time
 	CreatedAt          time.Time
+	// WebhookSlug 是该用户专属 webhook 回调路径里的随机段
+	//（/webhooks/linear/{slug}）。P1.5 第二步起，Linear 事件按它
+	// 路由到具体用户 —— 谁的事件、用谁的凭据、任务归谁的名下。
+	WebhookSlug string
 }
 
 // Disabled 报告账号是否已被禁用。
@@ -71,12 +75,14 @@ type Users struct {
 func (s *Store) NewUsers() *Users { return &Users{store: s} }
 
 const userCols = `id, email, coalesce(password_hash, ''), role,
-	disabled_at, must_change_password, last_login_at, created_at`
+	disabled_at, must_change_password, last_login_at, created_at,
+	coalesce(webhook_slug, '')`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role,
-		&u.DisabledAt, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt)
+		&u.DisabledAt, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt,
+		&u.WebhookSlug)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
@@ -130,6 +136,16 @@ func (u *Users) ByEmail(ctx context.Context, email string) (*User, error) {
 func (u *Users) ByID(ctx context.Context, id int64) (*User, error) {
 	return scanUser(u.store.pool.QueryRow(ctx,
 		`SELECT `+userCols+` FROM users WHERE id = $1`, id))
+}
+
+// ByWebhookSlug 按 webhook 回调路径里的随机段查账号。
+//
+// 这是 P1.5 第二步的路由入口：Linear 按用户各配一个 webhook，投递到
+// /webhooks/linear/{slug}，控制面据此把事件归到具体用户名下。slug 是
+// 16 字节随机值，本身已是不可猜的地址；真正的签名密钥仍按用户各自校验。
+func (u *Users) ByWebhookSlug(ctx context.Context, slug string) (*User, error) {
+	return scanUser(u.store.pool.QueryRow(ctx,
+		`SELECT `+userCols+` FROM users WHERE webhook_slug = $1`, slug))
 }
 
 // SetPassword 设置密码哈希。

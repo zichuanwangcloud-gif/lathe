@@ -64,15 +64,19 @@ func (s *Sessions) Create(ctx context.Context, userID int64, token string, ttl t
 // 不能依赖上层记得去查。
 func (s *Sessions) Lookup(ctx context.Context, token string) (*User, error) {
 	var u User
+	// 列清单与 users.go 的 userCols 保持一致（带 u. 前缀）—— 漏一列
+	// 不会报错，只会让 User 的对应字段悄悄是零值（webhook_slug 就踩过）。
 	err := s.store.pool.QueryRow(ctx, `
 		SELECT u.id, u.email, coalesce(u.password_hash, ''), u.role,
-		       u.disabled_at, u.must_change_password, u.last_login_at, u.created_at
+		       u.disabled_at, u.must_change_password, u.last_login_at, u.created_at,
+		       coalesce(u.webhook_slug, '')
 		FROM sessions s
 		JOIN users u ON u.id = s.user_id
 		WHERE s.id = $1 AND s.expires_at > now() AND u.disabled_at IS NULL`,
 		hashToken(token),
 	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role,
-		&u.DisabledAt, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt)
+		&u.DisabledAt, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt,
+		&u.WebhookSlug)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrSessionInvalid
 	}

@@ -1,7 +1,25 @@
 <script setup>
-import { ref, onMounted, inject } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
-import { auth } from '../auth'
+import { auth, isAdmin } from '../auth'
+
+// 每个用户专属的 Linear webhook 回调地址（P1.5 第二步）：
+// 事件按它路由到本人 —— 用谁的凭据验签、任务归谁的名下。
+const webhookURL = computed(() => {
+  const slug = auth.user?.webhookSlug
+  if (!slug) return ''
+  return `${location.origin}/webhooks/linear/${slug}`
+})
+const copied = ref(false)
+async function copyWebhook() {
+  try {
+    await navigator.clipboard.writeText(webhookURL.value)
+    copied.value = true
+    setTimeout(() => (copied.value = false), 2000)
+  } catch {
+    // 剪贴板不可用（非安全上下文）时退化为选中展示，地址本身就在页面上
+  }
+}
 
 const items = ref([])
 const runtime = ref(null)
@@ -188,6 +206,25 @@ onMounted(() => {
     因此拿到数据库转储也无法解出凭据。界面上永远只显示末尾几位。
   </p>
 
+  <div v-if="webhookURL" class="card cred">
+    <div class="spread">
+      <div>
+        <h2>你的 Linear Webhook 地址</h2>
+        <p class="faint desc">
+          在 Linear → Settings → API → Webhooks 里新建 webhook，指向这个地址，并勾选 Issue 事件。
+          之后把 issue 指派给你自己，Lathe 就会接单。每个人的地址不同，事件按地址归到本人名下。
+        </p>
+      </div>
+    </div>
+    <div class="row form">
+      <input readonly :value="webhookURL" class="mono" @focus="$event.target.select()" />
+      <button @click.prevent="copyWebhook">{{ copied ? '已复制 ✓' : '复制' }}</button>
+    </div>
+    <p class="faint hint">
+      地址里的随机段用于把事件路由给你；真正的防伪靠下面的 Webhook 密钥按人各自验签。
+    </p>
+  </div>
+
   <div v-for="item in items" :key="item.kind" class="card cred">
     <div class="spread">
       <div>
@@ -241,8 +278,10 @@ onMounted(() => {
 
     <p class="faint hint">
       获取位置：{{ META[item.kind]?.where }}
-      <span class="sep">·</span>
-      也可用环境变量 <code class="mono">{{ META[item.kind]?.env }}</code>（优先级低于此处配置）
+      <template v-if="isAdmin()">
+        <span class="sep">·</span>
+        也可用环境变量 <code class="mono">{{ META[item.kind]?.env }}</code>（仅对管理员兜底，优先级低于此处配置）
+      </template>
     </p>
   </div>
 

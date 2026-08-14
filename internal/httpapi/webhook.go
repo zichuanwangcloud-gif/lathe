@@ -22,44 +22,60 @@ type DeliveryClaimer interface {
 }
 
 // TaskEnqueuer 把一个已确认要处理的 issue 排进执行队列。
+//
+// ownerUserID 是任务归属（P1.5 第二步）：谁接的单，任务就归谁 ——
+// 用谁的 Linear/GitHub 凭据跑、出现在谁的看板上。
 type TaskEnqueuer interface {
-	Enqueue(ctx context.Context, issueID, issueKey string) error
+	Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKey string) error
+}
+
+// WebhookTarget 是一个 slug 解析出的投递目标。
+type WebhookTarget struct {
+	// OwnerID 是任务归属用户。
+	OwnerID int64
+	// Secret 是该用户的 webhook 签名密钥（各自在设置页配置）。
+	Secret string
+	// LinearUserID 用于「指派给我了吗」的接单判定（D2）。
+	LinearUserID string
+}
+
+// TargetResolver 把回调路径里的 slug 解析成投递目标。
+//
+// 空 slug（旧路径 /webhooks/linear）由实现方决定兜底 —— 生产实现
+// 映射到内置管理员，保住老部署的既有 webhook 配置。
+type TargetResolver interface {
+	Resolve(ctx context.Context, slug string) (*WebhookTarget, error)
 }
 
 // LinearWebhook 处理来自 Linear 的 webhook。
+//
+// P1.5 第二步起按用户隔离：每个用户在设置页拿到自己的回调地址
+// /webhooks/linear/{slug}，签名密钥与接单判定都按该用户的凭据来。
 type LinearWebhook struct {
-	// SecretFunc 取签名密钥，UserIDFunc 取接单判定用的 Linear 用户 ID。
-	//
-	// 用函数而非固定字符串：凭据可在设置页里随时修改，
-	// 每次请求现取才能让修改即刻生效，无需重启。
-	SecretFunc func() string
-	UserIDFunc func() string
+	// Resolver 按 slug 解析投递目标；为 nil 时一切投递都无法路由。
+	Resolver TargetResolver
 
 	Deliveries DeliveryClaimer
 	Tasks      TaskEnqueuer
 }
 
-func (h *LinearWebhook) secret() string {
-	if h.SecretFunc == nil {
-		return ""
-	}
-	return h.SecretFunc()
-}
-
-func (h *LinearWebhook) userID() string {
-	if h.UserIDFunc == nil {
-		return ""
-	}
-	return h.UserIDFunc()
-}
-
 // ServeHTTP 实现 http.Handler。
 //
-// 处理次序刻意如此：验签 → 幂等登记 → 业务判断。
+// 处理次序刻意如此：路由 → 验签 → 幂等登记 → 业务判断。
 // 幂等登记必须在业务处理之前，否则重投递会重复建任务。
 func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "只接受 POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	slug := r.PathValue("slug")
+	target, err := h.Resolver.Resolve(r.Context(), slug)
+	if err != nil {
+		// 未知 slug 与验签失败同等处理：404/401 不透露哪个环节挡掉的。
+		// slug 本身是不可猜的随机段，试错成本对攻击者已经足够高。
+		slog.Warn("webhook 无法路由", "slug", slug, "err", err, "remote", r.RemoteAddr)
+		http.Error(w, "无法路由", http.StatusNotFound)
 		return
 	}
 
@@ -69,7 +85,7 @@ func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ev, err := linear.ParseWebhook(h.secret(), body, r.Header.Get(linear.HeaderSignature))
+	ev, err := linear.ParseWebhook(target.Secret, body, r.Header.Get(linear.HeaderSignature))
 	if err != nil {
 		// 验签失败一律 401，不透露具体原因
 		slog.Warn("webhook 验签失败", "err", err, "remote", r.RemoteAddr)
@@ -100,14 +116,14 @@ func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// D2：只处理「指派给绑定用户」的事件；其余一律确认后忽略
-	if !ev.IsAssignedTo(h.userID()) {
+	if !ev.IsAssignedTo(target.LinearUserID) {
 		_ = h.Deliveries.FinishDelivery(ctx, deliveryID, "")
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "非指派给本用户的事件"})
 		return
 	}
 
-	if err := h.Tasks.Enqueue(ctx, ev.Data.ID, ev.Data.Identifier); err != nil {
-		slog.Error("排队任务失败", "issue", ev.Data.Identifier, "err", err)
+	if err := h.Tasks.Enqueue(ctx, target.OwnerID, ev.Data.ID, ev.Data.Identifier); err != nil {
+		slog.Error("排队任务失败", "issue", ev.Data.Identifier, "owner", target.OwnerID, "err", err)
 		_ = h.Deliveries.FinishDelivery(ctx, deliveryID, err.Error())
 		// 已登记去重，重投也不会再处理，因此返回 200 避免 Linear 无谓重试；
 		// 失败原因已落库，靠告警而非重投来发现
@@ -116,7 +132,7 @@ func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = h.Deliveries.FinishDelivery(ctx, deliveryID, "")
-	slog.Info("已接单", "issue", ev.Data.Identifier, "delivery", deliveryID)
+	slog.Info("已接单", "issue", ev.Data.Identifier, "owner", target.OwnerID, "delivery", deliveryID)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "queued", "issue": ev.Data.Identifier})
 }
 

@@ -37,7 +37,9 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/logout", a.Auth.Logout)
 	mux.HandleFunc("GET /api/me", a.Auth.Me)
 
-	// 读
+	// 读。全部按 CurrentUser 隔离（P1.5 第二步）：任何人只能看到
+	// 自己名下的任务与仓库配置，管理员也不例外 —— 跨用户读取的
+	// 后门宁可没有，排障走数据库。
 	mux.Handle("GET /api/tasks", a.Auth.RequireFunc(a.listTasks))
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
@@ -48,6 +50,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/tasks", a.Auth.RequireFunc(a.triggerTask))
 	mux.Handle("POST /api/tasks/{id}/retry", a.Auth.RequireFunc(a.retryTask))
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
+	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
 }
 
@@ -73,7 +76,7 @@ func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
 	rows, total, err := a.Store.ListTasks(r.Context(), store.ListTasksParams{
-		States: states, Limit: limit, Offset: offset,
+		UserID: CurrentUser(r).ID, States: states, Limit: limit, Offset: offset,
 	})
 	if err != nil {
 		serverError(w, "查询任务列表失败", err)
@@ -89,8 +92,9 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	detail, err := a.Store.TaskDetail(r.Context(), id)
+	detail, err := a.Store.TaskDetail(r.Context(), id, CurrentUser(r).ID)
 	if err != nil {
+		// 别人的任务与不存在同等处理：对非属主隐瞒存在
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
 		return
 	}
@@ -98,7 +102,7 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
-	st, err := a.Store.Stats(r.Context())
+	st, err := a.Store.Stats(r.Context(), CurrentUser(r).ID)
 	if err != nil {
 		serverError(w, "统计失败", err)
 		return
@@ -107,7 +111,7 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listRepos(w http.ResponseWriter, r *http.Request) {
-	repos, err := a.Store.ListRepos(r.Context())
+	repos, err := a.Store.ListRepos(r.Context(), CurrentUser(r).ID)
 	if err != nil {
 		serverError(w, "查询仓库失败", err)
 		return
@@ -153,7 +157,7 @@ func (a *API) triggerTask(w http.ResponseWriter, r *http.Request) {
 		body.IssueKey = body.IssueID
 	}
 
-	if err := a.Queue.Enqueue(r.Context(), body.IssueID, body.IssueKey); err != nil {
+	if err := a.Queue.Enqueue(r.Context(), CurrentUser(r).ID, body.IssueID, body.IssueKey); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}
@@ -171,7 +175,8 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tk, err := a.Tasks.Get(r.Context(), id)
-	if err != nil {
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		// 不是自己的任务 = 不存在（与 taskDetail 同一原则）
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
 		return
 	}
@@ -183,8 +188,8 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 状态已回到 queued，再排进执行队列
-	if err := a.Queue.Enqueue(r.Context(), tk.LinearIssueKey, tk.LinearIssueKey); err != nil {
+	// 状态已回到 queued，再排进执行队列；归属仍是原属主
+	if err := a.Queue.Enqueue(r.Context(), tk.UserID, tk.LinearIssueKey, tk.LinearIssueKey); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}
@@ -196,6 +201,11 @@ func (a *API) cancelTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return
+	}
 	if _, err := a.Tasks.Transition(r.Context(), id, task.StateCancelled, actorOf(r), &task.TransitionOpts{
 		Payload: map[string]any{"reason": "manual_cancel"},
 	}); err != nil {
@@ -203,6 +213,44 @@ func (a *API) cancelTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "cancelled", "taskId": id})
+}
+
+// createRepo 登记一个仓库配置到当前用户名下。
+//
+// 数据隔离之后这是新用户的必经入口：没有人能替你把仓库配到你名下，
+// 缺了它新用户永远等不到「管理员手工 INSERT」之外的第二条路。
+func (a *API) createRepo(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ProviderRepo  string `json:"providerRepo"`
+		DefaultBranch string `json:"defaultBranch"`
+		HotfixBase    string `json:"hotfixBase"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
+		return
+	}
+	body.ProviderRepo = strings.TrimSpace(body.ProviderRepo)
+	if body.ProviderRepo == "" || !strings.Contains(body.ProviderRepo, "/") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "providerRepo 须为 owner/repo 形式，如 Clouditera/CloudRouter",
+		})
+		return
+	}
+
+	repo, err := a.Store.CreateRepo(r.Context(), CurrentUser(r).ID, store.CreateRepoParams{
+		ProviderRepo:  body.ProviderRepo,
+		DefaultBranch: strings.TrimSpace(body.DefaultBranch),
+		HotfixBase:    strings.TrimSpace(body.HotfixBase),
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrRepoExists) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
+		serverError(w, "创建仓库配置失败", err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, repo)
 }
 
 func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +301,7 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	repo, err := a.Store.UpdateRepo(r.Context(), id, store.UpdateRepoParams{
+	repo, err := a.Store.UpdateRepo(r.Context(), id, CurrentUser(r).ID, store.UpdateRepoParams{
 		DefaultBranch:      body.DefaultBranch,
 		HotfixBase:         body.HotfixBase,
 		ProtectedBranches:  body.ProtectedBranches,
@@ -262,6 +310,10 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		VerifyTierOverride: body.VerifyTierOverride,
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrRepoNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "仓库不存在"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

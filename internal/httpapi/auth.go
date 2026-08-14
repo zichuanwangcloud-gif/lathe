@@ -281,6 +281,10 @@ func userJSON(u *store.User) map[string]any {
 		"mustChangePassword": u.MustChangePassword,
 		"createdAt":          u.CreatedAt,
 		"lastLoginAt":        u.LastLoginAt,
+		// 专属 webhook 回调路径段（P1.5 第二步）：设置页拼成完整地址
+		// 让用户配进 Linear。它本身不是密钥 —— 真正防伪的是按用户
+		// 各自校验的签名密钥。
+		"webhookSlug": u.WebhookSlug,
 	}
 }
 

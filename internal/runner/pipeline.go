@@ -35,6 +35,15 @@ type Clients interface {
 	GitHub(ctx context.Context) (GitHubAPI, error)
 }
 
+// ClientFactory 按任务属主解析客户端（P1.5 第二步）。
+//
+// 多用户之后，任务必须用【属主自己的】Linear/GitHub 凭据跑：issue
+// 从谁的 Linear 视角读、PR 以谁的身份开、回帖落在谁的单上。启动时
+// 固定一套客户端等于把所有用户的任务都跑在管理员账号下。
+type ClientFactory interface {
+	ForUser(ctx context.Context, userID int64) (Clients, error)
+}
+
 // AgentDriver 驱动 agent 执行。
 type AgentDriver interface {
 	Run(ctx context.Context, p agent.RunParams) (*agent.Result, error)
@@ -65,6 +74,10 @@ type Pipeline struct {
 	Clients   Clients
 	Notifier  Notifier
 	NewID     NewSessionID
+
+	// ClientFactory 非空时优先于 Clients：按任务属主解析客户端。
+	// 为 nil 时用静态 Clients（单用户部署与测试）。
+	ClientFactory ClientFactory
 
 	// Verifications 记录验证步骤；为 nil 时只回帖不落库（测试用）。
 	Verifications VerificationRecorder
@@ -106,12 +119,20 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		actor = "system"
 	}
 
-	// 凭据可能在任务排队期间被改过，因此每次执行都现取客户端
-	lin, err := p.Clients.Linear(ctx)
+	// 凭据可能在任务排队期间被改过，因此每次执行都现取客户端。
+	// 多用户：按任务属主解析，任务跑在谁的账号下一目了然。
+	clients := p.Clients
+	if p.ClientFactory != nil {
+		clients, err = p.ClientFactory.ForUser(ctx, tk.UserID)
+		if err != nil {
+			return fmt.Errorf("解析任务属主的凭据失败: %w", err)
+		}
+	}
+	lin, err := clients.Linear(ctx)
 	if err != nil {
 		return fmt.Errorf("获取 Linear 客户端失败（请在设置里配置并验证凭据）: %w", err)
 	}
-	gh, err := p.Clients.GitHub(ctx)
+	gh, err := clients.GitHub(ctx)
 	if err != nil {
 		return fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
 	}

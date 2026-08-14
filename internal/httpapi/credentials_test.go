@@ -37,27 +37,20 @@ func credFixture(t *testing.T) (*CredentialAPI, *fakeVerifier, *httptestServer) 
 		t.Fatal(err)
 	}
 
-	var userID int64
-	email := "cred-" + t.Name() + "@example.com"
-	if err := st.Pool().QueryRow(context.Background(),
-		`INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO UPDATE SET updated_at=now() RETURNING id`,
-		email).Scan(&userID); err != nil {
-		t.Fatalf("建 user 失败: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = st.Pool().Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID)
-	})
+	userID := mustUser(t, st, "cred-"+t.Name()+"@example.com")
 
 	ver := &fakeVerifier{results: map[string]VerifyResult{}}
 	api := &CredentialAPI{
-		Secrets: st.NewSecrets(sealer), UserID: userID,
-		Verifier: ver, Auth: NewAuth(apiTestToken),
+		Secrets: st.NewSecrets(sealer),
+		Verifier: ver, Auth: authAs(userID, "cred@example.com"),
 	}
 
 	mux := http.NewServeMux()
 	api.Routes(mux)
 	ts := newTestServer(t, mux)
 	ts.api = api
+	ts.store = st
+	ts.userID = userID
 	return api, ver, ts
 }
 
@@ -96,7 +89,7 @@ func TestCredentialSaveAndVerify(t *testing.T) {
 	}
 
 	// 存的是密文，读回来应还是原文
-	got, err := api.Secrets.Get(context.Background(), api.UserID, store.KindGitHub)
+	got, err := api.Secrets.Get(context.Background(), srv.userID, store.KindGitHub)
 	if err != nil || got != "ghp_real_token_value" {
 		t.Errorf("凭据读回不符: %q %v", got, err)
 	}
@@ -113,7 +106,7 @@ func TestCredentialSavesEvenWhenVerifyFails(t *testing.T) {
 		t.Error("验证失败也应保存")
 	}
 
-	got, err := api.Secrets.Get(context.Background(), api.UserID, store.KindGitHub)
+	got, err := api.Secrets.Get(context.Background(), srv.userID, store.KindGitHub)
 	if err != nil || got != "ghp_bad" {
 		t.Errorf("凭据应已保存: %q %v", got, err)
 	}
@@ -182,7 +175,7 @@ func TestCredentialDelete(t *testing.T) {
 		t.Fatalf("删除状态码 = %d", resp.StatusCode)
 	}
 
-	if _, err := api.Secrets.Get(context.Background(), api.UserID, store.KindGitHub); err == nil {
+	if _, err := api.Secrets.Get(context.Background(), srv.userID, store.KindGitHub); err == nil {
 		t.Error("删除后不应还能读到凭据")
 	}
 }
@@ -224,17 +217,67 @@ func TestCredentialRequiresAuth(t *testing.T) {
 }
 
 // 凭据变更后必须让缓存失效，否则改完还要等 TTL 过期才生效。
+// 失效粒度必须到用户：A 改凭据不该碰 B 的缓存。
 func TestCredentialInvalidatesCache(t *testing.T) {
-	var invalidated []string
+	var invalidated []int64
 	_, ver, srv := credFixture(t)
 	ver.results[store.KindGitHub] = VerifyResult{OK: true}
 
-	srv.api.OnChange = func(kind string) { invalidated = append(invalidated, kind) }
+	srv.api.OnChange = func(userID int64, kind string) { invalidated = append(invalidated, userID) }
 
 	srv.do(t, "PUT", "/api/integrations/github", `{"token":"tok"}`, true)
 	srv.do(t, "DELETE", "/api/integrations/github", "", true)
 
 	if len(invalidated) != 2 {
-		t.Errorf("保存与删除都应触发缓存失效，实际 %v", invalidated)
+		t.Fatalf("保存与删除都应触发缓存失效，实际 %v", invalidated)
+	}
+	for _, id := range invalidated {
+		if id != srv.userID {
+			t.Errorf("失效应针对当前用户 %d，实际 %d", srv.userID, id)
+		}
+	}
+}
+
+// ★隔离（P1.5 第二步）：B 保存的凭据落在 B 名下，读不到也动不了 A 的。
+func TestCredentialIsolationBetweenUsers(t *testing.T) {
+	_, ver, srvA := credFixture(t)
+	ver.results[store.KindGitHub] = VerifyResult{OK: true, AccountName: "user-a"}
+
+	srvA.do(t, "PUT", "/api/integrations/github", `{"token":"token-of-a"}`, true)
+
+	// B 的视角：同一台服务、同一个 Secrets 后端，只是登录的是 B
+	userB := mustUser(t, srvA.store, "cred-b-"+t.Name()+"@example.com")
+	apiB := &CredentialAPI{
+		Secrets: srvA.api.Secrets, Verifier: ver,
+		Auth: authAs(userB, "b@example.com"),
+	}
+	mux := http.NewServeMux()
+	apiB.Routes(mux)
+	srvB := newTestServer(t, mux)
+
+	// B 的状态列表里绝不能出现 A 的凭据痕迹
+	resp := srvB.do(t, "GET", "/api/integrations", "", true)
+	raw := srvB.raw(t, resp)
+	if strings.Contains(raw, "user-a") || strings.Contains(raw, "token-of-a") {
+		t.Errorf("B 不应看到 A 的凭据状态: %s", raw)
+	}
+
+	// B 验证 github → 未配置（A 配了不等于 B 配了）
+	resp = srvB.do(t, "POST", "/api/integrations/github/verify", "", true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("B 未配置时应 400，得到 %d", resp.StatusCode)
+	}
+
+	// B 保存自己的凭据，互不干扰
+	ver.results[store.KindGitHub] = VerifyResult{OK: true, AccountName: "user-b"}
+	srvB.do(t, "PUT", "/api/integrations/github", `{"token":"token-of-b"}`, true)
+
+	gotA, err := srvA.api.Secrets.Get(context.Background(), srvA.userID, store.KindGitHub)
+	if err != nil || gotA != "token-of-a" {
+		t.Errorf("A 的凭据不应被 B 改动: %q %v", gotA, err)
+	}
+	gotB, err := srvA.api.Secrets.Get(context.Background(), userB, store.KindGitHub)
+	if err != nil || gotB != "token-of-b" {
+		t.Errorf("B 的凭据应落在 B 名下: %q %v", gotB, err)
 	}
 }

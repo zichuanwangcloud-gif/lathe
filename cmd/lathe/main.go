@@ -1,6 +1,7 @@
 // Command lathe 是 Lathe 的控制面：HTTP API、任务状态机、串行执行队列。
 //
-// 当前形态：单机、串行、多用户共享数据。按用户隔离数据与多节点
+// 当前形态：单机、多用户、按人隔离 —— 每个用户有专属 webhook 地址、
+// 各自的任务 / 仓库 / 凭据，队列按属主解析凭据执行。多节点横向扩展
 // 见 docs/02-design.md §8。
 package main
 
@@ -115,31 +116,28 @@ func serve(cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	// 第一步：数据仍然共享，凭据与仓库配置全部挂在内置管理员名下。
-	// 按用户隔离（owner_id 全链路）是第二步的事。
-	userID := admin.ID
 
 	go gcSessions(ctx, sessions)
 
-	provider := creds.NewProvider(secrets, userID, creds.EnvFallback{
+	// P1.5 第二步：凭据按用户隔离。环境变量兜底只给内置管理员 ——
+	// 那是部署者自己的账号，不该借给普通成员的任务用。
+	factory := creds.NewFactory(secrets, creds.EnvFallback{
 		LinearToken:         cfg.LinearToken,
 		LinearWebhookSecret: cfg.LinearWebhookSecret,
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
-	})
+	}, admin.ID)
 
-	pipeline, err := buildPipeline(cfg, st, creds.NewClients(provider))
+	pipeline, err := buildPipeline(cfg, st, factory)
 	if err != nil {
 		return err
 	}
 
-	if ready, missing := provider.Ready(ctx); !ready {
-		slog.Warn("凭据尚不完整，请在设置页配置后再触发任务", "缺少", missing)
+	if ready, missing := factory.ProviderFor(admin.ID).Ready(ctx); !ready {
+		slog.Warn("管理员凭据尚不完整，请在设置页配置后再触发任务", "缺少", missing)
 	}
 
-	// P0 串行队列：一次只跑一个任务，彻底绕开端口冲突与 DB 隔离问题
-	// （docs/02-design.md §8 —— 并发留到 P1）
-	q := newQueue(st, task.NewMachine(st.Pool()), pipeline, cfg)
+	q := newQueue(st, task.NewMachine(st.Pool()), pipeline, factory, cfg)
 	go q.work(ctx)
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
@@ -155,13 +153,15 @@ func serve(cfg config.Config) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", httpapi.Health)
-	mux.Handle("POST /webhooks/linear", &httpapi.LinearWebhook{
-		// 用函数取值而非固定字符串：凭据可在界面里改，改完即刻生效
-		SecretFunc: func() string { return provider.WebhookSecret(context.Background()) },
-		UserIDFunc: func() string { return provider.LinearUserID(context.Background()) },
+	// 每用户专属回调：/webhooks/linear/{slug}（设置页展示完整地址）。
+	// 旧路径保留，路由到内置管理员，老部署的 Linear webhook 配置不用改。
+	webhook := &httpapi.LinearWebhook{
+		Resolver:   &webhookResolver{users: users, factory: factory, admin: admin},
 		Deliveries: st,
 		Tasks:      q,
-	})
+	}
+	mux.Handle("POST /webhooks/linear/{slug}", webhook)
+	mux.Handle("POST /webhooks/linear", webhook)
 
 	apiSrv := &httpapi.API{
 		Store:        st,
@@ -200,10 +200,9 @@ func serve(cfg config.Config) error {
 
 	credAPI := &httpapi.CredentialAPI{
 		Secrets:  secrets,
-		UserID:   userID,
 		Verifier: creds.Verifier{},
 		Auth:     auth,
-		OnChange: provider.Invalidate,
+		OnChange: factory.Invalidate,
 		EnvConfigured: func(kind string) bool {
 			switch kind {
 			case store.KindLinear:
@@ -258,7 +257,7 @@ func serve(cfg config.Config) error {
 // 刻意不在此校验 Linear/GitHub 凭据：凭据现在可在界面里配置，
 // 缺凭据不该阻止服务启动 —— 否则新用户连配置页都打不开。
 // 真正需要凭据时（执行任务）才会报错，并指引去设置页。
-func buildPipeline(cfg config.Config, st *store.Store, clients runner.Clients) (*runner.Pipeline, error) {
+func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFactory) (*runner.Pipeline, error) {
 	wm, err := runner.NewWorktreeManager(cfg.WorkspaceRoot)
 	if err != nil {
 		return nil, err
@@ -269,12 +268,48 @@ func buildPipeline(cfg config.Config, st *store.Store, clients runner.Clients) (
 		Worktrees:      wm,
 		Verifier:       runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
 		Agent:          agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
-		Clients:        clients,
+		ClientFactory:  factory,
 		Notifier:       logNotifier{},
 		Verifications:  st,
 		Gates:          runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode: "acceptEdits",
 		SettingSources: cfg.SettingSources,
+	}, nil
+}
+
+// webhookResolver 把回调路径里的 slug 解析成投递目标。
+//
+// 空 slug（旧路径）映射到内置管理员 —— 老部署的 webhook 不迁移也能用。
+// 签名密钥与接单判定的 Linear 用户 ID 都按目标用户的凭据现取，
+// 在设置页改完即刻生效。
+type webhookResolver struct {
+	users   *store.Users
+	factory *creds.Factory
+	admin   *store.User
+}
+
+func (r *webhookResolver) Resolve(ctx context.Context, slug string) (*httpapi.WebhookTarget, error) {
+	u := r.admin
+	if slug != "" {
+		var err error
+		u, err = r.users.ByWebhookSlug(ctx, slug)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if u.Disabled() {
+		return nil, fmt.Errorf("账号已停用")
+	}
+
+	p := r.factory.ProviderFor(u.ID)
+	secret := p.WebhookSecret(ctx)
+	if secret == "" {
+		return nil, fmt.Errorf("该用户尚未配置 webhook 签名密钥")
+	}
+	return &httpapi.WebhookTarget{
+		OwnerID:      u.ID,
+		Secret:       secret,
+		LinearUserID: p.LinearUserID(ctx),
 	}, nil
 }
 
@@ -297,7 +332,7 @@ func configStatus(cfg config.Config) func() map[string]any {
 				"pnpmStore":     cfg.PnpmStore,
 				"claudeBin":     cfg.ClaudeBin,
 				"agentTimeout":  cfg.AgentTimeout.String(),
-				"mode":          "P0 串行（单机，多用户共享数据）",
+				"mode":          "单机多用户（按人隔离）",
 			},
 		}
 	}

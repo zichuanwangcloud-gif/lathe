@@ -20,6 +20,9 @@ const queueDepth = 64
 
 // job 是一条待执行的任务。
 type job struct {
+	// OwnerID 是任务归属用户（P1.5 第二步）：仓库配置、Linear/GitHub
+	// 凭据、看板可见性全部按它隔离。
+	OwnerID  int64
 	IssueID  string
 	IssueKey string
 }
@@ -36,21 +39,22 @@ type queue struct {
 	store    *store.Store
 	tasks    *task.Machine
 	pipeline *runner.Pipeline
+	clients  runner.ClientFactory // 接单失败时回帖用
 	cfg      config.Config
 	ch       chan job
 }
 
-func newQueue(st *store.Store, tm *task.Machine, p *runner.Pipeline, cfg config.Config) *queue {
+func newQueue(st *store.Store, tm *task.Machine, p *runner.Pipeline, cf runner.ClientFactory, cfg config.Config) *queue {
 	return &queue{
-		store: st, tasks: tm, pipeline: p, cfg: cfg,
+		store: st, tasks: tm, pipeline: p, clients: cf, cfg: cfg,
 		ch: make(chan job, queueDepth),
 	}
 }
 
 // Enqueue 实现 httpapi.TaskEnqueuer。
-func (q *queue) Enqueue(ctx context.Context, issueID, issueKey string) error {
+func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKey string) error {
 	select {
-	case q.ch <- job{IssueID: issueID, IssueKey: issueKey}:
+	case q.ch <- job{OwnerID: ownerUserID, IssueID: issueID, IssueKey: issueKey}:
 		return nil
 	default:
 		return fmt.Errorf("执行队列已满（上限 %d），暂时无法接单", queueDepth)
@@ -88,16 +92,19 @@ func (q *queue) work(ctx context.Context) {
 }
 
 func (q *queue) runOne(ctx context.Context, j job) {
-	slog.Info("开始处理", "issue", j.IssueKey)
+	slog.Info("开始处理", "issue", j.IssueKey, "owner", j.OwnerID)
 
-	userID, repoID, repoCfg, cloneURL, err := q.resolveRepo(ctx, j)
+	repoID, repoCfg, cloneURL, err := q.resolveRepo(ctx, j)
 	if err != nil {
-		slog.Error("无法确定任务归属仓库", "issue", j.IssueKey, "err", err)
+		slog.Error("无法确定任务归属仓库", "issue", j.IssueKey, "owner", j.OwnerID, "err", err)
+		// 接单却跑不了不能沉默 —— 人在 Linear 那边指派完就干等。
+		// 尽力回帖说明原因；凭据也没配的话只能放弃，日志里已有痕迹。
+		q.commentUnresolved(ctx, j, err)
 		return
 	}
 
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: j.IssueKey,
+		UserID: j.OwnerID, RepoID: repoID, LinearIssueKey: j.IssueKey,
 	})
 	if err != nil {
 		// 同一 issue 已有活任务时会撞上部分唯一索引 —— 这是预期行为，非错误
@@ -119,12 +126,11 @@ func (q *queue) runOne(ctx context.Context, j job) {
 	slog.Info("任务处理完成", "issue", j.IssueKey, "task", tk.ID)
 }
 
-// resolveRepo 查出要操作的仓库。
+// resolveRepo 查出要操作的仓库：属主名下的第一条配置。
 //
-// 当前单仓：取第一条 repos 记录。账号体系的第一步数据仍然共享，所有任务都
-// 落在同一份仓库配置上；按用户隔离与按 issue 的 team/project 路由到不同仓库
-// 都留到第二步（见 docs/02-design.md §8）。
-func (q *queue) resolveRepo(ctx context.Context, j job) (userID, repoID int64, cfg runner.RepoConfig, cloneURL string, err error) {
+// 数据隔离（P1.5 第二步）后，每个用户各自在设置页登记仓库；按 issue 的
+// team/project 路由到不同仓库仍是后续项（docs/02-design.md §8）。
+func (q *queue) resolveRepo(ctx context.Context, j job) (repoID int64, cfg runner.RepoConfig, cloneURL string, err error) {
 	var (
 		providerRepo  string
 		defaultBranch string
@@ -134,12 +140,12 @@ func (q *queue) resolveRepo(ctx context.Context, j job) (userID, repoID int64, c
 		tierOverride  string
 	)
 	err = q.store.Pool().QueryRow(ctx, `
-		SELECT user_id, id, provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
+		SELECT id, provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
 		       COALESCE(verify_tier_override, '')
-		FROM repos ORDER BY id LIMIT 1`,
-	).Scan(&userID, &repoID, &providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride)
+		FROM repos WHERE user_id = $1 ORDER BY id LIMIT 1`, j.OwnerID,
+	).Scan(&repoID, &providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride)
 	if err != nil {
-		return 0, 0, cfg, "", fmt.Errorf("读取仓库配置失败（P0 需先在 repos 表插入一条记录）: %w", err)
+		return 0, cfg, "", fmt.Errorf("你的账号下没有仓库配置（请在设置页添加仓库）: %w", err)
 	}
 
 	cfg = runner.RepoConfig{
@@ -150,5 +156,28 @@ func (q *queue) resolveRepo(ctx context.Context, j job) (userID, repoID int64, c
 		BranchPattern:      pattern,
 		VerifyTierOverride: tierOverride,
 	}
-	return userID, repoID, cfg, "git@github.com:" + providerRepo + ".git", nil
+	return repoID, cfg, "git@github.com:" + providerRepo + ".git", nil
+}
+
+// commentUnresolved 在无法接单时尽力回帖说明原因。
+//
+// 多用户之后这一步更常见：新用户配好了 webhook 却还没登记仓库，
+// 指派事件照样投递。不回帖的话 Linear 那边看起来就是「指派了但
+// 毫无反应」，比明确的拒绝难受得多。
+func (q *queue) commentUnresolved(ctx context.Context, j job, cause error) {
+	if q.clients == nil {
+		return
+	}
+	clients, err := q.clients.ForUser(ctx, j.OwnerID)
+	if err != nil {
+		return
+	}
+	lin, err := clients.Linear(ctx)
+	if err != nil {
+		return // 凭据也没配 —— 无从回帖，日志已留痕
+	}
+	body := "Lathe 无法接单：" + cause.Error() + "\n\n配置完成后重新指派即可触发。"
+	if _, err := lin.Comment(ctx, j.IssueID, body); err != nil {
+		slog.Warn("接单失败回帖也没发出去", "issue", j.IssueKey, "err", err)
+	}
 }

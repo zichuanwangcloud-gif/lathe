@@ -74,6 +74,8 @@ export const api = {
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   updateRepo: (id, body) =>
     request(`/api/repos/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  createRepo: (body) =>
+    request('/api/repos', { method: 'POST', body: JSON.stringify(body) }),
 
   integrations: () => request('/api/integrations'),
   saveIntegration: (kind, token) =>

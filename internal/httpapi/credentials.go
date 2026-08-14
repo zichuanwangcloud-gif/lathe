@@ -26,15 +26,25 @@ type Verifier interface {
 }
 
 // CredentialAPI 管理凭据的配置与验证。
+//
+// P1.5 第二步：凭据按 CurrentUser 归属，各配各的。第一步那个
+// 「人人写的都是超管名下凭据」的洞就此堵上 —— 配套的缓存失效回调
+// 也要带上用户，否则 A 改凭据会把 B 的缓存也清掉（或更糟：清不掉）。
 type CredentialAPI struct {
 	Secrets  *store.Secrets
-	UserID   int64
 	Verifier Verifier
 	Auth     *Auth
-	// OnChange 在凭据变更后调用，用于让缓存立即失效。
-	OnChange func(kind string)
+	// OnChange 在凭据变更后调用，用于让该用户的缓存立即失效。
+	OnChange func(userID int64, kind string)
 	// EnvConfigured 报告某类凭据是否有环境变量兜底值。
+	// 环境变量是部署者（超管）的兜底，普通成员不该看到「已配置（来自环境变量）」
+	// —— 那会让成员以为自己的任务有凭据可用，实际并不会用到。
 	EnvConfigured func(kind string) bool
+}
+
+// owner 返回本次请求的凭据属主。
+func (c *CredentialAPI) owner(r *http.Request) int64 {
+	return CurrentUser(r).ID
 }
 
 // Routes 注册凭据管理接口。
@@ -46,15 +56,18 @@ func (c *CredentialAPI) Routes(mux *http.ServeMux) {
 }
 
 func (c *CredentialAPI) list(w http.ResponseWriter, r *http.Request) {
-	items, err := c.Secrets.Status(r.Context(), c.UserID)
+	u := CurrentUser(r)
+	items, err := c.Secrets.Status(r.Context(), u.ID)
 	if err != nil {
 		serverError(w, "查询凭据状态失败", err)
 		return
 	}
 
 	// 库里没有但环境变量里有的，标为 env 来源 —— 让人看清当前生效的是哪个，
-	// 避免"我明明配了环境变量，界面却说未配置"的困惑
-	if c.EnvConfigured != nil {
+	// 避免"我明明配了环境变量，界面却说未配置"的困惑。
+	// 只对管理员展示：环境变量兜底只对内置管理员生效（见 creds.Factory），
+	// 给成员看到这个标注是误导。
+	if c.EnvConfigured != nil && u.IsAdmin() {
 		for i := range items {
 			if !items[i].Configured && c.EnvConfigured(items[i].Kind) {
 				items[i].Configured = true
@@ -90,13 +103,13 @@ func (c *CredentialAPI) save(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := c.Secrets.Save(r.Context(), c.UserID, kind, body.Token); err != nil {
+	if err := c.Secrets.Save(r.Context(), c.owner(r), kind, body.Token); err != nil {
 		serverError(w, "保存凭据失败", err)
 		return
 	}
-	c.invalidate(kind)
+	c.invalidate(c.owner(r), kind)
 
-	result := c.runVerify(r.Context(), kind, body.Token)
+	result := c.runVerify(r.Context(), c.owner(r), kind, body.Token)
 	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "verify": result})
 }
 
@@ -108,18 +121,18 @@ func (c *CredentialAPI) verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := c.Secrets.Get(r.Context(), c.UserID, kind)
+	token, err := c.Secrets.Get(r.Context(), c.owner(r), kind)
 	if err != nil {
 		if errors.Is(err, store.ErrIntegrationNotFound) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "该凭据尚未在界面中配置（若配在环境变量里，请填入此处以便验证）",
+				"error": "该凭据尚未配置（管理员也可配在环境变量里；请填入此处以便验证）",
 			})
 			return
 		}
 		serverError(w, "读取凭据失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"verify": c.runVerify(r.Context(), kind, token)})
+	writeJSON(w, http.StatusOK, map[string]any{"verify": c.runVerify(r.Context(), c.owner(r), kind, token)})
 }
 
 func (c *CredentialAPI) remove(w http.ResponseWriter, r *http.Request) {
@@ -128,36 +141,36 @@ func (c *CredentialAPI) remove(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "未知凭据类型 " + kind})
 		return
 	}
-	if err := c.Secrets.Delete(r.Context(), c.UserID, kind); err != nil {
+	if err := c.Secrets.Delete(r.Context(), c.owner(r), kind); err != nil {
 		serverError(w, "删除凭据失败", err)
 		return
 	}
-	c.invalidate(kind)
+	c.invalidate(c.owner(r), kind)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
 // runVerify 执行验证并把结果记进数据库，供界面展示"上次验证情况"。
-func (c *CredentialAPI) runVerify(ctx context.Context, kind, token string) VerifyResult {
+func (c *CredentialAPI) runVerify(ctx context.Context, userID int64, kind, token string) VerifyResult {
 	if c.Verifier == nil {
 		return VerifyResult{OK: false, Error: "未配置验证器"}
 	}
 	res := c.Verifier.Verify(ctx, kind, token)
 
 	if res.OK {
-		_ = c.Secrets.MarkVerified(ctx, c.UserID, kind, res.AccountName)
+		_ = c.Secrets.MarkVerified(ctx, userID, kind, res.AccountName)
 		if res.AccountID != "" {
 			// Linear 场景：把账号 ID 存下来，接单判定直接用，
 			// 免去人工去 Linear 里翻自己的 user id
-			_ = c.Secrets.SetAccountName(ctx, c.UserID, kind, res.AccountID)
+			_ = c.Secrets.SetAccountName(ctx, userID, kind, res.AccountID)
 		}
 	} else {
-		_ = c.Secrets.MarkVerifyFailed(ctx, c.UserID, kind, res.Error)
+		_ = c.Secrets.MarkVerifyFailed(ctx, userID, kind, res.Error)
 	}
 	return res
 }
 
-func (c *CredentialAPI) invalidate(kind string) {
+func (c *CredentialAPI) invalidate(userID int64, kind string) {
 	if c.OnChange != nil {
-		c.OnChange(kind)
+		c.OnChange(userID, kind)
 	}
 }

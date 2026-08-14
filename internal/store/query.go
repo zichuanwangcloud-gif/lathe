@@ -2,13 +2,24 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// ErrRepoNotFound 表示仓库不存在或不属于当前用户（两者刻意不分）。
+var ErrRepoNotFound = errors.New("store: 仓库不存在")
+
+// ErrRepoExists 表示该用户名下已登记过这个仓库。
+var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
 	ID             int64      `json:"id"`
+	UserID         int64      `json:"userId"`
 	LinearIssueKey string     `json:"linearIssueKey"`
 	State          string     `json:"state"`
 	TaskKind       *string    `json:"taskKind"`
@@ -26,13 +37,17 @@ type TaskRow struct {
 
 // ListTasksParams 是任务列表的过滤条件。
 type ListTasksParams struct {
+	// UserID 是数据隔离的边界（P1.5 第二步）：只能看到「自己名下」的任务。
+	// 调用方从登录身份取值，没有任何「看全部」的旁路 —— 管理员排障走
+	// 用户管理页的计数或数据库，不在产品里留跨用户读取的后门。
+	UserID int64
 	// States 为空表示不过滤。
 	States []string
 	Limit  int
 	Offset int
 }
 
-// ListTasks 按更新时间倒序返回任务列表。
+// ListTasks 按更新时间倒序返回指定用户名下的任务列表。
 func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, int, error) {
 	if p.Limit <= 0 || p.Limit > 200 {
 		p.Limit = 50
@@ -50,20 +65,21 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 	var total int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT count(*) FROM tasks
-		WHERE ($1::text[] IS NULL OR state = ANY($1))`, states).Scan(&total); err != nil {
+		WHERE user_id = $1 AND ($2::text[] IS NULL OR state = ANY($2))`,
+		p.UserID, states).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("store: 统计任务数失败: %w", err)
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT t.id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
+		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at
 		FROM tasks t
 		JOIN repos r ON r.id = t.repo_id
-		WHERE ($1::text[] IS NULL OR t.state = ANY($1))
+		WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
 		ORDER BY t.updated_at DESC
-		LIMIT $2 OFFSET $3`, states, p.Limit, p.Offset)
+		LIMIT $3 OFFSET $4`, p.UserID, states, p.Limit, p.Offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: 查询任务列表失败: %w", err)
 	}
@@ -73,7 +89,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 	for rows.Next() {
 		var t TaskRow
 		if err := rows.Scan(
-			&t.ID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
+			&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
 			&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
 			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 			&t.AgentSessionID, &t.LeaseExpiresAt,
@@ -114,17 +130,20 @@ type TaskDetail struct {
 }
 
 // TaskDetail 读取单个任务的完整信息。
-func (s *Store) TaskDetail(ctx context.Context, id int64) (*TaskDetail, error) {
+//
+// userID 是隔离边界：任务不属于该用户时返回错误，API 层映射成 404
+// —— 对非属主隐瞒任务的存在，不用 403 暴露「有这个任务但不是你的」。
+func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, error) {
 	var t TaskRow
 	err := s.pool.QueryRow(ctx, `
-		SELECT t.id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
+		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at
 		FROM tasks t JOIN repos r ON r.id = t.repo_id
-		WHERE t.id = $1`, id,
+		WHERE t.id = $1 AND t.user_id = $2`, id, userID,
 	).Scan(
-		&t.ID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
+		&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
 		&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,
@@ -180,9 +199,10 @@ type Stats struct {
 	SuccessRate float64 `json:"successRate"`
 }
 
-// Stats 汇总任务状态分布。
-func (s *Store) Stats(ctx context.Context) (*Stats, error) {
-	rows, err := s.pool.Query(ctx, `SELECT state, count(*) FROM tasks GROUP BY state`)
+// Stats 汇总指定用户名下的任务状态分布。
+func (s *Store) Stats(ctx context.Context, userID int64) (*Stats, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT state, count(*) FROM tasks WHERE user_id = $1 GROUP BY state`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 统计任务状态失败: %w", err)
 	}
@@ -239,13 +259,13 @@ type RepoRow struct {
 	VerifyTierOverride string `json:"verifyTierOverride"`
 }
 
-// ListRepos 返回全部仓库配置。
-func (s *Store) ListRepos(ctx context.Context) ([]RepoRow, error) {
+// ListRepos 返回指定用户名下的仓库配置。
+func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
 		       COALESCE(verify_tier_override, '')
-		FROM repos ORDER BY id`)
+		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
 	}
@@ -278,31 +298,74 @@ type UpdateRepoParams struct {
 }
 
 // UpdateRepo 更新仓库配置。
-func (s *Store) UpdateRepo(ctx context.Context, id int64, p UpdateRepoParams) (*RepoRow, error) {
+//
+// userID 是隔离边界：WHERE 同时限定 id 与属主，改别人的仓库会得到
+// ErrRepoNotFound —— 与 TaskDetail 一样，对非属主隐瞒存在。
+func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoParams) (*RepoRow, error) {
 	var r RepoRow
 	err := s.pool.QueryRow(ctx, `
 		UPDATE repos SET
-			default_branch     = COALESCE(NULLIF($2,''), default_branch),
-			hotfix_base        = COALESCE(NULLIF($3,''), hotfix_base),
-			protected_branches = COALESCE($4, protected_branches),
-			branch_pattern     = COALESCE(NULLIF($5,''), branch_pattern),
-			gate_mode          = COALESCE(NULLIF($6,''), gate_mode),
+			default_branch     = COALESCE(NULLIF($3,''), default_branch),
+			hotfix_base        = COALESCE(NULLIF($4,''), hotfix_base),
+			protected_branches = COALESCE($5, protected_branches),
+			branch_pattern     = COALESCE(NULLIF($6,''), branch_pattern),
+			gate_mode          = COALESCE(NULLIF($7,''), gate_mode),
 			verify_tier_override = CASE
-				WHEN $7::text IS NULL THEN verify_tier_override
-				WHEN $7::text = '' THEN NULL
-				ELSE $7::text
+				WHEN $8::text IS NULL THEN verify_tier_override
+				WHEN $8::text = '' THEN NULL
+				ELSE $8::text
 			END
-		WHERE id = $1
+		WHERE id = $1 AND user_id = $2
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
 		          COALESCE(verify_tier_override, '')`,
-		id, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
+		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
 		p.VerifyTierOverride,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 		&r.VerifyTierOverride)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRepoNotFound
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store: 更新仓库 %d 失败: %w", id, err)
+	}
+	return &r, nil
+}
+
+// CreateRepoParams 是新建仓库配置的必填项。
+type CreateRepoParams struct {
+	ProviderRepo  string
+	DefaultBranch string
+	HotfixBase    string
+}
+
+// CreateRepo 给用户登记一个仓库配置。
+//
+// 数据隔离之后这是新用户的必经入口 —— 第一步可以靠管理员手工 INSERT
+// 顶过去，各归各之后没人能替你把仓库配到你的名下。分叉基线与 hotfix
+// 基线取默认值 dev/main，之后可以在界面上改。
+func (s *Store) CreateRepo(ctx context.Context, userID int64, p CreateRepoParams) (*RepoRow, error) {
+	var r RepoRow
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO repos (user_id, provider_repo, default_branch, hotfix_base)
+		VALUES ($1, $2,
+		        COALESCE(NULLIF($3,''), 'dev'),
+		        COALESCE(NULLIF($4,''), 'main'))
+		RETURNING id, provider_repo, default_branch, hotfix_base,
+		          protected_branches, branch_pattern, dep_strategy, gate_mode,
+		          COALESCE(verify_tier_override, '')`,
+		userID, p.ProviderRepo, p.DefaultBranch, p.HotfixBase,
+	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
+		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
+		&r.VerifyTierOverride)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		// 23505 = unique_violation，这里只可能是 (user_id, provider_repo)
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, ErrRepoExists
+		}
+		return nil, fmt.Errorf("store: 创建仓库配置失败: %w", err)
 	}
 	return &r, nil
 }

@@ -37,6 +37,9 @@ func testStoreForAPI(t *testing.T) *store.Store {
 type httptestServer struct {
 	srv *httptest.Server
 	api *CredentialAPI
+	// store 与 userID 供多用户隔离测试构造「另一个人的视角」。
+	store  *store.Store
+	userID int64
 }
 
 func newTestServer(t *testing.T, mux *http.ServeMux) *httptestServer {

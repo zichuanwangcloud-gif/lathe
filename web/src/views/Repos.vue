@@ -20,6 +20,26 @@ const VERIFY_TIERS = [
   { value: 'heavy', label: '强制 heavy', desc: '必须给出红-绿复现证明：复现测试在改动前失败、改动后通过，回归通过。' },
 ]
 
+// 登记新仓库（P1.5 第二步）：各归各的名下，不再需要管理员手工插库
+const newRepo = ref('')
+const newBusy = ref(false)
+
+async function add() {
+  const providerRepo = newRepo.value.trim()
+  if (!providerRepo) return
+  newBusy.value = true
+  error.value = ''
+  try {
+    await api.createRepo({ providerRepo })
+    newRepo.value = ''
+    await load()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    newBusy.value = false
+  }
+}
+
 async function load() {
   try {
     const r = await api.repos()
@@ -73,10 +93,28 @@ onMounted(load)
   <h1>仓库配置</h1>
   <div v-if="error" class="error-banner">{{ error }}</div>
 
+  <div class="card">
+    <h2>登记仓库</h2>
+    <p class="faint" style="margin: 6px 0 12px">
+      把你要让 Lathe 干活的 GitHub 仓库登记到自己名下，例如 <code class="mono">Clouditera/CloudRouter</code>。
+      登记后把 issue 指派给你的 Linear 账号即可触发任务。
+    </p>
+    <form class="row" style="display: flex; gap: 10px" @submit.prevent="add">
+      <input
+        v-model="newRepo"
+        class="mono"
+        style="flex: 1"
+        placeholder="owner/repo"
+        :disabled="newBusy"
+      />
+      <button class="primary" :disabled="newBusy || !newRepo.trim()">
+        {{ newBusy ? '登记中…' : '登记' }}
+      </button>
+    </form>
+  </div>
+
   <div v-if="!repos.length" class="card empty">
-    尚未配置仓库。P0 需要先往 repos 表插一条记录：
-    <pre style="margin-top: 12px; text-align: left">INSERT INTO repos (user_id, provider_repo)
-VALUES (1, 'Clouditera/CloudRouter');</pre>
+    你名下还没有仓库 —— 在上方登记一个，issue 才会被路由到这里。
   </div>
 
   <div v-for="repo in repos" :key="repo.id" class="card repo">

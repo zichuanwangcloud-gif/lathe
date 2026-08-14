@@ -42,18 +42,34 @@ func (f *fakeClaimer) FinishDelivery(ctx context.Context, id, errMsg string) err
 
 type fakeEnqueuer struct {
 	issues []string
+	owners []int64
 	err    error
 }
 
-func (f *fakeEnqueuer) Enqueue(ctx context.Context, issueID, issueKey string) error {
+func (f *fakeEnqueuer) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKey string) error {
 	if f.err != nil {
 		return f.err
 	}
+	f.owners = append(f.owners, ownerUserID)
 	f.issues = append(f.issues, issueKey)
 	return nil
 }
 
 const testSecret = "webhook-secret"
+
+// fakeResolver 按 slug 路由：空 slug 与 "admin-slug" 都给管理员（用户 1），
+// "member-slug" 给成员（用户 2），其余找不到。
+type fakeResolver struct{}
+
+func (fakeResolver) Resolve(ctx context.Context, slug string) (*WebhookTarget, error) {
+	switch slug {
+	case "", "admin-slug":
+		return &WebhookTarget{OwnerID: 1, Secret: testSecret, LinearUserID: "user-me"}, nil
+	case "member-slug":
+		return &WebhookTarget{OwnerID: 2, Secret: testSecret, LinearUserID: "user-member"}, nil
+	}
+	return nil, errors.New("未知 slug")
+}
 
 func post(t *testing.T, h http.Handler, body string, opts ...func(*http.Request)) *httptest.ResponseRecorder {
 	t.Helper()
@@ -75,10 +91,17 @@ func post(t *testing.T, h http.Handler, body string, opts ...func(*http.Request)
 
 func newHandler(c *fakeClaimer, e *fakeEnqueuer) *LinearWebhook {
 	return &LinearWebhook{
-		SecretFunc: func() string { return testSecret },
-		UserIDFunc: func() string { return "user-me" },
+		Resolver:   fakeResolver{},
 		Deliveries: c, Tasks: e,
 	}
+}
+
+// slugged 模拟路由层把路径里的 {slug} 放进 PathValue。
+func slugged(h *LinearWebhook, slug string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.SetPathValue("slug", slug)
+		h.ServeHTTP(w, r)
+	})
 }
 
 const assignedBody = `{"action":"update","type":"Issue","data":{"id":"uuid-1","identifier":"CR-777","assigneeId":"user-me"},"updatedFrom":{"assigneeId":null}}`
@@ -196,6 +219,44 @@ func TestWebhookEnqueueErrorRecorded(t *testing.T) {
 	}
 	if got := c.finished["deliv-1"]; !strings.Contains(got, "仓库未配置") {
 		t.Errorf("失败原因应落库，得到 %q", got)
+	}
+}
+
+// P1.5 第二步：同一台服务接多个用户的 webhook，按 slug 路由 ——
+// 谁的事件、用谁的密钥验签、任务归谁的名下。
+func TestWebhookRoutesBySlug(t *testing.T) {
+	c, e := newFakeClaimer(), &fakeEnqueuer{}
+	h := newHandler(c, e)
+
+	// 成员自己的回调地址：指派给「成员的 Linear 账号」才接单
+	memberBody := `{"action":"update","type":"Issue","data":{"id":"uuid-m","identifier":"CR-900","assigneeId":"user-member"},"updatedFrom":{"assigneeId":null}}`
+	rec := post(t, slugged(h, "member-slug"), memberBody)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "queued") {
+		t.Fatalf("成员 slug 应正常接单: %d %s", rec.Code, rec.Body)
+	}
+	if len(e.owners) != 1 || e.owners[0] != 2 {
+		t.Errorf("任务应归成员（用户 2）名下，实际属主 %v", e.owners)
+	}
+
+	// 同一事件打到管理员的地址：assigneeId 不匹配管理员的 Linear ID，应忽略
+	c2, e2 := newFakeClaimer(), &fakeEnqueuer{}
+	rec = post(t, slugged(newHandler(c2, e2), "admin-slug"), memberBody)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "ignored") {
+		t.Errorf("指派给成员的事件打到管理员地址应被忽略: %d %s", rec.Code, rec.Body)
+	}
+	if len(e2.issues) != 0 {
+		t.Errorf("不应接单: %v", e2.issues)
+	}
+}
+
+func TestWebhookUnknownSlug(t *testing.T) {
+	c, e := newFakeClaimer(), &fakeEnqueuer{}
+	rec := post(t, slugged(newHandler(c, e), "no-such-slug"), assignedBody)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("未知 slug 应 404，得到 %d", rec.Code)
+	}
+	if len(e.issues) != 0 || len(c.claimed) != 0 {
+		t.Error("无法路由的投递不应进入任何后续环节")
 	}
 }
 

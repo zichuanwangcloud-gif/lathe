@@ -59,8 +59,9 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
 #    接单判定直接使用，无需手工填写。
 #
-# 6. 在「仓库配置」页设置目标仓库与分支策略，把 Linear webhook 指到
-#    /webhooks/linear
+# 6. 「设置」页顶部有你的专属 Linear webhook 地址（/webhooks/linear/<你的随机段>），
+#    在 Linear → Settings → API → Webhooks 里指过去，勾选 Issue 事件
+# 7. 在「仓库配置」页登记目标仓库（owner/repo）并设置分支策略
 ```
 
 ### 账号
@@ -96,7 +97,8 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 
 也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等），优先级低于界面配置。
 
-流程：指派 issue 给自己 → webhook 接单 → 分诊 → 实现（fix/feature 必须交复现/验收
+流程：指派 issue 给自己 → 事件按你的专属 webhook 地址路由到你名下（用你的
+webhook 密钥验签）→ 接单 → 分诊 → 实现（fix/feature 必须交复现/验收
 测试）→ 按 diff 定档验证（light 构建检查 / heavy 红-绿-回归）→ 开 PR → 回帖。
 失败则回帖说明原因、**保留 worktree 现场**、推送通知，不自动重试。
 
@@ -117,12 +119,14 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 - ⬜ per-task compose 隔离栈：红绿阶段目前在 git worktree 里跑（进程组隔离），
   待目标仓库声明服务栈后补
 
-账号体系分两步交付，**当前是第一步**：注册登录、找回密码、角色与用户管理都可用，
-但**数据仍然共享** —— 任务、仓库配置、Linear/GitHub 凭据都挂在内置管理员名下，
-任何登录用户看到的是同一份。第二步做全链路 `owner_id` 隔离与每用户专属的
-webhook 回调地址（`users.webhook_slug` 已在迁移里预留）。
+账号体系两步都已交付：注册登录、找回密码、角色与用户管理（第一步），以及
+**全链路数据隔离**（P1.5 第二步）——每个用户有专属的 webhook 回调地址
+（`/webhooks/linear/{随机段}`，设置页可复制），事件按地址路由到本人：用各自的
+webhook 密钥验签、任务记在各自名下、队列按属主解析各自的 Linear/GitHub 凭据执行。
+任务、仓库、凭据、统计互不可见（对非属主一律 404，不用 403 暴露存在）。
+旧路径 `/webhooks/linear` 继续指向内置管理员，兼容既有部署；环境变量凭据只给
+内置管理员兜底，不会漏给普通成员。
 
-后续见 [docs/02-design.md](docs/02-design.md) §8：
-P1.5 数据隔离 → P2 OAuth 绑定与配额 → P3 多节点。
+后续见 [docs/02-design.md](docs/02-design.md) §8：P2 OAuth 绑定与配额 → P3 多节点。
 
 未完成：per-task compose 隔离、按用户隔离数据、多节点。

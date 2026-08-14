@@ -85,7 +85,7 @@ users(id, email, created_at,
       disabled_at,            -- NULL = 启用
       must_change_password,   -- 初始口令未改前，除改密外一律挡住
       last_login_at,
-      webhook_slug)           -- 每用户专属 webhook 回调地址；第一步只生成不使用
+      webhook_slug)           -- 每用户专属 webhook 回调地址（P1.5 第二步已启用路由）
 sessions(id, user_id, expires_at, created_at)
       -- id 是会话令牌的 sha256，明文只存在于 Cookie 里
 password_reset_tokens(token_hash, user_id, expires_at, used_at, created_at)
@@ -227,7 +227,7 @@ Linear: issue 指派给用户
 | **P0 闭环** | 单机单账号串行。状态机 + 持久化 + 幂等；`direct` 档；`light` 验证；失败三件套；worktree 自动回收。**刻意不做**：多节点、并发、Web UI |
 | **P1 验证基建（已交付 3/4）** | ~~红-绿复现证明~~（红立不起来 ⇒ blocked_spec，证据落 verifications 表）；~~§5.1 档位路由~~（diff 后定档 + 仓库级强制覆盖）；~~单机双通道并发~~（闸门在验证阶段按定档准入，light/heavy 独立配额）；per-task compose 隔离**未做**（红绿阶段目前在 git worktree 里跑，待目标仓库声明服务栈后补） |
 | **P1.5 账号体系（第一步已交付）** | 平台账号：开放注册、邮箱口令登录、两级角色、SMTP 找回密码、用户管理与统计。**数据仍共享**，凭据与仓库配置挂在内置管理员名下 |
-| **P1.5 数据隔离（第二步）** | 全链路 `owner_id`：任务/仓库/凭据按用户隔离；每用户专属 webhook 回调地址（`users.webhook_slug` 已预留）；每用户绑自己的 Linear/GitHub |
+| ~~**P1.5 数据隔离（第二步）**~~ | 全链路 `owner_id`：任务/仓库/凭据按用户隔离（对非属主一律 404）；每用户专属 webhook 回调地址 `/webhooks/linear/{slug}`（旧路径兜底到内置管理员）；队列按属主解析凭据，环境变量只给超管兜底 ✅ |
 | **P2 产品化** | Linear OAuth + GitHub App + CloudRouter 绑定；租户配额 |
 | **P3 横向扩展** | 节点注册 + 心跳 + 能力声明；能力路由调度；跨节点仓库缓存与依赖 store |
 
