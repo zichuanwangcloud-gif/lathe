@@ -42,6 +42,40 @@ func helper() {}
 	}
 }
 
+// monorepo：go.mod 在子目录时，pkg 必须是模块相对路径 —— 命令在模块
+// 根执行（Dir=模块目录），根相对路径会被拼到模块目录下导致
+// directory not found（任务 #466：红绿双阶段因此空转，红假成立）。
+func TestIdentifyReproTests_GoMonorepo(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "apps/console-v2/backend/go.mod"), "module demo\n\ngo 1.25\n")
+	writeFile(t, filepath.Join(root, "apps/console-v2/backend/internal/svc/x_test.go"),
+		`package svc
+
+import "testing"
+
+func TestFix(t *testing.T) {}
+`)
+
+	tests, err := IdentifyReproTests(root, []string{"apps/console-v2/backend/internal/svc/x_test.go"})
+	if err != nil {
+		t.Fatalf("IdentifyReproTests: %v", err)
+	}
+	if len(tests) != 1 {
+		t.Fatalf("应识别出 1 条复现测试，实际 %d", len(tests))
+	}
+	rt := tests[0]
+	if rt.Dir != "apps/console-v2/backend" {
+		t.Errorf("Dir 应为模块目录，实际 %q", rt.Dir)
+	}
+	joined := strings.Join(rt.Cmd, " ")
+	if !strings.Contains(joined, "./internal/svc") {
+		t.Errorf("pkg 应为模块相对路径 ./internal/svc，实际: %s", joined)
+	}
+	if strings.Contains(joined, "./apps/") {
+		t.Errorf("pkg 不应是根相对路径（会被拼到模块目录下）: %s", joined)
+	}
+}
+
 func TestIdentifyReproTests_Frontend(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "package.json"),

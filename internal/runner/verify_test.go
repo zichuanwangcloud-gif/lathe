@@ -155,6 +155,44 @@ func TestDetectLightProfileEmpty(t *testing.T) {
 	}
 }
 
+// 仓库级排除要同时作用于 pnpm 递归脚本：落在排除目录下的包被转成
+// 负向过滤器，绕过根脚本直接递归（根脚本里的 pnpm -r 注不进过滤器）。
+func TestDetectLightProfilePnpmExclude(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{
+	  "name": "x",
+	  "scripts": {"build": "pnpm -r build", "lint": "pnpm -r lint"}
+	}`)
+	// 排除目录下的包（嵌套一层，模拟 apps/console/frontend）
+	writeFile(t, filepath.Join(root, "apps/legacy/web/package.json"), `{"name":"old"}`)
+	// 未被排除的包不受影响
+	writeFile(t, filepath.Join(root, "apps/main/web/package.json"), `{"name":"new"}`)
+
+	steps, err := DetectLightProfile(root, "apps/legacy")
+	if err != nil {
+		t.Fatalf("DetectLightProfile 失败: %v", err)
+	}
+
+	var joined []string
+	for _, s := range steps {
+		joined = append(joined, strings.Join(s.Cmd, " "))
+	}
+	all := strings.Join(joined, " | ")
+
+	want := "pnpm -r --filter=!{apps/legacy/web} run lint"
+	if !strings.Contains(all, want) {
+		t.Errorf("lint 应带排除过滤器 %q，实际: %s", want, all)
+	}
+	if !strings.Contains(all, "--filter=!{apps/legacy/web} run build") {
+		t.Errorf("build 同样应带过滤器，实际: %s", all)
+	}
+	// install 不过滤：workspace 链接依赖完整安装
+	if strings.Contains(all, "install --frozen-lockfile --filter") ||
+		!strings.Contains(all, "pnpm install --frozen-lockfile") {
+		t.Errorf("install 应保持原样不过滤，实际: %s", all)
+	}
+}
+
 func TestDetectLightProfileBadPackageJSON(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "package.json"), "{ 这不是合法 JSON ")

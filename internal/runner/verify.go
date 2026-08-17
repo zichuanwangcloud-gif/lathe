@@ -165,8 +165,15 @@ func DetectLightProfile(root string, exclude ...string) ([]Step, error) {
 	}
 	if scripts != nil {
 		// 依赖必须先装，且走共享 store —— 不能每任务装一份
-		// （docs/00-analysis.md 风险 1）
+		// （docs/00-analysis.md 风险 1）。install 不过滤：workspace
+		// 链接依赖完整安装。
 		steps = append(steps, Step{Name: StepBuild, Cmd: []string{"pnpm", "install", "--frozen-lockfile"}})
+
+		// 仓库级排除同样要作用于前端脚本。根脚本通常是 pnpm -r <script>
+		// 的递归包装，过滤器注不进去，所以有排除时绕过根脚本直接递归，
+		// 把落在排除目录下的包逐个转成负向过滤器（pnpm 的 {dir} 选择器
+		// 只认精确的包目录，没有子树语义，必须先枚举包）。
+		negFilters := pnpmExcludeFilters(root, exclude)
 
 		for _, s := range []struct {
 			script string
@@ -176,9 +183,16 @@ func DetectLightProfile(root string, exclude ...string) ([]Step, error) {
 			{"lint", StepLint},
 			{"typecheck", StepTypecheck},
 		} {
-			if _, ok := scripts[s.script]; ok {
-				steps = append(steps, Step{Name: s.name, Cmd: []string{"pnpm", "run", s.script}})
+			if _, ok := scripts[s.script]; !ok {
+				continue
 			}
+			if len(negFilters) == 0 {
+				steps = append(steps, Step{Name: s.name, Cmd: []string{"pnpm", "run", s.script}})
+				continue
+			}
+			cmd := append([]string{"pnpm", "-r"}, negFilters...)
+			cmd = append(cmd, "run", s.script)
+			steps = append(steps, Step{Name: s.name, Cmd: cmd})
 		}
 	}
 
@@ -354,6 +368,44 @@ func findGoModules(root string, extraExclude []string) ([]string, error) {
 	}
 	sort.Strings(dirs)
 	return dirs, nil
+}
+
+// pnpmExcludeFilters 把落在排除目录下的 pnpm 工作区包枚出来，转成
+// pnpm 负向过滤器（--filter=!{dir}）。{dir} 选择器只匹配精确的包目录、
+// 没有子树语义，所以必须枚举到包这一级。只处理路径形式的排除项
+//（含 /）；纯目录名形式对 pnpm 步骤不适用 —— 名字太泛误伤面大，
+// Go 模块扫描那边两种形式都认。
+func pnpmExcludeFilters(root string, exclude []string) []string {
+	var filters []string
+	for _, ex := range exclude {
+		ex = strings.Trim(strings.TrimSpace(ex), "/")
+		if ex == "" || !strings.Contains(ex, "/") {
+			continue
+		}
+		base := filepath.Join(root, ex)
+		_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil // 单个目录读不了不中断
+			}
+			if d.IsDir() {
+				if strings.HasPrefix(d.Name(), ".") || d.Name() == "node_modules" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Name() != "package.json" {
+				return nil
+			}
+			rel, relErr := filepath.Rel(root, filepath.Dir(path))
+			if relErr != nil {
+				return nil
+			}
+			filters = append(filters, "--filter=!{"+filepath.ToSlash(rel)+"}")
+			return nil
+		})
+	}
+	sort.Strings(filters)
+	return filters
 }
 
 // readPackageScripts 读取 package.json 的 scripts 段；文件不存在返回 (nil, nil)。

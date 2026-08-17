@@ -118,12 +118,23 @@ func goReproTests(root, rel string) ([]ReproTest, error) {
 	if len(uniq) > 0 {
 		cmd = append(cmd, "-run", "^("+strings.Join(uniq, "|")+")$")
 	}
-	pkg := "./" + filepath.ToSlash(filepath.Dir(rel))
-	if pkg == "./." {
-		pkg = "."
+	// pkg 必须是【模块相对】路径：命令在模块根执行（Dir=modDir）。
+	// 用根相对路径会被拼到模块目录下 —— directory not found，红绿
+	// 双阶段一起空转（任务 #466：红在 16ms 里假成立，绿同样秒挂）。
+	modDir := goModuleDir(root, rel)
+	pkgDir := filepath.ToSlash(filepath.Dir(rel))
+	pkg := "."
+	switch {
+	case modDir == "":
+		// 模块在仓库根：根相对即模块相对
+		if pkgDir != "." {
+			pkg = "./" + pkgDir
+		}
+	case pkgDir != modDir:
+		pkg = "./" + strings.TrimPrefix(pkgDir, modDir+"/")
 	}
 	cmd = append(cmd, pkg)
-	return []ReproTest{{File: rel, Cmd: cmd, Dir: goModuleDir(root, rel)}}, nil
+	return []ReproTest{{File: rel, Cmd: cmd, Dir: modDir}}, nil
 }
 
 // goModuleDir 找测试文件所属 go.mod 所在目录（命令要在模块根跑）。
