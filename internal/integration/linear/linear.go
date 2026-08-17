@@ -64,9 +64,94 @@ type Issue struct {
 
 // Comment 是 issue 下的一条评论。
 type Comment struct {
-	ID       string
-	Body     string
-	UserName string
+	ID       string `json:"id"`
+	Body     string `json:"body"`
+	UserName string `json:"userName"`
+}
+
+// IssueSummary 是列表用的轻量视图 —— 不含描述与评论，
+// 那是详情（Issue）才需要拉的东西。
+type IssueSummary struct {
+	ID         string   `json:"id"`
+	Identifier string   `json:"identifier"`
+	Title      string   `json:"title"`
+	URL        string   `json:"url"`
+	StateName  string   `json:"state"`
+	Priority   int      `json:"priority"`
+	Labels     []string `json:"labels"`
+	UpdatedAt  string   `json:"updatedAt"`
+}
+
+const assignedIssuesQuery = `query($first: Int!) {
+  viewer {
+    assignedIssues(
+      first: $first
+      filter: { state: { type: { nin: ["completed", "canceled"] } } }
+      orderBy: updatedAt
+    ) {
+      nodes {
+        id identifier title url priority updatedAt
+        state { name }
+        labels { nodes { name } }
+      }
+    }
+  }
+}`
+
+// AssignedIssues 拉取「指派给我、尚未完结」的 issue，按最近更新排序。
+//
+// 看板的「同步 Linear」用它。只取未完成的是刻意为之：已完成/已取消的
+// 单子同步下来没有任何可做的动作，只会把列表淹掉。
+func (c *Client) AssignedIssues(ctx context.Context, first int) ([]IssueSummary, error) {
+	if first <= 0 || first > 100 {
+		first = 50
+	}
+
+	var resp struct {
+		Viewer *struct {
+			AssignedIssues struct {
+				Nodes []struct {
+					ID         string  `json:"id"`
+					Identifier string  `json:"identifier"`
+					Title      string  `json:"title"`
+					URL        string  `json:"url"`
+					Priority   float64 `json:"priority"`
+					UpdatedAt  string  `json:"updatedAt"`
+					State      *struct {
+						Name string `json:"name"`
+					} `json:"state"`
+					Labels struct {
+						Nodes []struct {
+							Name string `json:"name"`
+						} `json:"nodes"`
+					} `json:"labels"`
+				} `json:"nodes"`
+			} `json:"assignedIssues"`
+		} `json:"viewer"`
+	}
+
+	if err := c.do(ctx, assignedIssuesQuery, map[string]any{"first": first}, &resp); err != nil {
+		return nil, classifyVerifyError(err)
+	}
+	if resp.Viewer == nil {
+		return nil, fmt.Errorf("linear: 令牌有效但未取到账号信息")
+	}
+
+	out := make([]IssueSummary, 0, len(resp.Viewer.AssignedIssues.Nodes))
+	for _, n := range resp.Viewer.AssignedIssues.Nodes {
+		s := IssueSummary{
+			ID: n.ID, Identifier: n.Identifier, Title: n.Title,
+			URL: n.URL, Priority: int(n.Priority), UpdatedAt: n.UpdatedAt,
+		}
+		if n.State != nil {
+			s.StateName = n.State.Name
+		}
+		for _, l := range n.Labels.Nodes {
+			s.Labels = append(s.Labels, l.Name)
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // Context 把 issue 及其评论拼成交给 agent 的任务描述。

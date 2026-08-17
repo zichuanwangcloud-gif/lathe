@@ -70,6 +70,10 @@ export const api = {
 
   trigger: (issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueKey }) }),
+  linearIssues: () => request('/api/linear/issues'),
+  linearIssue: (id) => request(`/api/linear/issues/${encodeURIComponent(id)}`),
+  startIssue: (issueId, issueKey) =>
+    request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueId, issueKey }) }),
   retry: (id) => request(`/api/tasks/${id}/retry`, { method: 'POST' }),
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   updateRepo: (id, body) =>

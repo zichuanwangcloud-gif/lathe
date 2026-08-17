@@ -336,3 +336,57 @@ func TestIssueContextEmptyDescription(t *testing.T) {
 		t.Errorf("空描述应显式标注，便于分诊判定不明确: %s", ctx)
 	}
 }
+
+func TestAssignedIssues(t *testing.T) {
+	var gotQuery string
+	c := stubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotQuery = req.Query
+
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"assignedIssues":{"nodes":[
+			{"id":"uuid-1","identifier":"CR-1326","title":"导入失败",
+			 "url":"https://linear.app/x/CR-1326","priority":2,"updatedAt":"2025-01-02T03:04:05Z",
+			 "state":{"name":"Todo"},"labels":{"nodes":[{"name":"bug"}]}},
+			{"id":"uuid-2","identifier":"CR-1327","title":"文案调整",
+			 "url":"https://linear.app/x/CR-1327","priority":0,"updatedAt":"2025-01-01T00:00:00Z",
+			 "state":{"name":"In Progress"},"labels":{"nodes":[]}}
+		]}}}}`))
+	})
+
+	issues, err := c.AssignedIssues(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("AssignedIssues 失败: %v", err)
+	}
+
+	// 已完结的单子不该同步下来 —— 必须在查询层就过滤掉
+	for _, want := range []string{"completed", "canceled"} {
+		if !strings.Contains(gotQuery, want) {
+			t.Errorf("查询应排除 %s 状态的单子:\n%s", want, gotQuery)
+		}
+	}
+
+	if len(issues) != 2 {
+		t.Fatalf("应解析出 2 条，得到 %d", len(issues))
+	}
+	first := issues[0]
+	if first.ID != "uuid-1" || first.Identifier != "CR-1326" || first.StateName != "Todo" {
+		t.Errorf("首条解析不符: %+v", first)
+	}
+	if first.Priority != 2 || len(first.Labels) != 1 || first.UpdatedAt == "" {
+		t.Errorf("字段解析不符: %+v", first)
+	}
+}
+
+// 同步失败的提示必须可操作：令牌错了说令牌，网络断了说网络。
+func TestAssignedIssuesAuthError(t *testing.T) {
+	c := stubAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"errors":[{"message":"Authentication required"}]}`))
+	})
+	if _, err := c.AssignedIssues(context.Background(), 50); err == nil ||
+		!strings.Contains(err.Error(), "令牌") {
+		t.Errorf("认证失败应提示重新签发令牌，得到: %v", err)
+	}
+}

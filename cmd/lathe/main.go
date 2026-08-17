@@ -22,6 +22,7 @@ import (
 	"github.com/Clouditera/lathe/internal/creds"
 	"github.com/Clouditera/lathe/internal/httpapi"
 	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/Clouditera/lathe/internal/integration/linear"
 	"github.com/Clouditera/lathe/internal/mail"
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/secret"
@@ -171,6 +172,16 @@ func serve(cfg config.Config) error {
 		ConfigStatus: configStatus(cfg),
 	}
 	apiSrv.Routes(mux)
+
+	// 看板「同步 Linear」的只读接口。凭据与执行队列走同一条通路，
+	// 设置页里改完 Linear token 即刻生效，不用重启。
+	linearAPI := &httpapi.LinearAPI{
+		ClientFor: func(ctx context.Context, userID int64) (*linear.Client, error) {
+			return factory.ProviderFor(userID).Linear(ctx)
+		},
+		Auth: auth,
+	}
+	linearAPI.Routes(mux)
 
 	accountAPI := &httpapi.AccountAPI{
 		Users:      users,
