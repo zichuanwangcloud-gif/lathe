@@ -368,28 +368,69 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 
 // DetectRegression 为受影响范围构造回归步骤。
 //
-// 范围按改动文件归属推导：改动落在哪个 go 模块就全量跑哪个模块的
-// 既有测试；前端则以根 package.json 的 test script 为准（CI=1 下
-// vitest/jest 都会单次运行后退出，不会挂 watch）。
+// 范围按改动文件归属的【包】收敛：改动落在哪些 Go 包就跑哪些包的既有
+// 测试（go.mod/go.sum 变更升级为全模块回归）。不按模块全量跑 —— 存量
+// 坏测试在大型 monorepo 里是常态（任务 #479 挂在与改动无关的 config 包
+// 存量失败上），全量回归等于让每个任务替历史还债。代价是跨包破坏不再
+// 被回归覆盖：本单正确性由红-绿复现守住，全量测试留给仓库自己的 CI。
+// 前端则以根 package.json 的 test script 为准（CI=1 下 vitest/jest 都会
+// 单次运行后退出，不会挂 watch）。
 func DetectRegression(root string, files []string, exclude ...string) []Step {
 	var steps []Step
 
 	goDirs, err := findGoModules(root, exclude)
 	if err == nil {
-		for _, d := range goDirs {
-			prefix := ""
-			if d != "" {
-				prefix = d + "/"
+		modPkgs := map[string]map[string]bool{} // 模块目录 → 被改动的包（模块相对）
+		modAll := map[string]bool{}             // go.mod/go.sum 变更 → 全模块
+		for _, f := range files {
+			rel := filepath.ToSlash(f)
+			if isExcludedPath(rel, exclude) {
+				continue
 			}
-			for _, f := range files {
-				if prefix == "" || strings.HasPrefix(filepath.ToSlash(f), prefix) {
-					steps = append(steps, Step{
-						Name: StepRegression,
-						Cmd:  []string{"go", "test", "-count=1", "./..."},
-						Dir:  d,
-					})
-					break
+			mod, ok := owningGoModule(rel, goDirs)
+			if !ok {
+				continue
+			}
+			switch base := filepath.Base(rel); {
+			case base == "go.mod" || base == "go.sum":
+				modAll[mod] = true
+			case strings.HasSuffix(base, ".go"):
+				pkg := filepath.Dir(rel)
+				switch {
+				case pkg == mod:
+					pkg = "."
+				case mod != "":
+					pkg = strings.TrimPrefix(pkg, mod+"/")
 				}
+				if modPkgs[mod] == nil {
+					modPkgs[mod] = map[string]bool{}
+				}
+				modPkgs[mod][pkg] = true
+			}
+		}
+		for _, mod := range goDirs {
+			switch {
+			case modAll[mod]:
+				steps = append(steps, Step{
+					Name: StepRegression,
+					Cmd:  []string{"go", "test", "-count=1", "./..."},
+					Dir:  mod,
+				})
+			case len(modPkgs[mod]) > 0:
+				pkgs := make([]string, 0, len(modPkgs[mod]))
+				for p := range modPkgs[mod] {
+					pkgs = append(pkgs, p)
+				}
+				sort.Strings(pkgs)
+				cmd := []string{"go", "test", "-count=1"}
+				for _, p := range pkgs {
+					if p == "." {
+						cmd = append(cmd, ".")
+					} else {
+						cmd = append(cmd, "./"+p)
+					}
+				}
+				steps = append(steps, Step{Name: StepRegression, Cmd: cmd, Dir: mod})
 			}
 		}
 	}
@@ -403,6 +444,49 @@ func DetectRegression(root string, files []string, exclude ...string) []Step {
 		}
 	}
 	return steps
+}
+
+// owningGoModule 返回拥有 rel 的模块目录（goDirs 中的最长前缀匹配）；
+// 第二个返回值 false 表示该文件不属于任何 Go 模块。
+func owningGoModule(rel string, goDirs []string) (string, bool) {
+	best, found := "", false
+	for _, d := range goDirs {
+		if d == "" {
+			if !found {
+				best, found = "", true // 根模块兜底
+			}
+			continue
+		}
+		if rel == d || strings.HasPrefix(rel, d+"/") {
+			if !found || len(d) > len(best) {
+				best, found = d, true
+			}
+		}
+	}
+	return best, found
+}
+
+// isExcludedPath 按与 findGoModules 相同的规则判定路径是否被排除：
+// 路径形式（含 /）按前缀匹配，纯目录名按任一路径段匹配。
+func isExcludedPath(rel string, exclude []string) bool {
+	for _, ex := range exclude {
+		ex = strings.Trim(strings.TrimSpace(ex), "/")
+		if ex == "" {
+			continue
+		}
+		if strings.Contains(ex, "/") {
+			if rel == ex || strings.HasPrefix(rel, ex+"/") {
+				return true
+			}
+			continue
+		}
+		for _, seg := range strings.Split(rel, "/") {
+			if seg == ex {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // touchesFrontend 报告改动是否涉及前端源码（决定是否值得跑前端回归）。

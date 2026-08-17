@@ -233,6 +233,46 @@ func TestRunHeavy_FullChain(t *testing.T) {
 	}
 }
 
+// 回归按改动包收敛（不再全量跑模块）：monorepo 里只有被改动的包被测；
+// go.mod 变更升级为全模块；排除目录下的改动不触发回归。
+func TestDetectRegressionPackageScoped(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "apps/a/go.mod"), "module a\n")
+	writeFile(t, filepath.Join(root, "apps/b/go.mod"), "module b\n")
+
+	// 改动 a 的两个包 ⇒ 一条步骤只跑这两个包；b 未动不回归
+	steps := DetectRegression(root, []string{
+		"apps/a/internal/svc/x.go",
+		"apps/a/pkg/util/z.go",
+		"docs/readme.md",
+	})
+	if len(steps) != 1 {
+		t.Fatalf("应只有 a 模块一条回归步骤，实际 %+v", steps)
+	}
+	joined := strings.Join(steps[0].Cmd, " ")
+	if !strings.Contains(joined, "./internal/svc") || !strings.Contains(joined, "./pkg/util") {
+		t.Errorf("应只跑被改动的两个包: %s", joined)
+	}
+	if strings.Contains(joined, "./...") {
+		t.Errorf("不应全量跑模块: %s", joined)
+	}
+	if steps[0].Dir != "apps/a" {
+		t.Errorf("Dir 应为 apps/a，实际 %q", steps[0].Dir)
+	}
+
+	// go.mod 变更 ⇒ 全模块回归
+	steps = DetectRegression(root, []string{"apps/a/go.mod"})
+	if len(steps) != 1 || !strings.Contains(strings.Join(steps[0].Cmd, " "), "./...") {
+		t.Errorf("go.mod 变更应升级为全模块回归: %+v", steps)
+	}
+
+	// 排除目录下的改动不触发回归
+	steps = DetectRegression(root, []string{"apps/b/internal/x/x.go"}, "apps/b")
+	if len(steps) != 0 {
+		t.Errorf("排除目录下的改动不应触发回归: %+v", steps)
+	}
+}
+
 func TestDetectRegression(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "go.mod"), "module demo\n\ngo 1.25\n")
