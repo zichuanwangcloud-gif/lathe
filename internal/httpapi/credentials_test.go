@@ -41,7 +41,7 @@ func credFixture(t *testing.T) (*CredentialAPI, *fakeVerifier, *httptestServer) 
 
 	ver := &fakeVerifier{results: map[string]VerifyResult{}}
 	api := &CredentialAPI{
-		Secrets: st.NewSecrets(sealer),
+		Secrets:  st.NewSecrets(sealer),
 		Verifier: ver, Auth: authAs(userID, "cred@example.com"),
 	}
 
