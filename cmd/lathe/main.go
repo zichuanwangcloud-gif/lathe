@@ -146,6 +146,12 @@ func serve(cfg config.Config) error {
 	auth := httpapi.NewAuth(os.Getenv("LATHE_ADMIN_TOKEN")).
 		WithStore(users, sessions, admin, cfg.SecureCookies())
 	auth.TrustProxy = cfg.TrustedProxy
+	// 「Linear 任务」菜单的显隐依据：与执行队列同一条凭据通路，
+	// 管理员的 env 兜底自然被覆盖；只解密本地凭据，不访问 Linear。
+	auth.HasLinearToken = func(ctx context.Context, userID int64) bool {
+		_, err := factory.ProviderFor(userID).Linear(ctx)
+		return err == nil
+	}
 
 	if cfg.BaseURL == "" {
 		slog.Warn("未设置 LATHE_BASE_URL，密码重置邮件里的链接将指向本机地址，外网用户点不开",

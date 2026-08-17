@@ -306,3 +306,93 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 		t.Fatalf("登出后应 401，得到 %d", resp.StatusCode)
 	}
 }
+
+// hasLinearToken 是「Linear 任务」菜单的显隐依据，登录响应与 /api/me
+// 都得如实带出 —— 前端在登录当刻就要渲染菜单，等不到第二次请求。
+func TestMeReportsLinearTokenBinding(t *testing.T) {
+	f := newAccountFixture(t)
+	email := f.email(t, "lintok")
+	f.mkUser(t, email, "right-password-1", store.RoleMember)
+
+	// 未注入判定函数时按未绑定处理（比如单测里的裸 Auth）
+	f.login(t, email, "right-password-1")
+	_, body := f.req(t, "GET", "/api/me", "")
+	user, _ := body["user"].(map[string]any)
+	if got, _ := user["hasLinearToken"].(bool); got {
+		t.Fatal("未注入 HasLinearToken 时应报告未绑定")
+	}
+
+	f.auth.HasLinearToken = func(_ context.Context, userID int64) bool { return userID > 0 }
+	resp, body := f.req(t, "GET", "/api/me", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/me 应 200，得到 %d", resp.StatusCode)
+	}
+	user, _ = body["user"].(map[string]any)
+	if got, _ := user["hasLinearToken"].(bool); !got {
+		t.Fatal("已绑定时令牌标志应为 true")
+	}
+
+	// 登录响应同样要带 —— 前端登录后直接用这份 user 渲染菜单
+	f.auth.HasLinearToken = func(context.Context, int64) bool { return true }
+	resp, body = f.req(t, "POST", "/api/login",
+		`{"email":"`+email+`","password":"right-password-1"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("登录应成功，得到 %d", resp.StatusCode)
+	}
+	user, _ = body["user"].(map[string]any)
+	if got, _ := user["hasLinearToken"].(bool); !got {
+		t.Fatal("登录响应也应带 hasLinearToken")
+	}
+}
+
+func TestSetNotifyEmail(t *testing.T) {
+	f := newAccountFixture(t)
+	email := f.email(t, "notify")
+	f.mkUser(t, email, "right-password-1", store.RoleMember)
+	f.login(t, email, "right-password-1")
+
+	// 初始未设置：/api/me 应给 null，语义是回退登录邮箱
+	_, body := f.req(t, "GET", "/api/me", "")
+	user, _ := body["user"].(map[string]any)
+	if v, ok := user["notifyEmail"]; !ok || v != nil {
+		t.Fatalf("初始通知邮箱应为 null，得到 %v (ok=%v)", v, ok)
+	}
+
+	// 设置合法地址
+	resp, body := f.req(t, "PUT", "/api/me/notify-email", `{"email":"Alerts@Example.com"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("设置通知邮箱应 200，得到 %d: %v", resp.StatusCode, body)
+	}
+	user, _ = body["user"].(map[string]any)
+	if got, _ := user["notifyEmail"].(string); got != "alerts@example.com" {
+		t.Fatalf("通知邮箱应归一化为小写，得到 %q", got)
+	}
+
+	// 落库后再查 /api/me 仍在 —— 不是只改了响应形状
+	_, body = f.req(t, "GET", "/api/me", "")
+	user, _ = body["user"].(map[string]any)
+	if got, _ := user["notifyEmail"].(string); got != "alerts@example.com" {
+		t.Fatalf("通知邮箱应持久化，得到 %q", got)
+	}
+
+	// 非法地址 400，且不许顺手清掉旧值
+	resp, _ = f.req(t, "PUT", "/api/me/notify-email", `{"email":"not-an-email"}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("非法邮箱应 400，得到 %d", resp.StatusCode)
+	}
+	_, body = f.req(t, "GET", "/api/me", "")
+	user, _ = body["user"].(map[string]any)
+	if got, _ := user["notifyEmail"].(string); got != "alerts@example.com" {
+		t.Fatalf("失败后不应改动旧值，得到 %q", got)
+	}
+
+	// 空串清除，回退登录邮箱
+	resp, body = f.req(t, "PUT", "/api/me/notify-email", `{"email":""}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("清除通知邮箱应 200，得到 %d", resp.StatusCode)
+	}
+	user, _ = body["user"].(map[string]any)
+	if v := user["notifyEmail"]; v != nil {
+		t.Fatalf("清除后应为 null，得到 %v", v)
+	}
+}

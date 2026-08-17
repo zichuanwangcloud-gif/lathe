@@ -69,14 +69,14 @@ func (s *Sessions) Lookup(ctx context.Context, token string) (*User, error) {
 	err := s.store.pool.QueryRow(ctx, `
 		SELECT u.id, u.email, coalesce(u.password_hash, ''), u.role,
 		       u.disabled_at, u.must_change_password, u.last_login_at, u.created_at,
-		       coalesce(u.webhook_slug, '')
+		       coalesce(u.webhook_slug, ''), u.notify_email
 		FROM sessions s
 		JOIN users u ON u.id = s.user_id
 		WHERE s.id = $1 AND s.expires_at > now() AND u.disabled_at IS NULL`,
 		hashToken(token),
 	).Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role,
 		&u.DisabledAt, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt,
-		&u.WebhookSlug)
+		&u.WebhookSlug, &u.NotifyEmail)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrSessionInvalid
 	}

@@ -2,7 +2,7 @@
 import { onMounted, provide } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from './api'
-import { auth, refresh, clear, isAdmin } from './auth'
+import { auth, refresh, clear, isAdmin, hasLinearToken } from './auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -47,9 +47,11 @@ onMounted(() => {
         <RouterLink to="/" class="brand">Lathe</RouterLink>
         <nav class="row">
           <RouterLink to="/">任务看板</RouterLink>
+          <RouterLink v-if="hasLinearToken()" to="/linear">Linear 任务</RouterLink>
           <RouterLink to="/repos">仓库配置</RouterLink>
+          <RouterLink to="/settings">个人设置</RouterLink>
+          <RouterLink v-if="isAdmin()" to="/admin/settings">系统设置</RouterLink>
           <RouterLink v-if="isAdmin()" to="/users">用户管理</RouterLink>
-          <RouterLink v-if="isAdmin()" to="/settings">设置</RouterLink>
         </nav>
       </div>
       <div class="row">

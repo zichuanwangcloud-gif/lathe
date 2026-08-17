@@ -50,6 +50,10 @@ type User struct {
 	//（/webhooks/linear/{slug}）。P1.5 第二步起，Linear 事件按它
 	// 路由到具体用户 —— 谁的事件、用谁的凭据、任务归谁的名下。
 	WebhookSlug string
+	// NotifyEmail 是个人通知邮箱（通知类邮件的收件人）。
+	// nil 表示未设置 —— 回退用登录邮箱 Email 收信。
+	// 密码重置邮件不看这一列，永远发往 Email。
+	NotifyEmail *string
 }
 
 // Disabled 报告账号是否已被禁用。
@@ -76,13 +80,13 @@ func (s *Store) NewUsers() *Users { return &Users{store: s} }
 
 const userCols = `id, email, coalesce(password_hash, ''), role,
 	disabled_at, must_change_password, last_login_at, created_at,
-	coalesce(webhook_slug, '')`
+	coalesce(webhook_slug, ''), notify_email`
 
 func scanUser(row pgx.Row) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role,
 		&u.DisabledAt, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt,
-		&u.WebhookSlug)
+		&u.WebhookSlug, &u.NotifyEmail)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrUserNotFound
 	}
@@ -174,6 +178,25 @@ func (u *Users) SetRole(ctx context.Context, id int64, role string) error {
 		`UPDATE users SET role = $2, updated_at = now() WHERE id = $1`, id, role)
 	if err != nil {
 		return fmt.Errorf("store: 更新角色失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+// SetNotifyEmail 设置个人通知邮箱；空串表示清除（回退用登录邮箱收信）。
+//
+// 格式校验在 httpapi 层做（与注册共用 validEmail），这里只负责落库。
+func (u *Users) SetNotifyEmail(ctx context.Context, id int64, email string) error {
+	var arg any
+	if email != "" {
+		arg = email
+	}
+	tag, err := u.store.pool.Exec(ctx,
+		`UPDATE users SET notify_email = $2, updated_at = now() WHERE id = $1`, id, arg)
+	if err != nil {
+		return fmt.Errorf("store: 更新通知邮箱失败: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrUserNotFound

@@ -34,4 +34,6 @@ export function clear() {
 }
 
 export const isAdmin = () => auth.user?.role === 'admin'
+// 「Linear 任务」菜单与路由守卫的显隐依据，由 /api/me 随用户信息下发。
+export const hasLinearToken = () => auth.user?.hasLinearToken === true
 export const mustChangePassword = () => auth.user?.mustChangePassword === true

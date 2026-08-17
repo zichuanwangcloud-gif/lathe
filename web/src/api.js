@@ -45,6 +45,8 @@ export const api = {
   register: (email, password) =>
     request('/api/register', { method: 'POST', body: JSON.stringify({ email, password }) }),
 
+  setNotifyEmail: (email) =>
+    request('/api/me/notify-email', { method: 'PUT', body: JSON.stringify({ email }) }),
   changePassword: (currentPassword, newPassword) =>
     request('/api/password/change', {
       method: 'POST',

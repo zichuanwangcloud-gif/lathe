@@ -48,6 +48,7 @@ func (a *AccountAPI) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/password/forgot", a.forgotPassword)
 	mux.HandleFunc("POST /api/password/reset", a.resetPassword)
 	mux.Handle("POST /api/password/change", a.Auth.RequireFunc(a.changePassword))
+	mux.Handle("PUT /api/me/notify-email", a.Auth.RequireFunc(a.setNotifyEmail))
 }
 
 func (a *AccountAPI) lim() *limiter {
@@ -168,6 +169,42 @@ func (a *AccountAPI) changePassword(w http.ResponseWriter, r *http.Request) {
 // 任何差异（响应体、状态码、耗时）都能被用来枚举已注册邮箱，所以真正的
 // 工作全部丢到后台 goroutine 里做，处理器本身立刻返回 —— 这样响应快慢
 // 也不受「查库 + 发信」的影响。
+// setNotifyEmail 设置个人通知邮箱；空串清除，回退用登录邮箱收信。
+//
+// 通知邮箱只服务于通知类邮件。密码重置邮件始终发往登录邮箱 ——
+// 找回密码的前提是证明对账号邮箱的所有权，允许改道自填地址等于
+// 把账号接管的后门递给任何能登录的人（比如短暂离开的 unlocked session）。
+func (a *AccountAPI) setNotifyEmail(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
+		return
+	}
+	email := store.NormalizeEmail(body.Email)
+	if email != "" {
+		if err := validEmail(email); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	u := CurrentUser(r)
+	if err := a.Users.SetNotifyEmail(r.Context(), u.ID, email); err != nil {
+		serverError(w, "保存通知邮箱失败", err)
+		return
+	}
+
+	// 返回最新用户形状，前端直接替换 auth.user，不必再发一次 /api/me
+	fresh, err := a.Users.ByID(r.Context(), u.ID)
+	if err != nil {
+		serverError(w, "读取用户信息失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": a.Auth.userJSON(r.Context(), fresh)})
+}
+
 func (a *AccountAPI) forgotPassword(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email string `json:"email"`

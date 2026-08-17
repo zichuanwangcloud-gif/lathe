@@ -63,6 +63,12 @@ type Auth struct {
 	// TrustProxy 决定限流时是否采信 X-Forwarded-For。
 	TrustProxy bool
 
+	// HasLinearToken 报告某用户是否已绑定 Linear API 令牌，
+	// 前端据此决定要不要显示「Linear 任务」菜单。
+	// 凭据通路与执行队列同一条（含管理员的 env 兜底），由 main 注入；
+	// 为 nil 时一律按未绑定处理。
+	HasLinearToken func(ctx context.Context, userID int64) bool
+
 	logins     *limiter
 	loginsOnce sync.Once
 }
@@ -240,7 +246,7 @@ func (a *Auth) issueSession(w http.ResponseWriter, r *http.Request, u *store.Use
 		MaxAge:   int(sessionTTL / time.Second),
 		Expires:  time.Now().Add(sessionTTL),
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "user": userJSON(u)})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "user": a.userJSON(r.Context(), u)})
 }
 
 // Logout 注销当前会话。
@@ -264,14 +270,21 @@ func (a *Auth) Me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": u != nil,
 		"authEnabled":   a.Enabled(),
-		"user":          userJSON(u),
+		"user":          a.userJSON(r.Context(), u),
 	})
 }
 
 // userJSON 是账号在接口上的形状。nil 进 nil 出，方便直接塞进响应。
-func userJSON(u *store.User) map[string]any {
+//
+// 是 *Auth 的方法而非自由函数：hasLinearToken 要走注入的凭据通路，
+// 登录响应与 /api/me 都得带上它，否则菜单显隐在登录当刻是错的。
+func (a *Auth) userJSON(ctx context.Context, u *store.User) map[string]any {
 	if u == nil {
 		return nil
+	}
+	hasLinear := false
+	if a.HasLinearToken != nil {
+		hasLinear = a.HasLinearToken(ctx, u.ID)
 	}
 	return map[string]any{
 		"id":                 u.ID,
@@ -285,6 +298,10 @@ func userJSON(u *store.User) map[string]any {
 		// 让用户配进 Linear。它本身不是密钥 —— 真正防伪的是按用户
 		// 各自校验的签名密钥。
 		"webhookSlug": u.WebhookSlug,
+		// 个人通知邮箱；未设置为 null，前端提示「回退用登录邮箱」。
+		"notifyEmail": u.NotifyEmail,
+		// 是否已绑定 Linear API 令牌 —— 「Linear 任务」菜单的显隐依据。
+		"hasLinearToken": hasLinear,
 	}
 }
 
