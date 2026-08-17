@@ -139,6 +139,11 @@ func serve(cfg config.Config) error {
 	}
 
 	q := newQueue(st, task.NewMachine(st.Pool()), pipeline, factory, cfg)
+	// 启动恢复（§6.4 单机形态）：在途任务转回 queued 重派，排队任务重新入队。
+	// 必须在 worker 启动前完成，避免同一任务被两边同时捡起。
+	if err := q.Reconcile(ctx); err != nil {
+		slog.Error("启动恢复失败（继续运行，残留任务可人工重试）", "err", err)
+	}
 	go q.work(ctx)
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
@@ -291,6 +296,7 @@ func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFact
 		AgentEvents:    st,
 		Gates:          runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode: "acceptEdits",
+		MaxFixAttempts: cfg.FixAttempts,
 		SettingSources: cfg.SettingSources,
 	}, nil
 }

@@ -265,8 +265,8 @@ func TestAPIRetryAndCancel(t *testing.T) {
 	if after.State != task.StateQueued {
 		t.Errorf("重试后状态 = %s，期望 queued", after.State)
 	}
-	if len(q.issues) != 1 {
-		t.Errorf("重试应重新入队，实际 %v", q.issues)
+	if len(q.requeued) != 1 || q.requeued[0] != tk.ID {
+		t.Errorf("重试应重派原任务行（不新建），实际 requeued=%v", q.requeued)
 	}
 
 	// 取消

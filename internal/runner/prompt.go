@@ -87,6 +87,40 @@ func ImplementPrompt(issueContext string, kind TaskKind, branch string) string {
 %s`, branch, extra, issueContext)
 }
 
+// FixPrompt 生成 §5 修复回路的续跑提示词：验证失败后 resume 原实现
+// 会话，把失败步骤的输出喂回去让 agent 就地修复。agent 还记得自己的
+// 实现思路，比新会话从零定位省一整轮上下文。
+func FixPrompt(attempt, maxAttempts int, f *StepResult, summary string) string {
+	loc := f.Step.Dir
+	if loc == "" {
+		loc = "."
+	}
+	output := f.Output
+	if f.Err != nil {
+		output = f.Err.Error() + "\n" + output
+	}
+	return fmt.Sprintf(`你在一个自动化编码流水线里。刚才的实现没有通过验证（第 %d/%d 轮修复）。
+
+失败步骤：%s
+命令：%s（目录 %s）
+输出：
+%s
+
+完整验证摘要：
+%s
+
+要求：
+- 先读懂失败输出定位原因，再动手修；改动保持最小，只解决这个失败
+- 修实现代码。不要为了让步骤变绿而删测试、放宽断言或注释掉检查 ——
+  除非你能论证是测试本身写错了（并在输出里说明论证过程）
+- 如果失败原因与本次改动无关（仓库既有问题、环境抖动），明确说出来，
+  不要硬改无关代码
+- 不要执行 git commit、git push —— 流水线负责
+- 完成后输出：修复了什么、为什么之前没考虑到`,
+		attempt, maxAttempts, f.Step.Name, strings.Join(f.Step.Cmd, " "), loc,
+		truncate(output, 3000), truncate(summary, 1500))
+}
+
 // ReviewPrompt 生成 review 二轮的 prompt。
 func ReviewPrompt(comments []string) string {
 	var b strings.Builder

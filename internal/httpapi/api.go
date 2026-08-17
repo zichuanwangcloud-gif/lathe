@@ -218,8 +218,9 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 状态已回到 queued，再排进执行队列；归属仍是原属主
-	if err := a.Queue.Enqueue(r.Context(), tk.UserID, tk.LinearIssueKey, tk.LinearIssueKey); err != nil {
+	// 状态已回到 queued，重派【原任务行】（不新建 —— 新建会撞同一 issue
+	// 的活任务唯一索引，重试因此永远卡死；任务 #313 的教训）
+	if err := a.Queue.Requeue(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}

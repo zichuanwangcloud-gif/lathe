@@ -97,6 +97,9 @@ type Pipeline struct {
 	// SettingSources 传给 agent 的 --setting-sources（§9：收敛上下文
 	// 基线成本，只加载目标仓库自己的配置，排除个人插件）。
 	SettingSources string
+	// MaxFixAttempts 是 §5 修复回路的轮数上限：验证失败 → resume 原
+	// 实现会话就地修复 → 重新验证。0 关闭回路（验证一挂即任务失败）。
+	MaxFixAttempts int
 	// ExcludeDirs 是仓库级的验证扫描排除目录（如 CloudRouter 的 upstream）。
 	ExcludeDirs []string
 }
@@ -274,16 +277,77 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		return p.fail(ctx, lin, tk.ID, params, wt, "无法确定验证步骤", err)
 	}
 
-	var report Report
-	if tier == TierHeavy {
-		report, err = p.runHeavy(ctx, tk.ID, params.Repo.ProviderRepo, wt, steps, changedFiles, params.Repo.ExcludeDirs)
-		if err != nil {
-			return p.fail(ctx, lin, tk.ID, params, wt, "heavy 档验证执行失败", err)
+	// 修复回路里要按最新 diff 重跑验证，抽成闭包共享判定逻辑。
+	// 档位维持首次判定结果：修复轮通常只收敛改动面，升档场景留给人工重试。
+	runVerify := func() (Report, error) {
+		if tier == TierHeavy {
+			return p.runHeavy(ctx, tk.ID, params.Repo.ProviderRepo, wt, steps, changedFiles, params.Repo.ExcludeDirs)
 		}
-	} else {
-		report = p.Verifier.RunLight(ctx, wt.Path, steps)
+		return p.Verifier.RunLight(ctx, wt.Path, steps), nil
+	}
+
+	report, err := runVerify()
+	if err != nil {
+		return p.fail(ctx, lin, tk.ID, params, wt, "验证执行失败", err)
 	}
 	p.persistVerifications(ctx, tk.ID, report)
+
+	// §5 修复回路：验证失败 → resume 原实现会话就地修复 → 重新验证。
+	// 红阶段立不起来（blocked_spec）不进回路 —— 那是单子没说清，修代码没用。
+	fixAttempts := 0
+	for attempt := 1; attempt <= p.MaxFixAttempts && !report.Passed() && redStepFailure(report) == nil; attempt++ {
+		f := report.FirstFailure()
+		if f == nil {
+			break
+		}
+		fixAttempts = attempt
+		slog.Info("验证未通过，进入修复回路", "task", tk.ID, "attempt", attempt, "step", f.Step.Name)
+		fixSink := newEventSink(ctx, p.AgentEvents, tk.ID, fmt.Sprintf("fix-%d", attempt))
+		fixRes, ferr := p.Agent.Run(ctx, agent.RunParams{
+			Prompt:         FixPrompt(attempt, p.MaxFixAttempts, f, report.Summary()),
+			Dir:            wt.Path,
+			SessionID:      implSession,
+			Resume:         true,
+			PermissionMode: p.PermissionMode,
+			SettingSources: p.SettingSources,
+			OnEvent:        fixSink.OnEvent,
+		})
+		fixSink.Close()
+		p.persistAgentResult(ctx, tk.ID, fixRes)
+		if ferr != nil {
+			slog.Warn("修复轮执行失败，按当前验证结果收尾", "task", tk.ID, "err", ferr)
+			break
+		}
+		if fixRes.IsError {
+			slog.Warn("修复轮未成功完成", "task", tk.ID, "subtype", fixRes.Subtype)
+			break
+		}
+		// 没产生改动的修复轮等于没修 —— 跳出按失败收尾，不空烧轮次
+		hasNew, cerr := p.Worktrees.HasChanges(ctx, wt)
+		if cerr != nil {
+			slog.Warn("检查修复改动失败", "task", tk.ID, "err", cerr)
+			break
+		}
+		if !hasNew {
+			slog.Warn("修复轮没有产生任何改动", "task", tk.ID, "attempt", attempt)
+			break
+		}
+		fixMsg := fmt.Sprintf("fix(%s): 验证修复（第 %d 轮）\n\n%s",
+			strings.ToLower(issue.Identifier), attempt, truncate(fixRes.Text, 1000))
+		if cerr := p.Worktrees.Commit(ctx, wt, fixMsg); cerr != nil {
+			slog.Warn("提交修复改动失败", "task", tk.ID, "err", cerr)
+			break
+		}
+		// 修复可能改变改动面：重算文件清单再验证
+		if nf, cerr := p.Worktrees.ChangedFiles(ctx, wt); cerr == nil {
+			changedFiles = nf
+		}
+		report, err = runVerify()
+		if err != nil {
+			return p.fail(ctx, lin, tk.ID, params, wt, "验证执行失败", err)
+		}
+		p.persistVerifications(ctx, tk.ID, report)
+	}
 
 	// heavy 档的红阶段立不起来（bug 没复现/复现跑不起来）不是任务失败，
 	// 是单子没说清 —— §5.3 规定转 blocked_spec 回帖请人补充复现步骤。
@@ -305,6 +369,9 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		cause := report.Summary()
 		if f := report.FirstFailure(); f != nil {
 			reason = fmt.Sprintf("验证未通过（%s 档）：%s", tier, f.Step.Name)
+			if fixAttempts > 0 {
+				reason = fmt.Sprintf("验证未通过（%s 档，已尝试 %d 轮修复）：%s", tier, fixAttempts, f.Step.Name)
+			}
 			// 把首个失败的具体错误放最前 —— 回帖时人先看到原因再看摘要
 			if f.Err != nil {
 				cause = f.Err.Error() + "\n\n" + report.Summary()

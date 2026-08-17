@@ -52,15 +52,16 @@ func AllStates() []State {
 //
 // 三条不显然但必要的边：
 //
-//  1. implementing/verifying → queued —— 节点崩溃后租约到期，任务被重新派发
-//     （docs/02-design.md §6.4）。没有这条边，节点故障就等于任务永久卡死。
+//  1. triaging/implementing/verifying → queued —— 节点崩溃后租约到期，任务被
+//     重新派发（docs/02-design.md §6.4）；单机形态下即服务重启后的启动恢复。
+//     没有这条边，进程故障就等于任务永久卡死。
 //  2. failed → queued —— 失败任务人工排查后可重新入队（D4 不自动重试，
 //     但允许人工重试）。
 //  3. review_feedback → implementing —— 二轮实现，调用方必须带上
 //     agent_session_id 走 --resume，见 RequiresSession。
 var transitions = map[State][]State{
 	StateQueued:   {StateTriaging, StateCancelled},
-	StateTriaging: {StateImplementing, StateAwaitingApproval, StateBlockedSpec, StateFailed, StateCancelled},
+	StateTriaging: {StateQueued, StateImplementing, StateAwaitingApproval, StateBlockedSpec, StateFailed, StateCancelled},
 
 	// 等人补充需求；补齐后重新入队
 	StateBlockedSpec: {StateQueued, StateCancelled},

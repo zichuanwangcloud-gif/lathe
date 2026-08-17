@@ -25,6 +25,12 @@ type job struct {
 	OwnerID  int64
 	IssueID  string
 	IssueKey string
+
+	// TaskID 非零表示重派一个【已存在】的任务行（手动重试 / 启动恢复），
+	// 此时不再新建任务 —— 同一 issue 的活任务唯一索引会把新建挡掉，
+	// 重试因此永远卡死（任务 #313 的教训）。OwnerID/IssueID/IssueKey
+	// 从任务行上取，此字段优先。
+	TaskID int64
 }
 
 // queue 是任务执行队列。
@@ -61,6 +67,83 @@ func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKe
 	}
 }
 
+// Requeue 实现 httpapi.TaskEnqueuer：重派已存在的任务行（不新建）。
+func (q *queue) Requeue(ctx context.Context, taskID int64) error {
+	select {
+	case q.ch <- job{TaskID: taskID}:
+		return nil
+	default:
+		return fmt.Errorf("执行队列已满（上限 %d），暂时无法重试", queueDepth)
+	}
+}
+
+// Reconcile 在启动时对齐数据库与内存队列（§6.4 的单机形态：
+// 没有租约，进程重启即视为节点崩溃）：
+//
+//   - in-flight 行（triaging/implementing/verifying）：agent 进程已随服务
+//     退出死亡，按设计边转回 queued 重新派发（从头重跑，不 resume ——
+//     resume 留给修复回路）；旧工作区与分支由重派路径丢弃。
+//   - queued 行：重新入队，重启前已接单的任务不丢。
+//
+// pr_open 不算 in-flight：流水线已跑完，在等人工 review。
+// 必须在 worker 启动前调用。
+func (q *queue) Reconcile(ctx context.Context) error {
+	rows, err := q.store.Pool().Query(ctx, `
+		SELECT id, state FROM tasks
+		WHERE state IN ('triaging', 'implementing', 'verifying')`)
+	if err != nil {
+		return fmt.Errorf("查询在途任务失败: %w", err)
+	}
+	var inflight []int64
+	for rows.Next() {
+		var id int64
+		var state string
+		if err := rows.Scan(&id, &state); err != nil {
+			rows.Close()
+			return err
+		}
+		inflight = append(inflight, id)
+	}
+	rows.Close()
+
+	for _, id := range inflight {
+		if _, err := q.tasks.Transition(ctx, id, task.StateQueued, "system", &task.TransitionOpts{
+			Payload: map[string]any{"reason": "restart_reconcile"},
+		}); err != nil {
+			slog.Error("在途任务恢复失败", "task", id, "err", err)
+			continue
+		}
+		if err := q.Requeue(ctx, id); err != nil {
+			slog.Error("在途任务重新入队失败", "task", id, "err", err)
+		}
+		slog.Info("在途任务已恢复", "task", id)
+	}
+
+	rows2, err := q.store.Pool().Query(ctx, `SELECT id FROM tasks WHERE state = 'queued' ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("查询排队任务失败: %w", err)
+	}
+	var queued []int64
+	for rows2.Next() {
+		var id int64
+		if err := rows2.Scan(&id); err != nil {
+			rows2.Close()
+			return err
+		}
+		queued = append(queued, id)
+	}
+	rows2.Close()
+	for _, id := range queued {
+		if err := q.Requeue(ctx, id); err != nil {
+			slog.Error("排队任务重新入队失败", "task", id, "err", err)
+		}
+	}
+	if len(inflight)+len(queued) > 0 {
+		slog.Info("启动恢复完成", "requeued_inflight", len(inflight), "requeued_queued", len(queued))
+	}
+	return nil
+}
+
 // work 启动 worker 协程池消费队列，直到 ctx 结束。
 func (q *queue) work(ctx context.Context) {
 	workers := q.cfg.LightSlots + q.cfg.HeavySlots
@@ -92,6 +175,20 @@ func (q *queue) work(ctx context.Context) {
 }
 
 func (q *queue) runOne(ctx context.Context, j job) {
+	// 重派路径（TaskID 非零）：任务行已存在，从行上取属主与 issue。
+	// 新建路径：job 里带着 webhook/API 调用方给的属主与 issue。
+	if j.TaskID > 0 {
+		tk, err := q.tasks.Get(ctx, j.TaskID)
+		if err != nil {
+			slog.Error("重派任务读取失败", "task", j.TaskID, "err", err)
+			return
+		}
+		j.OwnerID = tk.UserID
+		j.IssueKey = tk.LinearIssueKey
+		if tk.LinearIssueID != nil {
+			j.IssueID = *tk.LinearIssueID
+		}
+	}
 	slog.Info("开始处理", "issue", j.IssueKey, "owner", j.OwnerID)
 
 	repoID, repoCfg, cloneURL, err := q.resolveRepo(ctx, j)
@@ -103,27 +200,58 @@ func (q *queue) runOne(ctx context.Context, j job) {
 		return
 	}
 
-	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: j.OwnerID, RepoID: repoID, LinearIssueKey: j.IssueKey,
-	})
-	if err != nil {
-		// 同一 issue 已有活任务时会撞上部分唯一索引 —— 这是预期行为，非错误
-		slog.Warn("建任务失败（可能已有进行中的同名任务）", "issue", j.IssueKey, "err", err)
-		return
+	var taskID int64
+	if j.TaskID > 0 {
+		// 重派：丢弃旧现场（工作区 + 分支），否则 worktree add -b 会
+		// 撞同名残留直接失败。现场的使命是留给人接手（D4）；人选择
+		// 重试即表示交给机器重跑，旧现场作废。
+		tk, _ := q.tasks.Get(ctx, j.TaskID)
+		if tk != nil {
+			if tk.WorktreePath != nil && *tk.WorktreePath != "" {
+				branch := ""
+				if tk.BranchName != nil {
+					branch = *tk.BranchName
+				}
+				q.pipeline.Worktrees.Discard(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch)
+			}
+		}
+		if j.IssueID == "" || j.IssueID == j.IssueKey {
+			// 旧数据没有 Linear issue UUID（migration 0010 前），无法重跑。
+			// 取消而非失败：这不是任务本身的错，是数据不够。
+			reason := "缺少 Linear issue ID，无法重跑（请重新触发该 issue）"
+			if _, err := q.tasks.Transition(ctx, j.TaskID, task.StateCancelled, "system", &task.TransitionOpts{
+				FailureReason: &reason,
+			}); err != nil {
+				slog.Error("标记无法重跑的任务失败", "task", j.TaskID, "err", err)
+			}
+			return
+		}
+		taskID = j.TaskID
+	} else {
+		tk, err := q.tasks.Create(ctx, task.CreateParams{
+			UserID: j.OwnerID, RepoID: repoID, LinearIssueKey: j.IssueKey,
+			LinearIssueID: j.IssueID,
+		})
+		if err != nil {
+			// 同一 issue 已有活任务时会撞上部分唯一索引 —— 这是预期行为，非错误
+			slog.Warn("建任务失败（可能已有进行中的同名任务）", "issue", j.IssueKey, "err", err)
+			return
+		}
+		taskID = tk.ID
 	}
 
 	if err := q.pipeline.Execute(ctx, runner.ExecuteParams{
-		TaskID:   tk.ID,
+		TaskID:   taskID,
 		Repo:     repoCfg,
 		CloneURL: cloneURL,
 		IssueID:  j.IssueID,
 		Actor:    "node:" + q.cfg.NodeName,
 	}); err != nil {
 		// 失败三件套已在 pipeline 内部完成，这里只记日志
-		slog.Error("任务处理失败", "issue", j.IssueKey, "task", tk.ID, "err", err)
+		slog.Error("任务处理失败", "issue", j.IssueKey, "task", taskID, "err", err)
 		return
 	}
-	slog.Info("任务处理完成", "issue", j.IssueKey, "task", tk.ID)
+	slog.Info("任务处理完成", "issue", j.IssueKey, "task", taskID)
 }
 
 // resolveRepo 查出要操作的仓库：属主名下的第一条配置。

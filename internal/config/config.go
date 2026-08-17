@@ -35,6 +35,10 @@ type Config struct {
 	// SettingSources 传给 claude --setting-sources。默认 "project"：只加载
 	// 目标仓库自己的配置，排除执行者个人环境的插件（§9 上下文基线成本）。
 	SettingSources string
+	// FixAttempts 是验证失败后的修复轮回数上限（docs/02-design.md §5
+	// 就地修复）：resume 原实现会话，把失败输出喂回去让 agent 修。
+	// 0 关闭修复回路，验证一挂即任务失败。默认 2。
+	FixAttempts int
 
 	// 验证双通道（docs/02-design.md §6.2）：light/heavy 各自独立配额，
 	// 不共用一个数字 —— 资源画像差一个量级。任务worker总数 = 两者之和。
@@ -117,6 +121,7 @@ func Load() (Config, error) {
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
 		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
 		SettingSources:      env("LATHE_SETTING_SOURCES", "project"),
+		FixAttempts:         envInt("LATHE_FIX_ATTEMPTS", 2),
 		LightSlots:          envInt("LATHE_LIGHT_SLOTS", 2),
 		HeavySlots:          envInt("LATHE_HEAVY_SLOTS", 1),
 		LinearToken:         env("LATHE_LINEAR_TOKEN", ""),

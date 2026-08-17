@@ -41,9 +41,10 @@ func (f *fakeClaimer) FinishDelivery(ctx context.Context, id, errMsg string) err
 }
 
 type fakeEnqueuer struct {
-	issues []string
-	owners []int64
-	err    error
+	issues   []string
+	owners   []int64
+	requeued []int64
+	err      error
 }
 
 func (f *fakeEnqueuer) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKey string) error {
@@ -52,6 +53,14 @@ func (f *fakeEnqueuer) Enqueue(ctx context.Context, ownerUserID int64, issueID, 
 	}
 	f.owners = append(f.owners, ownerUserID)
 	f.issues = append(f.issues, issueKey)
+	return nil
+}
+
+func (f *fakeEnqueuer) Requeue(ctx context.Context, taskID int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.requeued = append(f.requeued, taskID)
 	return nil
 }
 

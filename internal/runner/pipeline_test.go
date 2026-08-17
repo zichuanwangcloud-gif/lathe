@@ -546,6 +546,113 @@ func TestPipelineHeavyNoReproTestIsFailure(t *testing.T) {
 }
 
 // agent 跑完却没改任何东西，属于失败而非「空改动的成功」。
+// §5 修复回路：首轮验证失败 → resume 原实现会话就地修复 → 重新验证
+// 通过 → 正常开 PR。回路必须复用实现阶段的会话 ID（agent 还记得自己
+// 的思路，比新会话从零定位省一整轮上下文）。
+func TestPipelineFixLoopRecovers(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{Number: 43, URL: "https://github.com/acme/demo/pull/43"}}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"有现象和期望行为","question":""}`},
+			{Success: true, Text: "初版实现（答错了）"},
+			{Success: true, Text: "把 greet 修正为 hello"},
+		},
+		mutate: []func(string) error{
+			nil, // 分诊不改文件
+			func(dir string) error { // 实现：测试对、实现错 —— 绿阶段必挂
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+			func(dir string) error { // 修复轮：改对实现
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"hello\" }\n"), 0o644)
+			},
+		},
+	}
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.MaxFixAttempts = 2
+
+	if err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+	}); err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StatePROpen {
+		t.Fatalf("修复回路后终态 = %s，期望 pr_open（失败原因: %v）", final.State, final.FailureReason)
+	}
+	if len(ag.calls) != 3 {
+		t.Fatalf("agent 应被调用 3 次（分诊/实现/修复），实际 %d", len(ag.calls))
+	}
+	fix := ag.calls[2]
+	if !fix.Resume {
+		t.Error("修复轮必须 resume 原会话")
+	}
+	if fix.SessionID != ag.calls[1].SessionID {
+		t.Errorf("修复轮会话 ID 应与实现轮一致：%q vs %q", fix.SessionID, ag.calls[1].SessionID)
+	}
+	if !strings.Contains(fix.Prompt, "repro_pass") {
+		t.Errorf("修复提示词应包含失败步骤名，实际: %s", fix.Prompt[:min(200, len(fix.Prompt))])
+	}
+}
+
+// 修复轮次用完仍不过 → 任务失败，失败原因里要能看到修复尝试的次数。
+func TestPipelineFixLoopExhausted(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"x","question":""}`},
+			{Success: true, Text: "初版实现（答错了）"},
+			{Success: true, Text: "假装修了但其实没改对"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+			func(dir string) error { // 有改动（避免走“无改动”跳出），但没修对
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\n// 换个注释不算修\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+		},
+	}
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.MaxFixAttempts = 1
+
+	err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+	})
+	if err == nil {
+		t.Fatal("修复耗尽应失败")
+	}
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StateFailed {
+		t.Errorf("终态 = %s，期望 failed", final.State)
+	}
+	if final.FailureReason == nil || !strings.Contains(*final.FailureReason, "已尝试 1 轮修复") {
+		t.Errorf("失败原因应注明修复轮数: %v", final.FailureReason)
+	}
+	if len(ag.calls) != 3 {
+		t.Errorf("agent 调用次数 = %d，期望 3", len(ag.calls))
+	}
+}
+
 func TestPipelineNoChangesIsFailure(t *testing.T) {
 	_, m, taskID, repo, src := pipelineFixture(t)
 

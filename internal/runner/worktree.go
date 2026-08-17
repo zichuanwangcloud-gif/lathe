@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 	"sync"
 	"time"
 )
@@ -280,6 +282,31 @@ func (m *WorktreeManager) Remove(ctx context.Context, wt *Worktree, force bool) 
 	return nil
 }
 
+// Discard 丢弃一个工作区及其分支（重试与启动恢复场景：旧现场作废）。
+//
+// 与 Remove 的区别在于容错：现场可能是残缺的（目录被手动删过、分支
+// 已不存在），Discard 尽力清理每一步并继续，最后 prune 兑底。
+// 不清理的话，同名分支会让下一次 worktree add -b 直接失败。
+func (m *WorktreeManager) Discard(ctx context.Context, providerRepo, path, branch string) {
+	mirror := m.MirrorPath(providerRepo)
+	if _, err := os.Stat(mirror); err != nil {
+		return // 没有 mirror 就没什么可丢的
+	}
+	unlock := m.lockMirror(mirror)
+	defer unlock()
+	if path != "" {
+		if _, err := m.git(ctx, mirror, "worktree", "remove", "--force", path); err != nil {
+			slog.Warn("丢弃工作区失败（继续清理）", "path", path, "err", err)
+		}
+	}
+	_, _ = m.git(ctx, mirror, "worktree", "prune")
+	if branch != "" {
+		if _, err := m.git(ctx, mirror, "branch", "-D", branch); err != nil {
+			slog.Warn("删除残留分支失败（继续）", "branch", branch, "err", err)
+		}
+	}
+}
+
 // Prune 清理已消失目录的 worktree 注册记录。
 func (m *WorktreeManager) Prune(ctx context.Context, providerRepo string) error {
 	mirror := m.MirrorPath(providerRepo)
@@ -358,5 +385,11 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…(已截断)"
+	// 回退到 rune 边界：按字节硬切会切断多字节 UTF-8 字符，
+	// 落库时 Postgres 拒绝非法 UTF-8（SQLSTATE 22021）。
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…(已截断)"
 }

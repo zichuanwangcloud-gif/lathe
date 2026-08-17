@@ -17,6 +17,10 @@ type Task struct {
 	UserID         int64
 	RepoID         int64
 	LinearIssueKey string
+	// LinearIssueID 是 issue 的 UUID（Linear API 的定位主键）。
+	// 重试与启动恢复靠它重新定位 issue —— key 只是给人看的编号。
+	// 旧行可能为 NULL（migration 0010 前的数据）。
+	LinearIssueID  *string
 	State          State
 	GateMode       string
 	TaskKind       *string
@@ -51,7 +55,7 @@ var ErrTaskNotFound = errors.New("task: 任务不存在")
 var ErrSessionRequired = errors.New("task: 该转移要求已持有 agent_session_id（review 二轮必须 resume 原会话）")
 
 const taskColumns = `
-	id, user_id, repo_id, linear_issue_key, state, gate_mode,
+	id, user_id, repo_id, linear_issue_key, linear_issue_id, state, gate_mode,
 	task_kind, verify_tier, agent_session_id, worktree_path,
 	branch_name, pr_url, failure_reason, node_id, lease_expires_at,
 	created_at, updated_at`
@@ -61,6 +65,8 @@ type CreateParams struct {
 	UserID         int64
 	RepoID         int64
 	LinearIssueKey string
+	// LinearIssueID 是 issue 的 UUID；为空时存 NULL（兼容旧调用方）。
+	LinearIssueID  string
 	GateMode       string
 	TaskKind       *string
 }
@@ -80,10 +86,10 @@ func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	row := tx.QueryRow(ctx, `
-		INSERT INTO tasks (user_id, repo_id, linear_issue_key, state, gate_mode, task_kind)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO tasks (user_id, repo_id, linear_issue_key, linear_issue_id, state, gate_mode, task_kind)
+		VALUES ($1, $2, $3, NULLIF($7, ''), $4, $5, $6)
 		RETURNING `+taskColumns,
-		p.UserID, p.RepoID, p.LinearIssueKey, StateQueued, p.GateMode, p.TaskKind)
+		p.UserID, p.RepoID, p.LinearIssueKey, StateQueued, p.GateMode, p.TaskKind, p.LinearIssueID)
 
 	t, err := scanTask(row)
 	if err != nil {
@@ -315,7 +321,7 @@ func scanTask(row pgx.Row) (*Task, error) {
 		state string
 	)
 	err := row.Scan(
-		&t.ID, &t.UserID, &t.RepoID, &t.LinearIssueKey, &state, &t.GateMode,
+		&t.ID, &t.UserID, &t.RepoID, &t.LinearIssueKey, &t.LinearIssueID, &state, &t.GateMode,
 		&t.TaskKind, &t.VerifyTier, &t.AgentSessionID, &t.WorktreePath,
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.NodeID, &t.LeaseExpiresAt,
 		&t.CreatedAt, &t.UpdatedAt,
