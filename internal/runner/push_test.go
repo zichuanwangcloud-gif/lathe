@@ -41,8 +41,8 @@ func TestEnsureMirrorDisablesMirrorPush(t *testing.T) {
 	}
 
 	fetch := gitOut(t, mirror, "config", "--get", "remote.origin.fetch")
-	if fetch != "+refs/heads/*:refs/heads/*" {
-		t.Errorf("fetch refspec = %q，期望只取分支", fetch)
+	if fetch != mirrorFetchRefspec {
+		t.Errorf("fetch refspec = %q，期望 %q（远端分支必须取到独立命名空间，否则 prune 会剪掉在途任务分支）", fetch, mirrorFetchRefspec)
 	}
 }
 

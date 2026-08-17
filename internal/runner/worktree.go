@@ -65,6 +65,24 @@ func (m *WorktreeManager) MirrorPath(providerRepo string) string {
 	return filepath.Join(m.root, ".mirrors", safe+".git")
 }
 
+// mirrorFetchRefspec 把远端分支映射进 refs/remotes/origin/* 命名空间。
+//
+// 为什么不能是 +refs/heads/*:refs/heads/*：任务分支也住在 refs/heads/*，
+// 且推送前只存在于本地。那种 refspec 下 fetch --prune 会把「远端没有」
+// 的任务分支全部剪掉 —— 即使它正被另一个 worktree 占用（git 的 prune
+// 不做 worktree 占用检查）。真实事故（任务 #494）：并发任务启动时的
+// fetch 剪掉了在途任务的分支，流水线随后的 commit 变成无父 root commit，
+// diff base...HEAD 报 no merge base，任务以一个与根因无关的错误失败。
+const mirrorFetchRefspec = "+refs/heads/*:refs/remotes/origin/*"
+
+// MirrorBaseRef 返回基线分支在 mirror 里的全限定 ref。
+//
+// 任务分支（refs/heads/*）与远端镜像（refs/remotes/origin/*）分属两个
+// 命名空间，fetch --prune 只清扫后者，在途任务分支天然免疫。
+func MirrorBaseRef(base string) string {
+	return "refs/remotes/origin/" + base
+}
+
 // EnsureMirror 确保 bare mirror 存在且是最新的。
 //
 // 首次调用会 clone --mirror；之后只做 fetch --prune。
@@ -79,29 +97,29 @@ func (m *WorktreeManager) EnsureMirror(ctx context.Context, providerRepo, cloneU
 	unlock := m.lockMirror(mirror)
 	defer unlock()
 
-	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err == nil {
-		// 已存在：只更新
-		if _, err := m.git(ctx, mirror, "fetch", "--prune", "--quiet", "origin"); err != nil {
-			return "", fmt.Errorf("runner: 更新 mirror %s 失败: %w", providerRepo, err)
+	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err != nil {
+		if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+			return "", fmt.Errorf("runner: 创建 mirror 目录失败: %w", err)
 		}
-		return mirror, nil
+		if _, err := m.git(ctx, "", "clone", "--mirror", "--quiet", cloneURL, mirror); err != nil {
+			return "", fmt.Errorf("runner: 克隆 mirror %s 失败: %w", providerRepo, err)
+		}
+
+		// ★安全：clone --mirror 会设 remote.origin.mirror=true，此时 git push
+		// 变成镜像推送 —— 会把本地所有 ref 一并推上远端，包括 dev/test/main。
+		// 这与「永不推受保护分支」直接冲突，必须在克隆后立刻解除。
+		if _, err := m.git(ctx, mirror, "config", "--unset-all", "remote.origin.mirror"); err != nil {
+			return "", fmt.Errorf("runner: 解除 mirror 推送模式失败（不解除会导致镜像推送覆盖受保护分支）: %w", err)
+		}
 	}
 
-	if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
-		return "", fmt.Errorf("runner: 创建 mirror 目录失败: %w", err)
-	}
-	if _, err := m.git(ctx, "", "clone", "--mirror", "--quiet", cloneURL, mirror); err != nil {
-		return "", fmt.Errorf("runner: 克隆 mirror %s 失败: %w", providerRepo, err)
-	}
-
-	// ★安全：clone --mirror 会设 remote.origin.mirror=true，此时 git push
-	// 变成镜像推送 —— 会把本地所有 ref 一并推上远端，包括 dev/test/main。
-	// 这与「永不推受保护分支」直接冲突，必须在克隆后立刻解除。
-	if _, err := m.git(ctx, mirror, "config", "--unset-all", "remote.origin.mirror"); err != nil {
-		return "", fmt.Errorf("runner: 解除 mirror 推送模式失败（不解除会导致镜像推送覆盖受保护分支）: %w", err)
-	}
-	if _, err := m.git(ctx, mirror, "config", "remote.origin.fetch", "+refs/heads/*:refs/heads/*"); err != nil {
+	// refspec 每次重写（幂等）：旧版 mirror 里的 +refs/heads/*:refs/heads/*
+	// 配置在这里被就地纠正，存量 mirror 无需手工迁移。
+	if _, err := m.git(ctx, mirror, "config", "--replace-all", "remote.origin.fetch", mirrorFetchRefspec); err != nil {
 		return "", fmt.Errorf("runner: 设置 fetch refspec 失败: %w", err)
+	}
+	if _, err := m.git(ctx, mirror, "fetch", "--prune", "--quiet", "origin"); err != nil {
+		return "", fmt.Errorf("runner: 更新 mirror %s 失败: %w", providerRepo, err)
 	}
 	return mirror, nil
 }
@@ -162,9 +180,10 @@ func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfi
 // ChangedFiles 列出任务分支相对基线的改动文件（新增/修改，相对路径）。
 //
 // 删除的文件被排除：档位路由与复现测试识别都只关心"现在存在什么"，
-// 删掉的文件既不能跑也不能拷。
+// 删掉的文件既不能跑也不能拷。基线用镜像命名空间的全限定 ref 解析，
+// 避免与 refs/heads/* 下可能存在的同名残留分支产生歧义。
 func (m *WorktreeManager) ChangedFiles(ctx context.Context, wt *Worktree) ([]string, error) {
-	out, err := m.git(ctx, wt.Path, "diff", "--name-only", "--diff-filter=AM", wt.BaseBranch+"...HEAD")
+	out, err := m.git(ctx, wt.Path, "diff", "--name-only", "--diff-filter=AM", MirrorBaseRef(wt.BaseBranch)+"...HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("runner: 列出改动文件失败: %w", err)
 	}
@@ -196,7 +215,7 @@ func (m *WorktreeManager) CreateDetached(ctx context.Context, providerRepo, base
 		// 上次崩溃留下的残骸：先清掉再建，不让一次意外卡死后续所有任务
 		_, _ = m.git(ctx, mirror, "worktree", "remove", "--force", path)
 	}
-	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "--detach", path, base); err != nil {
+	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "--detach", path, MirrorBaseRef(base)); err != nil {
 		return nil, fmt.Errorf("runner: 创建基线工作区失败（基线 %s）: %w", base, err)
 	}
 	return &Worktree{Path: path, Branch: "(detached)", BaseBranch: base, Mirror: mirror}, nil
@@ -206,7 +225,7 @@ func (m *WorktreeManager) CreateDetached(ctx context.Context, providerRepo, base
 type Worktree struct {
 	Path       string // 工作区绝对路径
 	Branch     string // 新建的任务分支
-	BaseBranch string // 分叉基线
+	BaseBranch string // 分叉基线的短名（如 dev；开 PR 用。git 解析时须经 MirrorBaseRef 限定到镜像命名空间）
 	Mirror     string // 所属 bare mirror
 }
 
@@ -238,8 +257,11 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 	unlock := m.lockMirror(mirror)
 	defer unlock()
 
-	// 基线分支必须真实存在，否则 worktree add 会报出难懂的错
-	if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", base+"^{commit}"); err != nil {
+	// 基线分支必须真实存在，否则 worktree add 会报出难懂的错。
+	// 查的是镜像命名空间（refs/remotes/origin/*），不是 refs/heads/* ——
+	// 后者可能躺着远端分支的陈旧副本或已失败任务留下的同名分支。
+	baseRef := MirrorBaseRef(base)
+	if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
 		return nil, fmt.Errorf("runner: 基线分支 %q 在仓库 %s 中不存在", base, p.Repo.ProviderRepo)
 	}
 
@@ -248,7 +270,7 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 		return nil, fmt.Errorf("runner: 工作区 %s 已存在（上一任务未回收？）", path)
 	}
 
-	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "-b", branch, path, base); err != nil {
+	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "-b", branch, path, baseRef); err != nil {
 		return nil, fmt.Errorf("runner: 创建工作区失败（分支 %s，基线 %s）: %w", branch, base, err)
 	}
 

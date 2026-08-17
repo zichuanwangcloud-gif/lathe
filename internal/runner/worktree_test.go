@@ -77,6 +77,55 @@ func TestEnsureMirrorCloneThenFetch(t *testing.T) {
 	if _, err := m.EnsureMirror(ctx, "acme/demo", ""); err == nil {
 		t.Error("空 clone URL 应报错")
 	}
+
+	// 远端分支应落在 refs/remotes/origin/* 命名空间（任务分支住
+	// refs/heads/*，两个命名空间隔离，prune 互不相扰）
+	gitOut(t, mirror, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/dev^{commit}")
+}
+
+// 回归 #494：并发任务启动触发的 fetch --prune 不得剪掉在途任务分支。
+//
+// 旧实现的 fetch refspec 是 +refs/heads/*:refs/heads/*，--prune 会把
+// 「远端不存在」的本地任务分支（即使正被 worktree 占用）删掉。任务
+// 流水线随后的 commit 落在不存在的 ref 上，变成无父 root commit，
+// ChangedFiles 的 diff base...HEAD 报 no merge base，任务含冤失败。
+func TestEnsureMirrorFetchPruneKeepsInflightTaskBranch(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	wt, err := m.Create(ctx, CreateParams{
+		Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-494", Title: "t",
+	})
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+
+	// 模拟第二个任务在同一仓库上启动：EnsureMirror 会 fetch --prune
+	if _, err := m.EnsureMirror(ctx, "acme/demo", src); err != nil {
+		t.Fatalf("并发 EnsureMirror 失败: %v", err)
+	}
+
+	// 在途任务分支必须还活着
+	if out := gitOut(t, wt.Mirror, "branch", "--list", wt.Branch); !strings.Contains(out, wt.Branch) {
+		t.Fatalf("fetch --prune 后在途任务分支 %s 被删除（#494 根因）", wt.Branch)
+	}
+
+	// 提交改动并 diff 基线：必须正常工作，不能退化成 root commit
+	if err := os.WriteFile(filepath.Join(wt.Path, "fix.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Commit(ctx, wt, "fix: test"); err != nil {
+		t.Fatalf("Commit 失败: %v", err)
+	}
+	files, err := m.ChangedFiles(ctx, wt)
+	if err != nil {
+		t.Fatalf("ChangedFiles 失败（#494 的报错点）: %v", err)
+	}
+	if len(files) != 1 || files[0] != "fix.txt" {
+		t.Errorf("ChangedFiles = %v，期望 [fix.txt]", files)
+	}
 }
 
 func TestCreateWorktreeUsesCorrectBase(t *testing.T) {
