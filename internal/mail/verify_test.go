@@ -3,7 +3,9 @@ package mail
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"net"
+	"net/textproto"
 	"strings"
 	"testing"
 
@@ -244,6 +246,55 @@ func TestVerifySMTPTLSModeMismatch(t *testing.T) {
 	}
 	if !strings.Contains(res.Error, "STARTTLS") {
 		t.Errorf("应建议改用 STARTTLS，得到 %q", res.Error)
+	}
+}
+
+// 服务器接上立刻挂断 —— 这是用明文/STARTTLS 连 465 时的典型现象，
+// 用户看到的不该是裸的「EOF」。
+func TestVerifySMTPServerClosesConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	f := &fakeSMTP{addr: ln.Addr().String()}
+	res := Verifier{}.VerifySMTP(context.Background(), cfgFor(f, store.TLSStartTLS), "", "to@example.com")
+
+	if res.OK {
+		t.Fatal("被挂断时不该算通过")
+	}
+	if !strings.Contains(res.Error, "465") {
+		t.Errorf("应给出加密方式与端口不匹配的排查线索，得到 %q", res.Error)
+	}
+}
+
+// 用户名是短格式、发件地址是完整地址时（163 上最常见的配错），
+// 提示里必须把两个值摆出来对比，而不是泛泛地说「要求一致」。
+func TestClassifySenderRejectedShowsMismatch(t *testing.T) {
+	err := fmt.Errorf("发件地址被拒绝: %w",
+		&textproto.Error{Code: 553, Msg: "Mail from must equal authorized user"})
+	cfg := store.SMTPConfig{
+		Host: "smtp.163.com", Port: 465,
+		Username: "sy_wzch", FromAddr: "sy_wzch@163.com",
+		TLSMode: store.TLSImplicit,
+	}
+
+	res := classify(err, cfg)
+	if res.OK {
+		t.Fatal("553 不该算通过")
+	}
+	if !strings.Contains(res.Error, `"sy_wzch"`) {
+		t.Errorf("应指出认证用户名的当前值，得到 %q", res.Error)
 	}
 }
 

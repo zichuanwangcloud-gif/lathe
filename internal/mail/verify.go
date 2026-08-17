@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/textproto"
 	"strings"
@@ -89,6 +90,16 @@ func classify(err error, cfg store.SMTPConfig) httpapi.VerifyResult {
 		}
 	}
 
+	// 连上后被直接挂断：几乎都是加密方式与端口不匹配 ——
+	// 用明文/STARTTLS 去连只收 TLS 握手的 465，服务器等不到
+	// ClientHello 就断开，客户端读 220 欢迎语时吃到 EOF。
+	// 少数情况是服务器按来源 IP 拒连。
+	if errors.Is(err, io.EOF) {
+		return bad(fmt.Sprintf("连接被 %s:%d 直接断开（EOF），最常见的原因是加密方式与端口不匹配："+
+			"465 选 TLS，587 选 STARTTLS，25 选不加密。若确认无误，可能是服务器按来源 IP 拒连",
+			cfg.Host, cfg.Port))
+	}
+
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "不支持 STARTTLS"):
@@ -132,6 +143,14 @@ func classifyCode(protoErr *textproto.Error, err error, cfg store.SMTPConfig) (h
 
 	switch {
 	case strings.HasPrefix(stage, "发件地址被拒绝"):
+		// 163 的原文是 "Mail from must equal authorized user"：它把 MAIL FROM
+		// 与认证用户名逐字符比。用户名只填了账号部分、发件地址是完整地址时
+		// 就会撞上 —— 把两个值摆在一起，让人一眼看出差别。
+		if cfg.Username != "" && cfg.Username != cfg.FromAddr {
+			return bad(fmt.Sprintf("发件地址 %s 被拒绝（%d）：与认证用户名 %q 不一致。"+
+				"163/QQ 等要求两者逐字符相同，把两处都填成完整邮箱地址试试",
+				cfg.FromAddr, protoErr.Code, cfg.Username))
+		}
 		return bad(fmt.Sprintf("发件地址 %s 被拒绝（%d）：多数服务器要求发件地址与认证账号一致",
 			cfg.FromAddr, protoErr.Code))
 	case strings.HasPrefix(stage, "收件地址被拒绝"):
