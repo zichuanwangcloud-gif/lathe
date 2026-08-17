@@ -288,6 +288,7 @@ func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFact
 		ClientFactory:  factory,
 		Notifier:       logNotifier{},
 		Verifications:  st,
+		AgentEvents:    st,
 		Gates:          runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode: "acceptEdits",
 		SettingSources: cfg.SettingSources,

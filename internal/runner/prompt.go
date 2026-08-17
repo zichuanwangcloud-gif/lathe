@@ -76,7 +76,13 @@ func ImplementPrompt(issueContext string, kind TaskKind, branch string) string {
 - 遵守仓库既有的代码风格与架构约定（如有 CLAUDE.md 请先读）
 - 改动尽量小而集中，只解决这个 issue
 - **不要执行 git commit、git push，也不要开 PR** —— 这些由流水线负责
-- 完成后用一段话说明你改了什么、为什么这样改%s
+- 完成后输出交付摘要，固定为以下四个小节（会直接展示在任务详情页）：
+
+## 改了什么
+## 为什么这样改
+## 涉及的关键文件
+## 自验证证据
+（跑了什么测试、改动前后的红绿结果）%s
 
 %s`, branch, extra, issueContext)
 }

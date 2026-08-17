@@ -112,6 +112,7 @@ func TestAPIRequiresAuth(t *testing.T) {
 	endpoints := []struct{ method, path, body string }{
 		{"GET", "/api/tasks", ""},
 		{"GET", "/api/tasks/1", ""},
+		{"GET", "/api/tasks/1/events", ""},
 		{"GET", "/api/stats", ""},
 		{"GET", "/api/repos", ""},
 		{"GET", "/api/config", ""},

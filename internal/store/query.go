@@ -33,6 +33,11 @@ type TaskRow struct {
 	UpdatedAt      time.Time  `json:"updatedAt"`
 	AgentSessionID *string    `json:"agentSessionId"`
 	LeaseExpiresAt *time.Time `json:"leaseExpiresAt"`
+	// 实现阶段终局摘要（0008，docs/04 §3.5）；未落过时为 NULL
+	AgentSummary    *string  `json:"agentSummary"`
+	AgentCostUSD    *float64 `json:"agentCostUsd"`
+	AgentDurationMS *int64   `json:"agentDurationMs"`
+	AgentNumTurns   *int     `json:"agentNumTurns"`
 }
 
 // ListTasksParams 是任务列表的过滤条件。
@@ -74,7 +79,8 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
-		       t.agent_session_id, t.lease_expires_at
+		       t.agent_session_id, t.lease_expires_at,
+		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
 		FROM tasks t
 		JOIN repos r ON r.id = t.repo_id
 		WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
@@ -93,6 +99,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 			&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
 			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 			&t.AgentSessionID, &t.LeaseExpiresAt,
+			&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
 		); err != nil {
 			return nil, 0, fmt.Errorf("store: 读取任务行失败: %w", err)
 		}
@@ -139,7 +146,8 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
-		       t.agent_session_id, t.lease_expires_at
+		       t.agent_session_id, t.lease_expires_at,
+		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
 		FROM tasks t JOIN repos r ON r.id = t.repo_id
 		WHERE t.id = $1 AND t.user_id = $2`, id, userID,
 	).Scan(
@@ -147,6 +155,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
 		&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,
+		&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: 读取任务 %d 失败: %w", id, err)

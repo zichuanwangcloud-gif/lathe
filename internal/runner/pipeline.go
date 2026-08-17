@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/Clouditera/lathe/internal/integration/agent"
 	"github.com/Clouditera/lathe/internal/integration/github"
@@ -82,6 +83,10 @@ type Pipeline struct {
 	// Verifications 记录验证步骤；为 nil 时只回帖不落库（测试用）。
 	Verifications VerificationRecorder
 
+	// AgentEvents 记录提炼后的 agent 事件流与实现阶段终局摘要
+	// （docs/04-agent-visibility.md）；为 nil 时整个可见性机制关闭。
+	AgentEvents AgentEventRecorder
+
 	// Gates 是验证阶段的双通道闸门（§6.2）；为 nil 时不限流。
 	// 档位在 diff 产出后才可判定（§5.1），因此闸门落在验证阶段而非
 	// 派发时：实现可以并发，真正稀缺的验证资源按档位排队。
@@ -148,12 +153,16 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 	}
 
 	triageSession := p.newID()
+	triageSink := newEventSink(ctx, p.AgentEvents, tk.ID, "triage")
 	triageRes, err := p.Agent.Run(ctx, agent.RunParams{
 		Prompt:         TriagePrompt(issue.Context()),
 		SessionID:      triageSession,
 		PermissionMode: "plan", // 分诊只读不写
 		SettingSources: p.SettingSources,
+		OnEvent:        triageSink.OnEvent,
 	})
+	// 成功与失败路径都必须 drain：失败时缓冲里恰是排障最关键的现场
+	triageSink.Close()
 	if err != nil {
 		return p.fail(ctx, lin, tk.ID, params, nil, "分诊执行失败", err)
 	}
@@ -198,13 +207,18 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 		return err
 	}
 
+	implSink := newEventSink(ctx, p.AgentEvents, tk.ID, "implement")
 	implRes, err := p.Agent.Run(ctx, agent.RunParams{
 		Prompt:         ImplementPrompt(issue.Context(), kind, wt.Branch),
 		Dir:            wt.Path,
 		SessionID:      implSession,
 		PermissionMode: p.PermissionMode,
 		SettingSources: p.SettingSources,
+		OnEvent:        implSink.OnEvent,
 	})
+	implSink.Close()
+	// 终局摘要落库含 fail 路径：有 result 就存（docs/04 §3.5）
+	p.persistAgentResult(ctx, tk.ID, implRes)
 	if err != nil {
 		return p.fail(ctx, lin, tk.ID, params, wt, "实现执行失败", err)
 	}
@@ -399,16 +413,70 @@ func redStepFailure(rep Report) *StepResult {
 
 // persistVerifications 把报告的每一步落库。落库失败只告警不中断 ——
 // 证据缺失不该把一个已验证通过的改动挡在 PR 之外（结论仍在 PR 与回帖里）。
+//
+// 同步写一条 kind=verify_step 的 agent 事件（docs/04 §3.2）：verifications
+// 表存结构化结果给红-绿判定，agent_events 存人读时间线，两者同源。
 func (p *Pipeline) persistVerifications(ctx context.Context, taskID int64, rep Report) {
-	if p.Verifications == nil {
+	if p.Verifications == nil && p.AgentEvents == nil {
 		return
 	}
+	var entries []agent.Entry
 	for _, s := range rep.Results {
-		if err := p.Verifications.InsertVerification(ctx, taskID,
-			string(rep.Tier), string(s.Step.Name), string(s.Status),
-			s.Duration.Milliseconds()); err != nil {
-			slog.Warn("验证步骤落库失败", "task", taskID, "step", s.Step.Name, "err", err)
+		if p.Verifications != nil {
+			if err := p.Verifications.InsertVerification(ctx, taskID,
+				string(rep.Tier), string(s.Step.Name), string(s.Status),
+				s.Duration.Milliseconds()); err != nil {
+				slog.Warn("验证步骤落库失败", "task", taskID, "step", s.Step.Name, "err", err)
+			}
 		}
+		entries = append(entries, verifyStepEntry(rep.Tier, s))
+	}
+	if p.AgentEvents != nil {
+		if err := p.AgentEvents.InsertAgentEvents(ctx, taskID, "verify", entries); err != nil {
+			slog.Warn("验证时间线落库失败", "task", taskID, "err", err)
+		}
+	}
+}
+
+// verifyStepEntry 把一步验证结果渲染成时间线条目。失败/跑不起来的步骤
+// 附带截断后的输出 —— 时间线上最先要看的就是它。
+func verifyStepEntry(tier VerifyTier, s StepResult) agent.Entry {
+	mark := map[StepStatus]string{
+		StatusPassed: "✓", StatusFailed: "✗",
+		StatusError: "!", StatusSkipped: "–",
+	}[s.Status]
+	loc := s.Step.Dir
+	if loc == "" {
+		loc = "."
+	}
+	body := fmt.Sprintf("%s %s (%s) · %s", mark, s.Step.Name, loc, s.Duration.Round(time.Millisecond))
+	if s.Err != nil {
+		body += " · " + s.Err.Error()
+	}
+	if s.Status != StatusPassed && s.Output != "" {
+		body += "\n\n" + truncate(s.Output, 4<<10)
+	}
+	return agent.Entry{
+		Kind: "verify_step",
+		Body: body,
+		Payload: map[string]any{
+			"tier":       string(tier),
+			"step":       string(s.Step.Name),
+			"status":     string(s.Status),
+			"durationMs": s.Duration.Milliseconds(),
+		},
+	}
+}
+
+// persistAgentResult 落实现阶段的终局摘要四列。有 result 就存，与成败
+// 无关；落库失败只告警（沿用 persistVerifications 的立场）。
+func (p *Pipeline) persistAgentResult(ctx context.Context, taskID int64, res *agent.Result) {
+	if p.AgentEvents == nil || res == nil {
+		return
+	}
+	if err := p.AgentEvents.SetAgentSummary(ctx, taskID,
+		res.Text, res.CostUSD, res.DurationMS, res.NumTurns); err != nil {
+		slog.Warn("agent 摘要落库失败", "task", taskID, "err", err)
 	}
 }
 

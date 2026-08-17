@@ -42,6 +42,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	// 后门宁可没有，排障走数据库。
 	mux.Handle("GET /api/tasks", a.Auth.RequireFunc(a.listTasks))
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
+	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
@@ -99,6 +100,35 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, detail)
+}
+
+// taskEvents 增量拉取 agent 执行事件（docs/04 §3.3）。
+//
+// 轮询协议：after 传上次的 last_id（首轮传 0），游标 id 严格单调，
+// 将来换 SSE + Last-Event-ID 时客户端协议不变，只是传输升级。
+func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+
+	// 权限与 taskDetail 同一原则：不是自己的任务按 404 处理
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return
+	}
+
+	q := r.URL.Query()
+	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+	limit, _ := strconv.Atoi(q.Get("limit"))
+
+	events, lastID, err := a.Store.AgentEventsAfter(r.Context(), id, tk.UserID, after, limit)
+	if err != nil {
+		serverError(w, "查询执行日志失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events, "last_id": lastID})
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {

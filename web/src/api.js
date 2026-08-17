@@ -66,6 +66,9 @@ export const api = {
     return request(`/api/tasks${qs ? '?' + qs : ''}`)
   },
   task: (id) => request(`/api/tasks/${id}`),
+  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0
+  taskEvents: (id, after = 0, limit = 200) =>
+    request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`),
   stats: () => request('/api/stats'),
   repos: () => request('/api/repos'),
   config: () => request('/api/config'),

@@ -205,7 +205,7 @@ func demoIssue() *linear.Issue {
 	}
 }
 
-func newPipeline(t *testing.T, m *task.Machine, lin *fakeLinear, gh *fakeGitHub, ag *fakeAgent, no *fakeNotifier) *Pipeline {
+func newPipeline(t *testing.T, m *task.Machine, lin *fakeLinear, gh *fakeGitHub, ag AgentDriver, no *fakeNotifier) *Pipeline {
 	t.Helper()
 	wm, err := NewWorktreeManager(t.TempDir())
 	if err != nil {
