@@ -255,14 +255,14 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 	}
 	defer release()
 
-	steps, err := DetectLightProfile(wt.Path, p.ExcludeDirs...)
+	steps, err := DetectLightProfile(wt.Path, mergedExcludeDirs(p.ExcludeDirs, params.Repo.ExcludeDirs)...)
 	if err != nil {
 		return p.fail(ctx, lin, tk.ID, params, wt, "无法确定验证步骤", err)
 	}
 
 	var report Report
 	if tier == TierHeavy {
-		report, err = p.runHeavy(ctx, tk.ID, params.Repo.ProviderRepo, wt, steps, changedFiles)
+		report, err = p.runHeavy(ctx, tk.ID, params.Repo.ProviderRepo, wt, steps, changedFiles, params.Repo.ExcludeDirs)
 		if err != nil {
 			return p.fail(ctx, lin, tk.ID, params, wt, "heavy 档验证执行失败", err)
 		}
@@ -336,7 +336,18 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 //
 // 基线工作区用完即拆（defer Remove force）：它是验证的临时道具，
 // 不是失败三件套要保留的现场 —— 现场指任务工作区本身。
-func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string) (Report, error) {
+// mergedExcludeDirs 合并节点级（Pipeline.ExcludeDirs）与仓库级
+//（RepoConfig.ExcludeDirs，来自 repos.exclude_dirs）的验证排除目录。
+func mergedExcludeDirs(global, repo []string) []string {
+	if len(repo) == 0 {
+		return global
+	}
+	out := make([]string, 0, len(global)+len(repo))
+	out = append(out, global...)
+	return append(out, repo...)
+}
+
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string) (Report, error) {
 	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
 	if err != nil {
 		return Report{}, err
@@ -351,7 +362,7 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 	if err != nil {
 		return Report{}, err
 	}
-	regression := DetectRegression(wt.Path, changedFiles, p.ExcludeDirs...)
+	regression := DetectRegression(wt.Path, changedFiles, mergedExcludeDirs(p.ExcludeDirs, repoExclude)...)
 
 	return p.Verifier.RunHeavy(ctx, HeavyParams{
 		TaskPath:   wt.Path,

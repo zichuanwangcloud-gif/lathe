@@ -138,12 +138,13 @@ func (q *queue) resolveRepo(ctx context.Context, j job) (repoID int64, cfg runne
 		protected     []string
 		pattern       string
 		tierOverride  string
+		excludeDirs   []string
 	)
 	err = q.store.Pool().QueryRow(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
-		       COALESCE(verify_tier_override, '')
+		       COALESCE(verify_tier_override, ''), exclude_dirs
 		FROM repos WHERE user_id = $1 ORDER BY id LIMIT 1`, j.OwnerID,
-	).Scan(&repoID, &providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride)
+	).Scan(&repoID, &providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs)
 	if err != nil {
 		return 0, cfg, "", fmt.Errorf("你的账号下没有仓库配置（请在设置页添加仓库）: %w", err)
 	}
@@ -154,6 +155,7 @@ func (q *queue) resolveRepo(ctx context.Context, j job) (repoID int64, cfg runne
 		HotfixBase:         hotfixBase,
 		ProtectedBranches:  protected,
 		BranchPattern:      pattern,
+		ExcludeDirs:        excludeDirs,
 		VerifyTierOverride: tierOverride,
 	}
 	return repoID, cfg, "git@github.com:" + providerRepo + ".git", nil

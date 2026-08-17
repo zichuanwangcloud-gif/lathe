@@ -36,6 +36,10 @@ type RepoConfig struct {
 	HotfixBase        string   // hotfix 的分叉基线，通常是 main
 	ProtectedBranches []string // 禁止直接推送的分支
 	BranchPattern     string   // 如 {kind}/{key}-{slug}
+	// ExcludeDirs 是验证扫描要跳过的目录（相对根路径或纯目录名），
+	// 对应 repos.exclude_dirs —— 停止维护的目录（如 CloudRouter 的
+	// apps/console）在这里排除，存量问题不再拖死新任务。
+	ExcludeDirs []string
 	// VerifyTierOverride 强制验证档位（light|heavy）；空表示按 §5.1 规则
 	// 在 diff 产出后自动判定。对应 repos.verify_tier_override。
 	VerifyTierOverride string

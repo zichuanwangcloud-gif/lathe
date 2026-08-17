@@ -47,6 +47,7 @@ async function load() {
     repos.value = (r.repos || []).map((x) => ({
       ...x,
       protectedText: (x.protectedBranches || []).join(', '),
+      excludeText: (x.excludeDirs || []).join(', '),
     }))
     error.value = ''
   } catch (e) {
@@ -69,6 +70,11 @@ async function save(repo) {
     return
   }
 
+  const excludeDirs = (repo.excludeText || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
   try {
     await api.updateRepo(repo.id, {
       defaultBranch: repo.defaultBranch,
@@ -76,6 +82,7 @@ async function save(repo) {
       protectedBranches,
       branchPattern: repo.branchPattern,
       gateMode: repo.gateMode,
+      excludeDirs,
       verifyTierOverride: repo.verifyTierOverride || '',
     })
     saved.value = repo.id
@@ -155,6 +162,15 @@ onMounted(load)
         </select>
         <small class="faint">
           {{ GATE_MODES.find((m) => m.value === repo.gateMode)?.desc }}
+        </small>
+      </label>
+
+      <label class="full">
+        <span>验证排除目录</span>
+        <input v-model="repo.excludeText" class="mono" placeholder="apps/console" />
+        <small class="faint">
+          逗号分隔，相对仓库根的路径或目录名。停止维护的目录在这里排除，
+          其存量问题不再参与构建/lint 扫描
         </small>
       </label>
 

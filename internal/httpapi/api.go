@@ -265,6 +265,9 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		ProtectedBranches []string `json:"protectedBranches"`
 		BranchPattern     string   `json:"branchPattern"`
 		GateMode          string   `json:"gateMode"`
+		// ExcludeDirs：nil（未传）= 不动；空数组 = 清回默认排除；
+		// 非空 = 整体替换。JSON 数组天然区分这三种语义，无需指针。
+		ExcludeDirs []string `json:"excludeDirs"`
 		// 指针区分「未传」（不动）与「空串」（清回自动档）
 		VerifyTierOverride *string `json:"verifyTierOverride"`
 	}
@@ -307,6 +310,7 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		ProtectedBranches:  body.ProtectedBranches,
 		BranchPattern:      body.BranchPattern,
 		GateMode:           body.GateMode,
+		ExcludeDirs:        body.ExcludeDirs,
 		VerifyTierOverride: body.VerifyTierOverride,
 	})
 	if err != nil {

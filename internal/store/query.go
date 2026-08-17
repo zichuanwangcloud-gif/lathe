@@ -255,6 +255,9 @@ type RepoRow struct {
 	BranchPattern     string   `json:"branchPattern"`
 	DepStrategy       string   `json:"depStrategy"`
 	GateMode          string   `json:"gateMode"`
+	// ExcludeDirs 是验证扫描要跳过的目录（相对根路径或纯目录名），
+	// 如停止维护的 apps/console。空切片表示只用内置默认排除。
+	ExcludeDirs []string `json:"excludeDirs"`
 	// VerifyTierOverride 强制验证档位；空串表示按 §5.1 自动判定
 	VerifyTierOverride string `json:"verifyTierOverride"`
 }
@@ -264,7 +267,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
-		       COALESCE(verify_tier_override, '')
+		       exclude_dirs, COALESCE(verify_tier_override, '')
 		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -276,7 +279,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		var r RepoRow
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-			&r.VerifyTierOverride); err != nil {
+			&r.ExcludeDirs, &r.VerifyTierOverride); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
@@ -291,6 +294,9 @@ type UpdateRepoParams struct {
 	ProtectedBranches []string
 	BranchPattern     string
 	GateMode          string
+	// ExcludeDirs 为 nil 表示不修改；非 nil（含空切片）表示整体替换 ——
+	// 空数组是"清回默认排除"的合法取值，不能走 nilIfEmpty 惯例。
+	ExcludeDirs []string
 	// VerifyTierOverride 是"light"|"heavy"|""（自动）。注意空串语义：
 	// 该字段允许被显式清空回自动档，因此不能用 NULLIF COALESCE 的
 	// "空即不动"惯例 —— 调用方传 nil 表示不修改。
@@ -310,20 +316,21 @@ func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoPa
 			protected_branches = COALESCE($5, protected_branches),
 			branch_pattern     = COALESCE(NULLIF($6,''), branch_pattern),
 			gate_mode          = COALESCE(NULLIF($7,''), gate_mode),
+			exclude_dirs       = COALESCE($8, exclude_dirs),
 			verify_tier_override = CASE
-				WHEN $8::text IS NULL THEN verify_tier_override
-				WHEN $8::text = '' THEN NULL
-				ELSE $8::text
+				WHEN $9::text IS NULL THEN verify_tier_override
+				WHEN $9::text = '' THEN NULL
+				ELSE $9::text
 			END
 		WHERE id = $1 AND user_id = $2
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
-		          COALESCE(verify_tier_override, '')`,
+		          exclude_dirs, COALESCE(verify_tier_override, '')`,
 		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
-		p.VerifyTierOverride,
+		p.ExcludeDirs, p.VerifyTierOverride,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.VerifyTierOverride)
+		&r.ExcludeDirs, &r.VerifyTierOverride)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
