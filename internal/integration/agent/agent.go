@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 	"time"
 )
 
@@ -317,24 +318,37 @@ func killProcessGroup(pgid int) {
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 }
 
-// sanitizedEnv 返回清理过的环境变量。
+// sanitizedEnv 返回 agent 子进程的环境变量。
 //
-// 从 Claude Code 会话内启动 claude 时，CLAUDECODE 与 CLAUDE_CODE_ENTRYPOINT
-// 会泄漏进子进程并导致其异常退出，必须剔除。
+// 白名单制而非黑名单制：serve 进程的环境里带着 LATHE_ADMIN_TOKEN、
+// 数据库口令、GitHub token 等敏感值，黑名单漏一个就全漏给 agent
+// 执行的任意命令。白名单只放行运行所需的操作性变量；确需追加时
+// 用 LATHE_AGENT_ENV_EXTRA（逗号分隔的变量名）显式开口。
+//
+// 历史：从 Claude Code 会话内启动 claude 时，CLAUDECODE 与
+// CLAUDE_CODE_ENTRYPOINT 会泄漏进子进程并导致其异常退出 ——
+// 白名单天然把它们挡在门外。
 func sanitizedEnv() []string {
-	drop := map[string]bool{
-		"CLAUDECODE":             true,
-		"CLAUDE_CODE_ENTRYPOINT": true,
-		"CLAUDE_CODE_SSE_PORT":   true,
-		"CLAUDE_CODE_SESSION_ID": true,
+	keep := map[string]bool{
+		"PATH": true, "HOME": true, "USER": true, "LOGNAME": true,
+		"SHELL": true, "TERM": true, "TMPDIR": true, "TZ": true,
+		"LANG": true, "LC_ALL": true, "LC_CTYPE": true,
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "no_proxy": true,
+		"SSH_AUTH_SOCK": true, // worktree 内的 git 操作需要
+		"CI":          true,   // 工具链据此关闭 watch/交互模式
+	}
+	for _, name := range strings.Split(os.Getenv("LATHE_AGENT_ENV_EXTRA"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			keep[name] = true
+		}
 	}
 	src := os.Environ()
-	out := make([]string, 0, len(src))
+	out := make([]string, 0, len(keep)+2)
 	for _, kv := range src {
-		if i := strings.IndexByte(kv, '='); i > 0 && drop[kv[:i]] {
-			continue
+		if i := strings.IndexByte(kv, '='); i > 0 && keep[kv[:i]] {
+			out = append(out, kv)
 		}
-		out = append(out, kv)
 	}
 	return out
 }
@@ -344,5 +358,11 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…(已截断)"
+	// 回退到 rune 边界：按字节硬切会切断多字节 UTF-8 字符，
+	// Postgres 拒绝非法 UTF-8（SQLSTATE 22021）导致整批事件落库失败。
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…(已截断)"
 }

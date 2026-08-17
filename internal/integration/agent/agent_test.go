@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 	"syscall"
 	"testing"
 	"time"
@@ -230,20 +231,47 @@ func TestRunParamValidation(t *testing.T) {
 }
 
 // 从 Claude Code 会话内启动时泄漏的环境变量必须被剔除。
+// 白名单语义：敏感值（serve 进程 env 里的 token/口令）必须被挡在
+// agent 子进程之外；只有操作性变量放行；LATHE_AGENT_ENV_EXTRA 是
+// 显式开口的逃生门。
 func TestSanitizedEnv(t *testing.T) {
 	t.Setenv("CLAUDECODE", "1")
 	t.Setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
+	t.Setenv("LATHE_ADMIN_TOKEN", "secret-admin-token")
 	t.Setenv("LATHE_KEEP_ME", "yes")
+	t.Setenv("MY_CUSTOM_VAR", "custom")
+	t.Setenv("LATHE_AGENT_ENV_EXTRA", "MY_CUSTOM_VAR, ,GOPROXY")
 
 	env := sanitizedEnv()
 	joined := strings.Join(env, "\n")
-	for _, bad := range []string{"CLAUDECODE=", "CLAUDE_CODE_ENTRYPOINT="} {
+	for _, bad := range []string{"CLAUDECODE=", "CLAUDE_CODE_ENTRYPOINT=", "LATHE_ADMIN_TOKEN=", "LATHE_KEEP_ME=", "LATHE_AGENT_ENV_EXTRA="} {
 		if strings.Contains(joined, bad) {
-			t.Errorf("环境变量 %s 应被剔除", bad)
+			t.Errorf("环境变量 %s 不应进入 agent 子进程", bad)
 		}
 	}
-	if !strings.Contains(joined, "LATHE_KEEP_ME=yes") {
-		t.Error("无关环境变量不应被剔除")
+	if !strings.Contains(joined, "MY_CUSTOM_VAR=custom") {
+		t.Error("LATHE_AGENT_ENV_EXTRA 显式放行的变量应保留")
+	}
+	// PATH/HOME 是运行基石，必须在
+	if !strings.Contains(joined, "PATH=") || !strings.Contains(joined, "HOME=") {
+		t.Error("PATH/HOME 必须保留")
+	}
+}
+
+// 截断必须回退到 rune 边界：按字节硬切会切断多字节 UTF-8 字符，
+// Postgres 拒绝非法 UTF-8（SQLSTATE 22021）导致整批事件落库失败。
+func TestTruncateRuneSafe(t *testing.T) {
+	// “中”是 3 字节；在第 5 字节处截断会正好切穿第二个“中”
+	s := "ab中中中中"
+	out := truncate(s, 5)
+	if !utf8.ValidString(out) {
+		t.Fatalf("截断结果不是合法 UTF-8: %q", out)
+	}
+	if !strings.HasSuffix(out, "…(已截断)") {
+		t.Errorf("应带截断标记: %q", out)
+	}
+	if strings.HasPrefix(out, "ab中中") {
+		t.Errorf("不应包含被切穿的字符: %q", out)
 	}
 }
 
