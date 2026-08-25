@@ -278,8 +278,27 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 	}
 
 	path := filepath.Join(m.root, worktreeDirName(p.IssueKey, branch))
-	if _, err := os.Stat(path); err == nil {
-		return nil, fmt.Errorf("runner: 工作区 %s 已存在（上一任务未回收？）", path)
+
+	// 尸体回收：目标目录或同名分支已存在时，回收后再建，而非报错卡死。
+	//
+	// 能走到 Create 的都是全新执行（断点续跑复用现场、不经过这里），
+	// 而 tasks_one_active_per_issue 保证同 (repo, issue) 没有第二个活
+	// 任务 —— 同名残留只会是上一个失败/取消任务按 D4 保留的现场。
+	// D4 的语义不变：现场一直留到「同 issue 的下一次尝试需要这个槽位」
+	// 为止；此时不回收，同 issue 的重试与重新触发会永久撞名
+	//（任务 #345/#466：worktree 尸体阻塞重试）。分支尸体也要清：目录
+	// 被人手工删掉后 refs/heads/<branch> 还在，worktree add -b 会报
+	// branch already exists。
+	_, pathErr := os.Stat(path)
+	branchExists := false
+	if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}"); err == nil {
+		branchExists = true
+	}
+	if pathErr == nil || branchExists {
+		slog.Warn("回收同名工作区尸体（上一任务保留的现场）",
+			"path", path, "branch", branch,
+			"pathExists", pathErr == nil, "branchExists", branchExists)
+		m.discardLocked(ctx, mirror, path, branch)
 	}
 
 	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "-b", branch, path, baseRef); err != nil {
@@ -328,9 +347,23 @@ func (m *WorktreeManager) Discard(ctx context.Context, providerRepo, path, branc
 	}
 	unlock := m.lockMirror(mirror)
 	defer unlock()
+	m.discardLocked(ctx, mirror, path, branch)
+}
+
+// discardLocked 是 Discard 的持锁版本，调用方必须已持有 mirror 锁
+//（Create 的尸体回收在锁内调用；sync.Mutex 不可重入，直接调 Discard
+// 会自死锁）。
+func (m *WorktreeManager) discardLocked(ctx context.Context, mirror, path, branch string) {
 	if path != "" {
 		if _, err := m.git(ctx, mirror, "worktree", "remove", "--force", path); err != nil {
 			slog.Warn("丢弃工作区失败（继续清理）", "path", path, "err", err)
+		}
+		// 目录可能不是注册的 worktree（手工建的/半残的），git 拒绝删除；
+		// 兜底直接删目录，否则下一步 worktree add 还会撞「目录已存在」。
+		if _, err := os.Stat(path); err == nil {
+			if rerr := os.RemoveAll(path); rerr != nil {
+				slog.Warn("删除工作区目录失败（继续）", "path", path, "err", rerr)
+			}
 		}
 	}
 	_, _ = m.git(ctx, mirror, "worktree", "prune")

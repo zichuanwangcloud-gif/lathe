@@ -41,7 +41,7 @@
 |---|---|
 | 重试端点语义断裂：failed→queued 后 `runOne` 走 `tasks.Create` 撞唯一索引，重试=永久卡死 | 任务 #313 |
 | 前置失败不落痕：pre-flight 裸 `return` 绕过 `p.fail`，任务永远"排队中"无痕迹 | 最初"卡排队"病根 |
-| worktree 尸体阻塞同 issue 重试（失败保留现场但无回收策略） | #345、#466 各撞一次 |
+| ~~worktree 尸体阻塞同 issue 重试（失败保留现场但无回收策略）~~ —— 已修复：`Create` 回收同名尸体再建（目录/分支/普通残留三形态），重试端点 Fresh 计划先 `Discard` | #345、#466 各撞一次 |
 | EventSink 落库 UTF-8 截断 bug：Digest 切断多字节字符 → 整批事件丢弃（SQLSTATE 22021） | 54075f4 commit body 已记录 |
 | agent 进程 env 泄漏：`sanitizedEnv()` 只剔 4 个变量，`LATHE_ADMIN_TOKEN`、GitHub token 原样漏给 agent 子进程 | 代码走查 |
 | 分诊工作目录污染：triage 未设 `Dir` → 继承 serve 的 cwd=`/opt/lathe` → `--setting-sources project` 把 Lathe 自己的 CLAUDE.md 灌进目标仓库的分诊上下文 | 代码走查 |
@@ -84,7 +84,7 @@
 
 ### 3.3 生命周期与现场管理
 
-8. **worktree 收割机**：失败现场 TTL 回收；或重试同 issue 时先回收旧现场。
+8. **worktree 收割机**：失败现场 TTL 回收（解决磁盘占用；同名撞车已由 Create 尸体回收覆盖，本条只剩 TTL 清理价值）。
 9. **通知闭环**：任务终态（失败/待 review）接 `internal/mail` 发 `notify_email` —— 不用盯面板。
 10. **GateMode 接线**：`gate=manual` 时验证通过后停下、人工确认再推 PR（"开 PR 前让我看一眼"）。
 

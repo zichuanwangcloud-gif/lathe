@@ -194,18 +194,94 @@ func TestCreateRejectsMissingBaseBranch(t *testing.T) {
 	}
 }
 
-func TestCreateRejectsDuplicateWorktree(t *testing.T) {
+// 尸体回收：同 issue 的下一次尝试接管槽位，而不是被上一任务按 D4
+// 保留的现场永久卡死（任务 #345/#466）。D4 语义不变 —— 现场一直留到
+// 下一次尝试需要这个槽位为止。
+func TestCreateReclaimsCorpseWorktree(t *testing.T) {
 	src := sourceRepo(t)
 	m := newManager(t)
 	ctx := context.Background()
 	repo := DefaultRepoConfig("acme/demo")
 
 	p := CreateParams{Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-1", Title: "t"}
-	if _, err := m.Create(ctx, p); err != nil {
+	wt1, err := m.Create(ctx, p)
+	if err != nil {
 		t.Fatalf("首次 Create 失败: %v", err)
 	}
-	if _, err := m.Create(ctx, p); err == nil {
-		t.Fatal("同一 issue 重复建工作区应报错（上一任务未回收）")
+	// 留下失败任务现场：未提交改动 + 已注册 worktree + 任务分支
+	if err := os.WriteFile(filepath.Join(wt1.Path, "wip.txt"), []byte("half done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wt2, err := m.Create(ctx, p)
+	if err != nil {
+		t.Fatalf("尸体存在时 Create 应回收重建，得到错误: %v", err)
+	}
+	if wt2.Path != wt1.Path || wt2.Branch != wt1.Branch {
+		t.Errorf("同 issue 应复用同一槽位: %q/%q vs %q/%q", wt2.Path, wt2.Branch, wt1.Path, wt1.Branch)
+	}
+	if _, err := os.Stat(filepath.Join(wt2.Path, "wip.txt")); !os.IsNotExist(err) {
+		t.Error("旧现场的未提交改动应随尸体一起被回收")
+	}
+	// 重建的分支应干净地停在基线上（旧分支尸体被删除后重建）
+	out, err := exec.Command("git", "-C", wt2.Path, "rev-list", "--count",
+		MirrorBaseRef(wt2.BaseBranch)+"..HEAD").Output()
+	if err != nil {
+		t.Fatalf("统计提交失败: %v", err)
+	}
+	if strings.TrimSpace(string(out)) != "0" {
+		t.Errorf("重建分支不应带有旧提交，得到 %s", out)
+	}
+}
+
+// 分支尸体：目录被人手工删掉后，refs/heads/<branch> 还在，
+// worktree add -b 会撞 branch already exists —— 同样要回收。
+func TestCreateReclaimsBranchOnlyCorpse(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	p := CreateParams{Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-1", Title: "t"}
+	wt1, err := m.Create(ctx, p)
+	if err != nil {
+		t.Fatalf("首次 Create 失败: %v", err)
+	}
+	if err := os.RemoveAll(wt1.Path); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Create(ctx, p); err != nil {
+		t.Fatalf("仅剩分支尸体时 Create 应回收重建，得到错误: %v", err)
+	}
+}
+
+// 普通目录尸体：路径存在但不是注册的 worktree（半残/手工创建），
+// git worktree remove 拒绝删除，需兜底 RemoveAll 后才能重建。
+func TestCreateReclaimsPlainDirectoryCorpse(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	p := CreateParams{Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-1", Title: "t"}
+	corpse := filepath.Join(m.Root(), "cr-1")
+	if err := os.MkdirAll(corpse, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corpse, "stray.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wt, err := m.Create(ctx, p)
+	if err != nil {
+		t.Fatalf("普通目录尸体时 Create 应回收重建，得到错误: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "stray.txt")); !os.IsNotExist(err) {
+		t.Error("尸体目录的内容应被清除")
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "README.md")); err != nil {
+		t.Errorf("新工作区应已 checkout 出基线文件: %v", err)
 	}
 }
 
