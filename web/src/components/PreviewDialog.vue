@@ -228,16 +228,28 @@ function pollRecommend() {
 }
 
 // 采用推荐：勾选推荐候选、预填变量与基础设施，展开让人核对。
+// compose 的变量进候选自己的 env 表单；dockerfile 的变量进对话框级
+// 额外 env 文本框（注入应用容器的通道）。
 function adoptRecommendation() {
   const r = rec.value?.result
   if (!r || !picks.value[r.path]) return
   picks.value[r.path].checked = true
-  for (const [name, s] of Object.entries(r.env || {})) {
-    if (s.value && name in picks.value[r.path].env) {
-      picks.value[r.path].env[name] = s.value
+  if (r.kind === 'compose') {
+    for (const [name, s] of Object.entries(r.env || {})) {
+      if (s.value && name in picks.value[r.path].env) {
+        picks.value[r.path].env[name] = s.value
+      }
     }
+  } else {
+    const lines = Object.entries(r.env || {})
+      .filter(([, s]) => s.value)
+      .map(([name, s]) => `${name}=${s.value}`)
+    if (lines.length) {
+      const existing = extraEnv.value.trim()
+      extraEnv.value = existing ? existing + '\n' + lines.join('\n') : lines.join('\n')
+    }
+    if (r.infra?.length) infra.value = [...r.infra]
   }
-  if (r.kind !== 'compose' && r.infra?.length) infra.value = [...r.infra]
   showAll.value = true
 }
 

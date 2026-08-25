@@ -2,6 +2,8 @@ package preview
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,8 +155,8 @@ func (m *Manager) runRecommend(taskID int64, absWorktree, issueContext string, o
 	res, err := m.agent.Run(ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            absWorktree,
-		SessionID:      fmt.Sprintf("preview-recommend-%d-%d", taskID, time.Now().UnixNano()),
-		PermissionMode: "plan", // 只读分析，不许改 worktree
+		SessionID:      newUUID(), // claude 要求 UUID 格式（实测非 UUID 直接拒跑）
+		PermissionMode: "plan",    // 只读分析，不许改 worktree
 		SettingSources: m.settingSources,
 		ExtraEnv:       channelEnv(m.agentChannel),
 	})
@@ -307,6 +309,19 @@ func channelEnv(channel string) []string {
 		return nil
 	}
 	return []string{"LATHE_AGENT_CHANNEL=" + strings.TrimSpace(channel)}
+}
+
+// newUUID 生成 v4 UUID（claude --session-id 只认这个格式）。
+// 与 runner 包同款小 helper，preview 不反向依赖 runner。
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("preview: 生成 UUID 失败: %v", err))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
 // sortedEnvNames 稳定排序，便于测试与展示。
