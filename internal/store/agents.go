@@ -15,11 +15,14 @@ import (
 // 写入侧直接消费 agent.Digest 提炼出的 Entry；读取侧多了游标 id 与
 // 时间戳 at，供详情页日志面板增量轮询。
 type AgentEvent struct {
-	ID      int64          `json:"id"`
-	Phase   string         `json:"phase"`
-	Kind    string         `json:"kind"`
-	Tool    *string        `json:"tool,omitempty"`
-	Body    string         `json:"body"`
+	ID    int64   `json:"id"`
+	Phase string  `json:"phase"`
+	Kind  string  `json:"kind"`
+	Tool  *string `json:"tool,omitempty"`
+	Body  string  `json:"body"`
+	// AgentID 非空表示这条来自 subagent（0014）。前端据此把它的步骤
+	// 缩进成子组，NULL/空 = 主 agent。
+	AgentID *string        `json:"agentId,omitempty"`
 	Payload map[string]any `json:"payload"`
 	At      time.Time      `json:"at"`
 }
@@ -35,18 +38,24 @@ func (s *Store) InsertAgentEvents(ctx context.Context, taskID int64, phase strin
 
 	_, err := s.pool.CopyFrom(ctx,
 		pgx.Identifier{"agent_events"},
-		[]string{"task_id", "phase", "kind", "tool", "body", "payload"},
+		[]string{"task_id", "phase", "kind", "tool", "body", "payload", "agent_id"},
 		pgx.CopyFromSlice(len(entries), func(i int) ([]any, error) {
 			e := entries[i]
 			var tool any
 			if e.Tool != "" {
 				tool = e.Tool
 			}
+			// 主 agent 的事件写 NULL 而不是空串：列语义是「归属哪个 subagent」，
+			// 空串会在前端分组时和真实 id 混为一谈
+			var agentID any
+			if e.AgentID != "" {
+				agentID = e.AgentID
+			}
 			payload := e.Payload
 			if payload == nil {
 				payload = map[string]any{} // 列是 NOT NULL DEFAULT '{}'
 			}
-			return []any{taskID, phase, e.Kind, tool, e.Body, payload}, nil
+			return []any{taskID, phase, e.Kind, tool, e.Body, payload, agentID}, nil
 		}))
 	if err != nil {
 		return fmt.Errorf("store: 批量落 agent 事件失败（task %d, %d 条）: %w", taskID, len(entries), err)
@@ -68,7 +77,7 @@ func (s *Store) AgentEventsAfter(ctx context.Context, taskID, userID, after int6
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT a.id, a.phase, a.kind, a.tool, a.body, a.payload, a.at
+		SELECT a.id, a.phase, a.kind, a.tool, a.body, a.payload, a.agent_id, a.at
 		FROM agent_events a
 		JOIN tasks t ON t.id = a.task_id
 		WHERE a.task_id = $1 AND t.user_id = $2 AND a.id > $3
@@ -83,7 +92,7 @@ func (s *Store) AgentEventsAfter(ctx context.Context, taskID, userID, after int6
 	lastID := after
 	for rows.Next() {
 		var e AgentEvent
-		if err := rows.Scan(&e.ID, &e.Phase, &e.Kind, &e.Tool, &e.Body, &e.Payload, &e.At); err != nil {
+		if err := rows.Scan(&e.ID, &e.Phase, &e.Kind, &e.Tool, &e.Body, &e.Payload, &e.AgentID, &e.At); err != nil {
 			return nil, after, fmt.Errorf("store: 读取 agent 事件行失败: %w", err)
 		}
 		out = append(out, e)

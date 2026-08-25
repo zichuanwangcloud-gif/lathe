@@ -105,6 +105,53 @@ func TestAgentEventsRoundTrip(t *testing.T) {
 	}
 }
 
+// subagent 的归属（0014）必须原样往返：写 AgentID、读回 agentId。
+// 主 agent 的事件要落成 NULL 而不是空串 —— 前端按「有无 agentId」分组。
+func TestAgentEventsSubagentAttribution(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	userID, taskID := agentEventFixture(t, st, "ae-sub@example.com")
+
+	batch := []agent.Entry{
+		{Kind: agent.KindToolUse, Tool: "Agent", Body: "Agent 找 group 模型的测试",
+			Payload: map[string]any{"toolUseId": "toolu_P1"}},
+		{Kind: agent.KindAgentStart, AgentID: "a89b3f", Body: "去找 group 模型的测试",
+			Payload: map[string]any{"agentId": "a89b3f"}},
+		{Kind: agent.KindToolUse, AgentID: "a89b3f", Tool: "Grep", Body: "Grep func TestGroup",
+			Payload: map[string]any{"toolUseId": "toolu_S1"}},
+		{Kind: agent.KindText, AgentID: "a89b3f", Body: "找到了 model_test.go"},
+	}
+	if err := st.InsertAgentEvents(ctx, taskID, "implement", batch); err != nil {
+		t.Fatalf("落库失败: %v", err)
+	}
+
+	events, _, err := st.AgentEventsAfter(ctx, taskID, userID, 0, 100)
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if len(events) != len(batch) {
+		t.Fatalf("应读回 %d 条，得到 %d", len(batch), len(events))
+	}
+
+	// 主 agent 那条：agent_id 必须是 NULL
+	if events[0].AgentID != nil {
+		t.Errorf("主 agent 的事件应落成 NULL，得到 %q", *events[0].AgentID)
+	}
+	// subagent 的三条：归属原样带回
+	for i := 1; i < 4; i++ {
+		if events[i].AgentID == nil || *events[i].AgentID != "a89b3f" {
+			t.Errorf("第 %d 条应属于 subagent a89b3f，得到 %v", i, events[i].AgentID)
+		}
+	}
+	if events[1].Kind != agent.KindAgentStart {
+		t.Errorf("分组头的 kind = %q，期望 %q（0014 扩了 CHECK）", events[1].Kind, agent.KindAgentStart)
+	}
+	// 配对 key 在 subagent 内部同样要保住
+	if events[2].Payload["toolUseId"] != "toolu_S1" {
+		t.Errorf("subagent 工具调用的 toolUseId = %v，期望 toolu_S1", events[2].Payload["toolUseId"])
+	}
+}
+
 // 事件查询走 JOIN tasks 限定属主：别人的任务与「没有事件」不可区分。
 func TestAgentEventsUserIsolation(t *testing.T) {
 	st := testStore(t)
