@@ -367,3 +367,34 @@ func TestStopCancelsBuild(t *testing.T) {
 	}
 	t.Error("Stop 后 op 应被清除且不复活")
 }
+
+// 所有 --filter 参数必须是合法过滤器（key=value，key 属于 docker 支持的
+// 过滤器集合）。回归：label 过滤曾漏写 label= 前缀，docker 报
+// "invalid filter" 而 Status 吞错，表现为容器凭空消失。
+func TestListFiltersWellFormed(t *testing.T) {
+	fd := &fakeDocker{outputs: map[string]fakeResult{
+		"ps":        {stdout: "c1\n"},
+		"container": {stdout: `[{"Name":"/c1","State":{"Status":"running"},"Config":{"Image":"img"},"NetworkSettings":{"Ports":{}}}]`},
+	}}
+	m, _ := newTestManager(t, fd, 100, 100)
+
+	if _, err := m.Status(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.Stop(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+
+	validKeys := map[string]bool{"label": true, "status": true}
+	for _, call := range fd.calls {
+		for i, arg := range call {
+			if arg != "--filter" || i+1 >= len(call) {
+				continue
+			}
+			kv := strings.SplitN(call[i+1], "=", 2)
+			if len(kv) != 2 || !validKeys[kv[0]] {
+				t.Errorf("非法过滤器 %q（调用 %v）", call[i+1], call)
+			}
+		}
+	}
+}

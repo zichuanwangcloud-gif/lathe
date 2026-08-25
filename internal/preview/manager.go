@@ -363,13 +363,17 @@ func (m *Manager) Status(ctx context.Context, taskID int64) (*Status, error) {
 
 	names, err := m.containerNames(ctx, taskID)
 	if err != nil {
-		return st, nil // docker 暂时够不着时，至少把 op 状态给界面
+		// docker 暂时够不着时，至少把 op 状态给界面；但错误必须留痕 ——
+		// 静默吞错曾让「过滤器语法错误」表现为「容器消失」，极难排查
+		slog.Warn("预览状态：列容器失败", "task", taskID, "err", err)
+		return st, nil
 	}
 	if len(names) == 0 {
 		return st, nil
 	}
 	out, _, err := m.exec(ctx, m.DockerBin, append([]string{"container", "inspect"}, names...)...)
 	if err != nil {
+		slog.Warn("预览状态：inspect 失败", "task", taskID, "err", err)
 		return st, nil
 	}
 	st.Containers = parseInspect(out)
@@ -399,7 +403,7 @@ func (m *Manager) Stop(ctx context.Context, taskID int64) (int, int, error) {
 	}
 
 	out, _, err := m.exec(ctx, m.DockerBin, "image", "ls", "-q",
-		"--filter", "label="+labelPreview+"=1", "--filter", fmt.Sprintf("%s=%d", labelTask, taskID))
+		"--filter", "label="+labelPreview+"=1", "--filter", "label="+fmt.Sprintf("%s=%d", labelTask, taskID))
 	if err != nil {
 		return len(names), 0, fmt.Errorf("preview: 查询镜像失败: %w", err)
 	}
@@ -416,7 +420,7 @@ func (m *Manager) Stop(ctx context.Context, taskID int64) (int, int, error) {
 
 func (m *Manager) containerNames(ctx context.Context, taskID int64) ([]string, error) {
 	out, _, err := m.exec(ctx, m.DockerBin, "ps", "-aq",
-		"--filter", "label="+labelPreview+"=1", "--filter", fmt.Sprintf("%s=%d", labelTask, taskID))
+		"--filter", "label="+labelPreview+"=1", "--filter", "label="+fmt.Sprintf("%s=%d", labelTask, taskID))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrDockerUnavailable, err)
 	}
