@@ -138,6 +138,13 @@ type RunParams struct {
 	// （docs/02-design.md §9）—— 这笔基线会乘以任务数，且让任务执行
 	// 结果依赖某台机器装了什么插件，不可复现。
 	SettingSources string
+	// ExtraEnv 是调用方显式注入的环境变量（KEY=VALUE），附加在
+	// sanitizedEnv 白名单之后（同名后者生效）。用途：按阶段路由模型
+	// 通道（LATHE_AGENT_CHANNEL，B2-2）这类「每次执行不同」的值。
+	// 与白名单的关系：白名单管「进程环境里什么能漏给 agent」，
+	// ExtraEnv 管「调用方明确要给 agent 什么」—— 后者是显式意图，
+	// 不受白名单限制，但调用方必须自己保证不注入敏感值。
+	ExtraEnv []string
 	// ExtraArgs 追加原样传给 CLI 的参数。
 	ExtraArgs []string
 
@@ -172,7 +179,7 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	// 自己的子进程。这里用 Setpgid 建独立进程组，超时后杀整组。
 	cmd := exec.Command(d.bin, args...)
 	cmd.Dir = p.Dir
-	cmd.Env = sanitizedEnv()
+	cmd.Env = append(sanitizedEnv(), p.ExtraEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()

@@ -1,0 +1,52 @@
+#!/bin/sh
+# claude-cc-switch —— Lathe 的 claude wrapper（LATHE_CLAUDE_BIN）。
+#
+# 问题：平台以 --setting-sources project 跑 claude（§9 排除个人插件，
+# 收敛上下文成本），此时 user settings（~/.claude/settings.json）整个
+# 不被加载 —— 包括 cc-switch 写入其中的 ANTHROPIC_BASE_URL / AUTH_TOKEN。
+# 而 serve 进程环境里的 ANTHROPIC_* 是启动时的快照，cc-switch 一切换
+# 通道，任务就拿着旧地址撞墙（2026-08-17 任务 #313 的 Connection refused）。
+#
+# 解法：每次执行前现取通道注入，再 exec 真正的 claude。两个事实源：
+#
+#   - LATHE_AGENT_CHANNEL 非空（B2-2 模型路由：pipeline 按阶段注入，
+#     分诊走便宜通道、实现走强通道）：从 ~/.cc-switch/config.json 的
+#     providers.<通道>.settingsConfig.env 取。通道不存在时告警并回落
+#     激活通道 —— 配置笔误不该让任务撞墙。
+#   - 否则跟随 cc-switch 当前激活通道（~/.claude/settings.json 的 env
+#     块）：cc-switch 切到哪，任务就用哪，无需重启服务。
+#
+# 通道 env 里的 ANTHROPIC_MODEL 一并透传（通道即「供应商+模型」的
+# 完整语义）；settings.json 不可读时退化为进程环境原样透传。
+
+eval "$(python3 - "$HOME/.cc-switch/config.json" "$HOME/.claude/settings.json" "${LATHE_AGENT_CHANNEL:-}" <<'EOF'
+import json, shlex, sys
+
+cfg_path, settings_path, channel = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def load(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+env = {}
+if channel:
+    prov = load(cfg_path).get("claude", {}).get("providers", {}).get(channel)
+    if prov is None:
+        # 注意：这里 print 的是要被 eval 的 shell，不是直接输出
+        print("echo 'claude-cc-switch: 通道 %s 不在 cc-switch 配置里，回落激活通道' >&2" % shlex.quote(channel))
+    else:
+        env = prov.get("settingsConfig", {}).get("env", {}) or {}
+if not env:
+    env = load(settings_path).get("env", {}) or {}
+
+for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
+    v = env.get(k)
+    if v:
+        print(f"export {k}={shlex.quote(v)}")
+EOF
+)"
+
+exec /home/clouditera/.local/bin/claude "$@"

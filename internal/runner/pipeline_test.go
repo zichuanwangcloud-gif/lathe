@@ -353,6 +353,78 @@ func TestPipelineHappyPath(t *testing.T) {
 	}
 }
 
+// B2-3/B2-2：分诊必须在中立目录里跑（不继承 serve 的 cwd，避免把
+// Lathe 自己的 CLAUDE.md 灌进目标仓库的分诊上下文）；模型通道按
+// 阶段路由 —— 分诊走 TriageChannel，实现与修复走 ImplementChannel。
+func TestPipelineTriageDirAndChannelRouting(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{Number: 42, URL: "https://github.com/acme/demo/pull/42"}}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"有现象和期望行为","question":""}`},
+			{Success: true, Text: "补了 greet 函数与复现测试"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"hello\" }\n"), 0o644)
+			},
+		},
+	}
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.Verifications = &fakeVerifications{}
+	p.TriageDir = filepath.Join(t.TempDir(), "neutral")
+	p.TriageChannel = "cheap"
+	p.ImplementChannel = "strong"
+
+	if err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+	}); err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+	if len(ag.calls) < 2 {
+		t.Fatalf("至少应有分诊与实现两次 agent 调用，实际 %d", len(ag.calls))
+	}
+
+	// 分诊：中立目录 + 便宜通道
+	triage := ag.calls[0]
+	if triage.Dir != p.TriageDir {
+		t.Errorf("分诊目录 = %q，期望中立目录 %q（不能继承 serve 的 cwd）", triage.Dir, p.TriageDir)
+	}
+	if len(triage.ExtraEnv) != 1 || triage.ExtraEnv[0] != "LATHE_AGENT_CHANNEL=cheap" {
+		t.Errorf("分诊通道注入不符: %v", triage.ExtraEnv)
+	}
+
+	// 实现：任务 worktree + 强通道
+	impl := ag.calls[1]
+	if impl.Dir == "" || impl.Dir == p.TriageDir {
+		t.Errorf("实现应在任务 worktree 里跑，实际 %q", impl.Dir)
+	}
+	if len(impl.ExtraEnv) != 1 || impl.ExtraEnv[0] != "LATHE_AGENT_CHANNEL=strong" {
+		t.Errorf("实现通道注入不符: %v", impl.ExtraEnv)
+	}
+}
+
+// 未配置通道时不注入 LATHE_AGENT_CHANNEL —— 跟随 cc-switch 激活通道。
+func TestChannelEnvEmpty(t *testing.T) {
+	if got := channelEnv(""); got != nil {
+		t.Errorf("空通道不应注入环境变量，得到 %v", got)
+	}
+	if got := channelEnv("  "); got != nil {
+		t.Errorf("空白通道不应注入环境变量，得到 %v", got)
+	}
+	if got := channelEnv(" stg "); len(got) != 1 || got[0] != "LATHE_AGENT_CHANNEL=stg" {
+		t.Errorf("通道名应去空白后注入，得到 %v", got)
+	}
+}
+
 // 分诊判定不明确：回帖提问、转 blocked_spec、不建工作区、不碰代码。
 func TestPipelineBlockedSpec(t *testing.T) {
 	_, m, taskID, repo, src := pipelineFixture(t)

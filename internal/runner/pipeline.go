@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -102,6 +104,22 @@ type Pipeline struct {
 	MaxFixAttempts int
 	// ExcludeDirs 是仓库级的验证扫描排除目录（如 CloudRouter 的 upstream）。
 	ExcludeDirs []string
+
+	// TriageDir 是分诊 agent 的工作目录。分诊在建 worktree 之前执行，
+	// 没有属于任务的目录；不指定的话子进程继承 serve 的 cwd（通常是
+	// Lathe 自己的仓库根），--setting-sources project 会把 Lathe 的
+	// CLAUDE.md/配置灌进目标仓库的分诊上下文 —— 既污染判断又白烧
+	// token（路线图 B2-3）。为空时用系统临时目录下的固定位置：中立
+	// 目录必须位于任何项目树之外（claude 会向上收集祖先目录的
+	// CLAUDE.md），WorkspaceRoot 默认在仓库根之下，不合格。
+	TriageDir string
+
+	// TriageChannel / ImplementChannel 是 cc-switch 通道名（B2-2 模型
+	// 路由）：分诊走便宜通道、实现与修复回路走强通道。非空时以
+	// LATHE_AGENT_CHANNEL 注入 agent 子进程，由 claude wrapper 解析
+	// 成实际的 BASE_URL/TOKEN；为空则跟随 cc-switch 当前激活通道。
+	TriageChannel    string
+	ImplementChannel string
 }
 
 // ExecuteParams 描述一次流水线执行。
@@ -321,13 +339,19 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	}
 	rc.issue = issue
 
+	triageDir, err := p.triageDir()
+	if err != nil {
+		return p.fail(rc, StageTriageRun, err)
+	}
 	triageSession := p.newID()
 	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage")
 	triageRes, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         TriagePrompt(issue.Context()),
+		Dir:            triageDir,
 		SessionID:      triageSession,
 		PermissionMode: "plan", // 分诊只读不写
 		SettingSources: p.SettingSources,
+		ExtraEnv:       channelEnv(p.TriageChannel),
 		OnEvent:        triageSink.OnEvent,
 	})
 	// 成功与失败路径都必须 drain：失败时缓冲里恰是排障最关键的现场
@@ -453,6 +477,9 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 }
 
 // runAgent 跑一次 agent 并接好事件汇。
+//
+// 实现与修复回路（同一会话的延续）都走 ImplementChannel：修复是
+// 实现的下半场，通道不该中途换。
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
 	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase)
 	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
@@ -462,10 +489,32 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 		Resume:         resume,
 		PermissionMode: p.PermissionMode,
 		SettingSources: p.SettingSources,
+		ExtraEnv:       channelEnv(p.ImplementChannel),
 		OnEvent:        sink.OnEvent,
 	})
 	sink.Close()
 	return res, err
+}
+
+// channelEnv 把 cc-switch 通道名编成注入 agent 子进程的环境变量；
+// 空通道表示跟随 cc-switch 当前激活通道（不注入）。
+func channelEnv(channel string) []string {
+	if strings.TrimSpace(channel) == "" {
+		return nil
+	}
+	return []string{"LATHE_AGENT_CHANNEL=" + strings.TrimSpace(channel)}
+}
+
+// triageDir 返回分诊 agent 的中立工作目录（惰性创建）。
+func (p *Pipeline) triageDir() (string, error) {
+	dir := p.TriageDir
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "lathe-triage")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("runner: 创建分诊中立目录失败: %w", err)
+	}
+	return dir, nil
 }
 
 // ---------------------------------------------------------------- 阶段：提交

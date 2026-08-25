@@ -87,6 +87,8 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 | `LATHE_LIGHT_SLOTS` | light 档验证并发上限，默认 2 |
 | `LATHE_HEAVY_SLOTS` | heavy 档验证并发上限，默认 1 |
 | `LATHE_SETTING_SOURCES` | agent 加载的配置源，默认 `project`（排除个人插件，见 §9） |
+| `LATHE_TRIAGE_CHANNEL` | 分诊的 cc-switch 通道名（模型路由：分诊走便宜通道），空 = 跟随激活通道 |
+| `LATHE_IMPLEMENT_CHANNEL` | 实现/修复回路的 cc-switch 通道名（走强通道），空 = 跟随激活通道 |
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。

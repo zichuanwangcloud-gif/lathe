@@ -46,6 +46,8 @@
 | agent 进程 env 泄漏：`sanitizedEnv()` 只剔 4 个变量，`LATHE_ADMIN_TOKEN`、GitHub token 原样漏给 agent 子进程 | 代码走查 |
 | 分诊工作目录污染：triage 未设 `Dir` → 继承 serve 的 cwd=`/opt/lathe` → `--setting-sources project` 把 Lathe 自己的 CLAUDE.md 灌进目标仓库的分诊上下文 | 代码走查 |
 
+~~已修复~~（B2-3）：分诊改在中立目录执行（默认 `$TMPDIR/lathe-triage`，位于任何项目树之外，`Pipeline.TriageDir` 可覆盖）。
+
 ### 1.3 数据残留
 
 - `repos` id=241（`acme/member-repo`，user 535 的占位行）—— 无真实仓库，建议清理
@@ -79,8 +81,8 @@
 ### 3.2 成本与效率 —— token 就是钱
 
 5. **成本核算面板**：`CostUSD/DurationMS/NumTurns` 已解析落库（pipeline.go:478 + migration 0009），缺聚合视图：每任务/每 issue/每日成本、分诊 vs 实现占比。这是"什么单子值得交给 agent"的决策数据。
-6. **模型路由**：分诊走便宜通道、实现走强通道。cc-switch wrapper 已按进程 env 读配置，pipeline 按 phase 注入不同 env 即可，小改大收益。
-7. **分诊目录中立化**：给 triage 一个干净 cwd，消除 §1.2 的上下文污染。
+6. ~~**模型路由**~~（已交付，B2-2）：`LATHE_TRIAGE_CHANNEL` / `LATHE_IMPLEMENT_CHANNEL` 配 cc-switch 通道名，pipeline 按阶段以 `LATHE_AGENT_CHANNEL` 注入子进程，wrapper（`scripts/claude-cc-switch`）从 `~/.cc-switch/config.json` 现取该通道的 BASE_URL/TOKEN/MODEL；通道不存在时告警回落激活通道。未配置则全局跟随 cc-switch 激活通道。
+7. ~~**分诊目录中立化**~~（已交付，B2-3）。
 
 ### 3.3 生命周期与现场管理
 
@@ -108,7 +110,7 @@
 | 批次 | 内容 | 理由 |
 |---|---|---|
 | **B1** | 修复回路（1）+ 重试语义（2）+ 启动 reconcile（3）+ env 白名单（13）+ EventSink UTF8 修复 | 闭环自愈 + 堵安全洞 |
-| **B2** | 成本面板（5）+ 模型路由（6）+ 分诊目录（7）+ 通知（9）+ worktree reaper（8） | 日常用得爽 |
+| **B2** | ~~模型路由（6）~~ + ~~分诊目录（7）~~ 已交付；剩成本面板（5）+ 通知（9）+ worktree reaper（8） | 日常用得爽 |
 | **B3** | GateMode（10）+ webhook 联动（11）+ PR 回流（12） | 自动化加深 |
 | **持续** | 度量（15）先行一点，每批落地后看数据决定下一批 | 数据驱动 |
 

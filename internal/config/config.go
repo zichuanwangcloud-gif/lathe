@@ -39,6 +39,12 @@ type Config struct {
 	// 就地修复）：resume 原实现会话，把失败输出喂回去让 agent 修。
 	// 0 关闭修复回路，验证一挂即任务失败。默认 2。
 	FixAttempts int
+	// TriageChannel / ImplementChannel 是 cc-switch 通道名（B2-2 模型
+	// 路由）：分诊走便宜通道、实现与修复走强通道。非空时 pipeline 按
+	// 阶段以 LATHE_AGENT_CHANNEL 注入 agent 子进程，由 claude wrapper
+	// 解析；为空则跟随 cc-switch 当前激活通道。
+	TriageChannel    string
+	ImplementChannel string
 
 	// 验证双通道（docs/02-design.md §6.2）：light/heavy 各自独立配额，
 	// 不共用一个数字 —— 资源画像差一个量级。任务worker总数 = 两者之和。
@@ -122,6 +128,8 @@ func Load() (Config, error) {
 		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
 		SettingSources:      env("LATHE_SETTING_SOURCES", "project"),
 		FixAttempts:         envInt("LATHE_FIX_ATTEMPTS", 2),
+		TriageChannel:       env("LATHE_TRIAGE_CHANNEL", ""),
+		ImplementChannel:    env("LATHE_IMPLEMENT_CHANNEL", ""),
 		LightSlots:          envInt("LATHE_LIGHT_SLOTS", 2),
 		HeavySlots:          envInt("LATHE_HEAVY_SLOTS", 1),
 		LinearToken:         env("LATHE_LINEAR_TOKEN", ""),

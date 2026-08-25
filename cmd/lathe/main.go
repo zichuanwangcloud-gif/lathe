@@ -286,18 +286,20 @@ func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFact
 	}
 
 	return &runner.Pipeline{
-		Tasks:          task.NewMachine(st.Pool()),
-		Worktrees:      wm,
-		Verifier:       runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
-		Agent:          agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
-		ClientFactory:  factory,
-		Notifier:       logNotifier{},
-		Verifications:  st,
-		AgentEvents:    st,
-		Gates:          runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
-		PermissionMode: "acceptEdits",
-		MaxFixAttempts: cfg.FixAttempts,
-		SettingSources: cfg.SettingSources,
+		Tasks:            task.NewMachine(st.Pool()),
+		Worktrees:        wm,
+		Verifier:         runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
+		Agent:            agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		ClientFactory:    factory,
+		Notifier:         logNotifier{},
+		Verifications:    st,
+		AgentEvents:      st,
+		Gates:            runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
+		PermissionMode:   "acceptEdits",
+		MaxFixAttempts:   cfg.FixAttempts,
+		SettingSources:   cfg.SettingSources,
+		TriageChannel:    cfg.TriageChannel,
+		ImplementChannel: cfg.ImplementChannel,
 	}, nil
 }
 
@@ -356,6 +358,8 @@ func configStatus(cfg config.Config) func() map[string]any {
 				"pnpmStore":     cfg.PnpmStore,
 				"claudeBin":     cfg.ClaudeBin,
 				"agentTimeout":  cfg.AgentTimeout.String(),
+				"triageChannel": cfg.TriageChannel,
+				"implChannel":   cfg.ImplementChannel,
 				"mode":          "单机多用户（按人隔离）",
 			},
 		}

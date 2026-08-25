@@ -305,6 +305,42 @@ echo '%s'
 	}
 }
 
+// ExtraEnv 是调用方的显式注入（B2-2 按阶段路由通道）：必须到达子进程，
+// 且与白名单同名时后者生效（子进程取最后出现的值）。
+func TestRunExtraEnvInjection(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "env.txt")
+	bin := fakeClaude(t, fmt.Sprintf(`
+echo "channel=$LATHE_AGENT_CHANNEL" > %s
+echo "tmpdir=$TMPDIR" >> %s
+echo '%s'
+`, out, out, resultOKLine))
+
+	t.Setenv("TMPDIR", "/tmp/whitelist-value")
+	d := NewDriver(bin, 30*time.Second)
+	_, err := d.Run(context.Background(), RunParams{
+		Prompt:    "x",
+		SessionID: "s",
+		ExtraEnv: []string{
+			"LATHE_AGENT_CHANNEL=cheap",
+			"TMPDIR=/tmp/extra-env-value",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run 报错: %v", err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("读取子进程环境输出失败: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "channel=cheap") {
+		t.Errorf("ExtraEnv 应到达子进程: %q", got)
+	}
+	if !strings.Contains(got, "tmpdir=/tmp/extra-env-value") {
+		t.Errorf("ExtraEnv 与白名单同名时应以后者为准: %q", got)
+	}
+}
+
 // CLI 非零退出但给了 result 事件时，以 result 为准。
 func TestRunNonZeroExitWithResult(t *testing.T) {
 	bin := fakeClaude(t, fmt.Sprintf("echo '%s'\nexit 1\n", resultErrLine))
