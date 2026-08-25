@@ -16,7 +16,7 @@ import (
 // *preview.Manager 实现此接口；测试可注入假件。
 type PreviewManager interface {
 	CheckResources(ctx context.Context) (*preview.ResourceStatus, error)
-	Start(ctx context.Context, taskID int64, worktree string, sels []preview.Selection) error
+	Start(ctx context.Context, taskID int64, worktree string, req preview.StartRequest) error
 	Status(ctx context.Context, taskID int64) (*preview.Status, error)
 	Stop(ctx context.Context, taskID int64) (containers, images int, err error)
 }
@@ -111,9 +111,7 @@ func (a *PreviewAPI) start(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var body struct {
-		Selections []preview.Selection `json:"selections"`
-	}
+	var body preview.StartRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBody)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
 		return
@@ -122,7 +120,7 @@ func (a *PreviewAPI) start(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "至少选择一个镜像"})
 		return
 	}
-	if err := a.Previews.Start(r.Context(), id, wt, body.Selections); err != nil {
+	if err := a.Previews.Start(r.Context(), id, wt, body); err != nil {
 		switch {
 		case errors.Is(err, preview.ErrOverThreshold), errors.Is(err, preview.ErrBuildInProgress):
 			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})

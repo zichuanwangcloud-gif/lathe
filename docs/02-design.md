@@ -298,18 +298,35 @@ Linear: issue 指派给用户
 预览环境补上这一环：任务看板上一键把任务的 worktree 跑成真实服务，
 人手动点完再决定合并。
 
-- **发现**：扫描 worktree 里的 `Dockerfile`（含 `Dockerfile.*` / `*.Dockerfile`
-  变体，跳过 `.git`/`node_modules`/`vendor` 等目录），解析 `EXPOSE` 预填端口；
-  未声明 EXPOSE 的由人手工指定。起哪几个镜像永远是人的选择，不自动决定。
-- **构建与运行**：`docker build`（20 分钟上限）后 `docker run -d`，宿主机端口
-  随机分配（`-p 0:<port>`，多任务同时预览不能撞端口），绑 `0.0.0.0`（用户从
-  局域网其他机器访问）。容器与镜像一律打 `lathe.preview=1` / `lathe.task=<id>`
-  标签 —— 发现、清理、跨 serve 重启的归属全靠标签，不依赖数据库状态。
-  构建输出实时流进操作状态并在弹窗里展示尾部：分钟级黑盒里「在编译」与
-  「卡死了」必须可区分（2026-08-25 一次健康构建就因进程静默被误判卡死
-  遭误杀）。停止按钮同时取消进行中的构建。
-- **清理**：停止按钮强删该任务的全部预览容器，再删对应镜像。镜像删除失败
-  （如被引用）不算整体失败：容器已删，残留镜像只是占盘，由阈值闸门兜住。
+- **发现**：扫描 worktree 里的可启动单元 —— `Dockerfile`（含变体）与
+  compose 编排文件（`docker-compose*.yml` / `compose.yml`，跳过
+  `.git`/`node_modules`/`vendor` 等目录）。**compose 是「服务拓扑 + 依赖 +
+  配置」的标准声明，有编排的项目优先走编排，不发明私有格式**。
+  Dockerfile 的 `EXPOSE` 解析为端口预填；compose 的 `${VAR}` 引用静态
+  扫描为变量表（无默认值 = 必填，启动前由人填齐）。起哪几个、填什么
+  永远是人的选择。
+- **构建与运行**：
+  - Dockerfile：`docker build`（20 分钟上限）后 `docker run -d`，宿主机
+    端口随机分配（`-p 0:<port>`，多任务同时预览不能撞端口），绑
+    `0.0.0.0`（用户从局域网其他机器访问）。
+  - compose：`docker compose -p lathe-preview-t<id> up -d --build`。编排里
+    钉死的宿主端口用 `!override` 生成 override 文件整体重置为随机
+    （compose 2.24+）；`${VAR:?}` 必填变量写 `--env-file` 注入 —— 连不连
+    共享测试库这类有数据风险的决定必须人来拍，系统不自动探测。
+  - 构建输出实时流进操作状态并在弹窗里展示尾部：分钟级黑盒里「在编译」
+    与「卡死了」必须可区分（2026-08-25 一次健康构建就因进程静默被误判
+    卡死遭误杀）。停止按钮同时取消进行中的构建。
+- **附加基础设施**（仅 Dockerfile 选择）：每个任务一个独立 docker 网络，
+  可勾选 postgres / redis / mysql —— 起官方镜像进网络（固定别名
+  pg/redis/mysql），就绪探测通过后才起应用（entrypoint 常在启动时跑迁移），
+  约定连接串（`DATABASE_URL` / `REDIS_URL` 等一组常见命名）自动注入应用
+  容器，人还可用额外 env（KEY=VALUE）覆盖。
+- **清理**：停止 = 取消进行中的构建 + 强删容器 + 删网络 + 删自建镜像。
+  dockerfile 流资源打 `lathe.preview=1` / `lathe.task=<id>` 标签；compose 流
+  资源自动带 `com.docker.compose.project=lathe-preview-t<id>` 标签 —— 发现与
+  清理两路并查，不依赖数据库状态，serve 重启后现场仍在。compose 里
+  `image:` 拉取的共享镜像不带项目标签，不会被误删。镜像删除失败（被
+  引用）不算整体失败：残留只是占盘，由阈值闸门兜住。
 - **资源闸门**：启动前测量内存（/proc/meminfo，口径用 MemAvailable）与磁盘
   （statfs，口径用 Bavail）占用率，任一达到阈值即拒绝启动。阈值在系统设置
   里由管理员配置（默认 90%，100 = 不启用），现取现用、改完即刻生效。

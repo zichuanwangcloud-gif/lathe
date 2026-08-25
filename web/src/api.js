@@ -99,8 +99,8 @@ export const api = {
   // 任务预览环境：worktree 里构建镜像、起容器给人手动点
   previewCandidates: (id) => request(`/api/tasks/${id}/preview/candidates`),
   previewStatus: (id) => request(`/api/tasks/${id}/preview/status`),
-  previewStart: (id, selections) =>
-    request(`/api/tasks/${id}/preview/start`, { method: 'POST', body: JSON.stringify({ selections }) }),
+  previewStart: (id, body) =>
+    request(`/api/tasks/${id}/preview/start`, { method: 'POST', body: JSON.stringify(body) }),
   previewStop: (id) => request(`/api/tasks/${id}/preview/stop`, { method: 'POST' }),
 
   adminSettings: () => request('/api/admin/settings'),

@@ -110,7 +110,7 @@ func TestStartRefusedOverThreshold(t *testing.T) {
 	fd := &fakeDocker{outputs: map[string]fakeResult{}}
 	m, wt := newTestManager(t, fd, 1, 100) // 内存阈值 1%：任何真实水位都超
 
-	err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile", Ports: []int{3000}}})
+	err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile", Ports: []int{3000}}}})
 	if !errors.Is(err, ErrOverThreshold) {
 		t.Fatalf("应被资源闸门拦下，得到 %v", err)
 	}
@@ -132,11 +132,11 @@ func TestStartValidation(t *testing.T) {
 		{"非法端口", []Selection{{Path: "Dockerfile", Ports: []int{0}}}, "端口 0 非法"},
 		{"Dockerfile 不存在", []Selection{{Path: "apps/x/Dockerfile"}}, "不存在"},
 		{"路径穿越被中和", []Selection{{Path: "../../../etc/passwd"}}, "不存在"},
-		{"撞镜像名", []Selection{{Path: "Dockerfile"}, {Path: "./Dockerfile"}}, "撞了镜像名"},
+		{"撞镜像名", []Selection{{Path: "Dockerfile"}, {Path: "./Dockerfile"}}, "撞了名"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := m.Start(context.Background(), 7, wt, tc.sels)
+			err := m.Start(context.Background(), 7, wt, StartRequest{Selections: tc.sels})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("错误 = %v，期望含 %q", err, tc.want)
 			}
@@ -148,7 +148,7 @@ func TestStartBuildsAndRuns(t *testing.T) {
 	fd := &fakeDocker{outputs: map[string]fakeResult{}}
 	m, wt := newTestManager(t, fd, 100, 100)
 
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile", Ports: []int{3000, 8080}}}); err != nil {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile", Ports: []int{3000, 8080}}}}); err != nil {
 		t.Fatalf("Start 报错: %v", err)
 	}
 	if op := waitOp(t, m, 7); op != nil {
@@ -173,7 +173,7 @@ func TestStartBuildFailureKeepsOp(t *testing.T) {
 	}
 	m, wt := newTestManager(t, fd, 100, 100)
 
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile", Ports: []int{3000}}}); err != nil {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile", Ports: []int{3000}}}}); err != nil {
 		t.Fatalf("Start 报错: %v", err)
 	}
 	op := waitOp(t, m, 7)
@@ -189,7 +189,7 @@ func TestStartBuildFailureKeepsOp(t *testing.T) {
 
 	// 构建失败后再来一次应允许（op 不是 building 态）
 	fd.stream = nil
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile", Ports: []int{3000}}}); err != nil {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile", Ports: []int{3000}}}}); err != nil {
 		t.Fatalf("失败后应可重新启动，得到 %v", err)
 	}
 	waitOp(t, m, 7)
@@ -212,11 +212,11 @@ func TestStartRejectsConcurrentBuild(t *testing.T) {
 	}
 	m, wt := newTestManager(t, fd, 100, 100)
 
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); err != nil {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile"}}}); err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); !errors.Is(err, ErrBuildInProgress) {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile"}}}); !errors.Is(err, ErrBuildInProgress) {
 		t.Fatalf("并发构建应报 ErrBuildInProgress，得到 %v", err)
 	}
 	close(release)
@@ -316,7 +316,7 @@ func TestBuildProgressVisibleMidFlight(t *testing.T) {
 	}
 	m, wt := newTestManager(t, fd, 100, 100)
 
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); err != nil {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile"}}}); err != nil {
 		t.Fatal(err)
 	}
 	<-inStep
@@ -346,7 +346,7 @@ func TestStopCancelsBuild(t *testing.T) {
 	}
 	m, wt := newTestManager(t, fd, 100, 100)
 
-	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); err != nil {
+	if err := m.Start(context.Background(), 7, wt, StartRequest{Selections: []Selection{{Path: "Dockerfile"}}}); err != nil {
 		t.Fatal(err)
 	}
 	<-started

@@ -20,13 +20,20 @@ const candidates = ref([])
 const resources = ref(null)
 const containers = ref([])
 const op = ref(null)
-// 每个候选的选择态：{ [path]: { checked, ports } }，ports 是逗号分隔文本
+// 每个候选的选择态：{ [path]: { checked, ports, env } }，ports 是逗号
+// 分隔文本，env 是 compose 变量名 → 值（可选的预填默认值）
 const picks = ref({})
+// 附加基础设施与额外 env（仅注入 Dockerfile 容器）
+const infra = ref([])
+const extraEnv = ref('')
 
 let pollTimer = null
 
 const building = computed(() => op.value?.state === 'building')
 const selectedCount = computed(() => Object.values(picks.value).filter((p) => p.checked).length)
+const hasDockerfilePick = computed(() =>
+  candidates.value.some((c) => c.kind !== 'compose' && picks.value[c.path]?.checked),
+)
 
 // 构建完成（building true→false 且容器出现）给明确成功信号
 const justStarted = ref(false)
@@ -72,10 +79,13 @@ async function loadCandidates() {
     const data = await api.previewCandidates(props.task.id)
     candidates.value = data.candidates || []
     resources.value = data.resources
-    // 默认全不选，端口预填 EXPOSE 解析结果 —— 起什么是人的决定
+    // 默认全不选，端口预填 EXPOSE 解析结果、compose 可选变量预填
+    // 默认值 —— 起什么、填什么是人的决定
     const p = {}
     for (const c of candidates.value) {
-      p[c.path] = { checked: false, ports: (c.ports || []).join(', ') }
+      const env = {}
+      for (const e of c.env || []) env[e.name] = e.default || ''
+      p[c.path] = { checked: false, ports: (c.ports || []).join(', '), env }
     }
     picks.value = p
   } catch (e) {
@@ -105,19 +115,44 @@ async function start() {
   for (const c of candidates.value) {
     const p = picks.value[c.path]
     if (!p?.checked) continue
+    if (c.kind === 'compose') {
+      const env = {}
+      for (const e of c.env || []) {
+        const v = (p.env[e.name] || '').trim()
+        if (e.required && !v) {
+          error.value = `${c.path} 的必填变量 ${e.name} 未填写`
+          return
+        }
+        if (v) env[e.name] = v
+      }
+      selections.push({ path: c.path, kind: 'compose', env })
+      continue
+    }
     const ports = parsePorts(p.ports)
     if (ports.some((n) => !Number.isInteger(n) || n <= 0 || n > 65535)) {
       error.value = `${c.path} 的端口含非法值（1..65535，逗号分隔）`
       return
     }
-    selections.push({ path: c.path, ports })
+    selections.push({ path: c.path, kind: 'dockerfile', ports })
   }
   if (!selections.length) return
+  // 额外 env：每行 KEY=VALUE
+  const env = {}
+  for (const line of extraEnv.value.split('\n')) {
+    const t = line.trim()
+    if (!t) continue
+    const eq = t.indexOf('=')
+    if (eq <= 0) {
+      error.value = `环境变量行格式不对（应 KEY=VALUE）：${t}`
+      return
+    }
+    env[t.slice(0, eq).trim()] = t.slice(eq + 1)
+  }
   busy.value = true
   error.value = ''
   justStarted.value = false
   try {
-    await api.previewStart(props.task.id, selections)
+    await api.previewStart(props.task.id, { selections, infra: infra.value, env })
     await loadStatus()
     schedulePoll()
   } catch (e) {
@@ -226,24 +261,62 @@ onUnmounted(() => clearTimeout(pollTimer))
         上次启动失败：{{ op.error }}
       </div>
 
-      <!-- 候选镜像 -->
+      <!-- 候选：Dockerfile 单镜像 或 compose 编排（拓扑+依赖的标准声明） -->
       <div class="section">
-        <div class="label">选择要启动的镜像（基于 worktree 里的 Dockerfile）</div>
+        <div class="label">选择要启动的服务（基于 worktree 里的 Dockerfile / compose 编排）</div>
         <div v-if="loading" class="dim">扫描中……</div>
         <div v-else-if="!candidates.length" class="dim">
-          worktree 里没找到 Dockerfile —— 这个仓库可能不支持容器化运行。
+          worktree 里没找到 Dockerfile 或 compose 文件 —— 这个仓库可能不支持容器化运行。
         </div>
-        <div v-for="c in candidates" :key="c.path" class="row cand">
-          <input type="checkbox" v-model="picks[c.path].checked" :disabled="building" />
-          <span class="mono name">{{ c.path }}</span>
-          <input
-            class="ports-input mono"
-            v-model="picks[c.path].ports"
-            :disabled="building || !picks[c.path].checked"
-            placeholder="容器端口，逗号分隔"
-          />
-          <span v-if="!c.ports?.length" class="faint">未声明 EXPOSE，请手工填端口</span>
+        <div v-for="c in candidates" :key="c.path" class="cand-block">
+          <div class="row cand">
+            <input type="checkbox" v-model="picks[c.path].checked" :disabled="building" />
+            <span class="badge" :class="c.kind === 'compose' ? 'ok' : 'idle'">
+              {{ c.kind === 'compose' ? '编排' : '镜像' }}
+            </span>
+            <span class="mono name">{{ c.path }}</span>
+            <template v-if="c.kind !== 'compose'">
+              <input
+                class="ports-input mono"
+                v-model="picks[c.path].ports"
+                :disabled="building || !picks[c.path].checked"
+                placeholder="容器端口，逗号分隔"
+              />
+              <span v-if="!c.ports?.length" class="faint">未声明 EXPOSE，请手工填端口</span>
+            </template>
+            <span v-else class="faint">端口由编排声明，启动时重置为随机宿主端口</span>
+          </div>
+          <!-- compose 必填变量：连不连共享测试库这类决定由人拍板 -->
+          <div v-if="c.kind === 'compose' && picks[c.path].checked && c.env?.length" class="env-grid">
+            <div v-for="e in c.env" :key="e.name" class="env-row">
+              <label class="mono dim">{{ e.name }}<span v-if="e.required" class="req">*</span></label>
+              <input
+                class="mono"
+                v-model="picks[c.path].env[e.name]"
+                :placeholder="e.required ? '必填' : '可选'"
+                :disabled="building"
+              />
+            </div>
+          </div>
         </div>
+
+        <!-- 附加基础设施：仅注入 Dockerfile 容器（compose 的依赖自己声明） -->
+        <template v-if="hasDockerfilePick">
+          <div class="label">附加基础设施（起官方镜像进任务网络，连接串自动注入）</div>
+          <div class="row">
+            <label v-for="i in ['postgres', 'redis', 'mysql']" :key="i" class="infra-pick">
+              <input type="checkbox" :value="i" v-model="infra" :disabled="building" /> {{ i }}
+            </label>
+          </div>
+          <textarea
+            class="mono env-text"
+            v-model="extraEnv"
+            rows="2"
+            placeholder="额外环境变量，每行 KEY=VALUE（可选，注入所有选中的 Dockerfile 容器）"
+            :disabled="building"
+          ></textarea>
+        </template>
+
         <button
           class="primary"
           :disabled="busy || building || !selectedCount || (resources && !resources.allowed)"
@@ -315,6 +388,30 @@ h2 { font-size: 16px; margin: 0; }
   padding: 4px 8px;
 }
 .cand input[type='checkbox'] { margin: 0; }
+.cand-block { display: flex; flex-direction: column; gap: 6px; }
+.env-grid {
+  margin-left: 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border);
+}
+.env-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; }
+.env-row label { min-width: 220px; word-break: break-all; }
+.env-row input { flex: 1; }
+.req { color: var(--bad); }
+.infra-pick { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; font-size: 13px; }
+.env-text {
+  width: 100%;
+  resize: vertical;
+  font-size: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+}
 button { align-self: flex-start; }
 .error-banner.small { font-size: 13px; }
 

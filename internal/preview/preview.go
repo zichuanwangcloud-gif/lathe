@@ -15,24 +15,40 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 )
 
-// Candidate 是 worktree 里发现的一个可构建镜像。
+// Candidate 是 worktree 里发现的一个可启动单元：一个 Dockerfile
+// （单镜像）或一个 compose 编排文件（多服务 + 依赖拓扑）。
 type Candidate struct {
-	// Path 是 Dockerfile 相对 worktree 根的路径（如 apps/web/Dockerfile）。
+	// Path 是相对 worktree 根的路径（如 apps/web/Dockerfile 或
+	// deploy/docker-compose.yml）。
 	Path string `json:"path"`
-	// Context 是构建上下文目录（相对 worktree 根；根目录为 "."）。
+	// Kind 是 "dockerfile" 或 "compose"。
+	Kind string `json:"kind"`
+	// Context 是构建上下文目录（相对 worktree 根；仅 dockerfile 用）。
 	Context string `json:"context"`
 	// Name 是展示名，取 Path。
 	Name string `json:"name"`
-	// Ports 是从 EXPOSE 指令解析出的容器端口（去重、升序）。
-	// 为空表示 Dockerfile 未声明 —— 启动时需人手工指定，否则
-	// 容器起来了也够不着。
+	// Ports 是从 EXPOSE 指令解析出的容器端口（去重、升序，仅
+	// dockerfile）。compose 的端口由编排文件自己声明，启动时统一
+	// 重置为随机宿主端口，不在此预填。
 	Ports []int `json:"ports"`
+	// Env 是 compose 文件里引用的环境变量（仅 compose）。无默认值
+	// 的（${VAR} 或 ${VAR:?提示}）为必填 —— 启动前必须由人填齐，
+	// 比如数据库连接串；有没有默认值、默认值是什么都从文件里来。
+	Env []EnvVarSpec `json:"env,omitempty"`
+}
+
+// EnvVarSpec 是 compose 文件里一个环境变量引用的静态扫描结果。
+type EnvVarSpec struct {
+	Name     string `json:"name"`
+	Default  string `json:"default,omitempty"`
+	Required bool   `json:"required"` // 无默认值 = 必填
 }
 
 // discoverSkipDirs 是扫描时要跳过的目录。.git 是底线；其余是
@@ -43,8 +59,9 @@ var discoverSkipDirs = map[string]bool{
 	"dist": true, "build": true, ".next": true, ".pnpm-store": true,
 }
 
-// Discover 扫描 worktree 里的 Dockerfile（含 Dockerfile.* 与
-// *.Dockerfile 变体），按路径升序返回。
+// Discover 扫描 worktree 里的可启动单元：Dockerfile（含 Dockerfile.*
+// 与 *.Dockerfile 变体）与 compose 编排文件（compose.yml /
+// docker-compose.yml 及 docker-compose.*.yml 等变体），按路径升序返回。
 func Discover(worktreePath string) ([]Candidate, error) {
 	var out []Candidate
 	err := filepath.WalkDir(worktreePath, func(path string, d fs.DirEntry, err error) error {
@@ -57,7 +74,8 @@ func Discover(worktreePath string) ([]Candidate, error) {
 			}
 			return nil
 		}
-		if !isDockerfile(d.Name()) {
+		isDF, isCompose := isDockerfile(d.Name()), isComposeFile(d.Name())
+		if !isDF && !isCompose {
 			return nil
 		}
 		rel, err := filepath.Rel(worktreePath, path)
@@ -68,13 +86,19 @@ func Discover(worktreePath string) ([]Candidate, error) {
 		if err != nil {
 			return fmt.Errorf("preview: 读取 %s 失败: %w", rel, err)
 		}
-		ctxDir := filepath.Dir(rel)
-		out = append(out, Candidate{
+		c := Candidate{
 			Path:    filepath.ToSlash(rel),
-			Context: filepath.ToSlash(ctxDir),
+			Context: filepath.ToSlash(filepath.Dir(rel)),
 			Name:    filepath.ToSlash(rel),
-			Ports:   ParseExposes(string(data)),
-		})
+		}
+		if isCompose {
+			c.Kind = "compose"
+			c.Env = ScanComposeEnv(string(data))
+		} else {
+			c.Kind = "dockerfile"
+			c.Ports = ParseExposes(string(data))
+		}
+		out = append(out, c)
 		return nil
 	})
 	if err != nil {
@@ -88,6 +112,57 @@ func isDockerfile(name string) bool {
 	return name == "Dockerfile" ||
 		strings.HasPrefix(name, "Dockerfile.") ||
 		strings.HasSuffix(name, ".Dockerfile")
+}
+
+// isComposeFile 识别 compose 编排文件：compose.yml / compose.yaml /
+// docker-compose.yml / docker-compose.*.yml 等。compose 是「服务拓扑 +
+// 依赖 + 配置」的标准声明，有编排文件的项目优先走编排。
+func isComposeFile(name string) bool {
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".yml", ".yaml"} {
+		base := strings.TrimSuffix(lower, ext)
+		if base == "compose" || base == "docker-compose" ||
+			strings.HasPrefix(base, "docker-compose.") || strings.HasPrefix(base, "compose.") {
+			return true
+		}
+	}
+	return false
+}
+
+// envRefRe 匹配 compose 文件里的变量插值：${VAR}、${VAR:-默认}、
+// ${VAR:?必填提示} 及对应的 :- / :? 简写。$$ 转义（字面 $）不匹配。
+var envRefRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?([-?])([^}]*))?\}`)
+
+// ScanComposeEnv 静态扫描 compose 文件里的环境变量引用。
+// ${VAR} 与 ${VAR:?...} 无默认值 → 必填；${VAR:-x} → 可选并预填 x。
+// 按变量名去重，必填优先（同一变量同时以两种形态出现时宁可要求填）。
+func ScanComposeEnv(content string) []EnvVarSpec {
+	// $$ 是 compose 的字面美元符转义：先中和掉，$${VAR} 就不会被
+	// 误识为变量引用（RE2 没有 lookbehind，替换比正则技巧可靠）。
+	content = strings.ReplaceAll(content, "$$", "\x00")
+	byName := map[string]*EnvVarSpec{}
+	var order []string
+	for _, m := range envRefRe.FindAllStringSubmatch(content, -1) {
+		name, op, arg := m[1], m[2], m[3]
+		spec, ok := byName[name]
+		if !ok {
+			spec = &EnvVarSpec{Name: name}
+			byName[name] = spec
+			order = append(order, name)
+		}
+		if op == "-" { // :- 或 - ：有默认值
+			if !spec.Required || spec.Default == "" {
+				spec.Default = arg
+			}
+		} else { // :? 、 ? 或无操作符：无默认值 → 必填
+			spec.Required = true
+		}
+	}
+	out := make([]EnvVarSpec, 0, len(order))
+	for _, n := range order {
+		out = append(out, *byName[n])
+	}
+	return out
 }
 
 // readHead 读取文件前 limit 字节（Dockerfile 都是小文件，限额只是防御）。

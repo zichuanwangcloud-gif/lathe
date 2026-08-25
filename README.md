@@ -74,10 +74,13 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 
 ### 任务预览环境
 
-看板上有工作区的任务可以一键「预览」：扫描 worktree 里的 Dockerfile，
-人选要起哪几个，平台构建镜像、起容器并随机映射宿主机端口，手动验证完
-一键停止并清理。内存/磁盘占用率达到阈值时禁止启动（阈值在「系统设置」
-由管理员配置，默认 90%）。需要本机 docker 可用。详见 docs/02-design.md §10。
+看板上有工作区的任务可以一键「预览」：扫描 worktree 里的 Dockerfile 与
+compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附加基础设施
+（postgres/redis/mysql，连接串自动注入）；compose 编排直接 `up -d --build`
+（钉死的端口自动重置为随机，`${VAR:?}` 必填变量由人填写注入）。构建
+进度实时可见，手动验证完一键停止并清理（容器/网络/自建镜像）。内存/磁盘
+占用率达到阈值时禁止启动（阈值在「系统设置」由管理员配置，默认 90%）。
+需要本机 docker 与 docker compose 可用。详见 docs/02-design.md §10。
 
 `LATHE_ADMIN_TOKEN` 仍然可用，但已降级为**脚本与应急通道**：带
 `Authorization: Bearer <token>` 的请求会被当作内置管理员，供 curl 直接调接口；

@@ -17,18 +17,18 @@ import (
 // fakePreviews 记录调用并返回预设结果。
 type fakePreviews struct {
 	startErr error
-	started  []preview.Selection
+	started  preview.StartRequest
 	stopped  int
 }
 
 func (f *fakePreviews) CheckResources(ctx context.Context) (*preview.ResourceStatus, error) {
 	return &preview.ResourceStatus{MemUsedPct: 40, DiskUsedPct: 50, MemThreshold: 90, DiskThreshold: 90, DockerOK: true, Allowed: true}, nil
 }
-func (f *fakePreviews) Start(ctx context.Context, taskID int64, worktree string, sels []preview.Selection) error {
+func (f *fakePreviews) Start(ctx context.Context, taskID int64, worktree string, req preview.StartRequest) error {
 	if f.startErr != nil {
 		return f.startErr
 	}
-	f.started = sels
+	f.started = req
 	return nil
 }
 func (f *fakePreviews) Status(ctx context.Context, taskID int64) (*preview.Status, error) {
@@ -113,7 +113,7 @@ func TestPreviewCandidatesAndLifecycle(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("start 应 202，得到 %d: %v", resp.StatusCode, decode(t, resp))
 	}
-	if len(fp.started) != 1 || fp.started[0].Path != "Dockerfile" || fp.started[0].Ports[0] != 3000 {
+	if len(fp.started.Selections) != 1 || fp.started.Selections[0].Path != "Dockerfile" || fp.started.Selections[0].Ports[0] != 3000 {
 		t.Errorf("选择未透传: %+v", fp.started)
 	}
 
