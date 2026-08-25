@@ -72,6 +72,13 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 
 忘记密码需要先配好 SMTP。没配的话，管理员可以在用户管理页代为重置。
 
+### 任务预览环境
+
+看板上有工作区的任务可以一键「预览」：扫描 worktree 里的 Dockerfile，
+人选要起哪几个，平台构建镜像、起容器并随机映射宿主机端口，手动验证完
+一键停止并清理。内存/磁盘占用率达到阈值时禁止启动（阈值在「系统设置」
+由管理员配置，默认 90%）。需要本机 docker 可用。详见 docs/02-design.md §10。
+
 `LATHE_ADMIN_TOKEN` 仍然可用，但已降级为**脚本与应急通道**：带
 `Authorization: Bearer <token>` 的请求会被当作内置管理员，供 curl 直接调接口；
 同时它也是「SMTP 挂了且管理员把自己锁在门外」时唯一进得去的路。日常登录不用它。

@@ -83,6 +83,17 @@ export const api = {
     request(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ mode }) }),
   retryPlan: (id) => request(`/api/tasks/${id}/retry-plan`),
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
+
+  // 任务预览环境：worktree 里构建镜像、起容器给人手动点
+  previewCandidates: (id) => request(`/api/tasks/${id}/preview/candidates`),
+  previewStatus: (id) => request(`/api/tasks/${id}/preview`),
+  previewStart: (id, selections) =>
+    request(`/api/tasks/${id}/preview/start`, { method: 'POST', body: JSON.stringify({ selections }) }),
+  previewStop: (id) => request(`/api/tasks/${id}/preview/stop`, { method: 'POST' }),
+
+  adminSettings: () => request('/api/admin/settings'),
+  saveAdminSettings: (body) =>
+    request('/api/admin/settings', { method: 'PUT', body: JSON.stringify(body) }),
   updateRepo: (id, body) =>
     request(`/api/repos/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   createRepo: (body) =>

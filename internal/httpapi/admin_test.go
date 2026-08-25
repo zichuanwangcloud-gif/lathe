@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -199,5 +200,56 @@ func TestAdminSetRole(t *testing.T) {
 	resp, _ = f.req(t, "POST", replaceID("/api/admin/users/{id}/role", target.ID), `{"role":"nonsense"}`)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("非法角色应 400，得到 %d", resp.StatusCode)
+	}
+}
+
+// 系统设置：预览资源阈值的读写与校验（管理员限定；member 应被挡）。
+// 注意：测试库是共享的，阈值是全局单例 —— 读回断言用「保存→读回」
+// 闭环，不断言出厂默认值；测试结束恢复原值，不给别的用例留现场。
+func TestAdminSettingsThresholds(t *testing.T) {
+	f := newAccountFixture(t)
+	f.asAdmin(t)
+
+	// 记录原值，测试结束恢复
+	resp, body := f.req(t, "GET", "/api/admin/settings", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("读设置应 200，得到 %d", resp.StatusCode)
+	}
+	origMem := int(body["previewMemThreshold"].(float64))
+	origDisk := int(body["previewDiskThreshold"].(float64))
+	t.Cleanup(func() {
+		f.req(t, "PUT", "/api/admin/settings",
+			fmt.Sprintf(`{"previewMemThreshold":%d,"previewDiskThreshold":%d}`, origMem, origDisk))
+	})
+
+	// 保存合法值并读回
+	resp, _ = f.req(t, "PUT", "/api/admin/settings", `{"previewMemThreshold":85,"previewDiskThreshold":80}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("保存应 200，得到 %d", resp.StatusCode)
+	}
+	_, body = f.req(t, "GET", "/api/admin/settings", "")
+	if body["previewMemThreshold"] != float64(85) || body["previewDiskThreshold"] != float64(80) {
+		t.Errorf("保存后读回不符: %v", body)
+	}
+
+	// 越界值 → 400
+	resp, _ = f.req(t, "PUT", "/api/admin/settings", `{"previewMemThreshold":0,"previewDiskThreshold":80}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("阈值 0 应 400，得到 %d", resp.StatusCode)
+	}
+	resp, _ = f.req(t, "PUT", "/api/admin/settings", `{"previewMemThreshold":85,"previewDiskThreshold":101}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("阈值 101 应 400，得到 %d", resp.StatusCode)
+	}
+}
+
+func TestAdminSettingsRequireAdmin(t *testing.T) {
+	f := newAccountFixture(t)
+	f.mkUser(t, f.email(t, "member"), "member-password-1", store.RoleMember)
+	f.login(t, f.email(t, "member"), "member-password-1")
+
+	resp, _ := f.req(t, "GET", "/api/admin/settings", "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("member 读系统设置应 403，得到 %d", resp.StatusCode)
 	}
 }

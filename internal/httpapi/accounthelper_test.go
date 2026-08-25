@@ -73,7 +73,7 @@ func newAccountFixture(t *testing.T) *accountFixture {
 	}
 	acct.Routes(mux)
 
-	admin := &AdminAPI{Users: users, Sessions: sessions, Resets: st.NewResets(), Auth: a}
+	admin := &AdminAPI{Users: users, Sessions: sessions, Resets: st.NewResets(), Auth: a, Store: st}
 	admin.Routes(mux)
 
 	srv := httptest.NewServer(mux)

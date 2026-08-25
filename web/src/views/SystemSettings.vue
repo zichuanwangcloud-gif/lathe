@@ -23,6 +23,37 @@ const smtpPassword = ref('')
 const smtpTestTo = ref('')
 const smtpResult = ref(null)
 
+// 预览环境资源阈值：内存/磁盘占用率超过该百分比时禁止一键起服务，
+// 防止预览构建把任务执行挤爆。100 = 不启用该闸门。
+const thresholds = ref(null)
+const thresholdSaved = ref(false)
+
+async function loadThresholds() {
+  try {
+    thresholds.value = await api.adminSettings()
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    error.value = e.message
+  }
+}
+
+async function saveThresholds() {
+  busy.value = 'thresholds'
+  error.value = ''
+  thresholdSaved.value = false
+  try {
+    await api.saveAdminSettings({
+      previewMemThreshold: Number(thresholds.value.previewMemThreshold),
+      previewDiskThreshold: Number(thresholds.value.previewDiskThreshold),
+    })
+    thresholdSaved.value = true
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    busy.value = ''
+  }
+}
+
 async function load() {
   try {
     const cfg = await api.config()
@@ -104,6 +135,7 @@ async function removeSmtp() {
 onMounted(() => {
   load()
   loadSmtp()
+  loadThresholds()
 })
 </script>
 
@@ -202,6 +234,32 @@ onMounted(() => {
         >删除</button>
       </div>
     </form>
+  </div>
+
+  <div v-if="thresholds" class="card cred">
+    <div class="spread">
+      <div>
+        <h2>预览环境资源阈值</h2>
+        <p class="faint desc">
+          看板「预览」一键起服务前的资源闸门：内存或磁盘占用率达到阈值即禁止启动，
+          防止预览构建把任务执行挤爆。填 100 表示不启用该闸门。
+        </p>
+      </div>
+    </div>
+    <form class="fields" @submit.prevent="saveThresholds">
+      <label>
+        <span>内存占用阈值（%）</span>
+        <input type="number" min="1" max="100" v-model.number="thresholds.previewMemThreshold" required />
+      </label>
+      <label>
+        <span>磁盘占用阈值（%）</span>
+        <input type="number" min="1" max="100" v-model.number="thresholds.previewDiskThreshold" required />
+      </label>
+    </form>
+    <button class="primary" :disabled="busy === 'thresholds'" @click="saveThresholds">
+      {{ busy === 'thresholds' ? '保存中……' : '保存阈值' }}
+    </button>
+    <span v-if="thresholdSaved" class="faint" style="margin-left: 10px">已保存，即刻生效</span>
   </div>
 
   <div v-if="runtime" class="card">

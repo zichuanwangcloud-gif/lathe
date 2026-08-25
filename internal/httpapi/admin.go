@@ -1,7 +1,9 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -16,6 +18,8 @@ type AdminAPI struct {
 	Sessions SessionStore
 	Resets   *store.Resets
 	Auth     *Auth
+	// Store 读写系统设置（预览资源阈值等）；为 nil 时设置端点不可用。
+	Store *store.Store
 }
 
 // Routes 注册用户管理接口。
@@ -26,6 +30,52 @@ func (a *AdminAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/admin/users/{id}/role", a.Auth.RequireAdminFunc(a.setRole))
 	mux.Handle("POST /api/admin/users/{id}/password", a.Auth.RequireAdminFunc(a.resetPassword))
 	mux.Handle("DELETE /api/admin/users/{id}", a.Auth.RequireAdminFunc(a.remove))
+	mux.Handle("GET /api/admin/settings", a.Auth.RequireAdminFunc(a.getSettings))
+	mux.Handle("PUT /api/admin/settings", a.Auth.RequireAdminFunc(a.putSettings))
+}
+
+// getSettings 返回系统设置（当前只有预览资源阈值）。
+func (a *AdminAPI) getSettings(w http.ResponseWriter, r *http.Request) {
+	mem, disk, err := a.Store.PreviewThresholds(r.Context())
+	if err != nil {
+		serverError(w, "读取系统设置失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"previewMemThreshold":  mem,
+		"previewDiskThreshold": disk,
+	})
+}
+
+// putSettings 保存系统设置。阈值口径 1..100（100 = 不启用该闸门）。
+func (a *AdminAPI) putSettings(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PreviewMemThreshold  int `json:"previewMemThreshold"`
+		PreviewDiskThreshold int `json:"previewDiskThreshold"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBody)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
+		return
+	}
+	if err := store.ValidateThreshold(body.PreviewMemThreshold); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "内存" + err.Error()})
+		return
+	}
+	if err := store.ValidateThreshold(body.PreviewDiskThreshold); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "磁盘" + err.Error()})
+		return
+	}
+	ctx := r.Context()
+	if err := a.Store.SetSetting(ctx, store.SettingPreviewMemThreshold, strconv.Itoa(body.PreviewMemThreshold)); err != nil {
+		serverError(w, "保存内存阈值失败", err)
+		return
+	}
+	if err := a.Store.SetSetting(ctx, store.SettingPreviewDiskThreshold, strconv.Itoa(body.PreviewDiskThreshold)); err != nil {
+		serverError(w, "保存磁盘阈值失败", err)
+		return
+	}
+	slog.Info("系统设置已更新", "previewMem", body.PreviewMemThreshold, "previewDisk", body.PreviewDiskThreshold, "by", actorOf(r))
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (a *AdminAPI) list(w http.ResponseWriter, r *http.Request) {

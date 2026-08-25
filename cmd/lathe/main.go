@@ -24,6 +24,7 @@ import (
 	"github.com/Clouditera/lathe/internal/integration/agent"
 	"github.com/Clouditera/lathe/internal/integration/linear"
 	"github.com/Clouditera/lathe/internal/mail"
+	"github.com/Clouditera/lathe/internal/preview"
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/secret"
 	"github.com/Clouditera/lathe/internal/store"
@@ -217,8 +218,18 @@ func serve(cfg config.Config) error {
 		Sessions: sessions,
 		Resets:   st.NewResets(),
 		Auth:     auth,
+		Store:    st,
 	}
 	adminAPI.Routes(mux)
+
+	// 任务预览环境：在 worktree 里构建镜像、起容器给人手动验证。
+	// 阈值现取现用 —— 系统设置里改完即刻生效。
+	previewAPI := &httpapi.PreviewAPI{
+		Store:    st,
+		Auth:     auth,
+		Previews: preview.NewManager(cfg.WorkspaceRoot, st.PreviewThresholds),
+	}
+	previewAPI.Routes(mux)
 
 	credAPI := &httpapi.CredentialAPI{
 		Secrets:  secrets,

@@ -2,12 +2,14 @@
 import { ref, onMounted, onUnmounted, inject } from 'vue'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime } from '../api'
 import { hasLinearToken } from '../auth'
+import PreviewDialog from '../components/PreviewDialog.vue'
 
 const tasks = ref([])
 const stats = ref(null)
 const total = ref(0)
 const filter = ref('')
 const error = ref('')
+const previewTask = ref(null) // 打开预览弹窗的任务
 const onUnauthorized = inject('onUnauthorized')
 
 // 活跃状态：看板默认最关心这些
@@ -89,6 +91,7 @@ onUnmounted(() => clearInterval(timer))
           <th>类型</th>
           <th>分支</th>
           <th>PR</th>
+          <th>服务</th>
           <th>更新时间</th>
         </tr>
       </thead>
@@ -108,6 +111,11 @@ onUnmounted(() => clearInterval(timer))
             <a v-if="t.prUrl" :href="t.prUrl" target="_blank" rel="noopener">查看</a>
             <span v-else class="faint">—</span>
           </td>
+          <td>
+            <!-- 有 worktree 才能起预览；queued/triaging 还没建，merged 已回收 -->
+            <button v-if="t.worktreePath" @click="previewTask = t">预览</button>
+            <span v-else class="faint">—</span>
+          </td>
           <td class="dim">{{ formatTime(t.updatedAt) }}</td>
         </tr>
       </tbody>
@@ -124,6 +132,8 @@ onUnmounted(() => clearInterval(timer))
   </div>
 
   <p class="faint" style="margin-top: 12px">共 {{ total }} 条 · 每 5 秒自动刷新</p>
+
+  <PreviewDialog v-if="previewTask" :task="previewTask" @close="previewTask = null" />
 </template>
 
 <style scoped>
