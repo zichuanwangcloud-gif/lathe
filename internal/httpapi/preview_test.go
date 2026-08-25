@@ -16,9 +16,11 @@ import (
 
 // fakePreviews 记录调用并返回预设结果。
 type fakePreviews struct {
-	startErr error
-	started  preview.StartRequest
-	stopped  int
+	startErr     error
+	started      preview.StartRequest
+	stopped      int
+	recommendErr error
+	recOp        *preview.RecommendOp
 }
 
 func (f *fakePreviews) CheckResources(ctx context.Context) (*preview.ResourceStatus, error) {
@@ -37,6 +39,12 @@ func (f *fakePreviews) Status(ctx context.Context, taskID int64) (*preview.Statu
 func (f *fakePreviews) Stop(ctx context.Context, taskID int64) (int, int, error) {
 	f.stopped++
 	return 1, 1, nil
+}
+func (f *fakePreviews) Recommend(ctx context.Context, taskID int64, worktree, issueContext string) error {
+	return f.recommendErr
+}
+func (f *fakePreviews) RecommendStatus(taskID int64) *preview.RecommendOp {
+	return f.recOp
 }
 
 // previewFixture 建用户/仓库/任务（带真实 worktree 目录与 Dockerfile），
@@ -185,5 +193,52 @@ func TestPreviewCrossUserIs404(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("跨用户 %s 应 404，得到 %d", path, resp.StatusCode)
 		}
+	}
+}
+
+// AI 推荐端点：启动异步推荐、查询状态、未配置 agent 时 503。
+func TestPreviewRecommendEndpoints(t *testing.T) {
+	fp := &fakePreviews{recOp: &preview.RecommendOp{
+		State: "done",
+		Result: &preview.Recommendation{
+			Path: "Dockerfile", Kind: "dockerfile", Reason: "唯一候选",
+			Infra: []string{"postgres"},
+		},
+	}}
+	srv, _, _, _, taskID := previewFixture(t, fp)
+	base := "/api/tasks/" + itoa(taskID)
+
+	// 未登录 → 401
+	resp := do(t, srv, "POST", base+"/preview/recommend", "", false)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("未登录应 401，得到 %d", resp.StatusCode)
+	}
+
+	// 缓存命中（recOp 已 done）→ 200 带结果
+	resp = do(t, srv, "POST", base+"/preview/recommend", "", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("缓存命中应 200，得到 %d", resp.StatusCode)
+	}
+	body := decode(t, resp)
+	op, _ := body["op"].(map[string]any)
+	if res, _ := op["result"].(map[string]any); res["reason"] != "唯一候选" {
+		t.Errorf("应返回缓存的推荐结果: %v", body)
+	}
+
+	// 状态查询
+	resp = do(t, srv, "GET", base+"/preview/recommend", "", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态查询应 200，得到 %d", resp.StatusCode)
+	}
+	if op, _ := decode(t, resp)["op"].(map[string]any); op["state"] != "done" {
+		t.Errorf("状态查询应返回 done: %v", op)
+	}
+
+	// agent 未配置 → 503（同一假件翻错误位，避免二次 fixture 撞唯一键）
+	fp.recommendErr = preview.ErrRecommendUnavailable
+	fp.recOp = nil
+	resp = do(t, srv, "POST", base+"/preview/recommend", "", true)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("未配置 agent 应 503，得到 %d", resp.StatusCode)
 	}
 }

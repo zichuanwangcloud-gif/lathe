@@ -26,14 +26,26 @@ const picks = ref({})
 // 附加基础设施与额外 env（仅注入 Dockerfile 容器）
 const infra = ref([])
 const extraEnv = ref('')
+// AI 推荐：{ state, error, result }；showAll 控制是否展开全部候选
+const rec = ref(null)
+const showAll = ref(false)
+let recTimer = null
 
 let pollTimer = null
 
 const building = computed(() => op.value?.state === 'building')
+const recommending = computed(() => rec.value?.state === 'running')
 const selectedCount = computed(() => Object.values(picks.value).filter((p) => p.checked).length)
 const hasDockerfilePick = computed(() =>
   candidates.value.some((c) => c.kind !== 'compose' && picks.value[c.path]?.checked),
 )
+// 有推荐时默认只显示推荐项，其余折叠 —— 21 个候选平铺谁也看不过来
+const visibleCandidates = computed(() => {
+  if (!rec.value?.result || showAll.value) return candidates.value
+  const hit = candidates.value.filter((c) => c.path === rec.value.result.path)
+  return hit.length ? hit : candidates.value
+})
+const recEnvNames = computed(() => Object.keys(rec.value?.result?.env || {}).sort())
 
 // 构建完成（building true→false 且容器出现）给明确成功信号
 const justStarted = ref(false)
@@ -186,11 +198,68 @@ function pctTone(used, threshold) {
   return used >= threshold ? 'bad' : used >= threshold - 10 ? 'warn' : 'ok'
 }
 
+async function recommend() {
+  error.value = ''
+  try {
+    const resp = await api.previewRecommend(props.task.id)
+    if (resp.op) {
+      rec.value = resp.op // 缓存命中直接出结果
+      return
+    }
+    rec.value = { state: 'running' }
+    pollRecommend()
+  } catch (e) {
+    guard(e)
+  }
+}
+
+function pollRecommend() {
+  clearTimeout(recTimer)
+  recTimer = setTimeout(async () => {
+    try {
+      const { op: o } = await api.previewRecommendStatus(props.task.id)
+      rec.value = o
+      if (o?.state === 'running') pollRecommend()
+    } catch {
+      /* 网络抖动下轮再说 */
+      pollRecommend()
+    }
+  }, 2000)
+}
+
+// 采用推荐：勾选推荐候选、预填变量与基础设施，展开让人核对。
+function adoptRecommendation() {
+  const r = rec.value?.result
+  if (!r || !picks.value[r.path]) return
+  picks.value[r.path].checked = true
+  for (const [name, s] of Object.entries(r.env || {})) {
+    if (s.value && name in picks.value[r.path].env) {
+      picks.value[r.path].env[name] = s.value
+    }
+  }
+  if (r.kind !== 'compose' && r.infra?.length) infra.value = [...r.infra]
+  showAll.value = true
+}
+
+async function loadRecommend() {
+  try {
+    const { op: o } = await api.previewRecommendStatus(props.task.id)
+    rec.value = o
+    if (o?.state === 'running') pollRecommend()
+  } catch {
+    /* 推荐状态是增强信息，拿不到不挡主流程 */
+  }
+}
+
 onMounted(() => {
   loadCandidates()
   loadStatus()
+  loadRecommend()
 })
-onUnmounted(() => clearTimeout(pollTimer))
+onUnmounted(() => {
+  clearTimeout(pollTimer)
+  clearTimeout(recTimer)
+})
 </script>
 
 <template>
@@ -263,42 +332,73 @@ onUnmounted(() => clearTimeout(pollTimer))
 
       <!-- 候选：Dockerfile 单镜像 或 compose 编排（拓扑+依赖的标准声明） -->
       <div class="section">
-        <div class="label">选择要启动的服务（基于 worktree 里的 Dockerfile / compose 编排）</div>
+        <div class="row spread">
+          <div class="label">选择要启动的服务（基于 worktree 里的 Dockerfile / compose 编排）</div>
+          <button class="link" :disabled="recommending || building" @click="recommend">
+            {{ recommending ? 'AI 分析中……' : 'AI 推荐' }}
+          </button>
+        </div>
+
+        <!-- AI 推荐卡片：建议只是预填，启动前由人核对 -->
+        <div v-if="rec?.state === 'done' && rec.result" class="rec-card">
+          <div class="rec-head">
+            <span class="badge ok">{{ rec.result.kind === 'compose' ? '编排' : '镜像' }}</span>
+            <span class="mono">{{ rec.result.path }}</span>
+          </div>
+          <div class="dim">{{ rec.result.reason }}</div>
+          <div v-for="name in recEnvNames" :key="name" class="rec-env mono">
+            {{ name }}={{ rec.result.env[name].value || '（需人填）' }}
+            <span class="faint">← {{ rec.result.env[name].source || '无来源，请核对' }}</span>
+          </div>
+          <div v-if="rec.result.infra?.length" class="dim">附加基础设施：{{ rec.result.infra.join(', ') }}</div>
+          <div v-if="rec.result.notes" class="rec-notes">⚠ {{ rec.result.notes }}</div>
+          <button class="primary" :disabled="building" @click="adoptRecommendation">采用推荐（自动勾选并预填）</button>
+        </div>
+        <div v-else-if="rec?.state === 'failed'" class="error-banner small">
+          AI 推荐失败：{{ rec.error }}（仍可手工选择）
+        </div>
+
         <div v-if="loading" class="dim">扫描中……</div>
         <div v-else-if="!candidates.length" class="dim">
           worktree 里没找到 Dockerfile 或 compose 文件 —— 这个仓库可能不支持容器化运行。
         </div>
-        <div v-for="c in candidates" :key="c.path" class="cand-block">
-          <div class="row cand">
-            <input type="checkbox" v-model="picks[c.path].checked" :disabled="building" />
-            <span class="badge" :class="c.kind === 'compose' ? 'ok' : 'idle'">
-              {{ c.kind === 'compose' ? '编排' : '镜像' }}
-            </span>
-            <span class="mono name">{{ c.path }}</span>
-            <template v-if="c.kind !== 'compose'">
-              <input
-                class="ports-input mono"
-                v-model="picks[c.path].ports"
-                :disabled="building || !picks[c.path].checked"
-                placeholder="容器端口，逗号分隔"
-              />
-              <span v-if="!c.ports?.length" class="faint">未声明 EXPOSE，请手工填端口</span>
-            </template>
-            <span v-else class="faint">端口由编排声明，启动时重置为随机宿主端口</span>
-          </div>
-          <!-- compose 必填变量：连不连共享测试库这类决定由人拍板 -->
-          <div v-if="c.kind === 'compose' && picks[c.path].checked && c.env?.length" class="env-grid">
-            <div v-for="e in c.env" :key="e.name" class="env-row">
-              <label class="mono dim">{{ e.name }}<span v-if="e.required" class="req">*</span></label>
-              <input
-                class="mono"
-                v-model="picks[c.path].env[e.name]"
-                :placeholder="e.required ? '必填' : '可选'"
-                :disabled="building"
-              />
+        <template v-else>
+          <div v-for="c in visibleCandidates" :key="c.path" class="cand-block">
+            <div class="row cand" :class="{ recommended: rec?.result?.path === c.path }">
+              <input type="checkbox" v-model="picks[c.path].checked" :disabled="building" />
+              <span class="badge" :class="c.kind === 'compose' ? 'ok' : 'idle'">
+                {{ c.kind === 'compose' ? '编排' : '镜像' }}
+              </span>
+              <span class="mono name">{{ c.path }}</span>
+              <span v-if="rec?.result?.path === c.path" class="badge ok">推荐</span>
+              <template v-if="c.kind !== 'compose'">
+                <input
+                  class="ports-input mono"
+                  v-model="picks[c.path].ports"
+                  :disabled="building || !picks[c.path].checked"
+                  placeholder="容器端口，逗号分隔"
+                />
+                <span v-if="!c.ports?.length" class="faint">未声明 EXPOSE，请手工填端口</span>
+              </template>
+              <span v-else class="faint">端口由编排声明，启动时重置为随机宿主端口</span>
+            </div>
+            <!-- compose 必填变量：连不连共享测试库这类决定由人拍板 -->
+            <div v-if="c.kind === 'compose' && picks[c.path].checked && c.env?.length" class="env-grid">
+              <div v-for="e in c.env" :key="e.name" class="env-row">
+                <label class="mono dim">{{ e.name }}<span v-if="e.required" class="req">*</span></label>
+                <input
+                  class="mono"
+                  v-model="picks[c.path].env[e.name]"
+                  :placeholder="e.required ? '必填' : '可选'"
+                  :disabled="building"
+                />
+              </div>
             </div>
           </div>
-        </div>
+          <button v-if="rec?.result && candidates.length > 1" class="link faint" @click="showAll = !showAll">
+            {{ showAll ? '收起全部候选' : `展开全部候选（${candidates.length}）` }}
+          </button>
+        </template>
 
         <!-- 附加基础设施：仅注入 Dockerfile 容器（compose 的依赖自己声明） -->
         <template v-if="hasDockerfilePick">
@@ -388,6 +488,32 @@ h2 { font-size: 16px; margin: 0; }
   padding: 4px 8px;
 }
 .cand input[type='checkbox'] { margin: 0; }
+.cand.recommended {
+  border-left: 2px solid var(--ok);
+  padding-left: 8px;
+}
+.link {
+  border: none;
+  background: none;
+  color: var(--accent, #7af);
+  font-size: 12.5px;
+  padding: 0;
+  text-decoration: underline;
+}
+.link:disabled { color: var(--text-dim); text-decoration: none; }
+.rec-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--ok);
+  border-radius: var(--radius);
+  background: var(--ok-bg);
+  font-size: 12.5px;
+}
+.rec-head { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+.rec-env { font-size: 12px; word-break: break-all; }
+.rec-notes { color: var(--warn); }
 .cand-block { display: flex; flex-direction: column; gap: 6px; }
 .env-grid {
   margin-left: 26px;

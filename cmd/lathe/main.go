@@ -224,10 +224,36 @@ func serve(cfg config.Config) error {
 
 	// 任务预览环境：在 worktree 里构建镜像、起容器给人手动验证。
 	// 阈值现取现用 —— 系统设置里改完即刻生效。
+	previewMgr := preview.NewManager(cfg.WorkspaceRoot, st.PreviewThresholds)
+	// AI 推荐：只读 agent 分析仓库后建议「起哪个候选、变量填什么」。
+	// 与分诊同级走便宜通道；推荐只是预填，启动仍是人拍板。
+	previewMgr.SetRecommender(agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		cfg.TriageChannel, cfg.SettingSources)
 	previewAPI := &httpapi.PreviewAPI{
 		Store:    st,
 		Auth:     auth,
-		Previews: preview.NewManager(cfg.WorkspaceRoot, st.PreviewThresholds),
+		Previews: previewMgr,
+		IssueContextFor: func(ctx context.Context, userID, taskID int64) string {
+			detail, err := st.TaskDetail(ctx, taskID, userID)
+			if err != nil {
+				return ""
+			}
+			key := detail.Task.LinearIssueKey
+			lin, err := factory.ProviderFor(userID).Linear(ctx)
+			if err != nil {
+				return key // Linear 未配置：只用 key，推荐质量降级不挡路
+			}
+			// Linear 的 issue 查询同时接受 UUID 与 identifier
+			issue, err := lin.Issue(ctx, key)
+			if err != nil {
+				return key
+			}
+			desc := issue.Description
+			if len(desc) > 800 {
+				desc = desc[:800] + "……"
+			}
+			return fmt.Sprintf("%s %s\n%s", issue.Identifier, issue.Title, desc)
+		},
 	}
 	previewAPI.Routes(mux)
 

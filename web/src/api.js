@@ -102,6 +102,8 @@ export const api = {
   previewStart: (id, body) =>
     request(`/api/tasks/${id}/preview/start`, { method: 'POST', body: JSON.stringify(body) }),
   previewStop: (id) => request(`/api/tasks/${id}/preview/stop`, { method: 'POST' }),
+  previewRecommend: (id) => request(`/api/tasks/${id}/preview/recommend`, { method: 'POST' }),
+  previewRecommendStatus: (id) => request(`/api/tasks/${id}/preview/recommend`),
 
   adminSettings: () => request('/api/admin/settings'),
   saveAdminSettings: (body) =>

@@ -187,8 +187,14 @@ type Manager struct {
 	// stderr），返回输出尾部供错误展示。测试注入假件。
 	execStream func(ctx context.Context, name string, args []string, onLine func(string)) (string, error)
 
-	mu  sync.Mutex
-	ops map[int64]*Op
+	mu     sync.Mutex
+	ops    map[int64]*Op
+	recOps map[int64]*RecommendOp
+
+	// AI 推荐（SetRecommender 装配；nil 时推荐不可用，其余功能不受影响）
+	agent          AgentRunner
+	agentChannel   string
+	settingSources string
 }
 
 // NewManager 用真实 docker CLI 构造 Manager。
@@ -200,6 +206,7 @@ func NewManager(workspaceRoot string, thresholds func(context.Context) (int, int
 		exec:          realExec,
 		execStream:    realStreamExec,
 		ops:           map[int64]*Op{},
+		recOps:        map[int64]*RecommendOp{},
 	}
 }
 

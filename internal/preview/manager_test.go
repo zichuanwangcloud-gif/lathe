@@ -82,6 +82,7 @@ func newTestManager(t *testing.T, fd *fakeDocker, memTh, diskTh int) (*Manager, 
 		exec:          fd.run,
 		execStream:    fd.runStream,
 		ops:           map[int64]*Op{},
+		recOps:        map[int64]*RecommendOp{},
 	}
 	return m, wt
 }
