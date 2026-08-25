@@ -28,6 +28,12 @@ let pollTimer = null
 const building = computed(() => op.value?.state === 'building')
 const selectedCount = computed(() => Object.values(picks.value).filter((p) => p.checked).length)
 
+// 构建完成（building true→false 且容器出现）给明确成功信号
+const justStarted = ref(false)
+watch(building, (now, before) => {
+  if (before && !now && containers.value.length > 0) justStarted.value = true
+})
+
 // 构建日志自动滚到底部（除非人往上翻了）
 const logEl = ref(null)
 watch(
@@ -109,6 +115,7 @@ async function start() {
   if (!selections.length) return
   busy.value = true
   error.value = ''
+  justStarted.value = false
   try {
     await api.previewStart(props.task.id, selections)
     await loadStatus()
@@ -127,6 +134,7 @@ async function stop() {
   try {
     await api.previewStop(props.task.id)
     op.value = null
+    justStarted.value = false
     await loadStatus()
   } catch (e) {
     guard(e)
@@ -185,6 +193,11 @@ onUnmounted(() => clearTimeout(pollTimer))
         <div v-if="!resources.allowed" class="error-banner small" style="grid-column: 1 / -1">
           {{ resources.reason }} —— 已禁止启动新预览（阈值见「系统设置」）
         </div>
+      </div>
+
+      <!-- 构建成功提示：从「构建中」回到列表的变化太微妙，必须明说 -->
+      <div v-if="justStarted" class="success-banner">
+        ✓ 构建完成，服务已启动。点下方链接打开验证；用完记得「停止并清理」。
       </div>
 
       <!-- 运行中的容器 -->
@@ -304,6 +317,15 @@ h2 { font-size: 16px; margin: 0; }
 .cand input[type='checkbox'] { margin: 0; }
 button { align-self: flex-start; }
 .error-banner.small { font-size: 13px; }
+
+.success-banner {
+  padding: 10px 12px;
+  border: 1px solid var(--ok);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+  color: var(--ok);
+  font-size: 13px;
+}
 
 .buildlog {
   margin: 0;

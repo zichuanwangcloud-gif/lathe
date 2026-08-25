@@ -33,7 +33,7 @@ type PreviewAPI struct {
 // Routes 注册预览接口。
 func (a *PreviewAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}/preview/candidates", a.Auth.RequireFunc(a.candidates))
-	mux.Handle("GET /api/tasks/{id}/preview", a.Auth.RequireFunc(a.status))
+	mux.Handle("GET /api/tasks/{id}/preview/status", a.Auth.RequireFunc(a.status))
 	mux.Handle("POST /api/tasks/{id}/preview/start", a.Auth.RequireFunc(a.start))
 	mux.Handle("POST /api/tasks/{id}/preview/stop", a.Auth.RequireFunc(a.stop))
 }

@@ -118,7 +118,7 @@ func TestPreviewCandidatesAndLifecycle(t *testing.T) {
 	}
 
 	// 状态：容器列表
-	resp = do(t, srv, "GET", base+"/preview", "", true)
+	resp = do(t, srv, "GET", base+"/preview/status", "", true)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status 应 200，得到 %d", resp.StatusCode)
 	}
@@ -180,7 +180,7 @@ func TestPreviewCrossUserIs404(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	for _, path := range []string{"/preview", "/preview/candidates"} {
+	for _, path := range []string{"/preview/status", "/preview/candidates"} {
 		resp := do(t, srv, "GET", "/api/tasks/"+itoa(taskID)+path, "", true)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("跨用户 %s 应 404，得到 %d", path, resp.StatusCode)
