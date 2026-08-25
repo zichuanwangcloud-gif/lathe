@@ -28,6 +28,9 @@ const (
 	KindToolResult = "tool_result"
 	// KindResult 终局事件，携带成败、耗时、成本。
 	KindResult = "result"
+	// KindAgentStart subagent 被派活：body 是派给它的任务描述。
+	// 只由 transcript.go 产出（stdout 里没有 subagent 的内部事件）。
+	KindAgentStart = "agent_start"
 	// KindRaw 提炼不出结构时的兜底，保留截断后的原文。
 	KindRaw = "raw"
 )
@@ -37,9 +40,12 @@ const (
 // 刻意不保留原始 NDJSON：单行上限 16MB（见 maxLineBytes），原样入库既浪费
 // 空间也没人看得懂。Payload 只放界面真正会用到的结构化补充。
 type Entry struct {
-	Kind    string
-	Tool    string
-	Body    string
+	Kind string
+	Tool string
+	Body string
+	// AgentID 非空表示这条事件来自一个 subagent（值是 transcript 里的
+	// agentId）。空 = 主 agent。界面据此把 subagent 的步骤缩进成子组。
+	AgentID string
 	Payload map[string]any
 }
 

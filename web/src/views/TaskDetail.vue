@@ -104,6 +104,66 @@ const PHASE_META = {
   review: { label: '评审', order: 3 },
 }
 
+// 一次工具调用在事件流里是两条（tool_use 发起 + tool_result 结果）。平铺时
+// 两行各自漂着，只看得出「调过 Bash」，看不出这步花了多久、成没成 ——
+// 这是执行日志最难扫的根因。按 payload.toolUseId 把结果并进发起那条，
+// 顺带用两者的 at 之差算出耗时。
+//
+// 老事件的 tool_use 没有 id（该字段是后来才取的），配不上的一律原样放行，
+// 退回两行平铺 —— 降级而非崩溃，与后端 KindRaw 同一立场。
+function pairTools(list) {
+  const out = []
+  const pending = new Map() // toolUseId → 已放进 out 的发起项
+  for (const e of list) {
+    const id = e.payload?.toolUseId
+
+    if (e.kind === 'tool_use') {
+      const item = { ...e, result: null, durationMs: null }
+      if (id) pending.set(id, item)
+      out.push(item)
+      continue
+    }
+
+    if (e.kind === 'tool_result' && id && pending.has(id)) {
+      const item = pending.get(id)
+      pending.delete(id) // 同一 id 只认第一条结果
+      item.result = e
+      item.durationMs = toolDuration(item.at, e.at)
+      continue
+    }
+
+    out.push(e)
+  }
+  return out
+}
+
+// 耗时按两条事件的落库时间差算，但这个差值是粗粒度的：at 取自入库时的
+// now()，而 EventSink 是 200ms 批量刷库（eventsink.go 的 sinkFlushEvery），
+// 同一批里的发起与结果拿到的是同一个时间戳。也就是说误差约 ±200ms，
+// 快调用会算出 0ms。
+//
+// 因此只在 1s 以上才显示：那时相对误差已降到 20% 以内，数字才说得上话。
+// 更低的区间与其显示一个自信的错数，不如不显示 —— 「很快」这件事，
+// 从一行 ✓ 上已经看得出来了。要拿到真实的单次工具耗时，得在事件里记
+// 发生时刻而不是入库时刻（需要加列，见 docs/04 后续）。
+const TOOL_DURATION_FLOOR_MS = 1000
+
+function toolDuration(useAt, resultAt) {
+  const dt = new Date(resultAt) - new Date(useAt)
+  if (!Number.isFinite(dt) || dt < TOOL_DURATION_FLOOR_MS) return null
+  return dt
+}
+
+// 工具行的状态标记。返回 null 表示「无从判断」：老数据没有 toolUseId，
+// 此时不能显示 ⋯ —— 那会把历史任务里早已结束的调用说成还在跑。
+function toolMark(e) {
+  if (!e.payload?.toolUseId) return null
+  if (!e.result) return { glyph: '⋯', tone: 'run', title: '进行中或结果未落库' }
+  return e.result.payload?.isError
+    ? { glyph: '✗', tone: 'bad', title: '报错' }
+    : { glyph: '✓', tone: 'ok', title: '完成' }
+}
+
 const phaseGroups = computed(() => {
   const groups = new Map()
   for (const e of events.value) {
@@ -113,7 +173,7 @@ const phaseGroups = computed(() => {
   return [...groups.entries()]
     .map(([phase, list]) => ({
       phase,
-      list,
+      list: pairTools(list),
       meta: PHASE_META[phase] || { label: phase, order: 9 },
     }))
     .sort((a, b) => a.meta.order - b.meta.order)
@@ -335,10 +395,29 @@ onUnmounted(() => {
                 <pre>{{ e.body }}</pre>
               </details>
 
-              <!-- tool_use：工具名 + 参数摘要一行 -->
-              <div v-else-if="e.kind === 'tool_use'" class="mono tool-line">{{ e.body }}</div>
+              <!-- tool_use：工具名 + 参数摘要，结果缝在同一条上（✓/✗ + 耗时） -->
+              <div v-else-if="e.kind === 'tool_use'" class="tool-item">
+                <div class="mono tool-line">
+                  <span
+                    v-if="toolMark(e)"
+                    class="tool-mark"
+                    :class="'tm-' + toolMark(e).tone"
+                    :title="toolMark(e).title"
+                  >{{ toolMark(e).glyph }}</span>
+                  <span>{{ e.body }}</span>
+                  <span v-if="e.durationMs != null" class="tool-dur">
+                    {{ formatDuration(e.durationMs) }}
+                  </span>
+                </div>
+                <details v-if="e.result" class="ev-fold tool-out">
+                  <summary :class="e.result.payload?.isError ? 'bad-text' : 'faint'">
+                    {{ e.result.payload?.isError ? '报错输出' : '输出' }}
+                  </summary>
+                  <pre>{{ e.result.body }}</pre>
+                </details>
+              </div>
 
-              <!-- tool_result：默认折叠，报错标红 -->
+              <!-- tool_result：配不上发起方时才单独成行（老数据无 toolUseId） -->
               <details v-else-if="e.kind === 'tool_result'" class="ev-fold">
                 <summary :class="e.payload?.isError ? 'bad-text' : 'faint'">
                   工具结果{{ e.payload?.isError ? '（报错）' : '' }}
@@ -506,7 +585,30 @@ dd { margin: 0; overflow-wrap: anywhere; }
   font-size: 12.5px;
   color: var(--text-dim);
   overflow-wrap: anywhere;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
 }
+
+/* 状态标记定宽，让多行工具调用的文字左边对齐成一列，便于纵向扫读 */
+.tool-mark {
+  flex: none;
+  width: 11px;
+  text-align: center;
+  font-weight: 600;
+}
+.tm-ok { color: var(--ok); }
+.tm-bad { color: var(--bad); }
+.tm-run { color: var(--run); }
+
+.tool-dur {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.tool-out { margin: 4px 0 0 18px; }
 
 .result-box .badges { margin-bottom: 6px; }
 .bad-text { color: var(--bad); }

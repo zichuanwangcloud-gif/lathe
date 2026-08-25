@@ -172,6 +172,14 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 
 	ctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
+	// 报错用的实际上限：调用方可能带了更紧的 deadline（如预览推荐的
+	// 10 分钟），超时时报 45 分钟会误导排障
+	limit := d.timeout
+	if dl, ok := ctx.Deadline(); ok {
+		if remain := time.Until(dl); remain < limit {
+			limit = remain
+		}
+	}
 
 	args := d.buildArgs(p)
 
@@ -212,7 +220,7 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	killProcessGroup(pgid)
 
 	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
-		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", d.timeout)
+		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", limit.Round(time.Second))
 	} else if ctxErr != nil {
 		return result, fmt.Errorf("agent: 执行被取消: %w", ctxErr)
 	}

@@ -373,7 +373,7 @@ onUnmounted(() => {
         <div class="row spread">
           <div class="label">选择要启动的服务（基于 worktree 里的 Dockerfile / compose 编排）</div>
           <button class="link" :disabled="recommending || building" @click="recommend">
-            {{ recommending ? 'AI 分析中……' : 'AI 推荐' }}
+            {{ recommending ? 'AI 分析中（通常 1-3 分钟）……' : 'AI 推荐' }}
           </button>
         </div>
 

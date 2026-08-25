@@ -16,10 +16,11 @@ import (
 	"github.com/Clouditera/lathe/internal/integration/agent"
 )
 
-// recommendTimeout 是单次 AI 推荐的硬上限。推荐是只读的仓库分析，
-// 正常几十秒；给 3 分钟余量，超时杀掉（agent.Driver 自身超时是
-// 实现任务的 45 分钟口径，对推荐太宽）。
-const recommendTimeout = 3 * time.Minute
+// recommendTimeout 是单次 AI 推荐的硬上限。推荐要读部署文档 +
+// 大仓的 compose/Dockerfile，实测大仓首次分析超过 3 分钟被误杀 ——
+// 给 10 分钟。UI 轮询有状态展示，人等得起；agent.Driver 自身超时
+// 是实现任务的 45 分钟口径，对推荐太宽。
+const recommendTimeout = 10 * time.Minute
 
 // Recommendation 是 AI 对「这个任务该怎么跑预览」的建议。
 //
