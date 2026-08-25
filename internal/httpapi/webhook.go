@@ -30,7 +30,9 @@ type TaskEnqueuer interface {
 	// Requeue 重新派发一个已存在的任务（手动重试 / 启动恢复）。
 	// 与 Enqueue 的区别：不新建任务行 —— 同一 issue 的活任务唯一索引
 	// 会把新建挡掉，重试因此永远卡死（任务 #313 的教训）。
-	Requeue(ctx context.Context, taskID int64) error
+	// mode 是重试模式（auto/resume/fresh，见 runner.RetryMode），
+	// 空串按 auto（智能决策）处理。
+	Requeue(ctx context.Context, taskID int64, mode string) error
 }
 
 // WebhookTarget 是一个 slug 解析出的投递目标。

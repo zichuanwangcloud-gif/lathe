@@ -59,7 +59,9 @@ func TestLegalTransitions(t *testing.T) {
 		{StateReviewFeedback, StateMerged},
 		{StateImplementing, StateQueued}, // 租约到期重新派发
 		{StateVerifying, StateQueued},
-		{StateFailed, StateQueued}, // 人工重试
+		{StateFailed, StateQueued},       // 人工重试
+		{StateQueued, StateImplementing}, // 智能重试：断点续跑（跳过已完成的分诊）
+		{StateQueued, StateVerifying},    // 智能重试：续跑验证/推送（不绕过 verifying 本身）
 	}
 	for _, tc := range legal {
 		if !CanTransition(tc[0], tc[1]) {
@@ -73,8 +75,8 @@ func TestLegalTransitions(t *testing.T) {
 
 func TestIllegalTransitions(t *testing.T) {
 	illegal := [][2]State{
-		{StateQueued, StateImplementing},      // 必须先经分诊
-		{StateQueued, StateVerifying},         // 不能跳过实现
+		{StateQueued, StatePROpen},            // 不能跳过实现与验证直达 PR
+		{StateQueued, StateMerged},            // 不能跳过整个流水线
 		{StateImplementing, StatePROpen},      // 不能跳过验证 ★核心不变式
 		{StateTriaging, StatePROpen},          // 不能跳过实现与验证
 		{StateMerged, StateQueued},            // 终态不可复活
@@ -179,7 +181,7 @@ func TestErrIllegalTransitionMessages(t *testing.T) {
 		{State("bogus"), StateQueued, "源状态"},
 		{StateQueued, State("bogus"), "目标状态"},
 		{StateMerged, StateQueued, "终态"},
-		{StateQueued, StateVerifying, "不允许从"},
+		{StateQueued, StatePROpen, "不允许从"},
 	}
 	for _, tc := range cases {
 		err := Validate(tc.from, tc.to)

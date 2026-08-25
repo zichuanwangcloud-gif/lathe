@@ -30,11 +30,16 @@ import (
 
 // ErrNoReproTests 表示 diff 里识别不出可执行的复现测试。
 //
-// 这是 agent 没遵守输出契约（§5.3 要求随改动交复现/验收测试），属于
-// 任务失败（D4），与「复现测试在旧代码上通过了 ⇒ 单子没说清 ⇒
-// blocked_spec」是两种不同出口，流水线靠这个哨兵区分。
+// 两种可能：agent 没遵守输出契约（§5.3 要求随改动交复现/验收测试），
+// 或测试交了但启发式识别不出运行方式（monorepo 子包、非 go/vitest/jest
+// 框架 —— 任务 #596）。两者都是 agent 可就地修掉的契约违例：补测试，
+// 或提交 .lathe/repro.json 显式声明运行方式。流水线据此进修复回路，
+// 与「复现测试在旧代码上通过了 ⇒ 单子没说清 ⇒ blocked_spec」是两种
+// 不同出口，流水线靠这个哨兵区分。
 var ErrNoReproTests = errors.New(
-	"runner: diff 中没有新增或修改的测试文件 —— heavy 档要求随改动提交复现/验收测试（§5.3），没有它红-绿证明无从谈起")
+	"runner: diff 中没有可执行的复现测试文件 —— heavy 档要求随改动提交复现/验收测试（§5.3）。" +
+		"若测试文件已提交但流水线识别不出运行方式（monorepo 子包、非 go/vitest/jest 框架），" +
+		"请随改动提交 " + ReproManifestPath + " 显式声明（file/cmd/dir），流水线会原样执行声明的命令")
 
 // ReproTest 是从 diff 里识别出的一条复现/验收测试。
 //
@@ -225,6 +230,9 @@ type HeavyParams struct {
 	Light []Step
 	// Repro 是识别出的复现测试；为空时 heavy 无法给出红绿证明。
 	Repro []ReproTest
+	// ReproErr 是复现契约违例的原因（识别失败/声明不合法），在 Repro
+	// 为空时作为红阶段 error 的原因带出；为空则兜底 ErrNoReproTests。
+	ReproErr error
 	// Regression 是受影响范围的回归步骤。
 	Regression []Step
 }
@@ -253,10 +261,14 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 
 	// 2. 红阶段：复现测试在【改动前】代码上必须失败
 	if len(p.Repro) == 0 {
+		err := p.ReproErr
+		if err == nil {
+			err = ErrNoReproTests
+		}
 		rep.Results = append(rep.Results, StepResult{
 			Step:   Step{Name: StepReproFail},
 			Status: StatusError,
-			Err:    ErrNoReproTests,
+			Err:    err,
 		})
 		return rep
 	}

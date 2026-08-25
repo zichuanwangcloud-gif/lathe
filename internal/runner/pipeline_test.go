@@ -545,6 +545,114 @@ func TestPipelineHeavyNoReproTestIsFailure(t *testing.T) {
 	}
 }
 
+// 红阶段的执行环境错误（声明的命令起不来）既不是单子没说清、也不是
+// agent 改代码能修的：不进修复回路空烧轮次，不转 blocked_spec 骚扰
+// 提单人，直接失败留现场（任务 #596 的教训）。
+func TestPipelineHeavyReproEnvErrorFailsFast(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix"}`},
+			{Success: true, Text: "交了测试与声明，但声明的命令不存在"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestTrivial(t *testing.T) {}\n"), 0o644); err != nil {
+					return err
+				}
+				if err := os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc touched() {}\n"), 0o644); err != nil {
+					return err
+				}
+				// 声明合法（file 在 diff 里），但声明了一个不存在的二进制
+				if err := os.MkdirAll(filepath.Join(dir, ".lathe"), 0o755); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, ".lathe", "repro.json"),
+					[]byte(`{"version":1,"tests":[{"file":"main_test.go","cmd":["definitely-not-a-real-binary-lathe","run","main_test.go"]}]}`), 0o644)
+			},
+		},
+	}
+	no := &fakeNotifier{}
+	p := newPipeline(t, m, lin, gh, ag, no)
+	p.MaxFixAttempts = 2 // 即使开了修复回路，环境错误也不该进去空烧
+
+	err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+	})
+	if err == nil {
+		t.Fatal("环境错误应判为失败")
+	}
+
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StateFailed {
+		t.Errorf("状态 = %s，期望 failed（而非 blocked_spec）", final.State)
+	}
+	if final.FailureReason == nil || !strings.Contains(*final.FailureReason, "无法执行") {
+		t.Errorf("失败原因应指明复现测试无法执行: %v", final.FailureReason)
+	}
+	if len(ag.calls) != 2 {
+		t.Errorf("环境错误不应进修复回路，agent 调用 = %d，期望 2（分诊+实现）", len(ag.calls))
+	}
+	if len(gh.params) != 0 {
+		t.Error("不应开 PR")
+	}
+	if len(no.msgs) != 1 {
+		t.Errorf("应推送失败通知: %v", no.msgs)
+	}
+}
+
+// 契约违例（没交复现测试）是 agent 能自己修掉的：进修复回路，修复轮
+// 补上测试后红-绿-回归走完，正常开 PR —— 而不是直接判失败。
+func TestPipelineContractViolationFixLoopRecovers(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{Number: 44, URL: "https://github.com/acme/demo/pull/44"}}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"ok","question":""}`},
+			{Success: true, Text: "实现了但忘了交测试"},
+			{Success: true, Text: "补上复现测试"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error { // 实现对了，但没交测试 ⇒ ErrNoReproTests
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"hello\" }\n"), 0o644)
+			},
+			func(dir string) error { // 修复轮补上复现测试
+				return os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644)
+			},
+		},
+	}
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.MaxFixAttempts = 1
+
+	if err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+	}); err != nil {
+		t.Fatalf("契约违例修复后应正常开 PR: %v", err)
+	}
+
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StatePROpen {
+		t.Fatalf("终态 = %s，期望 pr_open（失败原因: %v）", final.State, final.FailureReason)
+	}
+	if len(ag.calls) != 3 {
+		t.Fatalf("agent 应被调用 3 次（分诊/实现/修复），实际 %d", len(ag.calls))
+	}
+	if !strings.Contains(ag.calls[2].Prompt, "repro_fail") {
+		t.Errorf("修复提示词应指出失败步骤是 repro_fail: %s", ag.calls[2].Prompt[:min(200, len(ag.calls[2].Prompt))])
+	}
+}
+
 // agent 跑完却没改任何东西，属于失败而非「空改动的成功」。
 // §5 修复回路：首轮验证失败 → resume 原实现会话就地修复 → 重新验证
 // 通过 → 正常开 PR。回路必须复用实现阶段的会话 ID（agent 还记得自己

@@ -9,9 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"unicode/utf8"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // gitTimeout 是单条 git 命令的上限。clone 大仓可能较慢，故给得宽松。
@@ -177,6 +177,18 @@ func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfi
 	return nil
 }
 
+// HasCommitsAhead 报告任务分支相对基线是否已有提交。
+//
+// 断点续跑的提交阶段用它区分「agent 没干活」（无提交无改动，失败）与
+// 「上次已提交过」（有提交无改动，直接进验证）。
+func (m *WorktreeManager) HasCommitsAhead(ctx context.Context, wt *Worktree) (bool, error) {
+	out, err := m.git(ctx, wt.Path, "rev-list", "--count", MirrorBaseRef(wt.BaseBranch)+"..HEAD")
+	if err != nil {
+		return false, fmt.Errorf("runner: 统计分支提交失败: %w", err)
+	}
+	return strings.TrimSpace(out) != "0", nil
+}
+
 // ChangedFiles 列出任务分支相对基线的改动文件（新增/修改，相对路径）。
 //
 // 删除的文件被排除：档位路由与复现测试识别都只关心"现在存在什么"，
@@ -327,6 +339,95 @@ func (m *WorktreeManager) Discard(ctx context.Context, providerRepo, path, branc
 			slog.Warn("删除残留分支失败（继续）", "branch", branch, "err", err)
 		}
 	}
+}
+
+// WorktreeState 是 Inspect 对一份任务现场的体检结果。
+//
+// 智能重试（retry.go）据此判断现场能否续跑：目录与分支都在才能谈
+// 「续」，否则只能丢弃重建。所有字段都是尽力探测 —— 目录不存在时
+// 后续字段保持零值，Inspect 不因此报错。
+type WorktreeState struct {
+	// Exists 表示工作区目录存在且是一个 git 工作树。
+	Exists bool
+	// Registered 表示 mirror 的 worktree 注册表里有这个路径
+	//（目录被手动删过但注册残留时为 false，需要 prune/重建）。
+	Registered bool
+	// BranchExists 表示任务分支仍在 mirror 的 refs/heads/ 下。
+	BranchExists bool
+	// HasCommits 表示任务分支相对基线已有提交（实现阶段出过成果）。
+	HasCommits bool
+	// Dirty 表示工作区有未提交改动（agent 中断的半成品，或人手工介入）。
+	Dirty bool
+	// RemoteBranch 表示远端似乎已有该分支（worktree 里存在
+	// refs/remotes/origin/<branch> 追踪引用，说明 push 成功过）。
+	RemoteBranch bool
+	// Commits 是相对基线的提交数（HasCommits 为真时 >0），展示用。
+	Commits int
+}
+
+// Usable 报告现场是否达到续跑的最低门槛：目录、注册、分支三者俱在。
+func (s *WorktreeState) Usable() bool {
+	return s != nil && s.Exists && s.Registered && s.BranchExists
+}
+
+// Inspect 体检一份任务现场。path/branch 来自任务行，可能已残缺不全；
+// 本函数永不返回错误 —— 探测失败只意味着对应字段为 false，决策层
+// （PlanRetry）会把「查不出来」当「不可用」处理，安全地降级为重建。
+func (m *WorktreeManager) Inspect(ctx context.Context, providerRepo, path, branch, base string) *WorktreeState {
+	st := &WorktreeState{}
+	mirror := m.MirrorPath(providerRepo)
+
+	if path == "" {
+		return st
+	}
+	if _, err := os.Stat(path); err != nil {
+		return st // 目录没了，其余无从谈起
+	}
+	if _, err := m.git(ctx, path, "rev-parse", "--git-dir"); err != nil {
+		return st // 目录在但已不是 git 工作树（被手动清过？）
+	}
+	st.Exists = true
+
+	if _, err := os.Stat(mirror); err == nil {
+		unlock := m.lockMirror(mirror)
+		out, err := m.git(ctx, mirror, "worktree", "list", "--porcelain")
+		unlock()
+		if err == nil {
+			for _, line := range strings.Split(out, "\n") {
+				p, ok := strings.CutPrefix(strings.TrimSpace(line), "worktree ")
+				if ok && filepath.Clean(p) == filepath.Clean(path) {
+					st.Registered = true
+					break
+				}
+			}
+		}
+		if branch != "" {
+			if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet",
+				"refs/heads/"+branch+"^{commit}"); err == nil {
+				st.BranchExists = true
+			}
+		}
+	}
+
+	// 以下探测都在工作区自身上进行，与 mirror 无关。
+	if out, err := m.git(ctx, path, "status", "--porcelain"); err == nil {
+		st.Dirty = strings.TrimSpace(out) != ""
+	}
+	if branch != "" && st.BranchExists {
+		baseRef := MirrorBaseRef(base)
+		if out, err := m.git(ctx, path, "rev-list", "--count", baseRef+".."+branch); err == nil {
+			var n int
+			if _, serr := fmt.Sscanf(strings.TrimSpace(out), "%d", &n); serr == nil {
+				st.Commits = n
+				st.HasCommits = n > 0
+			}
+		}
+		if _, err := m.git(ctx, path, "rev-parse", "--verify", "--quiet",
+			"refs/remotes/origin/"+branch+"^{commit}"); err == nil {
+			st.RemoteBranch = true
+		}
+	}
+	return st
 }
 
 // Prune 清理已消失目录的 worktree 注册记录。

@@ -50,7 +50,7 @@ func AllStates() []State {
 
 // transitions 是合法转移表：key 可转到 value 中的任一状态。
 //
-// 三条不显然但必要的边：
+// 四条不显然但必要的边：
 //
 //  1. triaging/implementing/verifying → queued —— 节点崩溃后租约到期，任务被
 //     重新派发（docs/02-design.md §6.4）；单机形态下即服务重启后的启动恢复。
@@ -59,8 +59,11 @@ func AllStates() []State {
 //     但允许人工重试）。
 //  3. review_feedback → implementing —— 二轮实现，调用方必须带上
 //     agent_session_id 走 --resume，见 RequiresSession。
+//  4. queued → implementing / verifying —— 智能重试的断点续跑：失败任务的
+//     现场（worktree/分支/提交）经检查有效时，从失败阶段续跑而非从头重跑，
+//     跳过已完成的分诊/实现阶段（runner.PlanRetry 决策）。
 var transitions = map[State][]State{
-	StateQueued:   {StateTriaging, StateCancelled},
+	StateQueued:   {StateTriaging, StateImplementing, StateVerifying, StateCancelled},
 	StateTriaging: {StateQueued, StateImplementing, StateAwaitingApproval, StateBlockedSpec, StateFailed, StateCancelled},
 
 	// 等人补充需求；补齐后重新入队

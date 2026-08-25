@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
 )
@@ -16,12 +18,22 @@ import (
 // maxJSONBody 限制请求体大小。
 const maxJSONBody = 1 << 20
 
+// SceneInspector 体检任务现场（智能重试预览）。
+// *runner.WorktreeManager 实现此接口；测试可注入假件。
+type SceneInspector interface {
+	Inspect(ctx context.Context, providerRepo, path, branch, base string) *runner.WorktreeState
+}
+
 // API 提供管理界面所需的读写接口。
 type API struct {
 	Store *store.Store
 	Tasks *task.Machine
 	Queue TaskEnqueuer
 	Auth  *Auth
+
+	// Scenes 体检失败任务的 worktree 现场，供重试预览（retry-plan）
+	// 与 resume 模式预检。为 nil 时预览退化为「无法体检」并保守决策。
+	Scenes SceneInspector
 
 	// ConfigStatus 返回凭据配置状态（不含 token 本身）。
 	ConfigStatus func() map[string]any
@@ -50,6 +62,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	// 写
 	mux.Handle("POST /api/tasks", a.Auth.RequireFunc(a.triggerTask))
 	mux.Handle("POST /api/tasks/{id}/retry", a.Auth.RequireFunc(a.retryTask))
+	mux.Handle("GET /api/tasks/{id}/retry-plan", a.Auth.RequireFunc(a.retryPlan))
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
 	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
@@ -198,9 +211,31 @@ func (a *API) triggerTask(w http.ResponseWriter, r *http.Request) {
 //
 // 走 failed→queued 这条合法边（见 internal/task/state.go），
 // 而不是绕过状态机直接改表。
+//
+// 请求体可带 {"mode": "auto"|"resume"|"fresh"}（空体按 auto）：
+//   - auto   智能决策：按失败阶段 + 现场体检决定断点续跑或丢弃重建；
+//   - resume 强制续跑：现场不可用时直接拒绝（409）—— 人明确说了要续，
+//     静默重建是违背意图；
+//   - fresh  强制丢弃现场从头重建。
+//
+// 最终决策在派发侧（queue）执行前还会重做一次（TOCTOU：预检到执行
+// 之间现场可能失效），决策理由落任务事件流。
 func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
+		return
+	}
+
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
+		return
+	}
+	mode := runner.RetryMode(strings.TrimSpace(body.Mode))
+	if !mode.Valid() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "mode 必须是 auto / resume / fresh"})
 		return
 	}
 
@@ -211,8 +246,20 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// resume 预检：现场不可续跑时拒绝入队，把决策理由摆给人看
+	if mode == runner.RetryResume {
+		plan, _ := a.previewRetry(r.Context(), tk)
+		if plan.Fresh || plan.Entry == runner.EntryTriage {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":   "现场已不可续跑（工作区或分支缺失），请改用从头重跑",
+				"reasons": plan.Reasons,
+			})
+			return
+		}
+	}
+
 	if _, err := a.Tasks.Transition(r.Context(), id, task.StateQueued, actorOf(r), &task.TransitionOpts{
-		Payload: map[string]any{"reason": "manual_retry"},
+		Payload: map[string]any{"reason": "manual_retry", "mode": string(mode)},
 	}); err != nil {
 		transitionError(w, err)
 		return
@@ -220,11 +267,91 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 
 	// 状态已回到 queued，重派【原任务行】（不新建 —— 新建会撞同一 issue
 	// 的活任务唯一索引，重试因此永远卡死；任务 #313 的教训）
-	if err := a.Queue.Requeue(r.Context(), id); err != nil {
+	if err := a.Queue.Requeue(r.Context(), id, string(mode)); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "queued", "taskId": id})
+}
+
+// retryPlan 预览智能重试的决策：体检现场 + 决策理由，不执行任何变更。
+//
+// UI 在失败任务详情页调它，把「重试将会怎么走」提前摆出来（如
+// 「从验证阶段续跑：分支已有 3 个提交」），让重试不再是黑盒。
+func (a *API) retryPlan(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return
+	}
+
+	plan, wt := a.previewRetry(r.Context(), tk)
+	resp := map[string]any{
+		"fresh":         plan.Fresh,
+		"entry":         string(plan.Entry),
+		"entryLabel":    plan.Entry.Label(),
+		"resumeSession": plan.ResumeSession,
+		"reasons":       plan.Reasons,
+	}
+	if wt != nil {
+		resp["worktree"] = map[string]any{
+			"exists":       wt.Exists,
+			"registered":   wt.Registered,
+			"branchExists": wt.BranchExists,
+			"hasCommits":   wt.HasCommits,
+			"commits":      wt.Commits,
+			"dirty":        wt.Dirty,
+			"remoteBranch": wt.RemoteBranch,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// previewRetry 凑齐决策输入并调用纯逻辑决策（runner.PlanRetry）。
+// 返回计划与现场体检结果（无现场记录时为 nil）。
+func (a *API) previewRetry(ctx context.Context, tk *task.Task) (runner.RetryPlan, *runner.WorktreeState) {
+	var wtState *runner.WorktreeState
+	path, branch := "", ""
+	if tk.WorktreePath != nil {
+		path = *tk.WorktreePath
+	}
+	if tk.BranchName != nil {
+		branch = *tk.BranchName
+	}
+
+	if a.Scenes != nil && path != "" {
+		// 仓库配置与派发侧同语义：属主名下第一条
+		repos, err := a.Store.ListRepos(ctx, tk.UserID)
+		if err == nil && len(repos) > 0 {
+			kind := runner.KindFix
+			if tk.TaskKind != nil && *tk.TaskKind != "" {
+				kind = runner.TaskKind(*tk.TaskKind)
+			}
+			base, berr := (runner.RepoConfig{
+				DefaultBranch: repos[0].DefaultBranch,
+				HotfixBase:    repos[0].HotfixBase,
+			}).BaseBranch(kind)
+			if berr != nil {
+				base = repos[0].DefaultBranch
+			}
+			wtState = a.Scenes.Inspect(ctx, repos[0].ProviderRepo, path, branch, base)
+		}
+	}
+
+	var stage runner.Stage
+	if tk.FailureStage != nil {
+		stage = runner.Stage(*tk.FailureStage)
+	}
+	plan := runner.PlanRetry(runner.RetryAuto, runner.RetryInput{
+		Stage:      stage,
+		HasSession: tk.AgentSessionID != nil && *tk.AgentSessionID != "",
+		WT:         wtState,
+	})
+	return plan, wtState
 }
 
 func (a *API) cancelTask(w http.ResponseWriter, r *http.Request) {

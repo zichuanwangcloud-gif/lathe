@@ -56,7 +56,7 @@ func (f *fakeEnqueuer) Enqueue(ctx context.Context, ownerUserID int64, issueID, 
 	return nil
 }
 
-func (f *fakeEnqueuer) Requeue(ctx context.Context, taskID int64) error {
+func (f *fakeEnqueuer) Requeue(ctx context.Context, taskID int64, mode string) error {
 	if f.err != nil {
 		return f.err
 	}

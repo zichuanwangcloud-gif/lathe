@@ -31,6 +31,15 @@ type job struct {
 	// 重试因此永远卡死（任务 #313 的教训）。OwnerID/IssueID/IssueKey
 	// 从任务行上取，此字段优先。
 	TaskID int64
+
+	// Mode 是重试模式（auto/resume/fresh，见 runner.RetryMode），
+	// 仅 TaskID 非零时有意义；空串按 auto 处理。
+	Mode string
+
+	// StageHint 是启动恢复场景下任务中断前的状态（triaging/
+	//  implementing/verifying）。崩溃的任务没走过 fail()，没有
+	// failure_stage，断点位置由它推导（runner.stageFromState）。
+	StageHint string
 }
 
 // queue 是任务执行队列。
@@ -68,9 +77,15 @@ func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKe
 }
 
 // Requeue 实现 httpapi.TaskEnqueuer：重派已存在的任务行（不新建）。
-func (q *queue) Requeue(ctx context.Context, taskID int64) error {
+// mode 是重试模式（auto/resume/fresh），空串按 auto 处理。
+func (q *queue) Requeue(ctx context.Context, taskID int64, mode string) error {
+	return q.enqueueJob(job{TaskID: taskID, Mode: mode})
+}
+
+// enqueueJob 把任务塞进队列；队列满时快速失败。
+func (q *queue) enqueueJob(j job) error {
 	select {
-	case q.ch <- job{TaskID: taskID}:
+	case q.ch <- j:
 		return nil
 	default:
 		return fmt.Errorf("执行队列已满（上限 %d），暂时无法重试", queueDepth)
@@ -94,7 +109,10 @@ func (q *queue) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("查询在途任务失败: %w", err)
 	}
-	var inflight []int64
+	var inflight []struct {
+		id    int64
+		state string
+	}
 	for rows.Next() {
 		var id int64
 		var state string
@@ -102,21 +120,26 @@ func (q *queue) Reconcile(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		inflight = append(inflight, id)
+		inflight = append(inflight, struct {
+			id    int64
+			state string
+		}{id, state})
 	}
 	rows.Close()
 
-	for _, id := range inflight {
-		if _, err := q.tasks.Transition(ctx, id, task.StateQueued, "system", &task.TransitionOpts{
-			Payload: map[string]any{"reason": "restart_reconcile"},
+	for _, it := range inflight {
+		// 把中断前的状态带进 job：崩溃任务没有 failure_stage，
+		// 智能重试靠它推导断点（崩在 verifying 的任务不该重跑 agent）。
+		if _, err := q.tasks.Transition(ctx, it.id, task.StateQueued, "system", &task.TransitionOpts{
+			Payload: map[string]any{"reason": "restart_reconcile", "interrupted_state": it.state},
 		}); err != nil {
-			slog.Error("在途任务恢复失败", "task", id, "err", err)
+			slog.Error("在途任务恢复失败", "task", it.id, "err", err)
 			continue
 		}
-		if err := q.Requeue(ctx, id); err != nil {
-			slog.Error("在途任务重新入队失败", "task", id, "err", err)
+		if err := q.enqueueJob(job{TaskID: it.id, Mode: string(runner.RetryAuto), StageHint: it.state}); err != nil {
+			slog.Error("在途任务重新入队失败", "task", it.id, "err", err)
 		}
-		slog.Info("在途任务已恢复", "task", id)
+		slog.Info("在途任务已恢复", "task", it.id, "interrupted_state", it.state)
 	}
 
 	rows2, err := q.store.Pool().Query(ctx, `SELECT id FROM tasks WHERE state = 'queued' ORDER BY id`)
@@ -134,7 +157,7 @@ func (q *queue) Reconcile(ctx context.Context) error {
 	}
 	rows2.Close()
 	for _, id := range queued {
-		if err := q.Requeue(ctx, id); err != nil {
+		if err := q.Requeue(ctx, id, string(runner.RetryAuto)); err != nil {
 			slog.Error("排队任务重新入队失败", "task", id, "err", err)
 		}
 	}
@@ -177,12 +200,20 @@ func (q *queue) work(ctx context.Context) {
 func (q *queue) runOne(ctx context.Context, j job) {
 	// 重派路径（TaskID 非零）：任务行已存在，从行上取属主与 issue。
 	// 新建路径：job 里带着 webhook/API 调用方给的属主与 issue。
+	var retried *task.Task
 	if j.TaskID > 0 {
 		tk, err := q.tasks.Get(ctx, j.TaskID)
 		if err != nil {
 			slog.Error("重派任务读取失败", "task", j.TaskID, "err", err)
 			return
 		}
+		// 状态守卫：入队后任务可能已被人工取消（queued→cancelled），
+		// 或已被另一路处理。不检查的话会靠状态机报错收场，留噪音。
+		if tk.State != task.StateQueued {
+			slog.Info("任务已不在排队状态，跳过本次派发", "task", j.TaskID, "state", tk.State)
+			return
+		}
+		retried = tk
 		j.OwnerID = tk.UserID
 		j.IssueKey = tk.LinearIssueKey
 		if tk.LinearIssueID != nil {
@@ -201,20 +232,8 @@ func (q *queue) runOne(ctx context.Context, j job) {
 	}
 
 	var taskID int64
+	var plan *runner.RetryPlan
 	if j.TaskID > 0 {
-		// 重派：丢弃旧现场（工作区 + 分支），否则 worktree add -b 会
-		// 撞同名残留直接失败。现场的使命是留给人接手（D4）；人选择
-		// 重试即表示交给机器重跑，旧现场作废。
-		tk, _ := q.tasks.Get(ctx, j.TaskID)
-		if tk != nil {
-			if tk.WorktreePath != nil && *tk.WorktreePath != "" {
-				branch := ""
-				if tk.BranchName != nil {
-					branch = *tk.BranchName
-				}
-				q.pipeline.Worktrees.Discard(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch)
-			}
-		}
 		if j.IssueID == "" || j.IssueID == j.IssueKey {
 			// 旧数据没有 Linear issue UUID（migration 0010 前），无法重跑。
 			// 取消而非失败：这不是任务本身的错，是数据不够。
@@ -226,6 +245,22 @@ func (q *queue) runOne(ctx context.Context, j job) {
 			}
 			return
 		}
+
+		// 智能重试：体检现场 → 决策续跑入口或丢弃重建（runner.PlanRetry）。
+		// 重建路径必须丢弃旧现场（工作区 + 分支），否则 worktree add -b
+		// 会撞同名残留直接失败。
+		p := q.planRetry(ctx, retried, repoCfg, j)
+		if p.Fresh {
+			if retried.WorktreePath != nil && *retried.WorktreePath != "" {
+				branch := ""
+				if retried.BranchName != nil {
+					branch = *retried.BranchName
+				}
+				q.pipeline.Worktrees.Discard(ctx, repoCfg.ProviderRepo, *retried.WorktreePath, branch)
+			}
+		}
+		plan = &p
+		slog.Info("重试决策", "task", j.TaskID, "plan", p.String(), "reasons", p.Reasons)
 		taskID = j.TaskID
 	} else {
 		tk, err := q.tasks.Create(ctx, task.CreateParams{
@@ -246,12 +281,69 @@ func (q *queue) runOne(ctx context.Context, j job) {
 		CloneURL: cloneURL,
 		IssueID:  j.IssueID,
 		Actor:    "node:" + q.cfg.NodeName,
+		Retry:    plan,
 	}); err != nil {
 		// 失败三件套已在 pipeline 内部完成，这里只记日志
 		slog.Error("任务处理失败", "issue", j.IssueKey, "task", taskID, "err", err)
 		return
 	}
 	slog.Info("任务处理完成", "issue", j.IssueKey, "task", taskID)
+}
+
+// planRetry 体检任务现场并产出重试计划（智能重试的派发侧入口）。
+//
+// 决策是纯逻辑（runner.PlanRetry），这里负责凑齐输入：worktree 体检、
+// 失败阶段、会话凭据、崩溃恢复的中断状态。
+func (q *queue) planRetry(ctx context.Context, tk *task.Task, repoCfg runner.RepoConfig, j job) runner.RetryPlan {
+	mode := runner.RetryMode(j.Mode)
+	if !mode.Valid() {
+		mode = runner.RetryAuto
+	}
+
+	path, branch := "", ""
+	if tk.WorktreePath != nil {
+		path = *tk.WorktreePath
+	}
+	if tk.BranchName != nil {
+		branch = *tk.BranchName
+	}
+
+	var wtState *runner.WorktreeState
+	if path != "" {
+		kind := runner.KindFix
+		if tk.TaskKind != nil && *tk.TaskKind != "" {
+			kind = runner.TaskKind(*tk.TaskKind)
+		}
+		base, err := repoCfg.BaseBranch(kind)
+		if err != nil {
+			base = repoCfg.DefaultBranch
+		}
+		wtState = q.pipeline.Worktrees.Inspect(ctx, repoCfg.ProviderRepo, path, branch, base)
+	}
+
+	var stage runner.Stage
+	if tk.FailureStage != nil {
+		stage = runner.Stage(*tk.FailureStage)
+	}
+
+	plan := runner.PlanRetry(mode, runner.RetryInput{
+		Stage:            stage,
+		InterruptedState: task.State(j.StageHint),
+		HasSession:       tk.AgentSessionID != nil && *tk.AgentSessionID != "",
+		WT:               wtState,
+	})
+
+	// 强制续跑（resume）但现场在 API 预检后的窗口里失效了：人明确说了
+	// 要续，静默重建违背意图；但任务已回到 queued，没有合法边能再判死。
+	// 降级为重建并把违背意图这件事写进决策理由，事件流里可见。
+	if !plan.Fresh && plan.Entry == runner.EntryTriage && mode == runner.RetryResume {
+		plan = runner.RetryPlan{
+			Fresh:   true,
+			Entry:   runner.EntryTriage,
+			Reasons: append(plan.Reasons, "现场在派发前失效，降级为从头重建"),
+		}
+	}
+	return plan
 }
 
 // resolveRepo 查出要操作的仓库：属主名下的第一条配置。

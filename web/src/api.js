@@ -79,7 +79,9 @@ export const api = {
   linearIssue: (id) => request(`/api/linear/issues/${encodeURIComponent(id)}`),
   startIssue: (issueId, issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueId, issueKey }) }),
-  retry: (id) => request(`/api/tasks/${id}/retry`, { method: 'POST' }),
+  retry: (id, mode = 'auto') =>
+    request(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ mode }) }),
+  retryPlan: (id) => request(`/api/tasks/${id}/retry-plan`),
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   updateRepo: (id, body) =>
     request(`/api/repos/${id}`, { method: 'PUT', body: JSON.stringify(body) }),

@@ -12,6 +12,7 @@ const onUnauthorized = inject('onUnauthorized')
 const detail = ref(null)
 const error = ref('')
 const acting = ref(false)
+const retryPlan = ref(null)
 let timer = null
 
 const task = computed(() => detail.value?.task)
@@ -19,10 +20,28 @@ const isTerminal = computed(() =>
   ['merged', 'failed', 'cancelled'].includes(task.value?.state)
 )
 
+// 智能重试的按钮文案：预览决策直接写在按钮上，重试不是黑盒
+const retryCta = computed(() => {
+  const p = retryPlan.value
+  if (!p) return '重试'
+  if (p.fresh) return '重试 · 从头重跑'
+  return `重试 · 从「${p.entryLabel}」续跑`
+})
+
 async function load() {
   try {
     detail.value = await api.task(props.id)
     error.value = ''
+    // 失败任务拉取重试预览：体检现场 + 决策理由
+    if (detail.value.task.state === 'failed') {
+      try {
+        retryPlan.value = await api.retryPlan(props.id)
+      } catch {
+        retryPlan.value = null // 预览失败不挡着重试本身
+      }
+    } else {
+      retryPlan.value = null
+    }
   } catch (e) {
     if (e instanceof UnauthorizedError) return onUnauthorized()
     error.value = e.message
@@ -184,12 +203,19 @@ onUnmounted(() => {
       </div>
       <div class="wrap">
         <button @click="router.push('/')">返回</button>
-        <button
-          v-if="task.state === 'failed'"
-          class="primary"
-          :disabled="acting"
-          @click="act(api.retry)"
-        >重试</button>
+        <template v-if="task.state === 'failed'">
+          <button
+            class="primary"
+            :disabled="acting"
+            :title="retryPlan ? retryPlan.reasons.join('\n') : ''"
+            @click="act((id) => api.retry(id, 'auto'))"
+          >{{ retryCta }}</button>
+          <button
+            v-if="retryPlan && !retryPlan.fresh"
+            :disabled="acting"
+            @click="act((id) => api.retry(id, 'fresh'), '确认丢弃现有工作区与分支，从分诊从头重跑？')"
+          >从头重跑</button>
+        </template>
         <button
           v-if="!isTerminal"
           class="danger"
@@ -206,6 +232,23 @@ onUnmounted(() => {
         现场已保留，可直接进去接手：
         <code class="mono">cd {{ task.worktreePath }}</code>
       </p>
+      <div v-if="retryPlan" class="retry-plan">
+        <div class="label">重试计划（智能决策）</div>
+        <p>
+          <template v-if="retryPlan.fresh">丢弃旧现场，从分诊从头重跑。</template>
+          <template v-else>
+            从「{{ retryPlan.entryLabel }}」阶段续跑{{ retryPlan.resumeSession ? '，resume 原 agent 会话' : '' }}。
+          </template>
+        </p>
+        <ul class="reasons">
+          <li v-for="(r, i) in retryPlan.reasons" :key="i">{{ r }}</li>
+        </ul>
+        <p v-if="retryPlan.worktree && retryPlan.worktree.exists" class="dim">
+          现场：分支 {{ retryPlan.worktree.commits }} 个提交
+          <template v-if="retryPlan.worktree.dirty">，有未提交改动</template>
+          <template v-if="retryPlan.worktree.remoteBranch">，远端已有分支</template>
+        </p>
+      </div>
     </div>
 
     <!-- 交付摘要卡（docs/04 §3.5）：实现阶段终局自述 + 成本/耗时徽章 -->
@@ -377,6 +420,16 @@ h1 { margin: 0; font-size: 22px; }
 
 .fail-card { border-color: var(--bad); margin-bottom: 16px; }
 .tip { margin: 10px 0 0; font-size: 13px; }
+
+.retry-plan {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border, #444);
+  font-size: 13px;
+}
+.retry-plan p { margin: 6px 0; }
+.retry-plan .reasons { margin: 6px 0; padding-left: 18px; color: var(--text-dim); }
+.retry-plan .reasons li { margin: 2px 0; }
 
 .summary-card { margin-bottom: 16px; }
 .badges { gap: 8px; flex-wrap: wrap; }

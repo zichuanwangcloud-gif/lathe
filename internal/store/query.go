@@ -18,15 +18,18 @@ var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
-	ID             int64      `json:"id"`
-	UserID         int64      `json:"userId"`
-	LinearIssueKey string     `json:"linearIssueKey"`
-	State          string     `json:"state"`
-	TaskKind       *string    `json:"taskKind"`
-	VerifyTier     *string    `json:"verifyTier"`
-	BranchName     *string    `json:"branchName"`
-	PRURL          *string    `json:"prUrl"`
-	FailureReason  *string    `json:"failureReason"`
+	ID             int64   `json:"id"`
+	UserID         int64   `json:"userId"`
+	LinearIssueKey string  `json:"linearIssueKey"`
+	State          string  `json:"state"`
+	TaskKind       *string `json:"taskKind"`
+	VerifyTier     *string `json:"verifyTier"`
+	BranchName     *string `json:"branchName"`
+	PRURL          *string `json:"prUrl"`
+	FailureReason  *string `json:"failureReason"`
+	// FailureStage 是机器可读的失败阶段代码（智能重试的决策依据），
+	// 仅 state=failed 时有意义。
+	FailureStage   *string    `json:"failureStage"`
 	WorktreePath   *string    `json:"worktreePath"`
 	ProviderRepo   string     `json:"providerRepo"`
 	CreatedAt      time.Time  `json:"createdAt"`
@@ -77,7 +80,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 
 	rows, err := s.pool.Query(ctx, `
 		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
-		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
+		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
 		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
@@ -96,7 +99,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 		var t TaskRow
 		if err := rows.Scan(
 			&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
-			&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
+			&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
 			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 			&t.AgentSessionID, &t.LeaseExpiresAt,
 			&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
@@ -144,7 +147,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 	var t TaskRow
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
-		       t.branch_name, t.pr_url, t.failure_reason, t.worktree_path,
+		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
 		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
@@ -152,7 +155,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		WHERE t.id = $1 AND t.user_id = $2`, id, userID,
 	).Scan(
 		&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
-		&t.BranchName, &t.PRURL, &t.FailureReason, &t.WorktreePath,
+		&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
 		&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,
 		&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,

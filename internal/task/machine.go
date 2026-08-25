@@ -30,6 +30,9 @@ type Task struct {
 	BranchName     *string
 	PRURL          *string
 	FailureReason  *string
+	// FailureStage 是机器可读的失败阶段代码（runner 包定义），
+	// 智能重试的断点续跑决策依据。仅 state=failed 时有意义。
+	FailureStage   *string
 	NodeID         *int64
 	LeaseExpiresAt *time.Time
 	CreatedAt      time.Time
@@ -57,7 +60,7 @@ var ErrSessionRequired = errors.New("task: 该转移要求已持有 agent_sessio
 const taskColumns = `
 	id, user_id, repo_id, linear_issue_key, linear_issue_id, state, gate_mode,
 	task_kind, verify_tier, agent_session_id, worktree_path,
-	branch_name, pr_url, failure_reason, node_id, lease_expires_at,
+	branch_name, pr_url, failure_reason, failure_stage, node_id, lease_expires_at,
 	created_at, updated_at`
 
 // CreateParams 是建任务所需的最小输入。
@@ -66,9 +69,9 @@ type CreateParams struct {
 	RepoID         int64
 	LinearIssueKey string
 	// LinearIssueID 是 issue 的 UUID；为空时存 NULL（兼容旧调用方）。
-	LinearIssueID  string
-	GateMode       string
-	TaskKind       *string
+	LinearIssueID string
+	GateMode      string
+	TaskKind      *string
 }
 
 // Create 新建任务（初始状态 queued）并记录创建事件。
@@ -133,6 +136,8 @@ type TransitionOpts struct {
 	VerifyTier     *string
 	TaskKind       *string
 	FailureReason  *string
+	// FailureStage 随失败转移写入（runner 包的阶段代码）。
+	FailureStage   *string
 	NodeID         *int64
 	LeaseExpiresAt *time.Time
 	Payload        map[string]any
@@ -190,13 +195,15 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 			verify_tier       = COALESCE($7,  verify_tier),
 			task_kind         = COALESCE($8,  task_kind),
 			failure_reason    = COALESCE($9,  failure_reason),
-			node_id           = COALESCE($10, node_id),
-			lease_expires_at  = COALESCE($11, lease_expires_at)
+			failure_stage     = COALESCE($10, failure_stage),
+			node_id           = COALESCE($11, node_id),
+			lease_expires_at  = COALESCE($12, lease_expires_at)
 		WHERE id = $1
 		RETURNING `+taskColumns,
 		id, to,
 		opts.AgentSessionID, opts.WorktreePath, opts.BranchName, opts.PRURL,
-		opts.VerifyTier, opts.TaskKind, opts.FailureReason, opts.NodeID, opts.LeaseExpiresAt,
+		opts.VerifyTier, opts.TaskKind, opts.FailureReason, opts.FailureStage,
+		opts.NodeID, opts.LeaseExpiresAt,
 	))
 	if err != nil {
 		return nil, fmt.Errorf("task: 更新任务 %d 失败: %w", id, err)
@@ -211,6 +218,22 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 		return nil, fmt.Errorf("task: 提交转移失败: %w", err)
 	}
 	return updated, nil
+}
+
+// SetSessionID 在不改变状态的情况下替换任务的 agent 会话 ID。
+//
+// 为什么不是转移：断点续跑的降级路径（resume 失败换新会话）与修复回路
+// 开新会话都发生在状态不变的中途 —— 这是会话凭据的记账，不是状态变化。
+// 崩溃恢复与再次重试都靠这个值 --resume，必须即写即持久。
+func (m *Machine) SetSessionID(ctx context.Context, id int64, sessionID string) error {
+	tag, err := m.pool.Exec(ctx, `UPDATE tasks SET agent_session_id = $2 WHERE id = $1`, id, sessionID)
+	if err != nil {
+		return fmt.Errorf("task: 更新会话 ID 失败: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrTaskNotFound
+	}
+	return nil
 }
 
 // Event 是 task_events 表的一行。
@@ -323,7 +346,7 @@ func scanTask(row pgx.Row) (*Task, error) {
 	err := row.Scan(
 		&t.ID, &t.UserID, &t.RepoID, &t.LinearIssueKey, &t.LinearIssueID, &state, &t.GateMode,
 		&t.TaskKind, &t.VerifyTier, &t.AgentSessionID, &t.WorktreePath,
-		&t.BranchName, &t.PRURL, &t.FailureReason, &t.NodeID, &t.LeaseExpiresAt,
+		&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.NodeID, &t.LeaseExpiresAt,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {

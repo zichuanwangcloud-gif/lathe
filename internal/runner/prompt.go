@@ -76,6 +76,11 @@ func ImplementPrompt(issueContext string, kind TaskKind, branch string) string {
 - 遵守仓库既有的代码风格与架构约定（如有 CLAUDE.md 请先读）
 - 改动尽量小而集中，只解决这个 issue
 - **不要执行 git commit、git push，也不要开 PR** —— 这些由流水线负责
+- 流水线会自动识别你提交的测试并做红-绿验证（改动前必须失败、改动后必须通过）。
+  若仓库是 monorepo 子包布局、或测试框架不在仓库根的 package.json / go.mod 体系里，
+  自动识别可能够不着 —— 此时必须随改动提交 .lathe/repro.json 显式声明运行方式，
+  流水线会原样执行声明的命令：
+  {"version":1,"tests":[{"file":"测试文件路径（必须在本次改动里）","cmd":["命令","参数..."],"dir":"工作目录（相对仓库根，可空）"}]}
 - 完成后输出交付摘要，固定为以下四个小节（会直接展示在任务详情页）：
 
 ## 改了什么
@@ -119,6 +124,52 @@ func FixPrompt(attempt, maxAttempts int, f *StepResult, summary string) string {
 - 完成后输出：修复了什么、为什么之前没考虑到`,
 		attempt, maxAttempts, f.Step.Name, strings.Join(f.Step.Cmd, " "), loc,
 		truncate(output, 3000), truncate(summary, 1500))
+}
+
+// ContinueImplementPrompt 生成断点续跑的实现 prompt（resume 原会话）。
+//
+// agent 还记得自己的实现思路与已读过的代码，prompt 只需交代「你被中断
+// 了，看看现场继续干」，不必重复整份需求 —— 省一整轮上下文正是续跑
+// 的意义。测试要求必须重申：中断可能正发生在写测试之前。
+func ContinueImplementPrompt() string {
+	return `你的上一次执行被中断了（进程崩溃或超时）。工作区里可能留有半成品改动。
+
+请先运行 git status 与 git diff --stat 了解现状，然后继续完成这个 issue 的实现。
+
+要求重申：
+- 必须交出能复现问题/验证需求的测试（Go 写在 *_test.go，前端写在 *.test.* / *.spec.*），
+  它在改动前的代码上应失败、改动后必须通过
+- 不要执行 git commit、git push —— 流水线负责
+- 完成后输出交付摘要四小节：## 改了什么 / ## 为什么这样改 / ## 涉及的关键文件 / ## 自验证证据`
+}
+
+// ResumeFixPrompt 生成「验证未通过后人工重试」的修复 prompt（resume 原会话）。
+//
+// 与 FixPrompt 的区别：FixPrompt 携带当次验证的结构化失败步骤；这里是
+// 跨进程重试，手头只有落库的失败原因文本。agent 记得自己的实现，失败
+// 原因足以让它重新定位；它也可以自己重跑验证命令看现状。
+func ResumeFixPrompt(failureReason string) string {
+	return fmt.Sprintf(`这个任务的上一轮实现没有通过验证，失败原因：
+
+%s
+
+请修复实现让验证通过。要求：
+- 先自己重跑失败的验证命令确认现状（可能已被人工修过一部分），再动手
+- 改动保持最小，只解决验证失败；不要删测试、放宽断言来凑绿
+- 如果失败原因与本次改动无关（仓库既有问题、环境抖动），明确说出来
+- 不要执行 git commit、git push —— 流水线负责
+- 完成后输出：修复了什么、为什么之前没通过`, truncate(failureReason, 3000))
+}
+
+// ReentryImplementPrompt 生成「会话凭据丢失、在原工作区开新会话」的 prompt。
+//
+// 新会话没有任何记忆，必须给全量需求；但工作区里可能有上次中断留下的
+// 半成品，推倒重来会浪费已有的正确部分，故前置现状说明。
+func ReentryImplementPrompt(issueContext string, kind TaskKind, branch string) string {
+	return `【续跑场景】这个工作区里可能留有上一次执行中断前的半成品改动（git status / git log 先看清现状）。
+在已有成果的基础上继续完成，不要推倒重来；已有改动是错的才改。
+
+` + ImplementPrompt(issueContext, kind, branch)
 }
 
 // ReviewPrompt 生成 review 二轮的 prompt。

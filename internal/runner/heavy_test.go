@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -195,6 +196,17 @@ func TestRunHeavy_GatesAndOrdering(t *testing.T) {
 	red := rep.Results[len(rep.Results)-1]
 	if red.Step.Name != StepReproFail || red.Status != StatusError || !errors.Is(red.Err, ErrNoReproTests) {
 		t.Errorf("无复现测试应以 ErrNoReproTests 收尾: %+v", red)
+	}
+
+	// 契约违例的原因（如声明不合法）应原样带出，不被兜底成 ErrNoReproTests
+	rep = v.RunHeavy(context.Background(), HeavyParams{
+		TaskPath: dir, BasePath: dir,
+		Light:    []Step{{Name: StepBuild, Cmd: []string{"true"}}},
+		ReproErr: fmt.Errorf("%w: tests 为空", ErrReproManifest),
+	})
+	red = rep.Results[len(rep.Results)-1]
+	if red.Step.Name != StepReproFail || red.Status != StatusError || !errors.Is(red.Err, ErrReproManifest) {
+		t.Errorf("ReproErr 应作为红阶段 error 原因带出: %+v", red)
 	}
 }
 
