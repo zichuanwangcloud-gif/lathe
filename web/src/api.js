@@ -25,7 +25,19 @@ async function request(path, options = {}) {
   if (resp.status === 401) throw new UnauthorizedError()
 
   const text = await resp.text()
-  const data = text ? JSON.parse(text) : {}
+  // 响应不一定是 JSON（路由未注册时 mux 返回纯文本 "404 page not found"，
+  // 反代故障时可能是 HTML 错误页）。盲目 JSON.parse 会把「接口 404」
+  // 变成一串看不懂的解析报错 —— 先判形态再解析。
+  let data = {}
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      const err = new Error(`请求失败（HTTP ${resp.status}）：${text.slice(0, 120)}`)
+      err.status = resp.status
+      throw err
+    }
+  }
 
   if (resp.status === 409 && data.mustChangePassword) onPasswordChangeRequired()
 
@@ -86,7 +98,7 @@ export const api = {
 
   // 任务预览环境：worktree 里构建镜像、起容器给人手动点
   previewCandidates: (id) => request(`/api/tasks/${id}/preview/candidates`),
-  previewStatus: (id) => request(`/api/tasks/${id}/preview`),
+  previewStatus: (id) => request(`/api/tasks/${id}/preview/status`),
   previewStart: (id, selections) =>
     request(`/api/tasks/${id}/preview/start`, { method: 'POST', body: JSON.stringify({ selections }) }),
   previewStop: (id) => request(`/api/tasks/${id}/preview/stop`, { method: 'POST' }),
