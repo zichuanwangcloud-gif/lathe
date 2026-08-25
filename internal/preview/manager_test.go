@@ -18,6 +18,8 @@ type fakeDocker struct {
 	calls [][]string
 	// 按首参数（子命令）定制输出；未匹配的返回空成功。
 	outputs map[string]fakeResult
+	// stream 自定义构建行为；nil 时默认喂两行进度并返回成功。
+	stream func(ctx context.Context, args []string, onLine func(string)) (string, error)
 }
 
 type fakeResult struct {
@@ -34,6 +36,18 @@ func (f *fakeDocker) run(ctx context.Context, name string, args ...string) (stri
 		return r.stdout, r.stderr, r.err
 	}
 	return "", "", nil
+}
+
+func (f *fakeDocker) runStream(ctx context.Context, name string, args []string, onLine func(string)) (string, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, append([]string{name}, args...))
+	f.mu.Unlock()
+	if f.stream != nil {
+		return f.stream(ctx, args, onLine)
+	}
+	onLine("#1 [internal] load build definition")
+	onLine("#5 [5/5] RUN make")
+	return "#5 [5/5] RUN make\n", nil
 }
 
 func (f *fakeDocker) has(sub ...string) bool {
@@ -66,6 +80,7 @@ func newTestManager(t *testing.T, fd *fakeDocker, memTh, diskTh int) (*Manager, 
 		WorkspaceRoot: wt,
 		Thresholds:    func(context.Context) (int, int, error) { return memTh, diskTh, nil },
 		exec:          fd.run,
+		execStream:    fd.runStream,
 		ops:           map[int64]*Op{},
 	}
 	return m, wt
@@ -151,9 +166,11 @@ func TestStartBuildsAndRuns(t *testing.T) {
 }
 
 func TestStartBuildFailureKeepsOp(t *testing.T) {
-	fd := &fakeDocker{outputs: map[string]fakeResult{
-		"build": {stderr: "step 3/7 failed: npm ci error", err: errors.New("exit 1")},
-	}}
+	fd := &fakeDocker{outputs: map[string]fakeResult{}}
+	fd.stream = func(ctx context.Context, args []string, onLine func(string)) (string, error) {
+		onLine("#9 [3/7] RUN npm ci")
+		return "#9 [3/7] RUN npm ci\nstep 3/7 failed: npm ci error\n", errors.New("exit 1")
+	}
 	m, wt := newTestManager(t, fd, 100, 100)
 
 	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile", Ports: []int{3000}}}); err != nil {
@@ -171,7 +188,7 @@ func TestStartBuildFailureKeepsOp(t *testing.T) {
 	}
 
 	// 构建失败后再来一次应允许（op 不是 building 态）
-	fd.outputs["build"] = fakeResult{}
+	fd.stream = nil
 	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile", Ports: []int{3000}}}); err != nil {
 		t.Fatalf("失败后应可重新启动，得到 %v", err)
 	}
@@ -182,21 +199,18 @@ func TestStartRejectsConcurrentBuild(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	fd := &fakeDocker{outputs: map[string]fakeResult{}}
-	m, wt := newTestManager(t, fd, 100, 100)
 	// build 卡住，模拟分钟级构建
-	fd.outputs["build"] = fakeResult{}
-	origExec := m.exec
-	m.exec = func(ctx context.Context, name string, args ...string) (string, string, error) {
-		if args[0] == "build" {
-			close(started)
-			select {
-			case <-release:
-			case <-ctx.Done():
-				return "", "", ctx.Err()
-			}
+	fd.stream = func(ctx context.Context, args []string, onLine func(string)) (string, error) {
+		onLine("#1 load definition")
+		close(started)
+		select {
+		case <-release:
+			return "", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
 		}
-		return origExec(ctx, name, args...)
 	}
+	m, wt := newTestManager(t, fd, 100, 100)
 
 	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); err != nil {
 		t.Fatal(err)
@@ -286,4 +300,70 @@ func TestCheckResourcesGate(t *testing.T) {
 	if rs3.Allowed || rs3.DockerOK {
 		t.Errorf("docker 不可用应拦下: %+v", rs3)
 	}
+}
+
+// 构建进度必须实时可见：op.Progress 随构建输出更新 —— 分钟级黑盒
+// 里「在编译」与「卡死了」的唯一区分手段。
+func TestBuildProgressVisibleMidFlight(t *testing.T) {
+	inStep := make(chan struct{})
+	release := make(chan struct{})
+	fd := &fakeDocker{outputs: map[string]fakeResult{}}
+	fd.stream = func(ctx context.Context, args []string, onLine func(string)) (string, error) {
+		onLine("#31 [12/15] RUN pnpm build")
+		close(inStep)
+		<-release
+		return "", nil
+	}
+	m, wt := newTestManager(t, fd, 100, 100)
+
+	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); err != nil {
+		t.Fatal(err)
+	}
+	<-inStep
+
+	st, err := m.Status(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Op == nil || st.Op.State != "building" {
+		t.Fatalf("构建中应有 building op: %+v", st.Op)
+	}
+	if !strings.Contains(st.Op.Progress, "RUN pnpm build") {
+		t.Errorf("进度应含当前步骤，得到 %q", st.Op.Progress)
+	}
+	close(release)
+	waitOp(t, m, 7)
+}
+
+// 停止必须取消进行中的构建（context 取消传导到构建进程）。
+func TestStopCancelsBuild(t *testing.T) {
+	started := make(chan struct{})
+	fd := &fakeDocker{outputs: map[string]fakeResult{}}
+	fd.stream = func(ctx context.Context, args []string, onLine func(string)) (string, error) {
+		close(started)
+		<-ctx.Done() // 等取消
+		return "", ctx.Err()
+	}
+	m, wt := newTestManager(t, fd, 100, 100)
+
+	if err := m.Start(context.Background(), 7, wt, []Selection{{Path: "Dockerfile"}}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+
+	if _, _, err := m.Stop(context.Background(), 7); err != nil {
+		t.Fatalf("Stop 报错: %v", err)
+	}
+	// 构建被取消后 op 不复活为 failed（人主动放弃不是失败）
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		_, ok := m.ops[7]
+		m.mu.Unlock()
+		if !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("Stop 后 op 应被清除且不复活")
 }

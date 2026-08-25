@@ -4,7 +4,7 @@
 //
 // 静态测试（无论 AI 跑多少）替代不了肉眼确认前端实际效果 —— 这个
 // 弹窗就是「跑起来给我看看」的入口。
-import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { api, UnauthorizedError } from '../api'
 
 const props = defineProps({
@@ -27,6 +27,19 @@ let pollTimer = null
 
 const building = computed(() => op.value?.state === 'building')
 const selectedCount = computed(() => Object.values(picks.value).filter((p) => p.checked).length)
+
+// 构建日志自动滚到底部（除非人往上翻了）
+const logEl = ref(null)
+watch(
+  () => op.value?.progress,
+  async () => {
+    await nextTick()
+    const el = logEl.value
+    if (el && el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
+      el.scrollTop = el.scrollHeight
+    }
+  },
+)
 
 function guard(e) {
   if (e instanceof UnauthorizedError) return onUnauthorized(), true
@@ -190,9 +203,11 @@ onUnmounted(() => clearTimeout(pollTimer))
         <button class="danger" :disabled="busy" @click="stop">停止并清理（删容器与镜像）</button>
       </div>
 
-      <!-- 构建状态 -->
-      <div v-if="building" class="section dim">
-        正在构建镜像并启动容器…… 冷构建可能要几分钟，弹窗每 2 秒自动刷新。
+      <!-- 构建状态：实时日志尾部 —— 分钟级黑盒里「在编译」与「卡死了」的区分手段 -->
+      <div v-if="building" class="section">
+        <div class="dim">正在构建镜像并启动容器…… 冷构建可能要几分钟，弹窗每 2 秒自动刷新。</div>
+        <pre v-if="op?.progress" ref="logEl" class="buildlog mono">{{ op.progress }}</pre>
+        <button class="danger" :disabled="busy" @click="stop">取消构建并清理</button>
       </div>
       <div v-else-if="op?.state === 'failed'" class="error-banner small">
         上次启动失败：{{ op.error }}
@@ -289,4 +304,18 @@ h2 { font-size: 16px; margin: 0; }
 .cand input[type='checkbox'] { margin: 0; }
 button { align-self: flex-start; }
 .error-banner.small { font-size: 13px; }
+
+.buildlog {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-soft, #0d1117);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 </style>

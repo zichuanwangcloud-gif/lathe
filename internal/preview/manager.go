@@ -1,10 +1,12 @@
 package preview
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -57,9 +59,15 @@ type buildPlan struct {
 // Op 是一次进行中的构建操作的状态（内存态；成功完成后移除，
 // 之后容器自身即状态；失败保留到下次启动或停止，供界面展示原因）。
 type Op struct {
-	State     string    `json:"state"` // building / failed
-	Error     string    `json:"error,omitempty"`
+	State string `json:"state"` // building / failed
+	Error string `json:"error,omitempty"`
+	// Progress 是构建输出的尾部（实时更新）。构建是分钟级黑盒，
+	// 没有进度人无法分辨「在编译」还是「卡死了」—— 2026-08-25 一次
+	// 健康的构建就因 CLI 进程静默被误判卡死而遭误杀。
+	Progress  string    `json:"progress,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
+
+	cancel context.CancelFunc // 停止按钮取消构建用；不序列化
 }
 
 // PortMapping 是一个容器端口到宿主机端口的映射。
@@ -94,6 +102,9 @@ type Manager struct {
 
 	// exec 执行外部命令，返回 stdout/stderr；测试注入假件。
 	exec func(ctx context.Context, name string, args ...string) (string, string, error)
+	// execStream 执行构建命令：逐行回调输出（docker build 的进度走
+	// stderr），返回输出尾部供错误展示。测试注入假件。
+	execStream func(ctx context.Context, name string, args []string, onLine func(string)) (string, error)
 
 	mu  sync.Mutex
 	ops map[int64]*Op
@@ -106,6 +117,7 @@ func NewManager(workspaceRoot string, thresholds func(context.Context) (int, int
 		WorkspaceRoot: workspaceRoot,
 		Thresholds:    thresholds,
 		exec:          realExec,
+		execStream:    realStreamExec,
 		ops:           map[int64]*Op{},
 	}
 }
@@ -116,6 +128,63 @@ func realExec(ctx context.Context, name string, args ...string) (string, string,
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
 	return out.String(), errb.String(), err
+}
+
+// realStreamExec 流式执行命令：stdout/stderr 都逐行回调（buildkit 的
+// 进度在 stderr 上），同时维护一个尾部环形缓冲供错误展示。
+func realStreamExec(ctx context.Context, name string, args []string, onLine func(string)) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	var tb tailBuf
+	var wg sync.WaitGroup
+	scan := func(r io.Reader) {
+		defer wg.Done()
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 64*1024), 1<<20) // buildkit 单行可能很长
+		for sc.Scan() {
+			line := sc.Text()
+			tb.Write(line)
+			if onLine != nil {
+				onLine(line)
+			}
+		}
+	}
+	wg.Add(2)
+	go scan(stdout)
+	go scan(stderr)
+
+	err = cmd.Wait() // 等进程退出
+	wg.Wait()        // 再等管道读完（Wait 之前读完管道是调用方责任）
+	return tb.String(), err
+}
+
+// tailBuf 是并发安全的尾部缓冲：只留最后 cap 字节。
+type tailBuf struct {
+	mu  sync.Mutex
+	buf string
+}
+
+func (t *tailBuf) Write(line string) {
+	t.mu.Lock()
+	t.buf = tail(t.buf+line+"\n", 64*1024)
+	t.mu.Unlock()
+}
+
+func (t *tailBuf) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.buf
 }
 
 // CheckResources 测量当前水位并对照阈值，给出是否允许启动。
@@ -216,33 +285,46 @@ func (m *Manager) Start(ctx context.Context, taskID int64, worktree string, sels
 		m.mu.Unlock()
 		return ErrBuildInProgress
 	}
-	m.ops[taskID] = &Op{State: "building", StartedAt: time.Now()}
+	// 构建上下文可取消（停止按钮）且脱离请求生命周期；进程退出即取消，
+	// 半成品由 Stop 清理。
+	bctx, cancel := context.WithCancel(context.Background())
+	op := &Op{State: "building", StartedAt: time.Now(), cancel: cancel}
+	m.ops[taskID] = op
 	m.mu.Unlock()
 
-	// 构建是分钟级操作，必须脱离请求生命周期；但进程退出即取消
-	// （context.Background 挂进程寿命），半成品由 Stop 清理。
-	go m.run(context.Background(), taskID, plans)
+	go m.run(bctx, taskID, op, plans)
 	return nil
 }
 
 // run 依次构建并启动所有选中的镜像。任一失败即终止并记录原因；
 // 已起来的容器留给 Stop 统一清理（界面会展示它们）。
-func (m *Manager) run(ctx context.Context, taskID int64, plans []buildPlan) {
+func (m *Manager) run(ctx context.Context, taskID int64, op *Op, plans []buildPlan) {
 	fail := func(err error) {
 		slog.Warn("预览构建失败", "task", taskID, "err", err)
 		m.mu.Lock()
-		m.ops[taskID] = &Op{State: "failed", Error: err.Error(), StartedAt: time.Now()}
-		m.mu.Unlock()
+		defer m.mu.Unlock()
+		// Stop 已把 op 摘走（人主动放弃）时不再复活失败态
+		if cur, ok := m.ops[taskID]; ok && cur == op {
+			op.State, op.Error = "failed", err.Error()
+		}
 	}
 
 	for _, p := range plans {
 		bctx, cancel := context.WithTimeout(ctx, buildTimeout)
-		_, stderr, err := m.exec(bctx, m.DockerBin, "build",
-			"--label", labelPreview+"=1", "--label", fmt.Sprintf("%s=%d", labelTask, taskID),
-			"-t", p.image, "-f", p.absDF, p.absCtx)
+		output, err := m.execStream(bctx, m.DockerBin, []string{"build",
+			"--label", labelPreview + "=1", "--label", fmt.Sprintf("%s=%d", labelTask, taskID),
+			"-t", p.image, "-f", p.absDF, p.absCtx,
+		}, func(line string) {
+			m.mu.Lock()
+			op.Progress = tail(op.Progress+line+"\n", 4096)
+			m.mu.Unlock()
+		})
 		cancel()
 		if err != nil {
-			fail(fmt.Errorf("构建 %s 失败: %s", p.sel.Path, tail(stderr, 2000)))
+			if ctx.Err() != nil {
+				return // 被人为停止：Stop 已清理状态
+			}
+			fail(fmt.Errorf("构建 %s 失败: %s", p.sel.Path, tail(output, 2000)))
 			return
 		}
 
@@ -261,7 +343,10 @@ func (m *Manager) run(ctx context.Context, taskID int64, plans []buildPlan) {
 	}
 
 	m.mu.Lock()
-	delete(m.ops, taskID) // 成功：容器自身即状态
+	// Stop 可能已摘走 op（人主动停止后构建才跑完）：不干扰
+	if cur, ok := m.ops[taskID]; ok && cur == op {
+		delete(m.ops, taskID) // 成功：容器自身即状态
+	}
 	m.mu.Unlock()
 	slog.Info("预览环境已启动", "task", taskID, "images", len(plans))
 }
@@ -291,11 +376,16 @@ func (m *Manager) Status(ctx context.Context, taskID int64) (*Status, error) {
 	return st, nil
 }
 
-// Stop 强删该任务的全部预览容器，再删掉对应镜像。
+// Stop 取消进行中的构建，强删该任务的全部预览容器，再删掉对应镜像。
 // 返回（删掉的容器数, 删掉的镜像数）。
 func (m *Manager) Stop(ctx context.Context, taskID int64) (int, int, error) {
 	m.mu.Lock()
-	delete(m.ops, taskID)
+	if op, ok := m.ops[taskID]; ok {
+		if op.cancel != nil {
+			op.cancel() // 取消进行中的构建
+		}
+		delete(m.ops, taskID)
+	}
 	m.mu.Unlock()
 
 	names, err := m.containerNames(ctx, taskID)
