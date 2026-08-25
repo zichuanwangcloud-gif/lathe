@@ -232,3 +232,23 @@ func TestStopRemovesNetworks(t *testing.T) {
 		t.Errorf("Stop 应删除预览网络: %v", fd.calls)
 	}
 }
+
+// compose 文件名识别：必须先以 .yml/.yaml 结尾再看前缀，
+// 否则 .example 模板会凭前缀混入（线上实测扫出了
+// docker-compose.override.yml.example）。
+func TestIsComposeFile(t *testing.T) {
+	yes := []string{"compose.yml", "compose.yaml", "docker-compose.yml",
+		"docker-compose.dev.yml", "compose.prod.yaml", "Docker-Compose.YML"}
+	no := []string{"docker-compose.override.yml.example", "compose.yml.bak",
+		"my-compose.yml", "Dockerfile", "docker-compose.txt"}
+	for _, n := range yes {
+		if !isComposeFile(n) {
+			t.Errorf("%s 应识别为 compose 文件", n)
+		}
+	}
+	for _, n := range no {
+		if isComposeFile(n) {
+			t.Errorf("%s 不应识别为 compose 文件", n)
+		}
+	}
+}

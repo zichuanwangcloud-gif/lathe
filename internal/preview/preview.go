@@ -119,14 +119,21 @@ func isDockerfile(name string) bool {
 // 依赖 + 配置」的标准声明，有编排文件的项目优先走编排。
 func isComposeFile(name string) bool {
 	lower := strings.ToLower(name)
+	// 必须先确认是 yaml 文件再看前缀 —— 否则 TrimSuffix 对非 yaml
+	// 名原样返回，docker-compose.override.yml.example 这类模板文件
+	// 会凭前缀混进来。
+	var base string
 	for _, ext := range []string{".yml", ".yaml"} {
-		base := strings.TrimSuffix(lower, ext)
-		if base == "compose" || base == "docker-compose" ||
-			strings.HasPrefix(base, "docker-compose.") || strings.HasPrefix(base, "compose.") {
-			return true
+		if strings.HasSuffix(lower, ext) {
+			base = strings.TrimSuffix(lower, ext)
+			break
 		}
 	}
-	return false
+	if base == "" {
+		return false
+	}
+	return base == "compose" || base == "docker-compose" ||
+		strings.HasPrefix(base, "docker-compose.") || strings.HasPrefix(base, "compose.")
 }
 
 // envRefRe 匹配 compose 文件里的变量插值：${VAR}、${VAR:-默认}、
