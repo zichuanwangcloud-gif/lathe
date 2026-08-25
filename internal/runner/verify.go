@@ -373,7 +373,7 @@ func findGoModules(root string, extraExclude []string) ([]string, error) {
 // pnpmExcludeFilters 把落在排除目录下的 pnpm 工作区包枚出来，转成
 // pnpm 负向过滤器（--filter=!{dir}）。{dir} 选择器只匹配精确的包目录、
 // 没有子树语义，所以必须枚举到包这一级。只处理路径形式的排除项
-//（含 /）；纯目录名形式对 pnpm 步骤不适用 —— 名字太泛误伤面大，
+// （含 /）；纯目录名形式对 pnpm 步骤不适用 —— 名字太泛误伤面大，
 // Go 模块扫描那边两种形式都认。
 func pnpmExcludeFilters(root string, exclude []string) []string {
 	var filters []string

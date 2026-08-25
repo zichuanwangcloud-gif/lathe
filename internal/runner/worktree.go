@@ -351,7 +351,7 @@ func (m *WorktreeManager) Discard(ctx context.Context, providerRepo, path, branc
 }
 
 // discardLocked 是 Discard 的持锁版本，调用方必须已持有 mirror 锁
-//（Create 的尸体回收在锁内调用；sync.Mutex 不可重入，直接调 Discard
+// （Create 的尸体回收在锁内调用；sync.Mutex 不可重入，直接调 Discard
 // 会自死锁）。
 func (m *WorktreeManager) discardLocked(ctx context.Context, mirror, path, branch string) {
 	if path != "" {

@@ -17,8 +17,8 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
-	"unicode/utf8"
 	"time"
+	"unicode/utf8"
 )
 
 // maxLineBytes 是单条 stream-json 事件的上限。
@@ -343,7 +343,7 @@ func sanitizedEnv() []string {
 		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
 		"http_proxy": true, "https_proxy": true, "no_proxy": true,
 		"SSH_AUTH_SOCK": true, // worktree 内的 git 操作需要
-		"CI":          true,   // 工具链据此关闭 watch/交互模式
+		"CI":            true, // 工具链据此关闭 watch/交互模式
 	}
 	for _, name := range strings.Split(os.Getenv("LATHE_AGENT_ENV_EXTRA"), ",") {
 		if name = strings.TrimSpace(name); name != "" {
