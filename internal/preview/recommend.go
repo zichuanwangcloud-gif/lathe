@@ -25,17 +25,30 @@ const recommendTimeout = 3 * time.Minute
 //
 // 定位：建议只是预填 —— 勾选、改值、按下启动的永远是人
 // （连不连共享测试库这类有数据风险的决定不交给 AI）。
+// 但口令类值不需要人填：复用场景从在跑容器读凭据，其余自动生成。
 type Recommendation struct {
 	// Path / Kind 是推荐的候选，必须来自候选清单（解析时校验）。
 	Path   string `json:"path"`
 	Kind   string `json:"kind"`
 	Reason string `json:"reason"`
+	// Database 是数据库策略：复用主部署 / 克隆 / 全新 / 不需要。
+	Database *DatabaseRecommendation `json:"database,omitempty"`
 	// Env 是建议的变量值：变量名 → 值与证据来源。
 	Env map[string]EnvSuggestion `json:"env"`
 	// Infra 是建议附加的基础设施（仅 Dockerfile 候选有意义）。
 	Infra []string `json:"infra"`
 	// Notes 是需要人注意的事项（找不到证据的变量、数据风险提示等）。
 	Notes string `json:"notes"`
+}
+
+// DatabaseRecommendation 是数据库策略建议。
+type DatabaseRecommendation struct {
+	// Strategy: reuse=连主部署在跑的库（无 SQL 变更时）；clone=克隆一份
+	// 随便跑迁移；fresh=全新空库；none=不需要数据库。
+	Strategy string `json:"strategy"`
+	Source   string `json:"source"`  // reuse/clone 的源容器名
+	DBName   string `json:"db_name"` // clone 的源库名（空则取源容器 POSTGRES_DB）
+	Reason   string `json:"reason"`
 }
 
 // EnvSuggestion 是一条变量建议。Source 必须说明证据来源
@@ -146,12 +159,12 @@ func (m *Manager) runRecommend(taskID int64, absWorktree, issueContext string, o
 		return
 	}
 
-	// 本机正在运行的容器作为「可复用依赖」的证据交给 agent
-	// （例：本机 55432 已有 postgres 在跑 → DATABASE_HOST 可以指它）
-	running, _, _ := m.exec(ctx, "docker", "ps", "--format",
-		"{{.Names}}\t{{.Image}}\t{{.Ports}}")
+	// 机械证据：改动画像（改了哪个应用、有没有 SQL 变更）与在跑容器
+	// 清单（含 DB 凭据）由 Lathe 算好喂给模型 —— 不靠模型即兴发现。
+	profile := m.changeProfile(ctx, absWorktree)
+	running := m.runningContainers(ctx)
 
-	prompt := recommendPrompt(issueContext, cands, running)
+	prompt := recommendPrompt(issueContext, cands, profile, running)
 	res, err := m.agent.Run(ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            absWorktree,
@@ -169,7 +182,7 @@ func (m *Manager) runRecommend(taskID int64, absWorktree, issueContext string, o
 		return
 	}
 
-	rec, err := parseRecommendation(res.Text, cands)
+	rec, err := parseRecommendation(res.Text, cands, profile, running)
 	if err != nil {
 		fail(err)
 		return
@@ -184,17 +197,25 @@ func (m *Manager) runRecommend(taskID int64, absWorktree, issueContext string, o
 	slog.Info("预览推荐完成", "task", taskID, "path", rec.Path, "cost", res.CostUSD)
 }
 
-// recommendPrompt 组装推荐 prompt。三份证据：issue 上下文（改的是哪个
-// 应用）、候选清单（各自的端口与必填变量）、本机在跑的容器（可复用依赖）。
-func recommendPrompt(issueContext string, cands []Candidate, runningContainers string) string {
+// recommendPrompt 组装推荐 prompt。证据全是机械事实：issue 上下文、
+// 改动画像（应用 + SQL 标记 + 文件清单）、候选清单、在跑容器（含 DB
+// 凭据）。模型读部署文档后拍策略，危险位由解析层机械校验。
+func recommendPrompt(issueContext string, cands []Candidate, profile *ChangeProfile, running []RunningContainer) string {
 	var b strings.Builder
 	b.WriteString(`你在为一个任务预览环境做「怎么跑起来」的推荐。**只读分析：不要修改任何文件，不要构建或启动任何容器。**
 
 ## 背景
 用户想把这个任务的改动跑成可访问的预览服务，手动验证效果。
+**先找并阅读项目的部署文档**（docs/、deploy/ 目录、README 的部署章节），
+推荐方案以部署文档为准；文档没覆盖的再自行推断。
 `)
 	if strings.TrimSpace(issueContext) != "" {
 		fmt.Fprintf(&b, "\n## 任务 issue\n%s\n", issueContext)
+	}
+	if profile != nil && len(profile.Files) > 0 {
+		fmt.Fprintf(&b, "\n## 本次改动（相对 %s）\n涉及应用：%s\nSQL/迁移变更：%v\n文件清单：\n```\n%s\n```\n",
+			profile.Base, strings.Join(profile.Apps, ", "), profile.HasSQL,
+			strings.Join(profile.Files, "\n"))
 	}
 	b.WriteString("\n## 候选启动单元\n")
 	for _, c := range cands {
@@ -214,27 +235,54 @@ func recommendPrompt(issueContext string, cands []Candidate, runningContainers s
 		}
 		b.WriteString("\n")
 	}
-	if strings.TrimSpace(runningContainers) != "" {
-		fmt.Fprintf(&b, "\n## 本机正在运行的容器（可能可复用的依赖服务）\n```\n%s```\n", runningContainers)
+	if len(running) > 0 {
+		b.WriteString("\n## 本机正在运行的容器（可复用的依赖服务；DB 类已附凭据）\n```\n")
+		for _, c := range running {
+			fmt.Fprintf(&b, "%s (%s) %s", c.Name, c.Image, c.Ports)
+			if c.DBKind != "" {
+				fmt.Fprintf(&b, " [%s]", c.DBKind)
+				if c.HostPort > 0 {
+					fmt.Fprintf(&b, " 宿主端口=%d", c.HostPort)
+				}
+				for _, k := range []string{"POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB",
+					"MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE", "MYSQL_ROOT_PASSWORD"} {
+					if v := c.Env[k]; v != "" {
+						fmt.Fprintf(&b, " %s=%s", k, v)
+					}
+				}
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("```\n")
 	}
 	b.WriteString(`
 ## 要求
-读仓库（README、deploy 目录、.env.example、compose 文件内容、Dockerfile），判断：
-1. 哪个候选最适合预览这个 issue 的改动 —— issue 涉及哪个应用就预览哪个；
-   同一应用既有 compose 又有 Dockerfile 时优先 compose（编排自带依赖拓扑）
-2. 对 compose 候选：给出每个必填变量的建议值。**只能从仓库内证据
-   （.env.example、文档、其他 compose 的默认值）或本机正在运行的服务推断**；
-   找不到证据的变量不要编造（尤其口令），在 notes 里说明需要人填
-3. 对 Dockerfile 候选：建议需要哪些附加基础设施（postgres / redis / mysql 子集）
+1. 哪个候选最适合预览这个 issue 的改动 —— **改动涉及哪个应用就预览哪个**
+   （以上改动画像已给出）；同一应用既有 compose 又有 Dockerfile 时优先
+   compose（编排自带依赖拓扑）
+2. 数据库策略 database.strategy：
+   - reuse：主部署的库正在跑且**本次没有 SQL/迁移变更** → 直接连它，
+     复用已有测试数据（source 填容器名）
+   - clone：有 SQL/迁移变更 → 从 source 容器克隆一份独立库，迁移随便跑
+   - fresh：需要数据库但没有可复用的 → 全新空库，应用自己跑迁移
+   - none：不需要数据库
+   有 SQL 变更时选 reuse 会被系统强制纠正为 clone（迁移可能改坏共享库）。
+3. 对 compose 候选：给出每个必填变量的建议值。**只能从仓库内证据
+   （.env.example、部署文档、其他 compose 的默认值）或上面在跑服务的
+   凭据推断**；口令类变量（PASSWORD/SECRET/TOKEN 等）不用你填也不用
+   人填 —— 系统会自动生成或从复用容器读取，把它们留空并在 notes 说明
+4. 对 Dockerfile 候选：建议需要哪些附加基础设施（postgres / redis / mysql
+   子集，fresh 空库由系统起官方镜像）
 
 请只输出一个 JSON 对象，不要有其他内容：
 {
   "path": "推荐的候选路径（必须原样来自候选清单）",
   "kind": "compose 或 dockerfile",
   "reason": "推荐理由，一两句话，引用仓库内证据",
+  "database": {"strategy": "reuse|clone|fresh|none", "source": "容器名", "db_name": "源库名", "reason": "一句话"},
   "env": {"变量名": {"value": "建议值", "source": "证据来源，如 apps/x/.env.example:3 或 本机容器 lathe-postgres-dev"}},
   "infra": ["postgres"],
-  "notes": "需要人注意的事项（找不到证据的变量、数据风险提示等），没有则为空字符串"
+  "notes": "需要人注意的事项，没有则为空字符串"
 }`)
 	return b.String()
 }
@@ -243,8 +291,9 @@ func recommendPrompt(issueContext string, cands []Candidate, runningContainers s
 //
 // 校验是信任边界：模型可能幻觉出不存在的候选路径或变量名，
 // 推荐路径必须在候选清单里、变量名必须在扫描结果里，否则宁可报错
-// 让人手工选，也不把幻觉预填进表单。
-func parseRecommendation(output string, cands []Candidate) (*Recommendation, error) {
+// 让人手工选，也不把幻觉预填进表单。数据库策略的危险位（有 SQL
+// 变更选 reuse）在这里机械纠正并留痕，不信模型自觉。
+func parseRecommendation(output string, cands []Candidate, profile *ChangeProfile, running []RunningContainer) (*Recommendation, error) {
 	start := strings.Index(output, "{")
 	end := strings.LastIndex(output, "}")
 	if start < 0 || end <= start {
@@ -297,9 +346,67 @@ func parseRecommendation(output string, cands []Candidate) (*Recommendation, err
 		}
 		rec.Infra = kept
 	}
+
+	// 数据库策略校验
+	if rec.Database != nil {
+		if err := validateDatabaseStrategy(rec.Database, profile, running, &rec); err != nil {
+			return nil, err
+		}
+	}
 	rec.Reason = strings.TrimSpace(rec.Reason)
 	rec.Notes = strings.TrimSpace(rec.Notes)
 	return &rec, nil
+}
+
+// validateDatabaseStrategy 机械校验数据库策略。纠正动作全部记入
+// notes（静默降级可以，静默无痕不行）。
+func validateDatabaseStrategy(db *DatabaseRecommendation, profile *ChangeProfile, running []RunningContainer, rec *Recommendation) error {
+	switch db.Strategy {
+	case "none", "fresh", "":
+		if db.Strategy == "" {
+			db.Strategy = "none"
+		}
+		return nil
+	case "reuse", "clone":
+	default:
+		return fmt.Errorf("preview: 未知的数据库策略 %q", db.Strategy)
+	}
+
+	// 硬护栏：有 SQL 变更禁止复用共享库 —— 迁移可能改坏别人在用的数据。
+	if db.Strategy == "reuse" && profile != nil && profile.HasSQL {
+		db.Strategy = "clone"
+		appendNote(rec, "检测到 SQL/迁移变更，复用共享库已被系统纠正为克隆一份独立库")
+	}
+
+	// 源容器必须真实存在且是 DB 家族
+	var src *RunningContainer
+	for i := range running {
+		if running[i].Name == db.Source {
+			src = &running[i]
+			break
+		}
+	}
+	if src == nil {
+		return fmt.Errorf("preview: 数据库策略的源容器 %q 不在运行中", db.Source)
+	}
+	if src.DBKind == "" {
+		return fmt.Errorf("preview: 源容器 %q（%s）不是数据库镜像", db.Source, src.Image)
+	}
+	// 克隆本期只支持 postgres（dump|restore 管道）；其他家族降级 fresh 并留痕
+	if db.Strategy == "clone" && src.DBKind != "postgres" {
+		db.Strategy = "fresh"
+		db.Source = ""
+		appendNote(rec, fmt.Sprintf("%s 的克隆暂不支持（本期仅 postgres），已改为全新空库", src.DBKind))
+	}
+	return nil
+}
+
+func appendNote(rec *Recommendation, s string) {
+	if rec.Notes == "" {
+		rec.Notes = s
+		return
+	}
+	rec.Notes += "；" + s
 }
 
 // channelEnv 把 cc-switch 通道名编成注入 agent 子进程的环境变量

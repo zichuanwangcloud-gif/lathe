@@ -62,7 +62,7 @@ services:
 
 func TestBuildOverrideYAML(t *testing.T) {
 	// 有端口的服务重置为随机宿主端口
-	y := buildOverrideYAML(map[string][]int{"web": {8080}, "db": nil})
+	y := buildOverrideYAML(map[string][]int{"web": {8080}, "db": nil}, false)
 	if !strings.Contains(y, "!override") || !strings.Contains(y, `"0:8080"`) {
 		t.Errorf("override 应含随机端口重置:\n%s", y)
 	}
@@ -70,7 +70,7 @@ func TestBuildOverrideYAML(t *testing.T) {
 		t.Errorf("无端口的服务不应出现在 override 里:\n%s", y)
 	}
 	// 全部服务都没端口 → 不需要 override
-	if y := buildOverrideYAML(map[string][]int{"db": nil}); y != "" {
+	if y := buildOverrideYAML(map[string][]int{"db": nil}, false); y != "" {
 		t.Errorf("无端口时应返回空，得到 %q", y)
 	}
 }
@@ -176,8 +176,9 @@ func TestStartWithInfra(t *testing.T) {
 		!strings.Contains(joined, "lathe-preview-t7-infra-redis") {
 		t.Error("应启动 postgres 与 redis 基础设施容器")
 	}
-	// 就绪探测
-	if !strings.Contains(joined, "pg_isready") || !strings.Contains(joined, "redis-cli ping") {
+	// 就绪探测（psql 探到目标库可查 —— pg_isready 在 init 阶段就会假阳性）
+	if !strings.Contains(joined, "psql") || !strings.Contains(joined, "SELECT 1") ||
+		!strings.Contains(joined, "redis-cli ping") {
 		t.Error("应做就绪探测")
 	}
 	// 应用容器：进网络 + 注入约定连接串 + 人的额外 env

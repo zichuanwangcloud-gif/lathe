@@ -127,7 +127,7 @@ func TestRecommendValidation(t *testing.T) {
 // agent 在 JSON 前后附带说明文字时也能解析（与分诊同款容忍）。
 func TestParseRecommendationTolerant(t *testing.T) {
 	cands := []Candidate{{Path: "Dockerfile", Kind: "", Ports: []int{3000}}}
-	rec, err := parseRecommendation("好的，分析如下：\n{\"path\": \"Dockerfile\", \"kind\": \"wrong\", \"reason\": \"r\", \"infra\": [], \"notes\": \"\"}\n以上。", cands)
+	rec, err := parseRecommendation("好的，分析如下：\n{\"path\": \"Dockerfile\", \"kind\": \"wrong\", \"reason\": \"r\", \"infra\": [], \"notes\": \"\"}\n以上。", cands, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

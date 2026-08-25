@@ -32,8 +32,15 @@ func (f *fakeDocker) run(ctx context.Context, name string, args ...string) (stri
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]string{name}, args...))
 	f.mu.Unlock()
+	// 先按子命令（args[0]）精确匹配；git/sh 这类 args[0] 是 -C/-c 的，
+	// 退而按「任一参数整词等于 key」匹配（rev-parse / diff / show 等）。
 	if r, ok := f.outputs[args[0]]; ok {
 		return r.stdout, r.stderr, r.err
+	}
+	for _, a := range args[1:] {
+		if r, ok := f.outputs[a]; ok {
+			return r.stdout, r.stderr, r.err
+		}
 	}
 	return "", "", nil
 }
@@ -88,9 +95,10 @@ func newTestManager(t *testing.T, fd *fakeDocker, memTh, diskTh int) (*Manager, 
 }
 
 // waitOpGone 等异步构建收尾（成功删除 op 或转 failed）。
+// 真实 docker 的集成测试里构建可能超过 5 秒，给 2 分钟。
 func waitOp(t *testing.T, m *Manager, taskID int64) *Op {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
 		m.mu.Lock()
 		op, ok := m.ops[taskID]
@@ -101,9 +109,9 @@ func waitOp(t *testing.T, m *Manager, taskID int64) *Op {
 		if op.State == "failed" {
 			return op
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatal("构建操作 5 秒内未收尾")
+	t.Fatal("构建操作 2 分钟内未收尾")
 	return nil
 }
 

@@ -94,15 +94,25 @@ func digestSystem(ev Event) []Entry {
 	if ie.CWD != "" {
 		body += " · " + ie.CWD
 	}
+	payload := map[string]any{
+		"model":          ie.Model,
+		"cwd":            ie.CWD,
+		"permissionMode": ie.PermissionMode,
+		"toolCount":      len(ie.Tools),
+	}
+	// 会话 ID 按阶段留档。tasks.agent_session_id 是单列，实现轮之后被修复轮
+	// 覆盖（pipeline.go 的 SetSessionID），分诊与早期修复轮的会话 ID 此前
+	// 无处可寻。而 cwd + session ID 就能定位 claude 留在
+	// ~/.claude/projects/<slug>/ 下的完整 transcript —— 那里有 stdout 拿不到
+	// 的东西（subagent 的内部步骤落在 <session>/subagents/ 里），且它不随
+	// worktree 一起被清掉。留下这两个值，历史任务的原始现场才是可回溯的。
+	if ev.SessionID != "" {
+		payload["sessionId"] = ev.SessionID
+	}
 	return []Entry{{
-		Kind: KindInit,
-		Body: truncate(body, maxEntryBody),
-		Payload: map[string]any{
-			"model":          ie.Model,
-			"cwd":            ie.CWD,
-			"permissionMode": ie.PermissionMode,
-			"toolCount":      len(ie.Tools),
-		},
+		Kind:    KindInit,
+		Body:    truncate(body, maxEntryBody),
+		Payload: payload,
 	}}
 }
 
@@ -124,6 +134,11 @@ type contentBlock struct {
 	Thinking string `json:"thinking"` // type=thinking
 
 	// type=tool_use
+	//
+	// ID 是这次调用的标识，tool_result 用 tool_use_id 回指它。此前只取了
+	// 结果那一侧的 tool_use_id，发起侧的 id 没留，两行就此各自漂着 ——
+	// 界面只能显示"调过 Bash"，看不出这步花了多久、成没成。
+	ID    string          `json:"id"`
 	Name  string          `json:"name"`
 	Input json.RawMessage `json:"input"`
 
@@ -172,10 +187,18 @@ func digestMessage(ev Event, assistant bool) []Entry {
 			out = append(out, Entry{Kind: KindThinking, Body: truncate(b.Thinking, maxEntryBody)})
 
 		case "tool_use":
+			// 带上自身 id，界面据此把发起与结果缝成一条带耗时和成败的记录。
+			// id 缺失（CLI 改字段、老数据）时 payload 留空，界面退回原来的
+			// 两行平铺 —— 降级而非崩溃，与 KindRaw 同一立场。
+			var payload map[string]any
+			if b.ID != "" {
+				payload = map[string]any{"toolUseId": b.ID}
+			}
 			out = append(out, Entry{
-				Kind: KindToolUse,
-				Tool: b.Name,
-				Body: truncate(toolSummary(b.Name, b.Input), maxEntryBody),
+				Kind:    KindToolUse,
+				Tool:    b.Name,
+				Body:    truncate(toolSummary(b.Name, b.Input), maxEntryBody),
+				Payload: payload,
 			})
 
 		case "tool_result":

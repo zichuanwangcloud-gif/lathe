@@ -29,6 +29,8 @@ const extraEnv = ref('')
 // AI 推荐：{ state, error, result }；showAll 控制是否展开全部候选
 const rec = ref(null)
 const showAll = ref(false)
+// 采用推荐后定案的数据库策略（reuse/clone/fresh），随启动传给后端
+const dbPlan = ref(null)
 let recTimer = null
 
 let pollTimer = null
@@ -131,7 +133,8 @@ async function start() {
       const env = {}
       for (const e of c.env || []) {
         const v = (p.env[e.name] || '').trim()
-        if (e.required && !v) {
+        // 口令类必填变量留空 = 后端自动生成（不让人填口令）
+        if (e.required && !v && !isPasswordClass(e.name)) {
           error.value = `${c.path} 的必填变量 ${e.name} 未填写`
           return
         }
@@ -164,7 +167,12 @@ async function start() {
   error.value = ''
   justStarted.value = false
   try {
-    await api.previewStart(props.task.id, { selections, infra: infra.value, env })
+    await api.previewStart(props.task.id, {
+      selections,
+      infra: infra.value,
+      env,
+      database: dbPlan.value || undefined,
+    })
     await loadStatus()
     schedulePoll()
   } catch (e) {
@@ -196,6 +204,23 @@ function portURL(host) {
 
 function pctTone(used, threshold) {
   return used >= threshold ? 'bad' : used >= threshold - 10 ? 'warn' : 'ok'
+}
+
+function dbStrategyLabel(db) {
+  const src = db.source ? ` ${db.source}` : ''
+  return (
+    {
+      reuse: `复用主部署在跑的库${src}（共享测试数据）`,
+      clone: `从${src || '源库'}克隆一份独立库（迁移随便跑）`,
+      fresh: '全新空库（应用自己跑迁移）',
+    }[db.strategy] || db.strategy
+  )
+}
+
+// 与后端 passwordClassRe 同款：口令类必填变量留空由后端自动生成
+const PASSWORD_CLASS = /PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|CREDENTIALS/i
+function isPasswordClass(name) {
+  return PASSWORD_CLASS.test(name)
 }
 
 async function recommend() {
@@ -250,6 +275,7 @@ function adoptRecommendation() {
     }
     if (r.infra?.length) infra.value = [...r.infra]
   }
+  dbPlan.value = r.database && r.database.strategy && r.database.strategy !== 'none' ? r.database : null
   showAll.value = true
 }
 
@@ -358,6 +384,10 @@ onUnmounted(() => {
             <span class="mono">{{ rec.result.path }}</span>
           </div>
           <div class="dim">{{ rec.result.reason }}</div>
+          <div v-if="rec.result.database && rec.result.database.strategy !== 'none'" class="rec-db">
+            数据库：{{ dbStrategyLabel(rec.result.database) }}
+            <span v-if="rec.result.database.reason" class="faint">—— {{ rec.result.database.reason }}</span>
+          </div>
           <div v-for="name in recEnvNames" :key="name" class="rec-env mono">
             {{ name }}={{ rec.result.env[name].value || '（需人填）' }}
             <span class="faint">← {{ rec.result.env[name].source || '无来源，请核对' }}</span>
@@ -401,7 +431,7 @@ onUnmounted(() => {
                 <input
                   class="mono"
                   v-model="picks[c.path].env[e.name]"
-                  :placeholder="e.required ? '必填' : '可选'"
+                  :placeholder="e.required ? (isPasswordClass(e.name) ? '留空自动生成' : '必填') : '可选'"
                   :disabled="building"
                 />
               </div>
@@ -526,6 +556,7 @@ h2 { font-size: 16px; margin: 0; }
 .rec-head { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 .rec-env { font-size: 12px; word-break: break-all; }
 .rec-notes { color: var(--warn); }
+.rec-db { font-size: 12.5px; }
 .cand-block { display: flex; flex-direction: column; gap: 6px; }
 .env-grid {
   margin-left: 26px;

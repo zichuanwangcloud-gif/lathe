@@ -56,9 +56,10 @@ func parseComposeConfig(out string) (map[string][]int, error) {
 }
 
 // buildOverrideYAML 生成端口重置 override：每个声明了端口的服务，
-// ports 整体替换为 0:<target>（随机宿主端口）。没有任何服务声明
-// 端口时返回空串（调用方跳过 override 文件）。
-func buildOverrideYAML(servicePorts map[string][]int) string {
+// ports 整体替换为 0:<target>（随机宿主端口）。hostGateway 为真时
+// 给每个服务加 host.docker.internal 解析（复用主部署的库需要经
+// 宿主网关到达它发布的端口）。没有任何定制时返回空串（调用方跳过）。
+func buildOverrideYAML(servicePorts map[string][]int, hostGateway bool) string {
 	names := make([]string, 0, len(servicePorts))
 	for n := range servicePorts {
 		names = append(names, n)
@@ -71,13 +72,19 @@ func buildOverrideYAML(servicePorts map[string][]int) string {
 	wrote := false
 	for _, n := range names {
 		ports := servicePorts[n]
-		if len(ports) == 0 {
+		if len(ports) == 0 && !hostGateway {
 			continue
 		}
 		wrote = true
-		fmt.Fprintf(&b, "  %s:\n    ports: !override\n", yamlQuote(n))
-		for _, p := range ports {
-			fmt.Fprintf(&b, "      - \"0:%d\"\n", p)
+		fmt.Fprintf(&b, "  %s:\n", yamlQuote(n))
+		if hostGateway {
+			b.WriteString("    extra_hosts: [\"host.docker.internal:host-gateway\"]\n")
+		}
+		if len(ports) > 0 {
+			b.WriteString("    ports: !override\n")
+			for _, p := range ports {
+				fmt.Fprintf(&b, "      - \"0:%d\"\n", p)
+			}
 		}
 	}
 	if !wrote {
