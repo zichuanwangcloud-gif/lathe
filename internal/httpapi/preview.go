@@ -46,17 +46,17 @@ func (a *PreviewAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}/preview/recommend", a.Auth.RequireFunc(a.recommendStatus))
 }
 
-// taskWorktree 解析任务并取出 worktree 路径。
+// taskWorktree 解析任务并取出 worktree 路径与所属仓库的基线目录。
 // 任务不存在/不属于当前用户 → 404；worktree 未建或已回收 → 409。
-func (a *PreviewAPI) taskWorktree(w http.ResponseWriter, r *http.Request) (int64, string, bool) {
-	id, ok := pathID(w, r)
+func (a *PreviewAPI) taskWorktree(w http.ResponseWriter, r *http.Request) (id int64, worktree, baselineDir string, ok bool) {
+	tid, ok := pathID(w, r)
 	if !ok {
-		return 0, "", false
+		return 0, "", "", false
 	}
-	detail, err := a.Store.TaskDetail(r.Context(), id, CurrentUser(r).ID)
+	detail, err := a.Store.TaskDetail(r.Context(), tid, CurrentUser(r).ID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
-		return 0, "", false
+		return 0, "", "", false
 	}
 	wt := ""
 	if detail.Task.WorktreePath != nil {
@@ -64,17 +64,17 @@ func (a *PreviewAPI) taskWorktree(w http.ResponseWriter, r *http.Request) (int64
 	}
 	if wt == "" {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "任务尚未创建工作区（还在排队或分诊）"})
-		return 0, "", false
+		return 0, "", "", false
 	}
 	if _, err := os.Stat(wt); err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "工作区已回收（任务合并后现场即释放），无法预览"})
-		return 0, "", false
+		return 0, "", "", false
 	}
-	return id, wt, true
+	return tid, wt, detail.Task.BaselineDir, true
 }
 
 func (a *PreviewAPI) candidates(w http.ResponseWriter, r *http.Request) {
-	_, wt, ok := a.taskWorktree(w, r)
+	_, wt, _, ok := a.taskWorktree(w, r)
 	if !ok {
 		return
 	}
@@ -115,7 +115,7 @@ func (a *PreviewAPI) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *PreviewAPI) start(w http.ResponseWriter, r *http.Request) {
-	id, wt, ok := a.taskWorktree(w, r)
+	id, wt, baselineDir, ok := a.taskWorktree(w, r)
 	if !ok {
 		return
 	}
@@ -127,6 +127,15 @@ func (a *PreviewAPI) start(w http.ResponseWriter, r *http.Request) {
 	if len(body.Selections) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "至少选择一个镜像"})
 		return
+	}
+	// 人没选数据库策略、仓库又配了基线目录时，默认直接连基线已经在跑
+	// 的中间件——这是本次改动的核心："worktree 起服务不必再重建基础
+	// 设施"。人显式选了别的策略（fresh/none/…）则尊重人的选择。
+	// Dir 只从已验证归属的仓库配置里取，不接受客户端传入。
+	if body.Database == nil && baselineDir != "" {
+		body.Database = &preview.DatabasePlan{Strategy: "baseline", Dir: baselineDir}
+	} else if body.Database != nil && body.Database.Strategy == "baseline" {
+		body.Database.Dir = baselineDir
 	}
 	if err := a.Previews.Start(r.Context(), id, wt, body); err != nil {
 		switch {
@@ -162,7 +171,7 @@ func (a *PreviewAPI) stop(w http.ResponseWriter, r *http.Request) {
 // recommend 启动一次异步 AI 推荐（202）。同任务同 HEAD 的已完成结果
 // 直接复用（Manager 内部缓存），重复点击不重复烧 agent 调用。
 func (a *PreviewAPI) recommend(w http.ResponseWriter, r *http.Request) {
-	id, wt, ok := a.taskWorktree(w, r)
+	id, wt, _, ok := a.taskWorktree(w, r)
 	if !ok {
 		return
 	}

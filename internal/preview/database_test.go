@@ -2,6 +2,8 @@ package preview
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -147,6 +149,115 @@ func TestResolveSourceValidation(t *testing.T) {
 		Strategy: "reuse", Source: "不存在",
 	}); err == nil {
 		t.Error("不存在的源容器应拒绝")
+	}
+}
+
+// ---------------------------------------------------------------- baseline 策略
+
+// newBaselineDBTestManager 造一个"基线目录里有一个在跑 postgres"的场景：
+// 基线目录是真实临时目录（Discover 需要真的扫文件系统），docker 调用
+// 全部走 fakeDocker。
+func newBaselineDBTestManager(t *testing.T, gitDiff string) (m *Manager, worktree, baselineDir string) {
+	t.Helper()
+	baselineDir = t.TempDir()
+	if err := os.MkdirAll(filepath.Join(baselineDir, "infra"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(baselineDir, "infra", "docker-compose.yml"),
+		[]byte("services:\n  postgres:\n    image: postgres:16-alpine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fd := &fakeDocker{outputs: map[string]fakeResult{
+		"ps": {stdout: `[{"Name":"cloudrouter-postgres","Service":"postgres","State":"running",` +
+			`"Image":"postgres:16-alpine"}]`},
+		"inspect": {stdout: `postgres:16-alpine` +
+			`|["POSTGRES_USER=cloudrouter","POSTGRES_PASSWORD=devpassword","POSTGRES_DB=cloudrouter"]` +
+			`|{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5434"}]}`},
+		"rev-parse": {stdout: "dev\n"},
+		"diff":      {stdout: gitDiff},
+	}}
+	m, worktree = newTestManager(t, fd, 100, 100)
+	return m, worktree, baselineDir
+}
+
+// baseline 策略应与 reuse 走同一条连接逻辑（host-gateway + 源容器凭据），
+// 唯一区别是源容器从"仓库配置的基线目录检测结果"里找，而不是人工指定。
+func TestResolveBaseline(t *testing.T) {
+	m, wt, baselineDir := newBaselineDBTestManager(t, "apps/x.go\n") // 无 SQL
+	db, err := m.resolveDatabase(context.Background(), 7, wt, DatabasePlan{
+		Strategy: "baseline", Dir: baselineDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.host != "host.docker.internal" || db.port != "5434" {
+		t.Errorf("baseline 应经宿主网关连基线发布的端口: %+v", db)
+	}
+	if db.user != "cloudrouter" || db.password != "devpassword" || db.dbName != "cloudrouter" {
+		t.Errorf("凭据应来自基线检测到的容器: %+v", db)
+	}
+	if !db.hostGateway {
+		t.Error("baseline 同 reuse 一样需要 host-gateway 解析")
+	}
+}
+
+// 硬护栏同 reuse：换个策略名字不能绕过"有 SQL 变更不许连共享库"。
+func TestResolveBaselineRejectedWithSQL(t *testing.T) {
+	m, wt, baselineDir := newBaselineDBTestManager(t, "apps/x/migrations/0001.up.sql\n")
+	_, err := m.resolveDatabase(context.Background(), 7, wt, DatabasePlan{
+		Strategy: "baseline", Dir: baselineDir,
+	})
+	if err == nil || !strings.Contains(err.Error(), "SQL") {
+		t.Fatalf("有 SQL 变更时 baseline 应同 reuse 一样被拒绝，得到 %v", err)
+	}
+}
+
+func TestResolveBaselineRequiresDir(t *testing.T) {
+	m, wt := newDBTestManager(t, "")
+	if _, err := m.resolveDatabase(context.Background(), 7, wt, DatabasePlan{Strategy: "baseline"}); err == nil {
+		t.Error("未注入基线目录应报错，而不是当成没数据库处理")
+	}
+}
+
+func TestResolveBaselineNoRunningService(t *testing.T) {
+	baselineDir := t.TempDir() // 空目录：没有 compose 文件，也没有在跑容器
+	m, wt := newTestManager(t, &fakeDocker{outputs: map[string]fakeResult{}}, 100, 100)
+	_, err := m.resolveDatabase(context.Background(), 7, wt, DatabasePlan{
+		Strategy: "baseline", Dir: baselineDir,
+	})
+	if err == nil {
+		t.Error("基线目录没有在跑的中间件时应报错，引导人先部署基线或换策略")
+	}
+}
+
+// 基线目录里有两个同家族的中间件在跑时，不猜——要求人显式指定 source。
+func TestResolveBaselineAmbiguousRequiresSource(t *testing.T) {
+	baselineDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(baselineDir, "docker-compose.yml"),
+		[]byte("services:\n  a:\n    image: postgres:16-alpine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fd := &fakeDocker{outputs: map[string]fakeResult{
+		"ps": {stdout: `[{"Name":"pg-a","Service":"a","State":"running","Image":"postgres:16-alpine"},` +
+			`{"Name":"pg-b","Service":"b","State":"running","Image":"postgres:16-alpine"}]`},
+		"inspect": {stdout: `postgres:16-alpine|[]|{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"15432"}]}`},
+	}}
+	m, wt := newTestManager(t, fd, 100, 100)
+
+	if _, err := m.resolveDatabase(context.Background(), 7, wt, DatabasePlan{
+		Strategy: "baseline", Dir: baselineDir,
+	}); err == nil || !strings.Contains(err.Error(), "多个") {
+		t.Fatalf("两个匹配的中间件应要求显式指定 source，得到 %v", err)
+	}
+
+	db, err := m.resolveDatabase(context.Background(), 7, wt, DatabasePlan{
+		Strategy: "baseline", Dir: baselineDir, Source: "pg-b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.port != "15432" {
+		t.Errorf("显式指定 source 后应连到该服务: %+v", db)
 	}
 }
 

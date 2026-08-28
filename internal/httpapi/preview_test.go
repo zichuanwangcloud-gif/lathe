@@ -49,18 +49,17 @@ func (f *fakePreviews) RecommendStatus(taskID int64) *preview.RecommendOp {
 
 // previewFixture 建用户/仓库/任务（带真实 worktree 目录与 Dockerfile），
 // 返回可打的测试服务器。
-func previewFixture(t *testing.T, fp *fakePreviews) (*httptest.Server, *store.Store, *task.Machine, int64, int64) {
+func previewFixture(t *testing.T, fp *fakePreviews) (srv *httptest.Server, st *store.Store, m *task.Machine, userID, repoID, taskID int64) {
 	t.Helper()
-	st := testStoreForAPI(t)
-	userID := mustUser(t, st, "preview-"+t.Name()+"@example.com")
+	st = testStoreForAPI(t)
+	userID = mustUser(t, st, "preview-"+t.Name()+"@example.com")
 
-	var repoID int64
 	if err := st.Pool().QueryRow(context.Background(),
 		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
 		userID, "acme/preview-"+t.Name()).Scan(&repoID); err != nil {
 		t.Fatal(err)
 	}
-	m := task.NewMachine(st.Pool())
+	m = task.NewMachine(st.Pool())
 
 	wt := t.TempDir()
 	if err := os.WriteFile(filepath.Join(wt, "Dockerfile"), []byte("FROM alpine\nEXPOSE 3000\n"), 0o644); err != nil {
@@ -84,14 +83,14 @@ func previewFixture(t *testing.T, fp *fakePreviews) (*httptest.Server, *store.St
 	api := &PreviewAPI{Store: st, Auth: authAs(userID, "pv@example.com"), Previews: fp}
 	mux := http.NewServeMux()
 	api.Routes(mux)
-	srv := httptest.NewServer(mux)
+	srv = httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, st, m, userID, tk.ID
+	return srv, st, m, userID, repoID, tk.ID
 }
 
 func TestPreviewCandidatesAndLifecycle(t *testing.T) {
 	fp := &fakePreviews{}
-	srv, _, _, _, taskID := previewFixture(t, fp)
+	srv, _, _, _, _, taskID := previewFixture(t, fp)
 	base := "/api/tasks/" + itoa(taskID)
 
 	// 候选发现：应找到 worktree 里的 Dockerfile 与 EXPOSE 端口
@@ -148,7 +147,7 @@ func TestPreviewStartOverThreshold409(t *testing.T) {
 	fp := &fakePreviews{startErr: errors.New("preview: 资源占用超过阈值: 内存占用 95% 已达阈值 90%: " + preview.ErrOverThreshold.Error())}
 	// 用 errors.Is 可识别的包装
 	fp.startErr = preview.ErrOverThreshold
-	srv, _, _, _, taskID := previewFixture(t, fp)
+	srv, _, _, _, _, taskID := previewFixture(t, fp)
 
 	resp := do(t, srv, "POST", "/api/tasks/"+itoa(taskID)+"/preview/start",
 		`{"selections":[{"path":"Dockerfile","ports":[3000]}]}`, true)
@@ -159,7 +158,7 @@ func TestPreviewStartOverThreshold409(t *testing.T) {
 
 func TestPreviewWorktreeMissing409(t *testing.T) {
 	fp := &fakePreviews{}
-	srv, st, m, userID, _ := previewFixture(t, fp)
+	srv, st, m, userID, _, _ := previewFixture(t, fp)
 
 	// 另建一个还在 queued 的任务（无 worktree）
 	var repoID int64
@@ -178,7 +177,7 @@ func TestPreviewWorktreeMissing409(t *testing.T) {
 
 func TestPreviewCrossUserIs404(t *testing.T) {
 	fp := &fakePreviews{}
-	_, st, _, _, taskID := previewFixture(t, fp)
+	_, st, _, _, _, taskID := previewFixture(t, fp)
 
 	// 另一个用户的视角：任务不可见
 	other := mustUser(t, st, "preview-other-"+t.Name()+"@example.com")
@@ -205,7 +204,7 @@ func TestPreviewRecommendEndpoints(t *testing.T) {
 			Infra: []string{"postgres"},
 		},
 	}}
-	srv, _, _, _, taskID := previewFixture(t, fp)
+	srv, _, _, _, _, taskID := previewFixture(t, fp)
 	base := "/api/tasks/" + itoa(taskID)
 
 	// 未登录 → 401
@@ -240,5 +239,65 @@ func TestPreviewRecommendEndpoints(t *testing.T) {
 	resp = do(t, srv, "POST", base+"/preview/recommend", "", true)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("未配置 agent 应 503，得到 %d", resp.StatusCode)
+	}
+}
+
+// 仓库配置了基线目录、人没显式选数据库策略时，start 应默认注入
+// baseline 策略——这是"worktree 起服务不必再重建基础设施"的落地点。
+func TestPreviewStartDefaultsToBaselineDatabase(t *testing.T) {
+	fp := &fakePreviews{}
+	srv, st, _, _, repoID, taskID := previewFixture(t, fp)
+
+	if _, err := st.Pool().Exec(context.Background(),
+		`UPDATE repos SET baseline_dir=$1 WHERE id=$2`, "/opt/CloudRouter", repoID); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := do(t, srv, "POST", "/api/tasks/"+itoa(taskID)+"/preview/start",
+		`{"selections":[{"path":"Dockerfile","ports":[3000]}]}`, true)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start 应 202，得到 %d: %v", resp.StatusCode, decode(t, resp))
+	}
+	if fp.started.Database == nil || fp.started.Database.Strategy != "baseline" {
+		t.Fatalf("配置了基线目录时应默认注入 baseline 策略，得到 %+v", fp.started.Database)
+	}
+	if fp.started.Database.Dir != "/opt/CloudRouter" {
+		t.Errorf("Dir 应从仓库配置注入，得到 %q", fp.started.Database.Dir)
+	}
+}
+
+// 人显式选了其他策略（如 fresh）时，即使仓库配了基线目录也不覆盖——
+// 默认只补"人没选"的情况，不越权改写人的选择。
+func TestPreviewStartRespectsExplicitDatabaseChoice(t *testing.T) {
+	fp := &fakePreviews{}
+	srv, st, _, _, repoID, taskID := previewFixture(t, fp)
+
+	if _, err := st.Pool().Exec(context.Background(),
+		`UPDATE repos SET baseline_dir=$1 WHERE id=$2`, "/opt/CloudRouter", repoID); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := do(t, srv, "POST", "/api/tasks/"+itoa(taskID)+"/preview/start",
+		`{"selections":[{"path":"Dockerfile","ports":[3000]}],"database":{"strategy":"fresh"}}`, true)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start 应 202，得到 %d: %v", resp.StatusCode, decode(t, resp))
+	}
+	if fp.started.Database == nil || fp.started.Database.Strategy != "fresh" {
+		t.Fatalf("人显式选择的策略不应被基线默认覆盖，得到 %+v", fp.started.Database)
+	}
+}
+
+// 未配置基线目录的仓库：现有行为不变，不传数据库策略就是不传。
+func TestPreviewStartWithoutBaselineDirLeavesDatabaseNil(t *testing.T) {
+	fp := &fakePreviews{}
+	srv, _, _, _, _, taskID := previewFixture(t, fp)
+
+	resp := do(t, srv, "POST", "/api/tasks/"+itoa(taskID)+"/preview/start",
+		`{"selections":[{"path":"Dockerfile","ports":[3000]}]}`, true)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start 应 202，得到 %d: %v", resp.StatusCode, decode(t, resp))
+	}
+	if fp.started.Database != nil {
+		t.Errorf("未配置基线目录不应凭空注入数据库策略，得到 %+v", fp.started.Database)
 	}
 }
