@@ -2,6 +2,7 @@ package flow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -556,5 +557,138 @@ func TestServiceCreateFlowNoWarningWhenChainWithinConfiguredLimit(t *testing.T) 
 	}
 	if len(warnings) != 0 {
 		t.Fatalf("上限放宽到 10 后深度 5 不应超限，得到 warnings=%v", warnings)
+	}
+}
+
+// TestServiceCreateFlowRejectsOtherUsersRepo 覆盖归属校验（审查发现的
+// 真实缺口）：repoID 存在，但属于另一个用户，建图应报
+// store.ErrRepoNotFound，而不是替别的账号建出任务。
+func TestServiceCreateFlowRejectsOtherUsersRepo(t *testing.T) {
+	pool := testPool(t)
+	userID, _ := fixture(t, pool)
+	_, otherRepoID := fixture(t, pool, "other")
+	svc := &Service{Pool: pool, Tasks: task.NewMachine(pool)}
+
+	_, _, _, err := svc.CreateFlow(context.Background(), userID, otherRepoID, "steal-"+t.Name(),
+		[]NodeInput{{IssueKey: "T-steal-" + t.Name()}})
+	if !errors.Is(err, store.ErrRepoNotFound) {
+		t.Fatalf("别人的 repoID 应报 store.ErrRepoNotFound，得到 %v", err)
+	}
+
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM flows WHERE repo_id = $1`, otherRepoID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("归属校验失败不应创建任何 flow 行，得到 %d 个", n)
+	}
+}
+
+// TestServiceCreateFlowRejectsNonexistentRepo 覆盖归属校验的另一半：
+// repoID 压根不存在（不是"存在但属于别人"）也要走同一条错误路径。
+func TestServiceCreateFlowRejectsNonexistentRepo(t *testing.T) {
+	pool := testPool(t)
+	userID, _ := fixture(t, pool)
+	svc := &Service{Pool: pool, Tasks: task.NewMachine(pool)}
+
+	_, _, _, err := svc.CreateFlow(context.Background(), userID, 9999999, "ghost-"+t.Name(),
+		[]NodeInput{{IssueKey: "T-ghost-" + t.Name()}})
+	if !errors.Is(err, store.ErrRepoNotFound) {
+		t.Fatalf("不存在的 repoID 应报 store.ErrRepoNotFound，得到 %v", err)
+	}
+}
+
+// TestGetFlowExposesDependsOnAtAndProfile 覆盖新吐出的两个字段
+// （画布检视面板需要）：GetFlow 返回的 TaskSummary 要带上
+// depends_on_at 与 profile，不再只有 M1 时期的那几个精简字段。
+func TestGetFlowExposesDependsOnAtAndProfile(t *testing.T) {
+	pool := testPool(t)
+	userID, repoID := fixture(t, pool)
+	svc := &Service{Pool: pool, Tasks: task.NewMachine(pool)}
+
+	nodes := []NodeInput{
+		{IssueKey: "P-1-" + t.Name(), Profile: []byte(`{"modelChannel":"opus-plan"}`)},
+		{IssueKey: "P-2-" + t.Name(), DependsOnIndex: p(0), DependsOnAt: "merged"},
+	}
+	flowID, _, _, err := svc.CreateFlow(context.Background(), userID, repoID, "profile-"+t.Name(), nodes)
+	if err != nil {
+		t.Fatalf("建图应成功，得到 %v", err)
+	}
+
+	fs, err := svc.GetFlow(context.Background(), userID, flowID)
+	if err != nil {
+		t.Fatalf("读取应成功，得到 %v", err)
+	}
+	if len(fs.Tasks) != 2 {
+		t.Fatalf("应有 2 个任务，得到 %d", len(fs.Tasks))
+	}
+	if fs.Tasks[0].DependsOnAt != "pr_open" {
+		t.Errorf("第 1 个任务未指定 dependsOnAt 应落默认值 pr_open，得到 %q", fs.Tasks[0].DependsOnAt)
+	}
+	// jsonb 会规范化空白（如冒号后补一个空格），不能按字节比较原始 JSON
+	// 字符串，只能解析后比较字段值。
+	var profile struct {
+		ModelChannel string `json:"modelChannel"`
+	}
+	if err := json.Unmarshal(fs.Tasks[0].Profile, &profile); err != nil {
+		t.Fatalf("profile 应是合法 JSON，得到 %s: %v", fs.Tasks[0].Profile, err)
+	}
+	if profile.ModelChannel != "opus-plan" {
+		t.Errorf("第 1 个任务的 profile.modelChannel 应为 opus-plan，得到 %q", profile.ModelChannel)
+	}
+	if fs.Tasks[1].DependsOnAt != "merged" {
+		t.Errorf("第 2 个任务的 dependsOnAt 应为 merged，得到 %q", fs.Tasks[1].DependsOnAt)
+	}
+}
+
+// TestServiceListFlows 覆盖新端点的核心行为：只看得到自己名下的图，
+// 按创建时间倒序，任务数正确。
+func TestServiceListFlows(t *testing.T) {
+	pool := testPool(t)
+	userID, repoID := fixture(t, pool)
+	other, otherRepoID := fixture(t, pool, "other")
+	svc := &Service{Pool: pool, Tasks: task.NewMachine(pool)}
+
+	if got, err := svc.ListFlows(context.Background(), userID); err != nil {
+		t.Fatalf("空列表应成功，得到 %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("尚未建图应返回空列表，得到 %+v", got)
+	}
+
+	flowID1, _, _, err := svc.CreateFlow(context.Background(), userID, repoID, "list-a-"+t.Name(),
+		[]NodeInput{{IssueKey: "L-a-" + t.Name()}})
+	if err != nil {
+		t.Fatalf("建图 1 应成功，得到 %v", err)
+	}
+	flowID2, _, _, err := svc.CreateFlow(context.Background(), userID, repoID, "list-b-"+t.Name(),
+		[]NodeInput{
+			{IssueKey: "L-b1-" + t.Name()},
+			{IssueKey: "L-b2-" + t.Name(), DependsOnIndex: p(0)},
+		})
+	if err != nil {
+		t.Fatalf("建图 2 应成功，得到 %v", err)
+	}
+	if _, _, _, err := svc.CreateFlow(context.Background(), other, otherRepoID, "list-other-"+t.Name(),
+		[]NodeInput{{IssueKey: "L-other-" + t.Name()}}); err != nil {
+		t.Fatalf("另一个用户建图应成功，得到 %v", err)
+	}
+
+	got, err := svc.ListFlows(context.Background(), userID)
+	if err != nil {
+		t.Fatalf("列出应成功，得到 %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("应只看到自己的 2 张图，得到 %d 张: %+v", len(got), got)
+	}
+	// ORDER BY id DESC：后建的排前面
+	if got[0].ID != flowID2 || got[1].ID != flowID1 {
+		t.Fatalf("应按创建时间倒序，得到 %+v", got)
+	}
+	if got[0].TaskCount != 2 {
+		t.Errorf("第二张图应有 2 个任务，得到 %d", got[0].TaskCount)
+	}
+	if got[1].TaskCount != 1 {
+		t.Errorf("第一张图应有 1 个任务，得到 %d", got[1].TaskCount)
 	}
 }

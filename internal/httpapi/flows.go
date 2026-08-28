@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Clouditera/lathe/internal/flow"
+	"github.com/Clouditera/lathe/internal/store"
 )
 
 // FlowAPI 提供"一键批量入队"（PRD F1.4）的 HTTP 端点：一次请求建一整
@@ -20,17 +21,18 @@ type FlowAPI struct {
 // Routes 注册编排图接口。
 func (f *FlowAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/flows", f.Auth.RequireFunc(f.create))
+	mux.Handle("GET /api/flows", f.Auth.RequireFunc(f.list))
 	mux.Handle("GET /api/flows/{id}", f.Auth.RequireFunc(f.get))
 }
 
 // flowNodeRequest 是 POST /api/flows 请求体里的一个节点。
 type flowNodeRequest struct {
-	IssueKey       string          `json:"issueKey"`
-	IssueID        string          `json:"issueId"`
-	Title          string          `json:"title"`
-	Priority       int             `json:"priority"`
-	DependsOnIndex *int            `json:"dependsOnIndex"`
-	DependsOnAt    string          `json:"dependsOnAt"`
+	IssueKey       string `json:"issueKey"`
+	IssueID        string `json:"issueId"`
+	Title          string `json:"title"`
+	Priority       int    `json:"priority"`
+	DependsOnIndex *int   `json:"dependsOnIndex"`
+	DependsOnAt    string `json:"dependsOnAt"`
 	// Profile 是节点执行画像（F7.1），原样透传给 flow.NodeInput.Profile，
 	// 不在建图时校验其内部结构——校验交给 pipeline 执行时的
 	// runner.ParseProfile，读到非法画像时任务本身失败，不是建图时拒绝
@@ -102,6 +104,30 @@ func (f *FlowAPI) create(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"flowId": flowID, "tasks": tasks, "warnings": warnings})
 }
 
+// list 列出当前用户建过的全部编排图：GET /api/flows
+//
+// 前端"编排"菜单落地页要靠这个端点才能呈现"你有哪些图"——之前只有
+// create/get，拿不到任何一个已知 flowId 就无从查起，这是补上 M1
+// "无 UI"里缺的那半张地图（不是新功能，是把已有数据露出来）。
+func (f *FlowAPI) list(w http.ResponseWriter, r *http.Request) {
+	items, err := f.Flow.ListFlows(r.Context(), CurrentUser(r).ID)
+	if err != nil {
+		serverError(w, "查询编排图列表失败", err)
+		return
+	}
+	flows := make([]map[string]any, len(items))
+	for i, it := range items {
+		flows[i] = map[string]any{
+			"id":        it.ID,
+			"repoId":    it.RepoID,
+			"name":      it.Name,
+			"createdAt": it.CreatedAt,
+			"taskCount": it.TaskCount,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"flows": flows})
+}
+
 // get 查询一个 flow 的信息与其下全部任务的当前状态：GET /api/flows/{id}
 //
 // 这是本包里"查询一个 flow 下所有任务当前状态"能力的落点（供集成测试
@@ -127,12 +153,25 @@ func (f *FlowAPI) get(w http.ResponseWriter, r *http.Request) {
 
 	tasks := make([]map[string]any, len(fs.Tasks))
 	for i, t := range fs.Tasks {
+		// Profile 显式转成 json.RawMessage 才会被原样嵌入响应体——
+		// t.Profile 是 []byte，encoding/json 直接编码 []byte 会得到
+		// base64 字符串而不是这段字节本来表示的 JSON 对象（同一个坑，
+		// task.Task.Profile 至今没有任何 HTTP 端点序列化过，见
+		// flow.TaskSummary.Profile 的文档注释）。空字节转出来是
+		// json.RawMessage(nil)，编码为 JSON 的 null，前端按"未设画像"
+		// 处理即可。
+		var profile json.RawMessage
+		if len(t.Profile) > 0 {
+			profile = json.RawMessage(t.Profile)
+		}
 		tasks[i] = map[string]any{
-			"id":        t.ID,
-			"issueKey":  t.IssueKey,
-			"state":     t.State,
-			"dependsOn": t.DependsOn,
-			"priority":  t.Priority,
+			"id":          t.ID,
+			"issueKey":    t.IssueKey,
+			"state":       t.State,
+			"dependsOn":   t.DependsOn,
+			"priority":    t.Priority,
+			"dependsOnAt": t.DependsOnAt,
+			"profile":     profile,
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -147,8 +186,12 @@ func (f *FlowAPI) get(w http.ResponseWriter, r *http.Request) {
 //
 // 校验错误（非法下标/超出上限/字段缺失）与幂等冲突（issue 已占用）都是
 // "请求本身有问题"，一律 400——不像 task 状态机的非法转移那样是
-// "资源当前状态不允许"（那才该用 409）。
+// "资源当前状态不允许"（那才该用 409）。repoId 不属于当前用户单独判
+// 404——与其它资源对非属主隐瞒存在是同一原则，不是"请求格式错了"。
 func flowErrorStatus(err error) int {
+	if errors.Is(err, store.ErrRepoNotFound) {
+		return http.StatusNotFound
+	}
 	var invalid flow.ErrInvalidIndex
 	var tooMany flow.ErrTooMany
 	var issueActive flow.ErrIssueActive

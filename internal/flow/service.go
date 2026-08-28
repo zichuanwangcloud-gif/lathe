@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -190,6 +191,10 @@ func (s *Service) CreateFlow(ctx context.Context, ownerUserID, repoID int64, nam
 		return 0, nil, nil, err
 	}
 
+	if err := s.checkRepoOwnership(ctx, ownerUserID, repoID); err != nil {
+		return 0, nil, nil, err
+	}
+
 	warnings := s.chainWarnings(ctx, nodes)
 
 	release, err := s.acquireSubmissionLock(ctx, repoID, nodes[0])
@@ -252,6 +257,26 @@ func (s *Service) CreateFlow(ctx context.Context, ownerUserID, repoID int64, nam
 	}
 
 	return flowID, created, warnings, nil
+}
+
+// checkRepoOwnership 校验 repoID 属于 ownerUserID，不属于（含不存在）
+// 统一报 store.ErrRepoNotFound —— 与 store.UpdateRepo/GetFlow 对非属主
+// 隐瞒存在是同一原则：这里如果没有这层校验，任何登录用户传别人的
+// repoID 都能在别人名下建任务，是一个真实的越权口子，CreateFlow 必须
+// 在动手建任何东西之前把它挡掉。
+func (s *Service) checkRepoOwnership(ctx context.Context, ownerUserID, repoID int64) error {
+	var exists bool
+	err := s.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM repos WHERE id = $1 AND user_id = $2)`,
+		repoID, ownerUserID,
+	).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("flow: 校验仓库归属失败: %w", err)
+	}
+	if !exists {
+		return store.ErrRepoNotFound
+	}
+	return nil
 }
 
 // acquireSubmissionLock 用 Postgres 会话级事务咨询锁
@@ -440,6 +465,17 @@ type TaskSummary struct {
 	State     string
 	DependsOn *int64
 	Priority  int
+	// DependsOnAt 是前驱放行的判定时机（'pr_open' 或 'merged'），供
+	// 查看端展示"这条依赖在等什么"（画布检视面板，无 UI 消费方之前
+	// 一直没吐出来，见本文件顶部 NodeInput.DependsOnAt 注释）。
+	DependsOnAt string
+	// Profile 是节点执行画像的原始 jsonb 字节，类型与
+	// task.Task.Profile 保持一致（[]byte，而非 json.RawMessage）——
+	// 调用方（httpapi）序列化成响应 JSON 时需要显式转成
+	// json.RawMessage 才会被原样嵌入而不是被 encoding/json 当作普通
+	// []byte 编码成 base64 字符串，这层转换留给 httpapi，本包只管
+	// 原样透传字节。
+	Profile []byte
 }
 
 // GetFlow 读取一个 flow 的信息与其下全部任务的当前状态。
@@ -460,7 +496,7 @@ func (s *Service) GetFlow(ctx context.Context, ownerUserID, flowID int64) (*Flow
 	}
 
 	rows, err := s.Pool.Query(ctx,
-		`SELECT id, linear_issue_key, state, depends_on, priority
+		`SELECT id, linear_issue_key, state, depends_on, priority, depends_on_at, profile
 		 FROM tasks WHERE flow_id = $1 ORDER BY id`, flowID)
 	if err != nil {
 		return nil, fmt.Errorf("flow: 查询编排图 %d 的任务失败: %w", flowID, err)
@@ -468,7 +504,7 @@ func (s *Service) GetFlow(ctx context.Context, ownerUserID, flowID int64) (*Flow
 	defer rows.Close()
 	for rows.Next() {
 		var ts TaskSummary
-		if err := rows.Scan(&ts.ID, &ts.IssueKey, &ts.State, &ts.DependsOn, &ts.Priority); err != nil {
+		if err := rows.Scan(&ts.ID, &ts.IssueKey, &ts.State, &ts.DependsOn, &ts.Priority, &ts.DependsOnAt, &ts.Profile); err != nil {
 			return nil, fmt.Errorf("flow: 读取任务行失败: %w", err)
 		}
 		fs.Tasks = append(fs.Tasks, ts)
@@ -477,6 +513,50 @@ func (s *Service) GetFlow(ctx context.Context, ownerUserID, flowID int64) (*Flow
 		return nil, fmt.Errorf("flow: 查询编排图 %d 的任务失败: %w", flowID, err)
 	}
 	return &fs, nil
+}
+
+// FlowListItem 是"我的编排图"列表里的一行：flow 元信息 + 任务数量，
+// 不含每个任务的明细（那是 GetFlow 的职责）——列表页只需要知道
+// "这张图有多大、什么时候建的"，拉全部任务字段对列表场景是浪费。
+type FlowListItem struct {
+	ID        int64
+	RepoID    int64
+	Name      string
+	CreatedAt time.Time
+	TaskCount int
+}
+
+// ListFlows 列出 ownerUserID 名下建过的全部编排图，按创建时间倒序
+// （最新的图排最前，跟 Board 的任务列表默认视角一致）。
+//
+// 用 LEFT JOIN 而不是子查询数 —— flows 表本身没有冗余的任务计数列
+// （F1.4-AC2 的补偿式创建不改 flows 表结构），JOIN + COUNT 是最直接
+// 的算法，图的规模（≤ MaxNodes=200 个任务）小到不需要额外优化。
+func (s *Service) ListFlows(ctx context.Context, ownerUserID int64) ([]FlowListItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT f.id, f.repo_id, f.name, f.created_at, COUNT(t.id)
+		FROM flows f
+		LEFT JOIN tasks t ON t.flow_id = f.id
+		WHERE f.user_id = $1
+		GROUP BY f.id
+		ORDER BY f.id DESC`, ownerUserID)
+	if err != nil {
+		return nil, fmt.Errorf("flow: 查询编排图列表失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := []FlowListItem{}
+	for rows.Next() {
+		var it FlowListItem
+		if err := rows.Scan(&it.ID, &it.RepoID, &it.Name, &it.CreatedAt, &it.TaskCount); err != nil {
+			return nil, fmt.Errorf("flow: 读取编排图列表行失败: %w", err)
+		}
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("flow: 查询编排图列表失败: %w", err)
+	}
+	return out, nil
 }
 
 // isUniqueViolation 报告 err 是否是唯一约束冲突（SQLSTATE 23505）。

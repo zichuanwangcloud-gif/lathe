@@ -85,6 +85,11 @@ export const api = {
   repos: () => request('/api/repos'),
   config: () => request('/api/config'),
 
+  // 编排流程图（PRD 07）：批量建图、查图、列出我建过的图
+  flows: () => request('/api/flows'),
+  flow: (id) => request(`/api/flows/${id}`),
+  createFlow: (body) => request('/api/flows', { method: 'POST', body: JSON.stringify(body) }),
+
   trigger: (issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueKey }) }),
   linearIssues: () => request('/api/linear/issues'),
@@ -145,6 +150,7 @@ export const STATE_META = {
   queued: { label: '排队中', tone: 'idle' },
   triaging: { label: '分诊中', tone: 'run' },
   blocked_spec: { label: '待补充需求', tone: 'warn' },
+  blocked_dep: { label: '等待前驱', tone: 'warn' },
   awaiting_approval: { label: '待放行', tone: 'warn' },
   implementing: { label: '实现中', tone: 'run' },
   verifying: { label: '验证中', tone: 'run' },

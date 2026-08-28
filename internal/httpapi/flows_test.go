@@ -272,3 +272,133 @@ func TestFlowCreateNoWarningsWhenChainWithinLimit(t *testing.T) {
 		t.Errorf("深度 3 不超过默认上限 4，warnings 应为空，得到 %v", warningsRaw)
 	}
 }
+
+// TestFlowGetExposesDependsOnAtAndProfile 覆盖画布检视面板需要的两个
+// 新字段：GET /api/flows/{id} 的每个任务应带上 dependsOnAt（未指定时
+// 落默认值 pr_open）与 profile（原样透传，未设时为 null，不是 base64
+// 字符串——这正是审查发现的坑，见 flows.go get handler 的注释）。
+func TestFlowGetExposesDependsOnAtAndProfile(t *testing.T) {
+	srv, _, repoID := flowFixture(t)
+
+	body := fmt.Sprintf(`{"name":"insp","repoId":%d,"nodes":[
+		{"issueKey":"INSP-1","profile":{"modelChannel":"opus-plan","skills":["go-testing"]}},
+		{"issueKey":"INSP-2","dependsOnIndex":0,"dependsOnAt":"merged"}
+	]}`, repoID)
+
+	createResp := srv.do(t, "POST", "/api/flows", body, true)
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("创建应返回 201，得到 %d: %s", createResp.StatusCode, srv.raw(t, createResp))
+	}
+	flowID := int64(srv.decode(t, createResp)["flowId"].(float64))
+
+	getResp := srv.do(t, "GET", fmt.Sprintf("/api/flows/%d", flowID), "", true)
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("查询应返回 200，得到 %d: %s", getResp.StatusCode, srv.raw(t, getResp))
+	}
+	tasksRaw := srv.decode(t, getResp)["tasks"].([]any)
+	if len(tasksRaw) != 2 {
+		t.Fatalf("应有 2 个任务，得到 %v", tasksRaw)
+	}
+
+	t0 := tasksRaw[0].(map[string]any)
+	if t0["dependsOnAt"] != "pr_open" {
+		t.Errorf("第 1 个任务未指定 dependsOnAt 应落默认值 pr_open，得到 %v", t0["dependsOnAt"])
+	}
+	profile, ok := t0["profile"].(map[string]any)
+	if !ok {
+		t.Fatalf("profile 应原样解析成 JSON 对象（不是 base64 字符串），得到 %T: %v", t0["profile"], t0["profile"])
+	}
+	if profile["modelChannel"] != "opus-plan" {
+		t.Errorf("profile.modelChannel 应为 opus-plan，得到 %v", profile["modelChannel"])
+	}
+
+	t1 := tasksRaw[1].(map[string]any)
+	if t1["dependsOnAt"] != "merged" {
+		t.Errorf("第 2 个任务的 dependsOnAt 应为 merged，得到 %v", t1["dependsOnAt"])
+	}
+	// tasks.profile 列的 schema 默认值是 '{}'::jsonb（NOT NULL），不是
+	// SQL NULL——未设画像时应读回一个空对象，不是 null。
+	if empty, ok := t1["profile"].(map[string]any); !ok || len(empty) != 0 {
+		t.Errorf("第 2 个任务未设画像，profile 应为空对象 {}，得到 %T: %v", t1["profile"], t1["profile"])
+	}
+}
+
+// TestFlowCreateRejectsOtherUsersRepo 覆盖归属校验在 HTTP 层的表现：
+// repoId 属于别的账号时应返回 404（对非属主隐瞒存在），不是替别人建出
+// 任务。
+func TestFlowCreateRejectsOtherUsersRepo(t *testing.T) {
+	srv, _, _ := flowFixture(t)
+
+	otherUserID := mustUser(t, srv.store, "flow-other-"+t.Name()+"@example.com")
+	var otherRepoID int64
+	if err := srv.store.Pool().QueryRow(context.Background(),
+		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
+		otherUserID, "acme/flow-other-"+t.Name()).Scan(&otherRepoID); err != nil {
+		t.Fatalf("建另一个用户的 repo 失败: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"name":"steal","repoId":%d,"nodes":[{"issueKey":"STEAL-1"}]}`, otherRepoID)
+	resp := srv.do(t, "POST", "/api/flows", body, true)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("别人的 repoId 应返回 404，得到 %d: %s", resp.StatusCode, srv.raw(t, resp))
+	}
+}
+
+// TestFlowList 覆盖新端点：只列出当前用户名下的图，按创建时间倒序，
+// 任务数正确——这是"编排"菜单落地页唯一的数据来源。
+func TestFlowList(t *testing.T) {
+	srv, _, repoID := flowFixture(t)
+
+	empty := srv.do(t, "GET", "/api/flows", "", true)
+	if empty.StatusCode != http.StatusOK {
+		t.Fatalf("空列表应返回 200，得到 %d: %s", empty.StatusCode, srv.raw(t, empty))
+	}
+	if flows := srv.decode(t, empty)["flows"].([]any); len(flows) != 0 {
+		t.Fatalf("尚未建图应返回空数组，得到 %v", flows)
+	}
+
+	body1 := fmt.Sprintf(`{"name":"la","repoId":%d,"nodes":[{"issueKey":"LST-1"}]}`, repoID)
+	r1 := srv.do(t, "POST", "/api/flows", body1, true)
+	flowID1 := int64(srv.decode(t, r1)["flowId"].(float64))
+
+	body2 := fmt.Sprintf(`{"name":"lb","repoId":%d,"nodes":[
+		{"issueKey":"LST-2a"},{"issueKey":"LST-2b","dependsOnIndex":0}
+	]}`, repoID)
+	r2 := srv.do(t, "POST", "/api/flows", body2, true)
+	flowID2 := int64(srv.decode(t, r2)["flowId"].(float64))
+
+	// 另一个用户建的图不该出现在这次列表里
+	otherUserID := mustUser(t, srv.store, "flow-listother-"+t.Name()+"@example.com")
+	svc := flow.Service{Pool: srv.store.Pool(), Tasks: task.NewMachine(srv.store.Pool())}
+	var otherRepoID int64
+	if err := srv.store.Pool().QueryRow(context.Background(),
+		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
+		otherUserID, "acme/flow-listother-"+t.Name()).Scan(&otherRepoID); err != nil {
+		t.Fatalf("建另一个用户的 repo 失败: %v", err)
+	}
+	if _, _, _, err := svc.CreateFlow(context.Background(), otherUserID, otherRepoID, "not-mine",
+		[]flow.NodeInput{{IssueKey: "LST-OTHER"}}); err != nil {
+		t.Fatalf("另一个用户建图应成功，得到 %v", err)
+	}
+
+	listResp := srv.do(t, "GET", "/api/flows", "", true)
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("列表应返回 200，得到 %d: %s", listResp.StatusCode, srv.raw(t, listResp))
+	}
+	flowsRaw := srv.decode(t, listResp)["flows"].([]any)
+	if len(flowsRaw) != 2 {
+		t.Fatalf("应只看到自己的 2 张图，得到 %d 张: %v", len(flowsRaw), flowsRaw)
+	}
+
+	got0 := flowsRaw[0].(map[string]any)
+	got1 := flowsRaw[1].(map[string]any)
+	if int64(got0["id"].(float64)) != flowID2 || int64(got1["id"].(float64)) != flowID1 {
+		t.Fatalf("应按创建时间倒序（后建的在前），得到 %v", flowsRaw)
+	}
+	if int(got0["taskCount"].(float64)) != 2 {
+		t.Errorf("第二张图应有 2 个任务，得到 %v", got0["taskCount"])
+	}
+	if int(got1["taskCount"].(float64)) != 1 {
+		t.Errorf("第一张图应有 1 个任务，得到 %v", got1["taskCount"])
+	}
+}

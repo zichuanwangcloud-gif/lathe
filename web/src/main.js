@@ -5,6 +5,8 @@ import App from './App.vue'
 import Board from './views/Board.vue'
 import LinearIssues from './views/LinearIssues.vue'
 import TaskDetail from './views/TaskDetail.vue'
+import FlowList from './views/FlowList.vue'
+import FlowCanvas from './views/FlowCanvas.vue'
 import Repos from './views/Repos.vue'
 import PersonalSettings from './views/PersonalSettings.vue'
 import SystemSettings from './views/SystemSettings.vue'
@@ -22,6 +24,9 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'board', component: Board },
+    { path: '/flows', name: 'flows', component: FlowList },
+    { path: '/flows/new', name: 'flow-new', component: FlowCanvas },
+    { path: '/flows/:id', name: 'flow', component: FlowCanvas, props: true },
     // 「Linear 任务」只有绑定了 Linear API 令牌的人可见（菜单与守卫同一依据）
     { path: '/linear', name: 'linear', component: LinearIssues, meta: { linear: true } },
     { path: '/tasks/:id', name: 'task', component: TaskDetail, props: true },
