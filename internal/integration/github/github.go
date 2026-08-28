@@ -172,6 +172,39 @@ func (c *Client) GetPR(ctx context.Context, providerRepo string, number int) (*g
 	return pr, nil
 }
 
+// PRInfo 是 GetPR 结果的精简摘要，供 runner.GitHubAPI（F4.1 合并检测的
+// 轮询兜底）消费——定义在这里而不是 runner 包，是因为 runner 包已经
+// 依赖本包（CreatePR 用到 PRParams/PullRequest），反过来若 runner 定义
+// 这个类型会成环。
+type PRInfo struct {
+	Number int
+	Merged bool
+	// State 是 "open" / "closed"。
+	State string
+	// BaseRef 是 PR 当前指向的 base 分支名 —— GitHub 在 base 分支被删除
+	// 或 PR 被 retarget 后会变化。仅用于诊断，不强制消费。
+	BaseRef string
+	// HeadSHA 是 PR head 分支当前指向的 commit SHA——F4.4（前驱被改
+	// 重验）用它检测"PR 仍 open 但内容被 force-push 改写"：与轮询上
+	// 一次观察到的值不一致即判定发生了 force-push。
+	HeadSHA string
+}
+
+// GetPRInfo 是 GetPR 的精简包装，供 F4.1 合并检测的轮询兜底使用。
+func (c *Client) GetPRInfo(ctx context.Context, providerRepo string, number int) (*PRInfo, error) {
+	pr, err := c.GetPR(ctx, providerRepo, number)
+	if err != nil {
+		return nil, err
+	}
+	return &PRInfo{
+		Number:  pr.GetNumber(),
+		Merged:  pr.GetMerged(),
+		State:   pr.GetState(),
+		BaseRef: pr.GetBase().GetRef(),
+		HeadSHA: pr.GetHead().GetSHA(),
+	}, nil
+}
+
 // ReviewComment 是一条需要 agent 处理的 review 意见。
 type ReviewComment struct {
 	ID     int64

@@ -244,6 +244,32 @@ func TestGetPR(t *testing.T) {
 	}
 }
 
+// TestGetPRInfoExtractsHeadSHA 验证 F4.4（前驱被改重验）赖以判定
+// "PR 仍 open 但内容被 force-push 改写"的信号——GetPRInfo 必须能从
+// PR 的 head.sha 字段正确取值填进 PRInfo.HeadSHA。
+func TestGetPRInfoExtractsHeadSHA(t *testing.T) {
+	c := stubServer(t, map[string]http.HandlerFunc{
+		"/repos/acme/demo/pulls/7": func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"number":7,"state":"open","merged":false,
+				"base":{"ref":"dev"},"head":{"sha":"abc123deadbeef"}}`))
+		},
+	})
+
+	info, err := c.GetPRInfo(context.Background(), "acme/demo", 7)
+	if err != nil {
+		t.Fatalf("GetPRInfo 失败: %v", err)
+	}
+	if info.HeadSHA != "abc123deadbeef" {
+		t.Errorf("HeadSHA = %q，期望 %q", info.HeadSHA, "abc123deadbeef")
+	}
+	if info.State != "open" || info.Merged {
+		t.Errorf("state/merged 应保持 open/false，实际 state=%q merged=%v", info.State, info.Merged)
+	}
+	if info.BaseRef != "dev" {
+		t.Errorf("BaseRef = %q，期望 dev", info.BaseRef)
+	}
+}
+
 // PR 正文必须带上验证证据 —— 这是本产品与「随手产出的 diff」的区别。
 func TestBuildPRBody(t *testing.T) {
 	body := BuildPRBody(

@@ -21,6 +21,9 @@ const (
 	StateTriaging State = "triaging"
 	// StateBlockedSpec 单子不明确，已回帖提问，等人补充。
 	StateBlockedSpec State = "blocked_spec"
+	// StateBlockedDep 前驱失败或前驱 PR 被关闭未合并，后继的地基没了，
+	// 已回帖说明，等前驱恢复或人工中止（docs/06-orchestration.md §5.2）。
+	StateBlockedDep State = "blocked_dep"
 	// StateAwaitingApproval 等人工放行（仅 plan-first / manual 档使用）。
 	StateAwaitingApproval State = "awaiting_approval"
 	// StateImplementing agent 正在写代码。
@@ -42,7 +45,7 @@ const (
 // AllStates 按生命周期顺序列出全部状态。
 func AllStates() []State {
 	return []State{
-		StateQueued, StateTriaging, StateBlockedSpec, StateAwaitingApproval,
+		StateQueued, StateTriaging, StateBlockedSpec, StateBlockedDep, StateAwaitingApproval,
 		StateImplementing, StateVerifying, StatePROpen, StateReviewFeedback,
 		StateMerged, StateFailed, StateCancelled,
 	}
@@ -50,7 +53,7 @@ func AllStates() []State {
 
 // transitions 是合法转移表：key 可转到 value 中的任一状态。
 //
-// 四条不显然但必要的边：
+// 五条不显然但必要的边：
 //
 //  1. triaging/implementing/verifying → queued —— 节点崩溃后租约到期，任务被
 //     重新派发（docs/02-design.md §6.4）；单机形态下即服务重启后的启动恢复。
@@ -62,12 +65,17 @@ func AllStates() []State {
 //  4. queued → implementing / verifying —— 智能重试的断点续跑：失败任务的
 //     现场（worktree/分支/提交）经检查有效时，从失败阶段续跑而非从头重跑，
 //     跳过已完成的分诊/实现阶段（runner.PlanRetry 决策）。
+//  5. queued → blocked_dep —— 前驱失败或前驱 PR 被关闭未合并，后继的地基
+//     没了（docs/06-orchestration.md §5.2）；blocked_dep → queued 是前驱
+//     恢复后的唤醒路径，→ cancelled 是人工中止。
 var transitions = map[State][]State{
-	StateQueued:   {StateTriaging, StateImplementing, StateVerifying, StateCancelled},
+	StateQueued:   {StateTriaging, StateImplementing, StateVerifying, StateBlockedDep, StateCancelled},
 	StateTriaging: {StateQueued, StateImplementing, StateAwaitingApproval, StateBlockedSpec, StateFailed, StateCancelled},
 
 	// 等人补充需求；补齐后重新入队
 	StateBlockedSpec: {StateQueued, StateCancelled},
+	// 等前驱恢复（唤醒回 queued）或人工中止
+	StateBlockedDep: {StateQueued, StateCancelled},
 	// 等人放行
 	StateAwaitingApproval: {StateImplementing, StateCancelled},
 

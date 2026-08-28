@@ -41,6 +41,29 @@ func TestBaseBranchByKind(t *testing.T) {
 	}
 }
 
+// BaseRefOverride 生效时忽略 kind 直接返回它 —— 栈式 PR 后继任务从
+// 前驱分支分叉，而不是从仓库配置的默认分支（docs/06-orchestration.md §4）。
+func TestBaseBranchOverride(t *testing.T) {
+	c := DefaultRepoConfig("Clouditera/CloudRouter")
+	c.BaseRefOverride = "fix/cr-1000-base"
+
+	for _, kind := range []TaskKind{KindFix, KindFeature, KindHotfix} {
+		got, err := c.BaseBranch(kind)
+		if err != nil {
+			t.Errorf("BaseBranch(%s) 报错: %v", kind, err)
+			continue
+		}
+		if got != "fix/cr-1000-base" {
+			t.Errorf("BaseBranch(%s) = %q，override 生效时应忽略 kind 直接返回 override 值", kind, got)
+		}
+	}
+
+	// 未知 kind 也应被 override 短路，不落入 switch 的 default 报错分支
+	if got, err := c.BaseBranch(TaskKind("bogus")); err != nil || got != "fix/cr-1000-base" {
+		t.Errorf("override 生效时未知 kind 也应直接返回 override 值，得到 (%q, %v)", got, err)
+	}
+}
+
 // 受保护分支拦截 —— 产品边界「永不 push 受保护分支」的最后一道闸门。
 func TestValidatePushTarget(t *testing.T) {
 	c := DefaultRepoConfig("Clouditera/CloudRouter")

@@ -22,6 +22,17 @@ const (
 	DefaultPreviewDiskThreshold = 90
 )
 
+// SettingFlowMaxChainLength 是链长约束（PRD 07 §F3.3）的系统设置键名：
+// 一条 depends_on 链允许的最大深度。消费方：internal/flow.Service —— 建
+// 图时（CreateFlow）现取这个值，超限只警告、不拒绝创建（F3.3-AC1 的
+// "UI 警告"本次没有 UI，落点是 CreateFlow 返回结果里的 warnings 字段，
+// 供未来 M5 的画布 UI 消费）。
+const SettingFlowMaxChainLength = "flow_max_chain_length"
+
+// DefaultFlowMaxChainLength 是链长上限未配置时的默认值
+// （docs/07-prd-orchestration.md §8.2 U2 已定：4，仅警告）。
+const DefaultFlowMaxChainLength = 4
+
 // ErrSettingNotFound 表示该键尚未配置（调用方应回退默认值）。
 var ErrSettingNotFound = errors.New("store: 设置项不存在")
 
@@ -74,4 +85,21 @@ func (s *Store) PreviewThresholds(ctx context.Context) (mem, disk int, err error
 		}
 	}
 	return mem, disk, nil
+}
+
+// FlowMaxChainLength 现取链长上限（PRD F3.3-AC2）；未配置该键（表里没有
+// 这一行）或值损坏时回退默认值 4 —— 与 PreviewThresholds 同一原则：
+// 设置页写入口径本该已校验，损坏只可能来自手工改库，不该因此让建图
+// 整体报错。error 始终为 nil，保留返回值是为了跟 PreviewThresholds 的
+// 调用形状一致，给调用方（internal/flow.Service）留出以后收紧校验的口子。
+func (s *Store) FlowMaxChainLength(ctx context.Context) (int, error) {
+	v, err := s.Setting(ctx, SettingFlowMaxChainLength)
+	if err != nil {
+		return DefaultFlowMaxChainLength, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return DefaultFlowMaxChainLength, nil
+	}
+	return n, nil
 }

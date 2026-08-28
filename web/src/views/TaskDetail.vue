@@ -92,6 +92,7 @@ const PHASE_META = {
   implement: { label: '实现', order: 1 },
   verify: { label: '验证', order: 2 },
   review: { label: '评审', order: 3 },
+  push: { label: '推送', order: 4 },
 }
 
 // subagent 的事件（0014）收成一个可折叠子块，插在它首次出现的位置。
@@ -212,7 +213,10 @@ const activePhase = computed(() => {
     verifying: 'verify',
     review_feedback: 'review',
   }
-  const cur = byState[task.value?.state]
+  let cur = byState[task.value?.state]
+  // 推送复用 verifying 状态（状态机无独立推送态）：一旦出现推送阶段
+  // 事件（如网络抖动重试），说明验证已完、正在推送，置顶推送组
+  if (cur === 'verify' && g.some((x) => x.phase === 'push')) cur = 'push'
   return g.some((x) => x.phase === cur) ? cur : g[g.length - 1].phase
 })
 

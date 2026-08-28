@@ -1,4 +1,4 @@
-.PHONY: help all build test lint run migrate dev-infra dev-infra-down ui ui-deps ui-dev clean
+.PHONY: help all build test test-race lint run migrate dev-infra dev-infra-down ui ui-deps ui-dev clean
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
@@ -32,7 +32,17 @@ build: ## 编译控制面与节点代理（不重建界面，用 make all 一起
 all: ui build ## 构建界面与二进制
 
 test: ## 跑测试
-	go test ./... -count=1
+	# -p 1：DB 领单调度器（internal/task.Machine.ClaimReady）是全局查询，不按包/fixture
+	# 隔离，多个测试包默认并行跑在同一个真实 Postgres 上会互相抢/污染对方建的 'queued'
+	# 行，产生间歇性 FAIL（与代码正确性无关，是共享测试库的既有限制）。强制包间串行即可。
+	go test -p 1 ./... -count=1
+
+test-race: ## 跑并发相关测试的 -race 检测（F2.1-AC5；本地目标，未接入 CI）
+	# -p 1：这几个包的测试都跑在同一个真实 Postgres 上，ClaimReady 之类
+	# 的查询是全局的（不按包/fixture 隔离），多个包的测试二进制被 go
+	# test 默认并行跑起来时会互相在数据库里踩到对方的行，所以强制包间
+	# 串行；-race 检测的是包内 goroutine 竞态，与包间串行不冲突。
+	go test -p 1 ./cmd/lathe/... ./internal/task/... ./internal/runner/... ./internal/flow/... -race -count=1
 
 lint: ## 静态检查
 	go vet ./...

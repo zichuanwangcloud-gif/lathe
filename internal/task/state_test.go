@@ -7,8 +7,8 @@ import (
 
 func TestAllStatesValid(t *testing.T) {
 	all := AllStates()
-	if len(all) != 11 {
-		t.Errorf("状态总数 = %d，设计约定 11 个（docs/02-design.md §3）", len(all))
+	if len(all) != 12 {
+		t.Errorf("状态总数 = %d，设计约定 12 个（docs/02-design.md §3 + blocked_dep，docs/06-orchestration.md §5.2）", len(all))
 	}
 	for _, s := range all {
 		if !s.Valid() {
@@ -59,9 +59,12 @@ func TestLegalTransitions(t *testing.T) {
 		{StateReviewFeedback, StateMerged},
 		{StateImplementing, StateQueued}, // 租约到期重新派发
 		{StateVerifying, StateQueued},
-		{StateFailed, StateQueued},       // 人工重试
-		{StateQueued, StateImplementing}, // 智能重试：断点续跑（跳过已完成的分诊）
-		{StateQueued, StateVerifying},    // 智能重试：续跑验证/推送（不绕过 verifying 本身）
+		{StateFailed, StateQueued},        // 人工重试
+		{StateQueued, StateImplementing},  // 智能重试：断点续跑（跳过已完成的分诊）
+		{StateQueued, StateVerifying},     // 智能重试：续跑验证/推送（不绕过 verifying 本身）
+		{StateQueued, StateBlockedDep},    // 前驱失败或前驱 PR 被关闭未合并
+		{StateBlockedDep, StateQueued},    // 前驱恢复，唤醒后继
+		{StateBlockedDep, StateCancelled}, // 人工中止
 	}
 	for _, tc := range legal {
 		if !CanTransition(tc[0], tc[1]) {
@@ -83,6 +86,8 @@ func TestIllegalTransitions(t *testing.T) {
 		{StateCancelled, StateQueued},         // 终态不可复活
 		{StateMerged, StateImplementing},      // 终态不可复活
 		{StateBlockedSpec, StateImplementing}, // 必须回 queued 重新分诊
+		{StateBlockedDep, StateImplementing},  // 必须先回 queued 重新分诊/派发
+		{StateTriaging, StateBlockedDep},      // blocked_dep 只从 queued 进入（调度期判定，不是分诊期）
 		{State("bogus"), StateQueued},         // 未知源状态
 		{StateQueued, State("bogus")},         // 未知目标状态
 	}
