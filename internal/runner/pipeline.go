@@ -344,7 +344,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		return p.fail(rc, StageTriageRun, err)
 	}
 	triageSession := p.newID()
-	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage")
+	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", triageDir, triageSession)
 	triageRes, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         TriagePrompt(issue.Context()),
 		Dir:            triageDir,
@@ -481,7 +481,7 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 // 实现与修复回路（同一会话的延续）都走 ImplementChannel：修复是
 // 实现的下半场，通道不该中途换。
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
-	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase)
+	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
 	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            rc.wt.Path,

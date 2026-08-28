@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
+import AgentEventItem from '../components/AgentEventItem.vue'
 
 const props = defineProps({ id: { type: String, required: true } })
 const router = useRouter()
@@ -86,22 +87,43 @@ async function loadEvents() {
 marked.setOptions({ breaks: true })
 const md = (s) => DOMPurify.sanitize(marked.parse(s || ''))
 
-// 事件 append-only，按 id 缓存渲染结果，避免每轮轮询把整屏 markdown 重算一遍
-const htmlCache = new Map()
-function mdOf(e) {
-  let h = htmlCache.get(e.id)
-  if (h === undefined) {
-    h = md(e.body)
-    htmlCache.set(e.id, h)
-  }
-  return h
-}
-
 const PHASE_META = {
   triage: { label: '分诊', order: 0 },
   implement: { label: '实现', order: 1 },
   verify: { label: '验证', order: 2 },
   review: { label: '评审', order: 3 },
+}
+
+// subagent 的事件（0014）收成一个可折叠子块，插在它首次出现的位置。
+//
+// 为什么是「兄弟块」而不是真的挂在那条 Agent 调用下面：agentId 与父调用
+// toolUseId 的对应关系只存在于 transcript 的 toolUseResult 字段里，stdout
+// 这条通道给不出。与其按时间顺序猜一个父子关系，不如老实地并排放 —— 子块
+// 标题就是派给它的任务描述，与父调用那行显示的 description 是同一句话，
+// 人一眼能对上。（真要连线，得再读父会话的 transcript，见 docs/04 §7.4。）
+function groupSubagents(list) {
+  const out = []
+  const blocks = new Map() // agentId → 子块
+  for (const e of list) {
+    const aid = e.agentId
+    if (!aid) {
+      out.push(e)
+      continue
+    }
+    let b = blocks.get(aid)
+    if (!b) {
+      b = { subagent: true, id: 'sub-' + aid, agentId: aid, title: '', list: [] }
+      blocks.set(aid, b)
+      out.push(b) // 占住首次出现的位置，保持时间顺序
+    }
+    // 首行是派活描述，充当子块标题而不是块内的一条
+    if (e.kind === 'agent_start') {
+      b.title = e.body
+      continue
+    }
+    b.list.push(e)
+  }
+  return out
 }
 
 // 一次工具调用在事件流里是两条（tool_use 发起 + tool_result 结果）。平铺时
@@ -111,6 +133,8 @@ const PHASE_META = {
 //
 // 老事件的 tool_use 没有 id（该字段是后来才取的），配不上的一律原样放行，
 // 退回两行平铺 —— 降级而非崩溃，与后端 KindRaw 同一立场。
+//
+// 子块对象（groupSubagents 产出）没有 kind，会被原样放行。
 function pairTools(list) {
   const out = []
   const pending = new Map() // toolUseId → 已放进 out 的发起项
@@ -145,23 +169,13 @@ function pairTools(list) {
 // 因此只在 1s 以上才显示：那时相对误差已降到 20% 以内，数字才说得上话。
 // 更低的区间与其显示一个自信的错数，不如不显示 —— 「很快」这件事，
 // 从一行 ✓ 上已经看得出来了。要拿到真实的单次工具耗时，得在事件里记
-// 发生时刻而不是入库时刻（需要加列，见 docs/04 后续）。
+// 发生时刻而不是入库时刻（需要加列，见 docs/04 §7.5）。
 const TOOL_DURATION_FLOOR_MS = 1000
 
 function toolDuration(useAt, resultAt) {
   const dt = new Date(resultAt) - new Date(useAt)
   if (!Number.isFinite(dt) || dt < TOOL_DURATION_FLOOR_MS) return null
   return dt
-}
-
-// 工具行的状态标记。返回 null 表示「无从判断」：老数据没有 toolUseId，
-// 此时不能显示 ⋯ —— 那会把历史任务里早已结束的调用说成还在跑。
-function toolMark(e) {
-  if (!e.payload?.toolUseId) return null
-  if (!e.result) return { glyph: '⋯', tone: 'run', title: '进行中或结果未落库' }
-  return e.result.payload?.isError
-    ? { glyph: '✗', tone: 'bad', title: '报错' }
-    : { glyph: '✓', tone: 'ok', title: '完成' }
 }
 
 const phaseGroups = computed(() => {
@@ -173,11 +187,19 @@ const phaseGroups = computed(() => {
   return [...groups.entries()]
     .map(([phase, list]) => ({
       phase,
-      list: pairTools(list),
+      // 先把 subagent 收成子块，再对主流与每个子块分别做工具配对
+      list: pairTools(groupSubagents(list)).map((x) =>
+        x.subagent ? { ...x, list: pairTools(x.list) } : x
+      ),
       meta: PHASE_META[phase] || { label: phase, order: 9 },
     }))
     .sort((a, b) => a.meta.order - b.meta.order)
 })
+
+// 子块头上的计数：显示它调了多少次工具，比"多少条事件"更能说明它干了多少活
+function subagentToolCount(block) {
+  return block.list.filter((e) => e.kind === 'tool_use').length
+}
 
 // 当前阶段：进行中按任务状态推断，终态取最后一个有事件的阶段
 const activePhase = computed(() => {
@@ -200,22 +222,6 @@ const orderedGroups = computed(() => {
   const cur = g.find((x) => x.phase === activePhase.value)
   return cur ? [cur, ...g.filter((x) => x !== cur)] : g
 })
-
-// result 事件的第一行是徽章行（由 payload 重新渲染），正文从空行后开始
-function resultText(e) {
-  const i = e.body.indexOf('\n\n')
-  return i >= 0 ? e.body.slice(i + 2) : ''
-}
-
-// verify_step 同理：首行是状态行，失败时后面附截断输出
-function verifyLine(e) {
-  const i = e.body.indexOf('\n\n')
-  return i >= 0 ? e.body.slice(0, i) : e.body
-}
-function verifyOutput(e) {
-  const i = e.body.indexOf('\n\n')
-  return i >= 0 ? e.body.slice(i + 2) : ''
-}
 
 const STEP_LABEL = {
   build: '构建',
@@ -380,76 +386,23 @@ onUnmounted(() => {
           </summary>
 
           <ol class="log">
-            <li v-for="e in g.list" :key="e.id" class="ev" :class="'ev-' + e.kind">
-              <!-- init / raw：一行原文 -->
-              <div v-if="e.kind === 'init' || e.kind === 'raw'" class="faint mono ev-line">
-                {{ e.body }}
-              </div>
-
-              <!-- text：模型正文，markdown 渲染 -->
-              <div v-else-if="e.kind === 'text'" class="md" v-html="mdOf(e)"></div>
-
-              <!-- thinking：灰显折叠 -->
-              <details v-else-if="e.kind === 'thinking'" class="ev-fold">
-                <summary class="faint">思考过程</summary>
-                <pre>{{ e.body }}</pre>
-              </details>
-
-              <!-- tool_use：工具名 + 参数摘要，结果缝在同一条上（✓/✗ + 耗时） -->
-              <div v-else-if="e.kind === 'tool_use'" class="tool-item">
-                <div class="mono tool-line">
-                  <span
-                    v-if="toolMark(e)"
-                    class="tool-mark"
-                    :class="'tm-' + toolMark(e).tone"
-                    :title="toolMark(e).title"
-                  >{{ toolMark(e).glyph }}</span>
-                  <span>{{ e.body }}</span>
-                  <span v-if="e.durationMs != null" class="tool-dur">
-                    {{ formatDuration(e.durationMs) }}
-                  </span>
-                </div>
-                <details v-if="e.result" class="ev-fold tool-out">
-                  <summary :class="e.result.payload?.isError ? 'bad-text' : 'faint'">
-                    {{ e.result.payload?.isError ? '报错输出' : '输出' }}
-                  </summary>
-                  <pre>{{ e.result.body }}</pre>
-                </details>
-              </div>
-
-              <!-- tool_result：配不上发起方时才单独成行（老数据无 toolUseId） -->
-              <details v-else-if="e.kind === 'tool_result'" class="ev-fold">
-                <summary :class="e.payload?.isError ? 'bad-text' : 'faint'">
-                  工具结果{{ e.payload?.isError ? '（报错）' : '' }}
+            <li v-for="e in g.list" :key="e.id" class="ev" :class="e.subagent ? 'ev-sub' : 'ev-' + e.kind">
+              <!-- subagent 子块（0014）：它的内部步骤 stdout 里没有，
+                   来自 transcript。默认折叠，标题是派给它的任务 -->
+              <details v-if="e.subagent" class="subagent">
+                <summary>
+                  <span class="sub-tag">子 agent</span>
+                  <span class="sub-title">{{ e.title || e.agentId }}</span>
+                  <span class="faint sub-count">{{ subagentToolCount(e) }} 次工具调用</span>
                 </summary>
-                <pre>{{ e.body }}</pre>
+                <ol class="log sub-log">
+                  <li v-for="se in e.list" :key="se.id" class="ev" :class="'ev-' + se.kind">
+                    <AgentEventItem :ev="se" />
+                  </li>
+                </ol>
               </details>
 
-              <!-- result：徽章行（耗时/成本/轮数）+ 终局正文 -->
-              <div v-else-if="e.kind === 'result'" class="result-box">
-                <div class="row badges">
-                  <span class="badge" :class="e.payload?.isError ? 'bad' : 'ok'">
-                    {{ e.payload?.isError ? '失败' : '完成' }}
-                  </span>
-                  <span class="faint">{{ e.payload?.numTurns }} 轮</span>
-                  <span class="faint">{{ formatDuration(e.payload?.durationMs) }}</span>
-                  <span class="faint">${{ Number(e.payload?.costUsd || 0).toFixed(4) }}</span>
-                  <span v-if="e.payload?.permissionDenials" class="badge warn">
-                    权限拦截 ×{{ e.payload.permissionDenials }}
-                  </span>
-                </div>
-                <div v-if="resultText(e)" class="md" v-html="md(resultText(e))"></div>
-              </div>
-
-              <!-- verify_step：红绿状态色，失败附截断输出 -->
-              <div v-else-if="e.kind === 'verify_step'">
-                <div class="mono verify-line" :class="'st-' + (e.payload?.status || '')">
-                  {{ verifyLine(e) }}
-                </div>
-                <pre v-if="verifyOutput(e)" class="ev-output">{{ verifyOutput(e) }}</pre>
-              </div>
-
-              <div v-else class="faint mono ev-line">{{ e.body }}</div>
+              <AgentEventItem v-else :ev="e" />
             </li>
           </ol>
         </details>
@@ -571,54 +524,53 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .log { list-style: none; margin: 0; padding: 0 0 8px 18px; }
 .ev { padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
 .ev:last-child { border-bottom: none; }
-.ev-line { font-size: 12.5px; overflow-wrap: anywhere; }
 
-.ev-fold summary {
+/* 单条事件的排版在 components/AgentEventItem.vue 里（作用域样式不跨组件，
+   两边各管自己那部分）。这里只留容器与 subagent 子块。 */
+
+/* subagent 子块（0014）：默认折叠，避免它的几十步把主时间线冲垮；
+   左侧竖线表明这是一层缩进，而不是主 agent 的步骤 */
+.subagent { margin: 2px 0; }
+.subagent > summary {
   cursor: pointer;
-  font-size: 12.5px;
-  user-select: none;
-}
-.ev-fold pre { margin-top: 6px; max-height: 320px; overflow-y: auto; }
-.ev-thinking .ev-fold summary { font-style: italic; }
-
-.tool-line {
-  font-size: 12.5px;
-  color: var(--text-dim);
-  overflow-wrap: anywhere;
   display: flex;
   align-items: baseline;
-  gap: 7px;
+  gap: 8px;
+  padding: 3px 0;
+  list-style: none;
+  user-select: none;
+  font-size: 12.5px;
 }
-
-/* 状态标记定宽，让多行工具调用的文字左边对齐成一列，便于纵向扫读 */
-.tool-mark {
-  flex: none;
-  width: 11px;
-  text-align: center;
-  font-weight: 600;
-}
-.tm-ok { color: var(--ok); }
-.tm-bad { color: var(--bad); }
-.tm-run { color: var(--run); }
-
-.tool-dur {
-  flex: none;
-  margin-left: auto;
+.subagent > summary::-webkit-details-marker { display: none; }
+.subagent > summary::before {
+  content: '▸';
   color: var(--text-faint);
-  font-size: 11.5px;
+  flex: none;
+  transition: transform .15s;
+}
+.subagent[open] > summary::before { transform: rotate(90deg); }
+
+.sub-tag {
+  flex: none;
+  font-size: 11px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-dim);
+}
+.sub-title {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.tool-out { margin: 4px 0 0 18px; }
+.sub-count { flex: none; margin-left: auto; font-size: 11.5px; white-space: nowrap; }
 
-.result-box .badges { margin-bottom: 6px; }
-.bad-text { color: var(--bad); }
-
-.verify-line { font-size: 12.5px; }
-.verify-line.st-passed { color: var(--ok); }
-.verify-line.st-failed { color: var(--bad); }
-.verify-line.st-error { color: var(--warn); }
-.verify-line.st-skipped { color: var(--idle); }
-.ev-output { margin-top: 6px; max-height: 320px; overflow-y: auto; }
+.sub-log {
+  margin-left: 6px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border);
+}
 
 /* markdown 正文的基本排版（全局没有 md 样式，作用域内自给自足） */
 .md :deep(h1), .md :deep(h2), .md :deep(h3), .md :deep(h4) {
