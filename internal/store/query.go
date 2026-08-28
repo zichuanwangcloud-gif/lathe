@@ -29,9 +29,13 @@ type TaskRow struct {
 	FailureReason  *string `json:"failureReason"`
 	// FailureStage 是机器可读的失败阶段代码（智能重试的决策依据），
 	// 仅 state=failed 时有意义。
-	FailureStage   *string    `json:"failureStage"`
-	WorktreePath   *string    `json:"worktreePath"`
-	ProviderRepo   string     `json:"providerRepo"`
+	FailureStage *string `json:"failureStage"`
+	WorktreePath *string `json:"worktreePath"`
+	ProviderRepo string  `json:"providerRepo"`
+	// BaselineDir 是所属仓库配置的基线目录（预览起服务默认复用其中间件）；
+	// 空串 = 未配置。只有 TaskDetail 会填充这一列，ListTasks 留空即可
+	// （列表页不需要）。
+	BaselineDir    string     `json:"baselineDir,omitempty"`
 	CreatedAt      time.Time  `json:"createdAt"`
 	UpdatedAt      time.Time  `json:"updatedAt"`
 	AgentSessionID *string    `json:"agentSessionId"`
@@ -148,7 +152,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 	err := s.pool.QueryRow(ctx, `
 		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
-		       r.provider_repo, t.created_at, t.updated_at,
+		       r.provider_repo, COALESCE(r.baseline_dir, ''), t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
 		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
 		FROM tasks t JOIN repos r ON r.id = t.repo_id
@@ -156,7 +160,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 	).Scan(
 		&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
-		&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
+		&t.ProviderRepo, &t.BaselineDir, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,
 		&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
 	)
@@ -272,6 +276,9 @@ type RepoRow struct {
 	ExcludeDirs []string `json:"excludeDirs"`
 	// VerifyTierOverride 强制验证档位；空串表示按 §5.1 自动判定
 	VerifyTierOverride string `json:"verifyTierOverride"`
+	// BaselineDir 是基线分支在本机（运行节点）的目录，如 /opt/CloudRouter。
+	// 空串 = 未配置——任务预览/起服务维持现有行为，不复用任何基线中间件。
+	BaselineDir string `json:"baselineDir"`
 }
 
 // ListRepos 返回指定用户名下的仓库配置。
@@ -279,7 +286,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
-		       exclude_dirs, COALESCE(verify_tier_override, '')
+		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, '')
 		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -291,12 +298,33 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		var r RepoRow
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-			&r.ExcludeDirs, &r.VerifyTierOverride); err != nil {
+			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// GetRepo 读取单个仓库配置。userID 是隔离边界，语义同 TaskDetail：
+// 不属于该用户时返回 ErrRepoNotFound，不用另一种错误暴露"存在但不是你的"。
+func (s *Store) GetRepo(ctx context.Context, id, userID int64) (*RepoRow, error) {
+	var r RepoRow
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, provider_repo, default_branch, hotfix_base,
+		       protected_branches, branch_pattern, dep_strategy, gate_mode,
+		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, '')
+		FROM repos WHERE id = $1 AND user_id = $2`, id, userID,
+	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
+		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
+		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRepoNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: 读取仓库 %d 失败: %w", id, err)
+	}
+	return &r, nil
 }
 
 // UpdateRepoParams 是可通过界面修改的仓库配置项。
@@ -313,6 +341,9 @@ type UpdateRepoParams struct {
 	// 该字段允许被显式清空回自动档，因此不能用 NULLIF COALESCE 的
 	// "空即不动"惯例 —— 调用方传 nil 表示不修改。
 	VerifyTierOverride *string
+	// BaselineDir 同 VerifyTierOverride 的三态语义：nil=不动，
+	// 空串=清空（不再复用任何基线），非空=设置新目录。
+	BaselineDir *string
 }
 
 // UpdateRepo 更新仓库配置。
@@ -333,16 +364,21 @@ func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoPa
 				WHEN $9::text IS NULL THEN verify_tier_override
 				WHEN $9::text = '' THEN NULL
 				ELSE $9::text
+			END,
+			baseline_dir = CASE
+				WHEN $10::text IS NULL THEN baseline_dir
+				WHEN $10::text = '' THEN NULL
+				ELSE $10::text
 			END
 		WHERE id = $1 AND user_id = $2
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
-		          exclude_dirs, COALESCE(verify_tier_override, '')`,
+		          exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, '')`,
 		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
-		p.ExcludeDirs, p.VerifyTierOverride,
+		p.ExcludeDirs, p.VerifyTierOverride, p.BaselineDir,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.ExcludeDirs, &r.VerifyTierOverride)
+		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}

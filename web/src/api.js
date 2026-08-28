@@ -112,6 +112,12 @@ export const api = {
     request(`/api/repos/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
   createRepo: (body) =>
     request('/api/repos', { method: 'POST', body: JSON.stringify(body) }),
+  repoBaseline: (id) => request(`/api/repos/${id}/baseline`),
+  deployRepoBaseline: (id, composeFile) =>
+    request(`/api/repos/${id}/baseline/deploy`, {
+      method: 'POST',
+      body: JSON.stringify({ composeFile }),
+    }),
 
   integrations: () => request('/api/integrations'),
   saveIntegration: (kind, token) =>
