@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"sync"
@@ -93,6 +94,56 @@ func TestMachineCreateAndGet(t *testing.T) {
 
 	if _, err := m.Get(ctx, 999999999); !errors.Is(err, ErrTaskNotFound) {
 		t.Errorf("Get 不存在的任务应返回 ErrTaskNotFound，得到 %v", err)
+	}
+}
+
+// F7.1：CreateParams.Profile 设置合法 JSON 时读回来字节内容一致；
+// 不设置时（nil）落 schema 默认值 '{}'，不是空字符串/NULL。
+func TestMachineCreateProfileRoundtrip(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	withProfile, err := m.Create(ctx, CreateParams{
+		UserID: userID, RepoID: repoID,
+		LinearIssueKey: "CR-2001",
+		Profile:        []byte(`{"model_channel":"channel-x","verify_tier":"light"}`),
+	})
+	if err != nil {
+		t.Fatalf("Create（带 profile）失败: %v", err)
+	}
+	got, err := m.Get(ctx, withProfile.ID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	// jsonb 落库/读回会规整格式（如冒号后加空格），因此按语义（反序列化
+	// 后逐字段比较）而非按字节比较——"原样落库"指内容一致，不是字节流
+	// 一致。
+	var gotProfile struct {
+		ModelChannel string `json:"model_channel"`
+		VerifyTier   string `json:"verify_tier"`
+	}
+	if err := json.Unmarshal(got.Profile, &gotProfile); err != nil {
+		t.Fatalf("Profile 反序列化失败: %v（原始字节 %q）", err, string(got.Profile))
+	}
+	if gotProfile.ModelChannel != "channel-x" || gotProfile.VerifyTier != "light" {
+		t.Errorf("Profile = %+v，期望 model_channel=channel-x, verify_tier=light", gotProfile)
+	}
+
+	withoutProfile, err := m.Create(ctx, CreateParams{
+		UserID: userID, RepoID: repoID,
+		LinearIssueKey: "CR-2002",
+	})
+	if err != nil {
+		t.Fatalf("Create（不带 profile）失败: %v", err)
+	}
+	got2, err := m.Get(ctx, withoutProfile.ID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if string(got2.Profile) != `{}` {
+		t.Errorf("未设置 Profile 时应落 schema 默认值 '{}'，得到 %q", string(got2.Profile))
 	}
 }
 
@@ -341,5 +392,116 @@ func TestMachineLeaseExpiryRedispatch(t *testing.T) {
 	last := events[len(events)-1]
 	if last.Payload["reason"] != "lease_expired" {
 		t.Errorf("事件 payload 应记录重派原因，得到 %v", last.Payload)
+	}
+}
+
+// toPROpen 把任务从 queued 一路转到 pr_open，供合并检测相关测试复用。
+func toPROpen(t *testing.T, m *Machine, id int64) *Task {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := m.Transition(ctx, id, StateImplementing, "system", nil); err != nil {
+		t.Fatalf("转到 implementing 失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, id, StateVerifying, "system", nil); err != nil {
+		t.Fatalf("转到 verifying 失败: %v", err)
+	}
+	tk, err := m.Transition(ctx, id, StatePROpen, "system", nil)
+	if err != nil {
+		t.Fatalf("转到 pr_open 失败: %v", err)
+	}
+	return tk
+}
+
+// F4.1：ListOpenPRTasks 只返回真正 pr_open 且已记下 pr_number 的行。
+func TestMachineListOpenPRTasks(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	withPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-8001"})
+	toPROpen(t, m, withPR.ID)
+	if err := m.SetPRNumber(ctx, withPR.ID, 101); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+
+	withoutPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-8002"})
+	toPROpen(t, m, withoutPR.ID)
+	// 故意不调 SetPRNumber：模拟 pr_number 尚未落库的窗口期
+
+	stillQueued, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-8003"})
+	if err := m.SetPRNumber(ctx, stillQueued.ID, 103); err != nil {
+		// pr_number 与状态无关联，此处仅验证 SetPRNumber 本身不会因状态而拒绝
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+
+	tasks, err := m.ListOpenPRTasks(ctx)
+	if err != nil {
+		t.Fatalf("ListOpenPRTasks 失败: %v", err)
+	}
+	var got []int64
+	for _, tk := range tasks {
+		if tk.UserID == userID {
+			got = append(got, tk.ID)
+		}
+	}
+	if len(got) != 1 || got[0] != withPR.ID {
+		t.Errorf("ListOpenPRTasks（本用户范围）= %v，期望只含 %d", got, withPR.ID)
+	}
+}
+
+func TestMachineSetPRNumberNotFound(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+
+	if err := m.SetPRNumber(ctx, -1, 1); !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("SetPRNumber 对不存在的任务应返回 ErrTaskNotFound，得到 %v", err)
+	}
+}
+
+// F4.2-AC2：HasLiveDependentOnBranch 按"当前 base_ref == 分支名 且状态非终结"判定，
+// 不看 depends_on 结构 —— 终结状态的任务不算"活的依赖"。
+func TestMachineHasLiveDependentOnBranch(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	branch := "lathe/cr-9001-fix"
+	live, err := m.Create(ctx, CreateParams{
+		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-9002",
+		BaseRef: ptr(branch),
+	})
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+
+	has, err := m.HasLiveDependentOnBranch(ctx, branch)
+	if err != nil {
+		t.Fatalf("HasLiveDependentOnBranch 失败: %v", err)
+	}
+	if !has {
+		t.Errorf("非终结状态且 base_ref 匹配的任务应视为活依赖，得到 false")
+	}
+
+	// 转到终结状态（cancelled）后不再算活依赖
+	if _, err := m.Transition(ctx, live.ID, StateCancelled, "system", nil); err != nil {
+		t.Fatalf("转到 cancelled 失败: %v", err)
+	}
+	has, err = m.HasLiveDependentOnBranch(ctx, branch)
+	if err != nil {
+		t.Fatalf("HasLiveDependentOnBranch 失败: %v", err)
+	}
+	if has {
+		t.Errorf("终结状态的任务不该算活依赖，得到 true")
+	}
+
+	noMatch, err := m.HasLiveDependentOnBranch(ctx, "lathe/no-such-branch")
+	if err != nil {
+		t.Fatalf("HasLiveDependentOnBranch 失败: %v", err)
+	}
+	if noMatch {
+		t.Errorf("无匹配 base_ref 时应返回 false")
 	}
 }

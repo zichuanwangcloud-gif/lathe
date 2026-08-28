@@ -23,6 +23,10 @@ type fakeLinear struct {
 	issue    *linear.Issue
 	issueErr error
 	comments []string
+	// commentIssueIDs 与 comments 平行：commentIssueIDs[i] 是 comments[i]
+	// 回帖去的 issue —— F2.3 失败传播要回帖到多个不同 issue，光看正文
+	// 断言不够，需要按 issue 区分。
+	commentIssueIDs []string
 }
 
 func (f *fakeLinear) Issue(ctx context.Context, id string) (*linear.Issue, error) {
@@ -34,6 +38,7 @@ func (f *fakeLinear) Issue(ctx context.Context, id string) (*linear.Issue, error
 
 func (f *fakeLinear) Comment(ctx context.Context, issueID, body string) (string, error) {
 	f.comments = append(f.comments, body)
+	f.commentIssueIDs = append(f.commentIssueIDs, issueID)
 	return "c1", nil
 }
 
@@ -41,6 +46,11 @@ type fakeGitHub struct {
 	pr     *github.PullRequest
 	err    error
 	params []github.PRParams
+
+	// prInfo/prInfoErr 配置 GetPRInfo 的返回值（F4.1 合并检测用）；
+	// 大多数既有测试不涉及合并检测，留零值即可。
+	prInfo    *github.PRInfo
+	prInfoErr error
 }
 
 func (f *fakeGitHub) CreatePR(ctx context.Context, p github.PRParams) (*github.PullRequest, error) {
@@ -49,6 +59,13 @@ func (f *fakeGitHub) CreatePR(ctx context.Context, p github.PRParams) (*github.P
 		return nil, f.err
 	}
 	return f.pr, nil
+}
+
+func (f *fakeGitHub) GetPRInfo(ctx context.Context, providerRepo string, number int) (*github.PRInfo, error) {
+	if f.prInfoErr != nil {
+		return nil, f.prInfoErr
+	}
+	return f.prInfo, nil
 }
 
 // fakeAgent 按调用次序返回预设结果；可选地在工作区里制造改动。

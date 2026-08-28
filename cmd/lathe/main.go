@@ -20,6 +20,7 @@ import (
 	"github.com/Clouditera/lathe/internal/auth"
 	"github.com/Clouditera/lathe/internal/config"
 	"github.com/Clouditera/lathe/internal/creds"
+	"github.com/Clouditera/lathe/internal/flow"
 	"github.com/Clouditera/lathe/internal/httpapi"
 	"github.com/Clouditera/lathe/internal/integration/agent"
 	"github.com/Clouditera/lathe/internal/integration/linear"
@@ -146,6 +147,22 @@ func serve(cfg config.Config) error {
 		slog.Error("启动恢复失败（继续运行，残留任务可人工重试）", "err", err)
 	}
 	go q.work(ctx)
+
+	// F4.1 合并检测的轮询兜底 + F4.2 现场回收 + F4.3 后继链自动 rebase
+	// 跟进 + F2.3-AC2（PR 被关闭未合并 → blocked_dep）的触发源：常驻
+	// 轮询 pr_open 任务，见 mergepoll.go。Pipeline 复用 buildPipeline
+	// 建出来的那一份——rebase 跟进后的重验（Retry Entry=EntryVerify）
+	// 要走跟正常派发完全一样的 stageVerify，两边不能是两套配置。
+	mergePoller := &runner.MergePoller{
+		Tasks:         task.NewMachine(st.Pool()),
+		Worktrees:     pipeline.Worktrees,
+		ClientFactory: factory,
+		Notifier:      pipeline.Notifier,
+		RepoLookup:    runner.NewRepoLookup(st.Pool()),
+		Pipeline:      pipeline,
+		Interval:      45 * time.Second,
+	}
+	go mergePoller.Run(ctx)
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
 	// （脚本调用，同时是把自己锁在门外时的应急入口）
@@ -275,6 +292,14 @@ func serve(cfg config.Config) error {
 		},
 	}
 	credAPI.Routes(mux)
+
+	// 编排图：一键批量入队（PRD 07 F1.4），与执行队列共用同一个
+	// task.Machine，不重开数据库连接。
+	flowAPI := &httpapi.FlowAPI{
+		Flow: &flow.Service{Pool: st.Pool(), Tasks: task.NewMachine(st.Pool()), Store: st},
+		Auth: auth,
+	}
+	flowAPI.Routes(mux)
 
 	if webui.Available() {
 		mux.Handle("/", webui.Handler())

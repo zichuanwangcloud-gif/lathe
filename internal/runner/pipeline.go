@@ -27,6 +27,13 @@ type LinearAPI interface {
 // GitHubAPI 是流水线用到的 GitHub 能力。
 type GitHubAPI interface {
 	CreatePR(ctx context.Context, p github.PRParams) (*github.PullRequest, error)
+
+	// GetPRInfo 读取 PR 当前状态，供 F4.1 合并检测的轮询兜底判定
+	// "已合并" / "被关闭未合并"。返回类型定义在 github 包（而非本包）：
+	// runner 包已经依赖 github 包（CreatePR 用到 github.PRParams），
+	// 反过来让 github 包依赖 runner 包会成环，因此这个小结构体的
+	// "家"必须在 github 包，见 github.PRInfo 的注释。
+	GetPRInfo(ctx context.Context, providerRepo string, number int) (*github.PRInfo, error)
 }
 
 // Clients 按需提供各集成的客户端。
@@ -140,6 +147,17 @@ type ExecuteParams struct {
 // 不是失败，Execute 把它翻译为 nil。
 var errHalt = errors.New("pipeline: 任务正常终止（非失败）")
 
+// StageRebaseConflict 是 F4.3 rebase 跟进特有的失败阶段代码：自动
+// rebase（或改写历史后的 force push）失败，通常是真实冲突或远端在
+// 改写期间又被人动过，需要人工介入。
+//
+// 与 stage.go 里的其它 Stage 常量同属一套机器可读契约（tasks.failure_
+// stage），只是触发路径是 MergePoller.rebaseFollowup 而不是
+// Pipeline.Execute 的常规阶段编排，因此单独放在这里，不去改
+// stage.go 的既有函数逻辑（label()/stageOrder() 的 default 分支已经
+// 兜得住未列出的 Stage，不需要为它们改动这些函数）。
+const StageRebaseConflict Stage = "rebase_conflict"
+
 // runCtx 携带一次流水线执行的上下文，在阶段函数间传递。
 type runCtx struct {
 	ctx    context.Context
@@ -152,7 +170,14 @@ type runCtx struct {
 	plan *RetryPlan // 非空表示断点续跑
 	// failStage 是本次重试针对的失败阶段（tasks.failure_stage），
 	// 影响续跑 prompt 的选择（实现中断 vs 验证未通过）。
-	failStage    Stage
+	failStage Stage
+	// profile 是解析自 tk.Profile 的节点执行画像（F7.1），setup() 里
+	// 统一解析一次。解析/校验失败时 profile 为 nil、profileErr 非空
+	// ——消费点（stageImplement/stageVerify）各自决定何时因此失败任务
+	// （必须在已进入某个可以直接转 failed 的状态之后才能调用 fail()，
+	// 见 profile.go 的 StageProfileInvalid 注释）。
+	profile      *Profile
+	profileErr   error
 	issue        *linear.Issue
 	kind         TaskKind
 	wt           *Worktree
@@ -261,6 +286,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	}
 
 	rc := &runCtx{ctx: ctx, params: params, actor: actor, lin: lin, gh: gh, tk: tk}
+	rc.profile, rc.profileErr = ParseProfile(tk.Profile)
 	entry := EntryTriage
 	if params.Retry != nil {
 		// 决策全程保留（含 Fresh 重建）：第一次状态转移会把决策理由
@@ -430,6 +456,19 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	}
 	rc.tk = tk
 
+	// F7.1：节点画像损坏或字段非法时，在这里（已进入 implementing、
+	// 可以合法转 failed 的状态）以可读原因失败，不让非法值悄悄流进
+	// runAgent（ModelChannel）或后面的 stageVerify（VerifyTier）。
+	if rc.profileErr != nil {
+		return p.fail(rc, StageProfileInvalid, rc.profileErr)
+	}
+
+	// F7.2：worktree 已就位（新建或续跑复用现场），画像也已确认合法，
+	// 在驱动 agent 之前把节点画像声明的技能物化进 .claude/skills/。
+	if err := p.materializeSkills(rc); err != nil {
+		return p.fail(rc, StageSkillMissing, err)
+	}
+
 	prompt, resumeFlag := p.implementPrompt(rc)
 	implRes, err := p.runAgent(rc, "implement", prompt, rc.implSession, resumeFlag)
 
@@ -478,10 +517,16 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 
 // runAgent 跑一次 agent 并接好事件汇。
 //
-// 实现与修复回路（同一会话的延续）都走 ImplementChannel：修复是
-// 实现的下半场，通道不该中途换。
+// 实现与修复回路（同一会话的延续）都走同一个通道：修复是实现的下
+// 半场，通道不该中途换。通道优先取节点画像的 ModelChannel（F7.1-AC2：
+// 不同节点可路由到不同通道），画像未设置该字段时回落到仓库/流水线级
+// 的 p.ImplementChannel（既有行为，F7.1-AC4 的回归保证）。
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
 	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
+	channel := p.ImplementChannel
+	if rc.profile != nil && rc.profile.ModelChannel != "" {
+		channel = rc.profile.ModelChannel
+	}
 	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            rc.wt.Path,
@@ -489,7 +534,7 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 		Resume:         resume,
 		PermissionMode: p.PermissionMode,
 		SettingSources: p.SettingSources,
-		ExtraEnv:       channelEnv(p.ImplementChannel),
+		ExtraEnv:       channelEnv(channel),
 		OnEvent:        sink.OnEvent,
 	})
 	sink.Close()
@@ -574,7 +619,16 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	}
 	tier := rc.tier
 	tierReasons := []string{"沿用首次定档（断点续跑）"}
-	if tier == "" {
+	switch {
+	case tier != "":
+		// 断点续跑沿用首次定档，优先级最高——修复轮通常只收敛改动面，
+		// 升档场景留给从头重跑。
+	case rc.profile != nil && rc.profile.VerifyTier != "":
+		// F7.1-AC3：节点画像覆盖自动定档，优先级高于仓库级
+		// VerifyTierOverride，但低于断点续跑沿用的首次定档（上面那支）。
+		tier = VerifyTier(rc.profile.VerifyTier)
+		tierReasons = []string{"节点画像强制指定"}
+	default:
 		tier, tierReasons = ClassifyTier(changedFiles, OverrideTier(rc.params.Repo.VerifyTierOverride))
 	}
 	tierStr := string(tier)
@@ -593,6 +647,14 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		return err
 	}
 	rc.tk = tk
+
+	// F7.1：节点画像损坏或字段非法时，在这里（已进入 verifying、可以
+	// 合法转 failed 的状态）以可读原因失败——覆盖 stageImplement 没
+	// 覆盖到的入口（EntryVerify/EntryCommit 断点续跑跳过 stageImplement
+	// 直接到这里）。
+	if rc.profileErr != nil {
+		return p.fail(rc, StageProfileInvalid, rc.profileErr)
+	}
 
 	// 双通道限流：light/heavy 各自独立配额（§6.2）。等不到槽位且
 	// ctx 结束时按失败处理 —— 现场保留，人可重新入队。
@@ -752,7 +814,9 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		rc.tk = tk
 	}
 
-	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo); err != nil {
+	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo, func(prog PushProgress) {
+		p.pushProgress(rc, prog)
+	}); err != nil {
 		return p.fail(rc, StagePush, err)
 	}
 
@@ -776,6 +840,14 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		return p.fail(rc, StageCreatePR, err)
 	}
 
+	// F4.1 合并检测的轮询兜底按 (repo, pr_number) 遍历 pr_open 任务，
+	// 必须把 PR 编号落进可查询列（此前只进了 task_events.payload）。
+	// 落库失败只告警：PR 已开出且任务即将转 pr_open，不能因为这一列
+	// 写失败就让整个任务判死。
+	if err := p.Tasks.SetPRNumber(rc.ctx, rc.tk.ID, pr.Number); err != nil {
+		slog.Warn("pr_number 落库失败", "task", rc.tk.ID, "err", err)
+	}
+
 	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StatePROpen, rc.actor, &task.TransitionOpts{
 		PRURL:   &pr.URL,
 		Payload: map[string]any{"pr_number": pr.Number, "reused": pr.Existing},
@@ -789,8 +861,53 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		slog.Warn("回帖失败", "task", rc.tk.ID, "err", err)
 	}
 
+	// F2.3-AC5：本任务到达 pr_open，唤醒它直接依赖它、此前被阻塞的后继。
+	// 唤醒失败只告警；被唤醒的任务会在调度器下一轮轮询里自然被捞到，
+	// 这里不需要触发任何派发。
+	if woken, err := p.Tasks.WakeBlockedSuccessors(rc.ctx, rc.tk.ID); err != nil {
+		slog.Warn("唤醒被阻塞后继失败", "task", rc.tk.ID, "err", err)
+	} else if len(woken) > 0 {
+		slog.Info("唤醒被阻塞后继", "task", rc.tk.ID, "count", len(woken))
+	}
+
 	slog.Info("任务完成", "task", rc.tk.ID, "issue", rc.issue.Identifier, "pr", pr.URL)
 	return nil
+}
+
+// pushProgress 把推送重试过程写进任务事件流（phase=push）。
+//
+// 重试发生在 WorktreeManager 内部，界面本来完全看不见 —— 网络抖动时
+// 详情页只显示「卡在验证中」，与任务 #596 的修复期黑盒同款问题。
+// 落库失败只告警不阻断：可观测性不该反过来成为故障源（同 EventSink 立场）。
+func (p *Pipeline) pushProgress(rc *runCtx, prog PushProgress) {
+	if p.AgentEvents == nil {
+		return
+	}
+	payload := map[string]any{
+		"attempt":     prog.Attempt,
+		"maxAttempts": prog.MaxAttempts,
+	}
+	var body string
+	if prog.Err != nil {
+		// 错误原文压成单行：raw 事件在界面上是一行 mono 文本
+		errLine := strings.Join(strings.Fields(prog.Err.Error()), " ")
+		body = fmt.Sprintf("推送失败（疑似网络抖动），%s 后重试（第 %d/%d 次）: %s",
+			prog.Wait, prog.Attempt, prog.MaxAttempts, truncate(errLine, 300))
+		payload["waitMs"] = prog.Wait.Milliseconds()
+		payload["error"] = truncate(errLine, 600)
+	} else {
+		body = fmt.Sprintf("推送成功（第 %d 次尝试）", prog.Attempt)
+	}
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(rc.ctx), 5*time.Second)
+	defer cancel()
+	if err := p.AgentEvents.InsertAgentEvents(ctx, rc.tk.ID, "push", []agent.Entry{{
+		Kind:    agent.KindRaw,
+		Body:    body,
+		Payload: payload,
+	}}); err != nil {
+		slog.Warn("推送进度事件落库失败（已丢弃）", "task", rc.tk.ID, "err", err)
+	}
 }
 
 // runHeavy 跑 heavy 档验证：建基线工作区 → 识别复现测试 → 红-绿-回归。
@@ -986,6 +1103,34 @@ func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
 	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateFailed, "system", opts); err != nil {
 		return fmt.Errorf("任务失败(%s)，且状态转移也失败: %w（原因: %v）", stage.label(), err, cause)
 	}
+
+	// 4) 失败传播（F2.3-AC1~AC4）：depends_on 链上所有传递后继里仍排队的
+	// 任务转 blocked_dep，并回帖说明是被本任务连累的。传播出错或某个
+	// 回帖失败都只告警，不能掩盖原始失败原因，也不能改变 fail() 本身
+	// 的返回值语义（下面仍然照常返回 cause）。
+	blocked, propErr := p.Tasks.PropagateBlocked(rc.ctx, rc.tk.ID, reason)
+	if propErr != nil {
+		slog.Warn("失败传播失败", "task", rc.tk.ID, "err", propErr)
+	}
+	for _, bt := range blocked {
+		if bt.UserID != rc.tk.UserID {
+			// 当前是单用户/管理员凭据模型，同一 flow 下的任务理应同属主；
+			// 出现不一致说明建图或数据有问题，先告警观察，不静默假设。
+			slog.Warn("失败传播发现跨属主后继", "task", rc.tk.ID, "taskOwner", rc.tk.UserID,
+				"blockedTask", bt.ID, "blockedOwner", bt.UserID)
+		}
+		if rc.lin == nil || bt.LinearIssueID == nil || *bt.LinearIssueID == "" {
+			continue
+		}
+		blockedBody := fmt.Sprintf(
+			"**Lathe 已阻塞**\n\n前驱任务 #%d（issue `%s`）失败，本任务因依赖它而被阻塞（blocked_dep），"+
+				"等前驱恢复（重试成功或人工处理）后会自动回到排队。\n\n前驱失败原因：\n```\n%s\n```\n",
+			rc.tk.ID, rc.tk.LinearIssueKey, truncate(reason, 1000))
+		if _, cerr := rc.lin.Comment(rc.ctx, *bt.LinearIssueID, blockedBody); cerr != nil {
+			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", cerr)
+		}
+	}
+
 	return fmt.Errorf("任务失败于%s: %w", stage.label(), cause)
 }
 

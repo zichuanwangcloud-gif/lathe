@@ -158,7 +158,18 @@ func (m *WorktreeManager) Commit(ctx context.Context, wt *Worktree, message stri
 // 两道防线：
 //  1. 先校验分支不在受保护列表里；
 //  2. 用完整显式 refspec 推送，杜绝任何"顺带推别的 ref"的可能。
-func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfig) error {
+//
+// 推送是无人值守流水线里必经的公网操作，网络抖动（SSH kex 被掐、DNS
+// 抖动、网关 502）不该一次就把整个任务判死 —— 抖动几秒就恢复，而任务
+// 从实现烧到验证花了几十分钟（任务 #1551 的教训：kex 断连一次直接
+// 判败）。因此对非明确永久的错误做有限次退避重试。push 幂等：若首次
+// 其实已推上远端只是响应丢失，重试会得到 "Everything up-to-date" 的
+// 成功，不会重复建分支。
+//
+// onProgress 可为 nil；非 nil 时在每次退避重试前与「重试后成功」时各
+// 回调一次，调用方（pipeline）据此把重试过程写进任务事件流 —— 重试
+// 不该是黑盒，详情页要看得见。
+func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfig, onProgress func(PushProgress)) error {
 	if wt == nil {
 		return fmt.Errorf("runner: 工作区为空")
 	}
@@ -171,10 +182,163 @@ func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfi
 	}
 
 	refspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", wt.Branch, wt.Branch)
-	if _, err := m.git(ctx, wt.Path, "push", "--set-upstream", "origin", refspec); err != nil {
-		return fmt.Errorf("runner: 推送分支 %s 失败: %w", wt.Branch, err)
+	push := func() error {
+		_, err := m.git(ctx, wt.Path, "push", "--set-upstream", "origin", refspec)
+		return err
+	}
+	return pushWithRetry(ctx, wt.Branch, push, pushBackoff, onProgress)
+}
+
+// RebaseOnto 把 wt 当前 checkout 出来的分支从"基于 oldBaseTip 之前的
+// 内容"改写成"基于 newBaseBranch 当前内容"——F4.3 rebase 跟进的核心
+// git 操作。
+//
+// 不在 rebase 命令末尾带分支参数：省略时 git 默认操作当前 checkout 出来
+// 的分支（也就是 wt.Branch 本身），比显式传分支名更安全——不会有
+// "传错分支"的出错面。
+//
+// 调用前只刷新 mirror（fetch --prune），不走完整 EnsureMirror（不需要
+// 也拿不到 cloneURL）：能调用到这里的 wt 必然是已经跑过 Create 的任务
+// 现场，mirror 早就存在且配好了 origin，只需要把 newBaseBranch 最新的
+// 内容 fetch 进镜像命名空间。
+//
+// rebase 冲突（或任何其它非零退出）原样返回，不吞不重试——冲突需要人
+// 来看，自动重试或悄悄吞掉都会把冲突留在一个半改写的工作区里，比明确
+// 报错更危险。
+func (m *WorktreeManager) RebaseOnto(ctx context.Context, wt *Worktree, oldBaseTip, newBaseBranch string) error {
+	if wt == nil {
+		return fmt.Errorf("runner: 工作区为空")
+	}
+
+	unlock := m.lockMirror(wt.Mirror)
+	_, err := m.git(ctx, wt.Mirror, "fetch", "--prune", "--quiet", "origin")
+	unlock()
+	if err != nil {
+		return fmt.Errorf("runner: 刷新 mirror 失败: %w", err)
+	}
+
+	newBaseRef := MirrorBaseRef(newBaseBranch)
+	if _, err := m.git(ctx, wt.Path, "rebase", "--onto", newBaseRef, oldBaseTip); err != nil {
+		return fmt.Errorf("runner: rebase 分支 %s 到 %s 失败: %w", wt.Branch, newBaseBranch, err)
 	}
 	return nil
+}
+
+// ForcePush 把改写过历史的任务分支强推到远端，覆盖远端的旧历史
+// （RebaseOnto 之后分支的提交历史已经变了，普通 Push 会被
+// non-fast-forward 拒绝，只能强推）。
+//
+// 用 --force-with-lease 而不是裸 --force：远端在我们上次 fetch 之后被
+// 别人动过时会拒绝，不会悄悄覆盖掉别人刚推的东西——RebaseOnto 调用时
+// 已经 fetch 过一次，本地记录的 refs/remotes/origin/<branch> 就是那次
+// fetch 看到的远端状态，恰好是 force-with-lease 用来判断"远端有没有被
+// 别人动过"的依据。
+//
+// 结构照抄 Push：先校验推送目标不是受保护分支，再拼完整显式 refspec，
+// 复用同一套 pushWithRetry 退避重试——网络抖动不该让 rebase 跟进这一步
+// 比普通推送更脆弱。
+func (m *WorktreeManager) ForcePush(ctx context.Context, wt *Worktree, repo RepoConfig, onProgress func(PushProgress)) error {
+	if wt == nil {
+		return fmt.Errorf("runner: 工作区为空")
+	}
+	if err := repo.ValidatePushTarget(wt.Branch); err != nil {
+		return err
+	}
+	if base, err := repo.BaseBranch(KindFix); err == nil && wt.Branch == base {
+		return ErrProtectedBranch{Branch: wt.Branch, Repo: repo.ProviderRepo}
+	}
+
+	refspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", wt.Branch, wt.Branch)
+	push := func() error {
+		_, err := m.git(ctx, wt.Path, "push", "--force-with-lease", "--set-upstream", "origin", refspec)
+		return err
+	}
+	return pushWithRetry(ctx, wt.Branch, push, pushBackoff, onProgress)
+}
+
+// PushProgress 是推送进度的一次回调通知。
+type PushProgress struct {
+	Attempt     int           // 刚结束的尝试序号（1 起）
+	MaxAttempts int           // 尝试上限
+	Wait        time.Duration // >0：本次失败，将退避 Wait 后重试；=0 且 Err==nil：重试后成功
+	Err         error         // 本次错误；成功通知里为 nil
+}
+
+// pushAttempts 是推送的最大尝试次数（含首次）。
+const pushAttempts = 4
+
+// pushBackoff 是第 n 次失败后的退避等待，逐次拉长。最坏情况下为任务
+// 增加约 22s 延迟 —— 相对重烧实现+验证的代价可忽略。
+var pushBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second}
+
+// pushWithRetry 是推送的重试循环，与 git 调用解耦以便单测。
+// 尝试次数 = len(backoff)+1。
+func pushWithRetry(ctx context.Context, branch string, push func() error, backoff []time.Duration, onProgress func(PushProgress)) error {
+	attempts := len(backoff) + 1
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = push(); err == nil {
+			if attempt > 1 && onProgress != nil {
+				onProgress(PushProgress{Attempt: attempt, MaxAttempts: attempts})
+			}
+			return nil
+		}
+		if isPermanentPushErr(err) || attempt == attempts {
+			break
+		}
+		wait := backoff[attempt-1]
+		slog.Warn("推送失败（疑似网络抖动），退避后重试",
+			"branch", branch, "attempt", attempt, "wait", wait, "err", err)
+		if onProgress != nil {
+			onProgress(PushProgress{Attempt: attempt, MaxAttempts: attempts, Wait: wait, Err: err})
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done(): // 关机/超时：不等了，把原始错误交出去
+			timer.Stop()
+			return fmt.Errorf("runner: 推送分支 %s 失败: %w", branch, err)
+		case <-timer.C:
+		}
+	}
+	return fmt.Errorf("runner: 推送分支 %s 失败: %w", branch, err)
+}
+
+// permanentPushErrs 是明确无救的推送错误特征（小写匹配）：同样参数重试
+// 只会得到同样的拒绝，应立即失败把原因摆给人看。
+//
+// 注意：网络断连时 git 也会打印 "Please make sure you have the correct
+// access rights" 的兜底提示语，所以「access rights」绝不能进这个列表 ——
+// 判永久要靠只在真实拒绝里出现的措辞。
+var permanentPushErrs = []string{
+	"non-fast-forward", // 远端已分叉，需要人介入 rebase
+	"fetch first",      // non-fast-forward 的 hint 文案
+	"stale info",       // force-with-lease 竞争
+	"permission denied",
+	"denied to", // "Permission to x/y.git denied to <user>"
+	"authentication failed",
+	"returned error: 403", // HTTPS 鉴权/越权拒绝（5xx 才是抖动）
+	"repository not found",
+	"does not appear to be a git repository",
+	"protected branch", // 远端分支保护规则
+	"push protection",  // GitHub push protection（如泄密扫描）
+	"gh006", "gh013",   // GitHub 保护类拦截的错误码
+	"no such ref", "src refspec", // 本地 ref 缺失，属程序错误
+}
+
+// isPermanentPushErr 报告推送错误是否明确无救（重试无意义）。
+// 不在列表里的错误一律按可重试处理：误重试的代价是几十秒，
+// 误判永久（不重试）的代价是整个任务判死 —— 后者贵得多。
+func isPermanentPushErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pat := range permanentPushErrs {
+		if strings.Contains(msg, pat) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasCommitsAhead 报告任务分支相对基线是否已有提交。

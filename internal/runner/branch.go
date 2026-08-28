@@ -43,6 +43,10 @@ type RepoConfig struct {
 	// VerifyTierOverride 强制验证档位（light|heavy）；空表示按 §5.1 规则
 	// 在 diff 产出后自动判定。对应 repos.verify_tier_override。
 	VerifyTierOverride string
+	// BaseRefOverride 非空时代表"这是栈式 PR 的后继任务，应该从这个分支
+	// 分叉，而不是从 repos 配置的默认分支"，值来自 tasks.base_ref，由
+	// 调度器在派发前填充——本文件不关心是谁填的。
+	BaseRefOverride string
 }
 
 // DefaultRepoConfig 返回符合 CloudRouter 约定的默认配置。
@@ -61,6 +65,9 @@ func DefaultRepoConfig(providerRepo string) RepoConfig {
 // 依据 CloudRouter CLAUDE.md：代码单向流动 feature/* → dev → test → main，
 // 功能分支只能从 dev 创建，hotfix 分支只能从 main 创建。
 func (c RepoConfig) BaseBranch(kind TaskKind) (string, error) {
+	if c.BaseRefOverride != "" {
+		return c.BaseRefOverride, nil
+	}
 	switch kind {
 	case KindFix, KindFeature:
 		if c.DefaultBranch == "" {
