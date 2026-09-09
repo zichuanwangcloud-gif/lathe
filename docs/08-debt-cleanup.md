@@ -62,9 +62,9 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 
 | # | 项 | PR | 状态 |
 |---|---|---|---|
-| T0 | v0.1.0 发布准备（staged 文件入库） | A | DONE |
-| **T9** | **测试基线可信化（前置，见 §7）** | **A** | **TODO** |
-| T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | TODO |
+| T0 | v0.1.0 发布准备（staged 文件入库） | A | **DONE** |
+| T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | **DONE** |
+| **T9** | **测试基线可信化（前置，见 §7）** | **A** | **WIP** — 根因已取证，待实施 |
 | T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | TODO |
 | T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
 | T4 | `verifications.log_ref` 落盘写入 | C | TODO |
@@ -343,18 +343,43 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 开工前跑 `make test` 建立基线，`cmd/lathe` 包 FAIL；单独跑 `go test ./cmd/lathe/...` 却通过。
 再跑一遍完整套件又过了。典型的「首轮红、之后绿」。
 
-### 根因
+### 根因（已实验证伪一次，以下是取证后的结论）
 
-三条 **2026-08-28 的 `SMK-1/2/3` 排队尸体**（tasks id 10638–10640，`state='queued'`）
-留在共享开发库里。`Machine.ClaimReady` 是**全局**查询，排序是
-`priority DESC, id`（migration 0016 的 `tasks_queued_priority` 索引即按此建），
-陈尸 id 最小 → **永远被优先领走**。
+**第一次假设（错的）**：开发库里 3 条 2026-08-28 的 `SMK-1/2/3` 排队尸体被全局
+`ClaimReady`（排序 `priority DESC, id`）优先领走。
+**证伪方式**：把这 3 条行 `UPDATE ... SET state='queued'` 还原后单跑 `cmd/lathe`
+包 —— **通过了，EXIT=0**。所以陈尸不是原因，至少不是充分原因。教训：
+先复现再下结论，我这次是先下结论再复现。
 
-于是 `cmd/lathe/queue_test.go` 里所有「断言 ClaimReady 返回自己 fixture」的用例
-（`TestEnqueueCreatesImmediatelyClaimableTask`、`TestClaimReadyDependencyGating`、
-`TestConcurrentClaimAndDispatchExactlyOnce` 等，共 12 个测试函数里过半调用了它）
-领到的是陈尸而不是自己造的行，断言当场崩。首轮跑完这些用例把 3 条陈尸领走并推进了状态，
-`queued` 空了，第二轮就「绿」了——**绿是假的，是被上一轮的副作用洗出来的。**
+**取证后的真根因**：是**两个不同的**测试隔离缺陷，都源于「测试跑在共享真实
+Postgres 上，而生产查询是全局的」，但机制不同：
+
+**缺陷 1 —— `cmd/lathe` 的 `TestRunOneClaimedRecoversInterruptedStateFromEvents`**
+（`queue_test.go:367` 断言「应领到恢复后的任务」）：
+
+失败时日志是
+```
+INFO 在途任务已恢复 task=12460 interrupted_state=implementing
+INFO 在途任务已恢复 task=12489 interrupted_state=implementing
+INFO 启动恢复完成 requeued_inflight=2
+```
+`requeued_inflight=2` —— `Reconcile` 把**同包另一个测试遗留的在途任务** 12460
+也重新入队了，随后全局 `ClaimReady` 按 id 升序把它优先领走，测试拿到了别人的任务
+（断言输出里的 issue key 是 `CR-777`，不是本用例的 fixture）。
+注意 12460 与 12489 **都是本轮创建的 id** —— 所以这是**同包测试之间**的污染，
+不是跨轮次的历史残留。
+
+**缺陷 2 —— `internal/runner` 的 `TestPipelineHeavyNoReproTestIsFailure`**
+（`pipeline_test.go:595`）：
+```
+建任务失败: task: 创建任务失败: ERROR: duplicate key value violates
+unique constraint "tasks_one_active_per_issue" (SQLSTATE 23505)
+```
+固定的 fixture issue key 撞上了遗留的活任务（部分唯一索引
+`(repo_id, linear_issue_key) WHERE state NOT IN 终态`）。
+
+**共同点**：`-p 1` 只挡包间并行，挡不住「同一个包内前一个测试留下的活任务行」
+被后一个测试的全局查询捞走。Makefile 里已有的 `-p 1` 注释给了虚假的安全感。
 
 ### 为什么必须先修
 
@@ -405,3 +430,14 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
   的退出码，本轮据此误判过一次「全绿」，此后一律用 `$?` 或 `PIPESTATUS[0]` 判定。
 - 2026-09-09：T0 已提交（`chore(release): v0.1.0 发布准备`），
   `go build ./...` 与 `go vet ./...` 全绿，Postgres 起、迁移最新。
+- 2026-09-09：**T1 完成并提交**（`9fc5992`）。删 `cmd/lathe-runner/` 与 Makefile
+  的 `RUNNER_BIN` 目标；`config.NodeName` 按 AC4 **保留**并把注释改成记录它的两个
+  真实消费方（task_events 的 actor 前缀、管理界面运行时面板）；同步 6 处文档引用。
+  AC1/AC2/AC3/AC4 全部验过：目录已删、Makefile 无引用、`make build` 只产出
+  `bin/lathe`、`go build`/`go vet`/`gofmt` 全绿。顺手删掉了陈旧的 `bin/lathe-runner`。
+- 2026-09-09：**T9 根因取证完成**（详见 §7）。过程里犯了一个值得记的错：
+  先给出「陈尸被全局 ClaimReady 领走」的结论，再去复现，结果**实验把自己的结论证伪了**
+  （还原 3 条陈尸后单跑 `cmd/lathe` 通过）。改用「反复跑整套直到红」的取证方式后
+  拿到两个具体用例名与各自的失败输出，才定位到两个不同机制的隔离缺陷。
+  另记一条观测教训：`go test ... | tail` 取到的是 `tail` 的退出码，
+  本轮据此误判过一次「基线全绿」——此后一律用 `$?` 或 `PIPESTATUS[0]`。
