@@ -30,12 +30,17 @@ const (
 	RetryResume RetryMode = "resume"
 	// RetryFresh 强制丢弃现场从头重建。
 	RetryFresh RetryMode = "fresh"
+	// RetryApproved 是人工闸门放行（gate_mode=manual）：验证已经通过、
+	// 任务停在 awaiting_approval，人点了确认。只补 push + 开 PR，
+	// 绝不重跑实现与验证 —— 重跑等于把已经付过的 token 再烧一遍，
+	// 而且会让「人看过的那个 diff」和「最终开出 PR 的那个 diff」不是一份东西。
+	RetryApproved RetryMode = "approved"
 )
 
 // Valid 报告模式是否合法。空串按 auto 处理（缺省值）。
 func (m RetryMode) Valid() bool {
 	switch m {
-	case "", RetryAuto, RetryResume, RetryFresh:
+	case "", RetryAuto, RetryResume, RetryFresh, RetryApproved:
 		return true
 	}
 	return false
@@ -111,6 +116,19 @@ func PlanRetry(mode RetryMode, in RetryInput) RetryPlan {
 
 	if mode == RetryFresh {
 		return fresh("指定了从头重跑")
+	}
+
+	if mode == RetryApproved {
+		// 人工闸门放行。前提是验证已通过、分支已提交，所以只补
+		// push + 开 PR（两者都幂等）。
+		if in.WT.Usable() && in.WT.HasCommits {
+			return RetryPlan{Entry: EntryPush,
+				Reasons: []string{"人工闸门已确认，只补推送 + 开 PR（幂等），不重跑实现与验证"}}
+		}
+		// 现场没了就没法推。这里退回重建而不是报错：人已经表达了
+		// 「我要这个 PR」的意图，重建虽然贵，但比卡住不动更接近意图。
+		// 理由文案写清楚，让人在事件流里看得出这一轮为什么变贵了。
+		return fresh("人工闸门已确认，但工作区现场已不可用（目录/分支缺失），只能从头重建")
 	}
 
 	// ---------- 失败阶段归一化 ----------

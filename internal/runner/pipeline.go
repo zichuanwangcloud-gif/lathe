@@ -242,7 +242,60 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 			return unwind(err)
 		}
 	}
+
+	// 人工闸门（gate_mode=manual）：验证已过，但推分支/开 PR 前先停下等人。
+	//
+	// 只在【走过验证】的这一轮拦；entry == EntryPush 说明这一轮就是人点了
+	// 确认之后的续跑，此时绝不能再拦 —— 否则 awaiting_approval → queued
+	// → awaiting_approval 变成死循环，人点一次批准永远开不出 PR。
+	if entry != EntryPush {
+		if err := p.gateBeforePush(rc); err != nil {
+			return unwind(err)
+		}
+	}
+
 	return p.stagePushAndPR(rc)
+}
+
+// gateBeforePush 实现 repos.gate_mode 的人工闸门（05-roadmap §3.3 第 10 条）。
+//
+// 这个字段从 P0 就可配，但 pipeline 一直不读它 —— roadmap §0 记的
+// 「配置了但没接线」清单里就有它。本函数是它的消费方。
+//
+// 只有 manual 有拦截语义。CHECK 约束允许的另外三个值
+// （direct / guarded / plan-first）一律按 direct 处理：本轮不给它们
+// 编造语义，假装实现了又是一次「配了没接线」。真要做 guarded/plan-first
+// 时在这里补分支，届时它们各自的语义要先在设计文档里定下来。
+//
+// gate_mode 读的是 tasks.gate_mode（任务创建那刻从 repos 复制、从此钉死），
+// 不是现在的 repos.gate_mode —— 与 repo_id 的语义保持一致：
+// 任务在途期间人改了仓库配置，不该改变这个任务的行为。
+func (p *Pipeline) gateBeforePush(rc *runCtx) error {
+	if rc.tk.GateMode != task.GateManual {
+		return nil
+	}
+
+	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateAwaitingApproval, rc.actor,
+		&task.TransitionOpts{Payload: map[string]any{
+			"gate_mode": rc.tk.GateMode,
+			"reason":    "验证已通过，按仓库的人工闸门设置等待确认后再开 PR",
+		}}); err != nil {
+		return fmt.Errorf("转移到 awaiting_approval 失败: %w", err)
+	}
+
+	slog.Info("人工闸门拦住了开 PR，等人确认",
+		"task", rc.tk.ID, "issue", rc.tk.LinearIssueKey, "gate_mode", rc.tk.GateMode)
+
+	// 回帖告诉人「活干完了，等你点」—— 否则人得盯着面板才知道该去确认。
+	if rc.lin != nil {
+		body := "验证已通过，但这个仓库配了人工闸门（gate_mode=manual）：确认后才会推分支并开 PR。\n\n请到 Lathe 任务详情页点「确认开 PR」。"
+		if _, err := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); err != nil {
+			// 回帖失败不该影响闸门本身 —— 状态已经落库了，人在面板上照样能看到。
+			slog.Warn("人工闸门回帖失败", "task", rc.tk.ID, "err", err)
+		}
+	}
+
+	return errHalt
 }
 
 // unwind 把阶段正常终止的哨兵翻译为 nil。

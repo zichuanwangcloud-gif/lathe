@@ -273,6 +273,14 @@ onUnmounted(() => {
       </div>
       <div class="wrap">
         <button @click="router.push('/')">返回</button>
+        <!-- 人工闸门放行：只在任务真的停在闸门上时出现 -->
+        <button
+          v-if="task.state === 'awaiting_approval'"
+          class="primary"
+          :disabled="acting"
+          title="验证已通过。确认后才会推分支并开 PR"
+          @click="act(api.approve, '确认推分支并开 PR？')"
+        >确认开 PR</button>
         <template v-if="task.state === 'failed'">
           <button
             class="primary"
@@ -293,6 +301,18 @@ onUnmounted(() => {
           @click="act(api.cancel, '确认取消这个任务？')"
         >取消</button>
       </div>
+    </div>
+
+    <div v-if="task.state === 'awaiting_approval'" class="card gate-card">
+      <div class="label">等待人工放行</div>
+      <p>
+        验证已经通过，但这个仓库配了人工闸门（<span class="mono">gate_mode=manual</span>），
+        所以平台停在这里没有推分支、也没有开 PR。
+      </p>
+      <p class="dim">
+        看过改动之后点右上角「确认开 PR」；平台只补推送与开 PR 两步，
+        不会重跑实现与验证。不想要这个改动就直接取消任务。
+      </p>
     </div>
 
     <div v-if="task.failureReason" class="card fail-card">
@@ -455,6 +475,8 @@ h1 { margin: 0; font-size: 22px; }
 }
 
 .fail-card { border-color: var(--bad); margin-bottom: 16px; }
+.gate-card { border-color: var(--warn); margin-bottom: 16px; }
+
 .tip { margin: 10px 0 0; font-size: 13px; }
 
 .retry-plan {

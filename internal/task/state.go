@@ -76,11 +76,17 @@ var transitions = map[State][]State{
 	StateBlockedSpec: {StateQueued, StateCancelled},
 	// 等前驱恢复（唤醒回 queued）或人工中止
 	StateBlockedDep: {StateQueued, StateCancelled},
-	// 等人放行
-	StateAwaitingApproval: {StateImplementing, StateCancelled},
+	// 等人放行。
+	//
+	// → queued 是 gate_mode=manual 的放行路径（T2）：确认端点把任务转回
+	// queued 并在 payload 里写下 mode=approved，DB 领单调度器捡起来后
+	// PlanRetry 据此给出 EntryPush，只补 push + 开 PR。不直接
+	// → pr_open 是因为推分支/开 PR 是要跑 git 与调 GitHub 的活，
+	// 不该压在 HTTP 处理器里同步做。
+	StateAwaitingApproval: {StateImplementing, StateQueued, StateCancelled},
 
 	StateImplementing: {StateVerifying, StateQueued, StateFailed, StateCancelled},
-	StateVerifying:    {StatePROpen, StateBlockedSpec, StateQueued, StateFailed, StateCancelled},
+	StateVerifying:    {StatePROpen, StateAwaitingApproval, StateBlockedSpec, StateQueued, StateFailed, StateCancelled},
 
 	StatePROpen:         {StateReviewFeedback, StateMerged, StateFailed, StateCancelled},
 	StateReviewFeedback: {StateImplementing, StateMerged, StateFailed, StateCancelled},

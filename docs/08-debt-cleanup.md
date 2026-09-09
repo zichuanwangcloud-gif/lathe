@@ -65,7 +65,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T0 | v0.1.0 发布准备（staged 文件入库） | A | **DONE** |
 | T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | **DONE** |
 | **T9** | **测试基线可信化（前置，见 §7）** | **A** | **DONE** |
-| T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | TODO |
+| T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | **DONE** |
 | T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
 | T4 | `verifications.log_ref` 落盘写入 | C | TODO |
 | T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
@@ -509,3 +509,51 @@ repos / tasks / task_events / verifications / agent_events。
   email 以 `@example.com` 结尾）与 `make clean-test-db` 目标；
   Makefile 里那段「-p 1 就够了」的注释也改掉了 —— 它给的是虚假的安全感。
   顺带结清 roadmap §1.3 的 `repos` id=241 占位行（属 fixture 残留，被清理带走）。
+
+- 2026-09-09：**T2 实现完成**（PR B，分支 `feat/gate-mode`）。
+  真正的断点确认在 `Enqueue` 而非 pipeline —— 它从不把 `repos.gate_mode`
+  复制进任务行，所以 `tasks.gate_mode` 永远是 `direct`，人在仓库配置页
+  选了 manual 也毫无效果。改动：
+  - `resolveRepoID` → `resolveRepo`，顺带取出 `gate_mode` 并复制进
+    `CreateParams`（任务创建那刻**钉死**，与 `repo_id` 语义一致）
+  - `internal/task` 新增 `GateDirect/GateManual/GateGuarded/GatePlanFirst`
+    四个常量，并在注释里写明**只有 manual 有实现语义**，另三个按 direct 处理
+  - 状态机加两条边：`verifying → awaiting_approval`（闸门落点）与
+    `awaiting_approval → queued`（放行路径）
+  - `Pipeline.gateBeforePush`：验证通过后按 `tk.GateMode` 决定是否停机；
+    停机时转 `awaiting_approval` + 回帖告诉人「活干完了等你点」
+  - `RetryApproved` 重试模式 + `PlanRetry` 分支 → `EntryPush`
+  - `POST /api/tasks/{id}/approve`：只放行真的停在闸门上的任务
+    （其余状态 409 —— 否则「确认」就是个能把任意任务推去开 PR 的后门），
+    跨用户返回 404，转回 `queued` 并写 `mode=approved`，重派**原任务行**
+  - 前端：详情页「确认开 PR」按钮 + 一张说明卡（`awaiting_approval`
+    的状态文案「待放行」本来就在全站状态表里，无需新增）
+  - 鉴权回归表补登 `/approve` —— 本仓纪律是「所有 API 端点都必须要求认证」，
+    漏登记等于没有护栏
+
+  **一个必须防的死循环**：批准后以 `EntryPush` 重入时闸门不能再次触发，
+  否则 `awaiting_approval → queued → awaiting_approval` 无限转圈，
+  人点一次批准永远开不出 PR。实现上用 `entry != EntryPush` 守卫，
+  并在核心测试里显式断言「批准后恰好开一次 PR」。
+
+  测试：`TestPipelineManualGateHaltsBeforePRThenResumesOnApproval` 覆盖完整
+  闸门周期（停住→批准→补开 PR，两半合在一个测试里，只验前者会漏掉
+  「停住之后再也走不动了」这种更糟的实现）；
+  `TestPipelineNonManualGateModesUnchanged` 对三个非 manual 取值逐个断言
+  行为与现状一致（AC2）；`TestEnqueueCopiesRepoGateMode` 含「事后改仓库配置
+  不影响在途任务」的钉死语义断言；三条 approve 端点测试（正常/错状态/跨用户）。
+
+  门禁：注入 12 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净、`make ui` 通过。另外顺手核了一次「绿是不是真的」：
+  `cmd/lathe` 只用了 0.438s（之前 2.5s）显得可疑 —— 该包连不上库时走
+  `t.Skipf`，而 skip 也显示 `ok`。用 `-v` 数了一遍：14 个用例 RUN、
+  14 个 PASS、0 个 SKIP，绿是真的。**这一类核对以后每轮都做**，
+  本轮已经被假绿骗过两次（`| tail` 取错退出码、无条件打印的「gofmt 干净」）。
+
+- 2026-09-09：记一笔**遗留隐患**（不在本轮范围，但已确认存在）：
+  `internal/httpapi` 的 `apiFixture` 与 `mustUser` 也是「确定性 email +
+  `ON CONFLICT DO UPDATE` + 固定 repo `acme/api-test` + 固定 issue key
+  （`CR-R1`/`CR-EV`/`CR-PV`）」的组合 —— 与 T9 修掉的那两个包同款。
+  它目前不红是因为这个包不用全局 `ClaimReady`，但一旦有非终态孤儿残留，
+  `Create` 同样会撞 `tasks_one_active_per_issue`。没有混进 PR B 是为了
+  不让一个动状态机的 PR 里夹带无关的测试重构。**建议单独一个小 PR 修掉。**

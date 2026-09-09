@@ -77,6 +77,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/tasks/{id}/retry", a.Auth.RequireFunc(a.retryTask))
 	mux.Handle("GET /api/tasks/{id}/retry-plan", a.Auth.RequireFunc(a.retryPlan))
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
+	mux.Handle("POST /api/tasks/{id}/approve", a.Auth.RequireFunc(a.approveTask))
 	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
 	mux.Handle("GET /api/repos/{id}/baseline", a.Auth.RequireFunc(a.repoBaseline))
@@ -283,6 +284,54 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 	// 状态已回到 queued，重派【原任务行】（不新建 —— 新建会撞同一 issue
 	// 的活任务唯一索引，重试因此永远卡死；任务 #313 的教训）
 	if err := a.Queue.Requeue(r.Context(), id, string(mode)); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "queued", "taskId": id})
+}
+
+// approveTask 是 gate_mode=manual 的人工放行（T2，docs/08-debt-cleanup.md）。
+//
+// 语义：任务已经走完验证、停在 awaiting_approval；人看过之后点确认，
+// 平台才去推分支、开 PR。
+//
+// 实现上不在这里同步做 push + 开 PR —— 那是要跑 git 与调 GitHub 的活，
+// 压在 HTTP 处理器里会让请求挂很久，且失败没有重试路径。改为：转回
+// queued 并在事件 payload 里写下 mode=approved，DB 领单调度器捡起来后
+// runOneClaimed 回读它、PlanRetry 据此给出 EntryPush（只补 push + 开 PR，
+// 两者都幂等），走的是与手动重试完全一样的成熟通道。
+func (a *API) approveTask(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		// 不是自己的任务 = 不存在（与 taskDetail 同一原则）
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return
+	}
+
+	// 只放行真的停在闸门上的任务。不加这道检查，「确认」就成了一个能把
+	// 任意状态的任务直接推去开 PR 的后门。
+	if tk.State != task.StateAwaitingApproval {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "只有等待确认的任务可以放行，当前状态：" + string(tk.State),
+		})
+		return
+	}
+
+	if _, err := a.Tasks.Transition(r.Context(), id, task.StateQueued, actorOf(r), &task.TransitionOpts{
+		Payload: map[string]any{"reason": "manual_approve", "mode": string(runner.RetryApproved)},
+	}); err != nil {
+		transitionError(w, err)
+		return
+	}
+
+	// 重派【原任务行】，不新建 —— 新建会撞同一 issue 的活任务唯一索引
+	//（任务 #313 的教训，与 retryTask 同一处理）。
+	if err := a.Queue.Requeue(r.Context(), id, string(runner.RetryApproved)); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}

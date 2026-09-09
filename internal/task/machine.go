@@ -130,12 +130,29 @@ func nilIfEmptyJSON(b []byte) []byte {
 	return b
 }
 
+// 闸门模式（repos.gate_mode / tasks.gate_mode）。取值域由数据库的
+// repos_gate_mode_check 与 tasks_gate_mode_check 约束定义，四个值。
+//
+// 本轮（docs/08-debt-cleanup.md T2）只有 GateManual 有拦截语义：
+// 验证通过后停在 awaiting_approval 等人确认。其余三个一律按 GateDirect
+// 处理 —— 不给它们编造语义，假装实现了又是一次「配了没接线」。
+const (
+	// GateDirect 验证通过即推分支开 PR（默认）。
+	GateDirect = "direct"
+	// GateManual 验证通过后停下等人确认（T2 接线的那一个）。
+	GateManual = "manual"
+	// GateGuarded 已在 CHECK 约束里，但尚无实现语义，当前按 direct 处理。
+	GateGuarded = "guarded"
+	// GatePlanFirst 已在 CHECK 约束里，但尚无实现语义，当前按 direct 处理。
+	GatePlanFirst = "plan-first"
+)
+
 // Create 新建任务（初始状态 queued）并记录创建事件。
 //
 // 若同一 issue 已有活任务，数据库的部分唯一索引会拒绝插入。
 func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 	if p.GateMode == "" {
-		p.GateMode = "direct"
+		p.GateMode = GateDirect
 	}
 	dependsOnAt := p.DependsOnAt
 	if dependsOnAt == "" {

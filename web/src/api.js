@@ -100,6 +100,8 @@ export const api = {
     request(`/api/tasks/${id}/retry`, { method: 'POST', body: JSON.stringify({ mode }) }),
   retryPlan: (id) => request(`/api/tasks/${id}/retry-plan`),
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
+  // 人工闸门放行（gate_mode=manual）：验证已过，人看完点这个才推分支开 PR
+  approve: (id) => request(`/api/tasks/${id}/approve`, { method: 'POST' }),
 
   // 任务预览环境：worktree 里构建镜像、起容器给人手动点
   previewCandidates: (id) => request(`/api/tasks/${id}/preview/candidates`),
