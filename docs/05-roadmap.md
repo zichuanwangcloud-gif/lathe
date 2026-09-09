@@ -50,8 +50,17 @@
 
 ### 1.3 数据残留
 
-- `repos` id=241（`acme/member-repo`，user 535 的占位行）—— 无真实仓库，建议清理
+- ~~`repos` id=241（`acme/member-repo`，user 535 的占位行）~~ —— 已清理（2026-09-09）
 - ~~task #217（SMOKE-2 排队尸体）~~ —— 已清理，无需处理
+
+**2026-09-09 补记**：这类残留不是偶发，是**测试 fixture 被中断后的必然产物**
+（测试进程被杀 → `t.Cleanup` 不执行 → user/repo/task 三张表的行原样留下）。
+而且它会让下一轮测试变红，因为 `ClaimReady`／`Reconcile` 都是全局查询 ——
+实测过两种崩法，取证见 [08-debt-cleanup.md](./08-debt-cleanup.md) §7。
+
+治法分两层：测试侧已经免疫（fixture 加随机量、断言按归属过滤、领单前排空），
+库里的存量用 `make clean-test-db` 清（判别条件是 email 以 `@example.com` 结尾，
+RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 ### 1.4 已纠正的误判
 

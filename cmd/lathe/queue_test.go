@@ -66,6 +66,64 @@ func uniqueKey(prefix string) string {
 
 func ptr[T any](v T) *T { return &v }
 
+// ---------------- 全局队列语义下的归属过滤（T9，见 docs/08-debt-cleanup.md §7）
+
+// claimOwn 反复 ClaimReady，直到领到属于 userID 的任务；领不到则返回 nil。
+//
+// 为什么需要它：ClaimReady 是【全局】查询 —— 单机调度器就该看全局队列，
+// 这在生产上是正确语义，绝不能为了测试给它加 owner 过滤。但这让「断言领到
+// 自己的 fixture」变得脆弱：开发库里任何一条别人的 queued 行都会按
+// (priority DESC, id) 排在前面被优先领走。而别人的行是常态不是异常 ——
+// 测试进程被杀（Ctrl-C、CI 超时）时 t.Cleanup 不执行，孤儿行就留下了。
+//
+// 跳过外来任务的代价很小：ClaimReady 只写 lease_expires_at 与 node_id、
+// 不改 state（它的文档注释明确说明了这一点），而且被打上租约的行不会再被
+// 重复返回，所以循环一定收敛。顺带的好处是外来行被租约挡住，
+// 后续用例也不会再被它们干扰。
+func claimOwn(t *testing.T, q *queue, ctx context.Context, userID int64) *task.Task {
+	t.Helper()
+	// 上界防呆：正常情况下几次就命中，给足余量但不允许真的无界循环。
+	const maxSkips = 200
+	for i := 0; i < maxSkips; i++ {
+		tk, err := q.tasks.ClaimReady(ctx, time.Hour)
+		if err != nil {
+			t.Fatalf("ClaimReady 失败: %v", err)
+		}
+		if tk == nil {
+			return nil
+		}
+		if tk.UserID == userID {
+			return tk
+		}
+		t.Logf("跳过不属于本 fixture 的任务 %d（owner=%d，疑似上一轮中断留下的孤儿）", tk.ID, tk.UserID)
+	}
+	t.Fatalf("连续跳过 %d 条外来任务仍未领到自己的任务，开发库里的孤儿行过多，先跑一次清理", maxSkips)
+	return nil
+}
+
+// assertNoneOwnClaimable 断言当前【属于 userID 的】任务里没有任何一条可被领取。
+//
+// 直接写 `if tk, _ := ClaimReady(...); tk != nil { fail }` 是不对的：
+// 那条断言会被库里任何一条外来 queued 行推翻，而外来行与被测语义无关。
+func assertNoneOwnClaimable(t *testing.T, q *queue, ctx context.Context, userID int64, format string, args ...any) {
+	t.Helper()
+	const maxDrain = 200
+	for i := 0; i < maxDrain; i++ {
+		tk, err := q.tasks.ClaimReady(ctx, time.Hour)
+		if err != nil {
+			t.Fatalf("ClaimReady 失败: %v", err)
+		}
+		if tk == nil {
+			return
+		}
+		if tk.UserID == userID {
+			t.Fatalf(format+"（领到了自己的任务 %d）", append(args, tk.ID)...)
+		}
+		t.Logf("跳过不属于本 fixture 的任务 %d（owner=%d）", tk.ID, tk.UserID)
+	}
+	t.Fatalf("排空全局队列时连续跳过 %d 条外来任务，开发库里的孤儿行过多", maxDrain)
+}
+
 // fakePipeline 记录每次 Execute 调用，供断言"恰好被跑一次"与
 // "ExecuteParams 里的内容对不对"，不需要真正拉起 git/agent/Linear/
 // GitHub 的整套环境。
@@ -141,10 +199,7 @@ func TestEnqueueCreatesImmediatelyClaimableTask(t *testing.T) {
 		t.Fatalf("Enqueue 失败: %v", err)
 	}
 
-	tk, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	tk := claimOwn(t, q, ctx, userID)
 	if tk == nil || tk.LinearIssueKey != issueKey {
 		t.Fatalf("Enqueue 之后应能立刻领到该任务，得到 %v", tk)
 	}
@@ -222,51 +277,39 @@ func TestClaimReadyDependencyGating(t *testing.T) {
 
 	// AC1：独立根（前驱自己）立刻可被领取——先把它领出去，后面单独
 	// 通过 Transition 推进它的状态，不再让它参与 ClaimReady 的候选。
-	claimedPred, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	claimedPred := claimOwn(t, q, ctx, userID)
 	if claimedPred == nil || claimedPred.ID != pred.ID {
 		t.Fatalf("AC1：独立根应立刻可被领取，得到 %v", claimedPred)
 	}
 
 	// AC2/AC4：前驱处于 queued（刚被领走，state 未变）/triaging/
 	// implementing/verifying 时，两个后继都不该就绪。
-	if tk, _ := q.tasks.ClaimReady(ctx, time.Hour); tk != nil {
-		t.Fatalf("前驱仍处于 queued（只是被打了租约）时，后继不该就绪，却领到了任务 %d", tk.ID)
-	}
+	assertNoneOwnClaimable(t, q, ctx, userID,
+		"前驱仍处于 queued（只是被打了租约）时，后继不该就绪")
 	for _, s := range []task.State{task.StateTriaging, task.StateImplementing, task.StateVerifying} {
 		if _, err := q.tasks.Transition(ctx, pred.ID, s, "system", nil); err != nil {
 			t.Fatalf("前驱转移到 %s 失败: %v", s, err)
 		}
-		if tk, _ := q.tasks.ClaimReady(ctx, time.Hour); tk != nil {
-			t.Fatalf("前驱处于 %s 时任何语义的后继都不该就绪，却领到了任务 %d", s, tk.ID)
-		}
+		assertNoneOwnClaimable(t, q, ctx, userID,
+			"前驱处于 %s 时任何语义的后继都不该就绪", s)
 	}
 
 	// AC2：前驱到 pr_open：pr_open 语义的后继就绪，merged 语义的仍不该
 	if _, err := q.tasks.Transition(ctx, pred.ID, task.StatePROpen, "system", nil); err != nil {
 		t.Fatalf("前驱转移到 pr_open 失败: %v", err)
 	}
-	claimed, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	claimed := claimOwn(t, q, ctx, userID)
 	if claimed == nil || claimed.ID != succPR.ID {
 		t.Fatalf("AC2：前驱 pr_open 后，depends_on_at=pr_open 的后继应就绪，得到 %v", claimed)
 	}
-	if tk, _ := q.tasks.ClaimReady(ctx, time.Hour); tk != nil {
-		t.Fatalf("AC3：前驱只 pr_open 未 merged 时，depends_on_at=merged 的后继不该就绪，却领到了 %d", tk.ID)
-	}
+	assertNoneOwnClaimable(t, q, ctx, userID,
+		"AC3：前驱只 pr_open 未 merged 时，depends_on_at=merged 的后继不该就绪")
 
 	// AC3：前驱真正 merged：merged 语义的后继才就绪
 	if _, err := q.tasks.Transition(ctx, pred.ID, task.StateMerged, "system", nil); err != nil {
 		t.Fatalf("前驱转移到 merged 失败: %v", err)
 	}
-	claimed2, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	claimed2 := claimOwn(t, q, ctx, userID)
 	if claimed2 == nil || claimed2.ID != succMerged.ID {
 		t.Fatalf("AC3：前驱 merged 后，depends_on_at=merged 的后继应就绪，得到 %v", claimed2)
 	}
@@ -359,10 +402,7 @@ func TestRunOneClaimedRecoversInterruptedStateFromEvents(t *testing.T) {
 		t.Fatalf("Reconcile 失败: %v", err)
 	}
 
-	claimed, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	claimed := claimOwn(t, q, ctx, userID)
 	if claimed == nil || claimed.ID != tk.ID {
 		t.Fatalf("应领到恢复后的任务，得到 %v", claimed)
 	}
@@ -441,10 +481,7 @@ func TestRunOneClaimedRecoversModeFromEvents(t *testing.T) {
 		t.Fatalf("Requeue 失败: %v", err)
 	}
 
-	claimed, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	claimed := claimOwn(t, q, ctx, userID)
 	if claimed == nil || claimed.ID != tk.ID {
 		t.Fatalf("应领到任务，得到 %v", claimed)
 	}
@@ -518,10 +555,7 @@ func TestFillBaseRefFirstDispatchUsesPredecessorBranch(t *testing.T) {
 		t.Fatalf("后继初始 base_ref 应为 NULL，得到 %v", *succ.BaseRef)
 	}
 
-	claimed, err := q.tasks.ClaimReady(ctx, time.Hour)
-	if err != nil {
-		t.Fatalf("ClaimReady 失败: %v", err)
-	}
+	claimed := claimOwn(t, q, ctx, userID)
 	if claimed == nil || claimed.ID != succ.ID {
 		t.Fatalf("应领到后继任务，得到 %v", claimed)
 	}
@@ -723,5 +757,82 @@ func TestRunOneClaimedCancelsTaskWithoutLinearIssueID(t *testing.T) {
 	}
 	if len(pipe.snapshot()) != 0 {
 		t.Errorf("不该走到 pipeline.Execute，却被调用了 %d 次", len(pipe.snapshot()))
+	}
+}
+
+// ---------------------------------------------------------------- T9 测试隔离回归
+
+// orphanInflight 造一条【别的用户的】在途任务，模拟「上一轮测试被中断留下的孤儿」。
+//
+// 它刻意在调用方建自己的任务【之前】被创建，因此 id 更小 —— 而 ClaimReady 的
+// 排序是 (priority DESC, id)，所以孤儿必然被优先领走。这正是实测失败的成因。
+func orphanInflight(t *testing.T, st *store.Store, q *queue) int64 {
+	t.Helper()
+	ctx := context.Background()
+	userID, repoID := fixture(t, st)
+	tk, err := q.tasks.Create(ctx, task.CreateParams{
+		UserID: userID, RepoID: repoID,
+		LinearIssueKey: uniqueKey("ORPHAN"), LinearIssueID: uniqueKey("uuid-orphan"),
+	})
+	if err != nil {
+		t.Fatalf("造孤儿任务失败: %v", err)
+	}
+	if _, err := q.tasks.Transition(ctx, tk.ID, task.StateTriaging, "system", nil); err != nil {
+		t.Fatalf("孤儿转 triaging 失败: %v", err)
+	}
+	if _, err := q.tasks.Transition(ctx, tk.ID, task.StateImplementing, "system", nil); err != nil {
+		t.Fatalf("孤儿转 implementing 失败: %v", err)
+	}
+	return tk.ID
+}
+
+// 崩溃恢复的断言必须能在「库里还有别人的在途任务」时成立。
+//
+// 背景：q.Reconcile 与 tasks.ClaimReady 都是【全局】操作 —— 单机调度器就该看
+// 全局队列，这在生产上是正确语义，不能为了测试给它们加 owner 过滤。但这让
+// 「断言领到自己的任务」变得脆弱：Reconcile 会把库里所有在途任务一起重新入队
+// （实测日志 `启动恢复完成 requeued_inflight=2` 就是铁证），随后 ClaimReady
+// 按 id 升序把别人的那条优先领走，测试拿到的不是自己的 fixture。
+//
+// 开发库里出现别人的在途行是常态，不是异常：测试进程被杀时 t.Cleanup 不执行，
+// 孤儿行就留下了。所以隔离责任在测试侧。
+func TestClaimOwnIgnoresForeignInflightTasks(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	pipe := &fakePipeline{}
+	q := testQueue(st, pipe)
+
+	// 先造孤儿（id 更小，会被 ClaimReady 优先领走）
+	orphanID := orphanInflight(t, st, q)
+
+	// 再造自己的任务
+	userID, repoID := fixture(t, st)
+	tk, err := q.tasks.Create(ctx, task.CreateParams{
+		UserID: userID, RepoID: repoID,
+		LinearIssueKey: uniqueKey("Q-ISO"), LinearIssueID: uniqueKey("uuid-iso"),
+	})
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+	if _, err := q.tasks.Transition(ctx, tk.ID, task.StateTriaging, "system", nil); err != nil {
+		t.Fatalf("转 triaging 失败: %v", err)
+	}
+	if _, err := q.tasks.Transition(ctx, tk.ID, task.StateImplementing, "system", nil); err != nil {
+		t.Fatalf("转 implementing 失败: %v", err)
+	}
+
+	if err := q.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile 失败: %v", err)
+	}
+
+	claimed := claimOwn(t, q, ctx, userID)
+	if claimed == nil {
+		t.Fatal("应领到属于本 fixture 的任务")
+	}
+	if claimed.ID == orphanID {
+		t.Fatalf("领到了孤儿任务 %d，说明没有按归属过滤", orphanID)
+	}
+	if claimed.ID != tk.ID {
+		t.Fatalf("应领到 %d，得到 %d", tk.ID, claimed.ID)
 	}
 }

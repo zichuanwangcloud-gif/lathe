@@ -1,4 +1,4 @@
-.PHONY: help all build test test-race lint run migrate dev-infra dev-infra-down ui ui-deps ui-dev clean
+.PHONY: help all build test test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev clean
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
@@ -39,7 +39,13 @@ all: ui build ## 构建界面与二进制
 test: ## 跑测试
 	# -p 1：DB 领单调度器（internal/task.Machine.ClaimReady）是全局查询，不按包/fixture
 	# 隔离，多个测试包默认并行跑在同一个真实 Postgres 上会互相抢/污染对方建的 'queued'
-	# 行，产生间歇性 FAIL（与代码正确性无关，是共享测试库的既有限制）。强制包间串行即可。
+	# 行。强制包间串行即可。
+	#
+	# 注意 -p 1 只挡【包间并行】，挡不住【跨轮次的数据残留】—— 测试进程被杀时
+	# t.Cleanup 不执行，fixture 行留在库里，下一轮的全局查询会捞到它们。
+	# 那一层由测试侧自己扛：fixture 的 email 带随机量、领单断言按归属过滤、
+	# internal/task 在建自己的任务前先排空队列。详见 docs/08-debt-cleanup.md §7。
+	# 库里的残留用 make clean-test-db 清（默认干跑）。
 	go test -p 1 ./... -count=1
 
 test-race: ## 跑并发相关测试的 -race 检测（F2.1-AC5；本地目标，未接入 CI）
@@ -66,6 +72,9 @@ dev-infra: ## 起本地 Postgres（端口 55432，避开常见占用）
 
 dev-infra-down: ## 停本地 Postgres
 	docker compose -f docker-compose.dev.yml down
+
+clean-test-db: ## 报告开发库里的测试残留（加 YES=1 真删）
+	scripts/clean-test-db.sh $(if $(YES),--yes,)
 
 clean: ## 清理构建产物
 	rm -rf $(BIN_DIR) $(UI_SRC) $(UI_EMBED)

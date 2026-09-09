@@ -64,7 +64,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 |---|---|---|---|
 | T0 | v0.1.0 发布准备（staged 文件入库） | A | **DONE** |
 | T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | **DONE** |
-| **T9** | **测试基线可信化（前置，见 §7）** | **A** | **WIP** — 根因已取证，待实施 |
+| **T9** | **测试基线可信化（前置，见 §7）** | **A** | **DONE** |
 | T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | TODO |
 | T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
 | T4 | `verifications.log_ref` 落盘写入 | C | TODO |
@@ -390,35 +390,86 @@ unique constraint "tasks_one_active_per_issue" (SQLSTATE 23505)
 3. Makefile 里已有注释承认共享库限制并用 `-p 1` 缓解，但 `-p 1` 只挡**包间并行**，
    挡不住**跨轮次的数据残留**——注释给了虚假的安全感
 
-### 修法（待定，实施时确认）
+### 修法（已实施）
 
 `ClaimReady` 的全局语义是**生产上正确的**（单机调度器就该看全局队列），
-不能为了测试给它加 owner 过滤污染生产 API。所以隔离责任在测试侧：
+所以**一行生产代码都没改**，隔离责任全在测试侧。三处改动：
 
-- 方案 a：包级 `TestMain` 在跑之前清理「不属于本轮 fixture 的 `queued` 行」，
-  并在 `t.Cleanup` 里清理自己造的行
-- 方案 b：测试专用 helper `claimOwn(t, q, ownerID)`，循环 `ClaimReady`
-  直到拿到属于本 fixture owner 的任务，把不属于自己的显式跳过并放回
-- 方案 c：每个测试包用独立 schema / 独立库（最彻底，改动最大）
+**1. fixture 唯一性（治缺陷 2 的根）**
 
-倾向 a + b 组合：a 保证起点干净，b 保证即使并发下拿错也能自愈。方案 c 留作后续。
+`internal/runner/pipelineFixture` 与 `internal/task/fixture` 的 email 原先是
+`"<前缀>-" + t.Name() + "@example.com"` —— **没有随机量** —— 再配
+`ON CONFLICT (email) DO UPDATE`，于是被中断那一轮留下的孤儿 user 会被**复用**，
+连带它名下的 repo 与那些用固定 issue key（`CR-777` / `CR-1001` / `CR-ORCH-ROOT`）
+建的非终态任务，下一轮 `Create` 必然撞部分唯一索引。
+
+修法：email 加 `UnixNano()`，并**去掉两处 `ON CONFLICT`**。
+新 user 天然给出新 repo_id（repos 唯一键是 `(user_id, provider_repo)`），
+固定 issue key 也就被限定在这个 repo 内，跨轮次不再撞车。
+`provider_repo` 保持原值（`acme/demo` / `Clouditera/CloudRouter`）——
+调用方的断言依赖它。去掉 `ON CONFLICT` 是刻意的：带了随机量就不该再有冲突，
+真撞上了应该大声报错，而不是静默复用别人的行。
+
+对照：`cmd/lathe` 的 `fixture` 本来就用了 `UnixNano()`，是干净的 ——
+三个包里两个有病、一个健康，说明这不是设计决定而是各写各的。
+
+**2. 领单断言按归属过滤（治缺陷 1 的根）**
+
+`cmd/lathe/queue_test.go` 新增两个 helper：
+
+- `claimOwn(t, q, ctx, userID)` —— 循环 `ClaimReady` 直到领到属于本 fixture
+  的任务，外来任务显式跳过并 `t.Logf` 留痕。收敛性由 `ClaimReady` 自己保证：
+  它的 WHERE 里有 `lease_expires_at IS NULL OR lease_expires_at < now()`，
+  领走的行会带上租约、不会被重复返回。上界 200 条防呆。
+- `assertNoneOwnClaimable(t, q, ctx, userID, ...)` —— 断言「属于自己的任务里
+  没有一条可被领取」。原先写成 `if tk, _ := ClaimReady(...); tk != nil { fail }`
+  是错的：那条断言会被库里任何一条与被测语义无关的外来行推翻。
+
+跳过外来任务的代价很小：`ClaimReady` 只写 `lease_expires_at` 与 `node_id`、
+**不改 state**（它的文档注释明确写了这一点，因为转移表里没有 queued→queued
+这条边）。顺带的好处是外来行被租约挡住，后续用例也不会再被它们干扰。
+
+**3. 领单前排空（`internal/task` 包）**
+
+这个包的三个用例（`TestClaimReadyConcurrency` / `TestClaimReadyLeaseExpiry` /
+`TestClaimReadyRespectsDependsOnAt`）都断言「领到的就是自己创建的那条」。
+这里用 `drainForeignQueue(t, m, ctx)`：在**创建自己的任务之前**把已有候选用
+长租约领空，那一刻所有候选都必然不属于本用例。比事后按 owner 过滤改动更小，
+而且 `TestClaimReadyLeaseExpiry` 要用 100ms 短租约测过期，事后过滤会把
+短租约用在跳过外来任务上、反而不可靠。
+
+**没采用的方案**：包级 `TestMain` 直接删「不属于本轮的 queued 行」。
+它对指向真实库的 `LATHE_TEST_DSN` 是危险的 —— 测试代码不该有删生产数据的能力。
+清理动作单独做成脚本、要显式 `--yes`（见下）。
 
 ### 验收标准
 
 - AC1 **连续两次** `make test` 都全绿，且第一次不依赖前一次的副作用
-  （验收方式：手工插入 3 条陈尸 `queued` 行 → 跑 `make test` → 必须绿）
+  （验收方式：手工注入孤儿 `queued` / 在途行 → 跑整套 → 必须绿）
 - AC2 `go test -p 1 ./... -count=1` 的**真实退出码**为 0
   （注意：不能用 `go test ... | tail` 判断——那取到的是 `tail` 的退出码，
   本轮开工时正是这样误判了一次基线为绿）
 - AC3 测试跑完后开发库里不残留本轮 fixture 造的 `queued` 行
-- AC4 `cmd/lathe` 与 `internal/task` 两个包（都用 ClaimReady）都覆盖
-- AC5 生产代码 `Machine.ClaimReady` 的签名与语义不变
+- AC4 `cmd/lathe`、`internal/task`、`internal/runner` 三个包都覆盖
+- AC5 生产代码 `Machine.ClaimReady` 的签名与语义不变（本轮零生产代码改动）
+- AC6 新增两条**回归测试**，确定性复现原失败：
+  `TestPipelineFixtureSurvivesInterruptedRun`（预置同名孤儿 user + 非终态
+  `CR-777`，断言 `pipelineFixture` 仍可用）与
+  `TestClaimOwnIgnoresForeignInflightTasks`（先造 id 更小的外来在途任务，
+  断言仍领到自己那条）。两者在修复前都实测为红
 
 ### 顺带清理
 
-开发库里的存量脏数据（roadmap §1.3 记过同类问题）：
-`SMK-1/2/3` 三条陈尸、以及 §1.3 提到的 `repos` id=241 占位行。
-清理动作写成可重跑的脚本而非手工 SQL，否则下次又是一样。
+`scripts/clean-test-db.sh` —— 可重跑，默认**干跑只报告**，加 `--yes` 才真删。
+
+判别条件是 **email 以 `@example.com` 结尾**：RFC 2606 把该域保留给文档与测试，
+真实用户不会用，所以既充分又安全。删 user 会级联带走
+repos / tasks / task_events / verifications / agent_events。
+不属于 fixture 的非终态任务（如 user_id=1 名下 8 月那几条 `pr_open`）
+只报告、不删 —— 那是真实历史数据，该由人判断。
+
+磁盘上的 worktree 目录**不在本脚本职责内**：数据库行会被级联带走，目录不会。
+那是 T6 收割机的事。
 
 ## 8. 执行记录
 
@@ -441,3 +492,20 @@ unique constraint "tasks_one_active_per_issue" (SQLSTATE 23505)
   拿到两个具体用例名与各自的失败输出，才定位到两个不同机制的隔离缺陷。
   另记一条观测教训：`go test ... | tail` 取到的是 `tail` 的退出码，
   本轮据此误判过一次「基线全绿」——此后一律用 `$?` 或 `PIPESTATUS[0]`。
+
+- 2026-09-09：**T9 实施完成**。生产代码**零改动** —— `ClaimReady` 的全局语义在
+  生产上是对的，隔离责任全在测试侧。三处改动：`internal/runner` 与 `internal/task`
+  的 fixture email 加随机量并去掉 `ON CONFLICT DO UPDATE`；`cmd/lathe` 新增
+  `claimOwn` / `assertNoneOwnClaimable` 两个归属过滤 helper 并改造 7 处脆弱断言；
+  `internal/task` 三个领单用例改为建任务前先 `drainForeignQueue`。
+  新增两条回归测试，修复前实测为红、修复后转绿。
+  **AC1 验收方式比原定的更严**：不只是插 3 条陈尸，而是注入
+  「6 条 queued + 1 条在途 + 4 条 pr_open」的脏库，并且第二轮刻意注入各包的
+  **固定 issue key**（`CR-777` / `CR-1001` / `CR-ORCH-ROOT`）—— 正是会撞车的那些。
+  两遍都是 `GOTEST_EXIT=0`、15 个包全绿、零 FAIL —— AC1 的「连续两次且第一次
+  不依赖前一次副作用」达成，且两遍都跑在故意弄脏的库上（第二遍的脏数据是
+  清理脚本执行后新注入的，与第一遍无因果关系）。
+  配套产出 `scripts/clean-test-db.sh`（默认干跑，`--yes` 真删，判别条件是
+  email 以 `@example.com` 结尾）与 `make clean-test-db` 目标；
+  Makefile 里那段「-p 1 就够了」的注释也改掉了 —— 它给的是虚假的安全感。
+  顺带结清 roadmap §1.3 的 `repos` id=241 占位行（属 fixture 残留，被清理带走）。

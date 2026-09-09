@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -167,22 +168,35 @@ func pipelineFixture(t *testing.T) (*pgxpool.Pool, *task.Machine, int64, RepoCon
 	m := task.NewMachine(pool)
 	ctx := context.Background()
 
+	// email 必须带随机量。原先是 "pipe-<测试名>@example.com" —— 确定值 ——
+	// 再配 ON CONFLICT DO UPDATE，于是上一轮被中断（测试进程被杀，t.Cleanup
+	// 没执行）留下的孤儿 user 会被【复用】，连带它名下的 acme/demo repo；
+	// 而 issue key 固定为 CR-777，Create 就撞上部分唯一索引
+	// tasks_one_active_per_issue（SQLSTATE 23505）。
+	//
+	// 修法是让 user 每次都是新的：repos 的唯一键是 (user_id, provider_repo)，
+	// 所以新 user 天然给出新 repo_id，CR-777 也就被限定在这个 repo 内，
+	// 永远不会跨轮次撞车。provider_repo 仍保持 "acme/demo" ——
+	// 返回的 DefaultRepoConfig("acme/demo") 被调用方断言依赖着。
+	//
+	// 同时去掉两处 ON CONFLICT：带了随机量就不该再有冲突，
+	// 真撞上了应该大声报错而不是静默复用别人的行。
 	var userID, repoID int64
-	email := "pipe-" + t.Name() + "@example.com"
+	nonce := strconv.FormatInt(time.Now().UnixNano(), 10)
+	email := "pipe-" + t.Name() + "-" + nonce + "@example.com"
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO users (email) VALUES ($1) ON CONFLICT (email) DO UPDATE SET updated_at=now() RETURNING id`,
+		`INSERT INTO users (email) VALUES ($1) RETURNING id`,
 		email).Scan(&userID); err != nil {
 		t.Fatalf("建 user 失败: %v", err)
-	}
-	if err := pool.QueryRow(ctx,
-		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2)
-		 ON CONFLICT (user_id, provider_repo) DO UPDATE SET updated_at=now() RETURNING id`,
-		userID, "acme/demo").Scan(&repoID); err != nil {
-		t.Fatalf("建 repo 失败: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, userID)
 	})
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
+		userID, "acme/demo").Scan(&repoID); err != nil {
+		t.Fatalf("建 repo 失败: %v", err)
+	}
 
 	tk, err := m.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-777",
@@ -1063,4 +1077,55 @@ type countingClients struct {
 func (c *countingClients) Linear(ctx context.Context) (LinearAPI, error) {
 	c.linearCalls++
 	return c.fakeClients.Linear(ctx)
+}
+
+// ---------------------------------------------------------------- T9 测试隔离回归
+
+// pipelineFixture 必须能在「上一轮同名测试被中断、留下孤儿行」之后照常工作。
+//
+// 为什么会有孤儿行：测试进程被杀（Ctrl-C、CI 超时、TaskStop）时 t.Cleanup
+// 不会执行，user/repo/task 三张表的 fixture 行原样留在共享开发库里。
+//
+// 为什么这会让测试红：pipelineFixture 原先的 email 是 "pipe-<测试名>@example.com"
+// —— 没有随机量 —— 配上 ON CONFLICT DO UPDATE，孤儿 user 会被【复用】，
+// 连带它名下的 acme/demo repo；而 issue key 又固定为 CR-777，于是 Create
+// 撞上部分唯一索引 tasks_one_active_per_issue，报 SQLSTATE 23505。
+// 实测失败信息：`建任务失败: task: 创建任务失败: ERROR: duplicate key value
+// violates unique constraint "tasks_one_active_per_issue"`。
+func TestPipelineFixtureSurvivesInterruptedRun(t *testing.T) {
+	pool := testPoolForPipeline(t)
+	m := task.NewMachine(pool)
+	ctx := context.Background()
+
+	// 精确模拟中断后的残留：与 pipelineFixture 完全相同的 email/repo/issue key，
+	// 且任务处于非终态（终态行不会触发那个部分唯一索引）。
+	var orphanUser, orphanRepo int64
+	email := "pipe-" + t.Name() + "@example.com"
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (email) VALUES ($1)
+		 ON CONFLICT (email) DO UPDATE SET updated_at=now() RETURNING id`,
+		email).Scan(&orphanUser); err != nil {
+		t.Fatalf("造孤儿 user 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, orphanUser)
+	})
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2)
+		 ON CONFLICT (user_id, provider_repo) DO UPDATE SET updated_at=now() RETURNING id`,
+		orphanUser, "acme/demo").Scan(&orphanRepo); err != nil {
+		t.Fatalf("造孤儿 repo 失败: %v", err)
+	}
+	if _, err := m.Create(ctx, task.CreateParams{
+		UserID: orphanUser, RepoID: orphanRepo, LinearIssueKey: "CR-777",
+	}); err != nil {
+		t.Fatalf("造孤儿任务失败: %v", err)
+	}
+
+	// 关键断言：此时调 pipelineFixture 必须成功。
+	// 它内部会 t.Fatalf，所以「不 fatal」本身就是断言。
+	_, _, tkID, _, _ := pipelineFixture(t)
+	if tkID == 0 {
+		t.Fatal("pipelineFixture 应返回可用的 task id")
+	}
 }

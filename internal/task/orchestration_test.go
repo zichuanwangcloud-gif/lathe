@@ -111,6 +111,11 @@ func TestClaimReadyConcurrency(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
+	// 本用例断言「领到的就是自己创建的那条」，所以先把已有候选排空 ——
+	// 否则开发库里任何一条外来 queued 行都会被优先领走。见 machine_test.go
+	// 的 drainForeignQueue 注释。
+	drainForeignQueue(t, m, ctx)
+
 	const n = 12
 	ids := make(map[int64]bool, n)
 	for i := 0; i < n; i++ {
@@ -180,6 +185,11 @@ func TestClaimReadyLeaseExpiry(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
+	// 本用例断言「领到的就是自己创建的那条」，所以先把已有候选排空 ——
+	// 否则开发库里任何一条外来 queued 行都会被优先领走。见 machine_test.go
+	// 的 drainForeignQueue 注释。
+	drainForeignQueue(t, m, ctx)
+
 	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-LEASE-1"})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
@@ -222,6 +232,11 @@ func TestClaimReadyRespectsDependsOnAt(t *testing.T) {
 	m := NewMachine(pool)
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
+
+	// 本用例断言「领到的就是自己创建的那条」，所以先把已有候选排空 ——
+	// 否则开发库里任何一条外来 queued 行都会被优先领走。见 machine_test.go
+	// 的 drainForeignQueue 注释。
+	drainForeignQueue(t, m, ctx)
 
 	pred, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-DEP-PRED"})
 	if err != nil {
