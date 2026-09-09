@@ -40,6 +40,10 @@ func main() {
 	}
 }
 
+// version 是二进制自报的版本号，发布构建用
+// -ldflags "-X main.version=<版本>" 注入；本地构建保持 dev。
+var version = "dev"
+
 func run() error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -52,7 +56,7 @@ func run() error {
 		case "migrate":
 			return runMigrate(cfg, os.Args[2:])
 		case "version":
-			fmt.Println("lathe dev")
+			fmt.Println("lathe " + version)
 			return nil
 		case "serve":
 			// 显式 serve 与默认行为一致

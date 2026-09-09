@@ -6,6 +6,10 @@ RUNNER_BIN := $(BIN_DIR)/lathe-runner
 UI_SRC     := web/dist
 UI_EMBED   := internal/webui/dist
 
+# 发布构建注入版本号（make build VERSION=0.1.0）；不传则二进制自报 dev。
+VERSION    ?=
+LDFLAGS    := $(if $(VERSION),-ldflags "-X main.version=$(VERSION)",)
+
 help: ## 显示可用目标
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
@@ -15,6 +19,9 @@ ui: ## 构建管理界面并同步到内嵌目录
 	cd web && node_modules/.bin/vite build
 	rm -rf $(UI_EMBED)
 	cp -r $(UI_SRC) $(UI_EMBED)
+	# 补回占位文件：上面的 rm -rf 会把它删掉，而它是入库的唯一 dist 内容 ——
+	# 没有它，干净克隆里 //go:embed all:dist 找不到目录，go build/vet/test 全挂。
+	@touch $(UI_EMBED)/.gitkeep
 	@echo "→ 界面已同步到 $(UI_EMBED)"
 
 ui-deps: ## 安装前端依赖（首次或依赖变更后执行）
@@ -25,8 +32,8 @@ ui-dev: ## 前端热重载（需另起 make run）
 
 build: ## 编译控制面与节点代理（不重建界面，用 make all 一起构建）
 	@mkdir -p $(BIN_DIR)
-	go build -o $(CTRL_BIN) ./cmd/lathe
-	go build -o $(RUNNER_BIN) ./cmd/lathe-runner
+	go build $(LDFLAGS) -o $(CTRL_BIN) ./cmd/lathe
+	go build $(LDFLAGS) -o $(RUNNER_BIN) ./cmd/lathe-runner
 	@echo "→ $(CTRL_BIN) $(RUNNER_BIN)"
 
 all: ui build ## 构建界面与二进制
@@ -46,7 +53,9 @@ test-race: ## 跑并发相关测试的 -race 检测（F2.1-AC5；本地目标，
 
 lint: ## 静态检查
 	go vet ./...
-	gofmt -l -e .
+	# 排除 .claude/：那是 Claude Code 的本地 worktree，里面是别的分支的
+	# 检出副本，不是本仓工作树文件，扫它只会报无关噪声。
+	gofmt -l -e $$(git ls-files "*.go")
 
 run: build ## 起控制面
 	$(CTRL_BIN)
