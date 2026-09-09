@@ -66,7 +66,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | **DONE** |
 | **T9** | **测试基线可信化（前置，见 §7）** | **A** | **DONE** |
 | T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | **DONE** |
-| T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
+| T3 | 任务终态邮件通知（接 `notify_email`） | C | **DONE** |
 | T4 | `verifications.log_ref` 落盘写入 | C | TODO |
 | T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
 | T6 | worktree TTL 收割机 | E | TODO |
@@ -80,7 +80,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 
 | PR | 内容 | 聚合理由 |
 |---|---|---|
-| **A** `chore/release-and-prune` | T0 发布准备 + T1 删骨架 | 都是清理类，不碰运行逻辑，可最先合 |
+| **A** `chore/debt-cleanup-baseline` | T0 发布准备 + T1 删骨架 + T9 测试基线 | 都是清理类，不碰运行逻辑，可最先合；且后面每个 PR 都需要它的可信测试基线 |
 | **B** `feat/gate-mode` | T2 闸门 | 动状态机（新增可达状态），独立评审 |
 | **C** `feat/notify-and-logref` | T3 通知 + T4 日志指针 | 都是「终态时补一个副作用」，共享 pipeline 终态落点 |
 | **D** `feat/cost-panel` | T5 成本面板 | 纯读侧聚合 + 前端，零运行风险 |
@@ -88,7 +88,16 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | **F** `feat/webhook-triggers` | T7 webhook 联动 | 只动 ingress 层 |
 | **G** `feat/verify-isolation` | T8 compose 隔离 | 动验证主路径，风险最高，**最后合** |
 
-顺序：A → B/C/D/E/F（互不依赖，可并行推）→ G。
+顺序：A → B → C → D/E/F（互不依赖）→ G。
+
+**2026-09-09 修正**：原先写的「B/C/D/E/F 互不依赖，可并行推」是错的。
+**C 依赖 B**：T3-AC1 把 `awaiting_approval` 列为通知触发状态之一，
+而那个状态只有 T2 才让它可达 —— 我在 baseline 上开 C 的分支之后才发现
+`gateBeforePush` 根本不在场。C 已改栈到 B 之上。
+
+D/E/F 与 B/C 确实互不依赖（成本面板是读侧、收割机是独立轮询器、
+webhook 联动只动 ingress 层），但都 base 在 A 上，因为都需要那个测试基线。
+教训：拆 PR 时「模块不重叠」不等于「无依赖」，还得看**验收标准之间**有没有引用。
 
 ## 4. 验收标准
 
@@ -557,3 +566,50 @@ repos / tasks / task_events / verifications / agent_events。
   它目前不红是因为这个包不用全局 `ClaimReady`，但一旦有非终态孤儿残留，
   `Create` 同样会撞 `tasks_one_active_per_issue`。没有混进 PR B 是为了
   不让一个动状态机的 PR 里夹带无关的测试重构。**建议单独一个小 PR 修掉。**
+
+- 2026-09-09：**T3 实现完成**（PR C，分支 `feat/notify-and-logref`，栈在 B 之上）。
+  两个设计约束贯穿全程：
+  1. **runner 不 import `internal/mail`**。runner 只声明窄接口 `TaskMail`
+     （`internal/runner/notify.go`），实现 `taskMailer` 放在 `cmd/lathe`
+     —— 那里同时拿得到 store（解析收件人）与 mail（发信）。
+     这与既有的 `VerificationRecorder`/`AgentEventRecorder` 是同一套做法。
+  2. **发信绝不影响状态流转**。`mailTerminal` 刻意**不返回 error**：
+     调用方都在「任务已进终态」之后调它，返回错误只会诱导调用方去处理一个
+     不该影响主流程的东西。SMTP 没配、投递失败、收件人查不到 ——
+     一律只记日志。把通知做成能让任务卡住的东西，等于用一个「锦上添花」
+     的功能给主流程加了一个新的失败点。
+
+  收件人口径（`store.NotifyEmailForTask`）：优先 `notify_email`，
+  **NULL 与空串都回退登录邮箱**（界面上清空通知邮箱存下来的是空串，
+  不能因此发出一封收件人为 `""` 的信）。与密码重置刻意不同 ——
+  重置邮件永远发登录邮箱，因为那封信的意义就是「证明你拥有这个登录邮箱」。
+  单次 JOIN 而非「先查任务再查用户」：通知在终态转移后的热路径上。
+  查不到收件人返回 `ErrNoRecipient`，调用方据此静默跳过，
+  不把「没人可发」当成发信故障刷日志。
+
+  六个落点全接：`p.fail`（pipeline 所有失败路径的汇流处）、
+  `stagePushAndPR` 的 `pr_open`、`gateBeforePush` 的 `awaiting_approval`、
+  以及 mergepoll 的 `merged` / rebase 冲突 `failed` / PR 关闭 `cancelled`。
+  mergepoll 走 `p.Pipeline.mailTerminal` 而不是自己再拼一套 ——
+  同一份渲染逻辑只该有一处，否则两边正文迟早不一致。
+
+  **AC7（人工取消不发信）由构造保证**：`httpapi` 侧根本没有 `Mail` 依赖，
+  `cancelTask` 无从发信。人自己点的取消不需要通知自己。
+
+  测试：`terminalMail` 是纯函数，脱离 SMTP 断言「issue key／终态／失败原因／
+  失败阶段／补充信息／详情链接」都在正文里，以及 BaseURL 为空时**省略**
+  链接那一行（而不是拼一个指向 localhost 的无用链接）；
+  `TestPipelineFailureNotifiesOwnerAndSurvivesSMTPOutage` 是本项最重要的一条 ——
+  SMTP 全程报错，断言任务依然干净落在 `failed`；
+  另有闸门通知、pr_open 通知、`stateSubject` 全终态覆盖、
+  以及 4 条 store 收件人测试（优先/回退/空串/任务不存在）。
+
+  门禁：注入 14 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净。store 那 4 条用 `-v` 数过：4 RUN / 4 PASS / 0 SKIP。
+
+- 2026-09-09：**修正一处 PR 拆分判断错误**。原先写的「B/C/D/E/F 互不依赖，
+  可并行推」是错的：C 依赖 B，因为 T3-AC1 把 `awaiting_approval` 列为通知
+  触发状态之一，而那个状态只有 T2 才让它可达。我在 baseline 上开了 C 的分支、
+  写到一半才发现 `gateBeforePush` 根本不在场，已改栈到 B 之上。
+  教训：拆 PR 时「模块不重叠」不等于「无依赖」，还得看**验收标准之间**
+  有没有互相引用。

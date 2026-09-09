@@ -85,6 +85,15 @@ type Pipeline struct {
 	Notifier  Notifier
 	NewID     NewSessionID
 
+	// Mail 给任务属主发终态通知信（T3）。为 nil 时不发信 ——
+	// 通知是副作用，缺了不影响任何流程。实现在 cmd/lathe，
+	// 见 notify.go 的 TaskMail 注释。
+	Mail TaskMail
+
+	// BaseURL 是本实例对外地址，通知邮件里的详情页链接用它拼。
+	// 空串时邮件省略链接那一行，而不是拼一个指向 localhost 的无用链接。
+	BaseURL string
+
 	// ClientFactory 非空时优先于 Clients：按任务属主解析客户端。
 	// 为 nil 时用静态 Clients（单用户部署与测试）。
 	ClientFactory ClientFactory
@@ -275,13 +284,19 @@ func (p *Pipeline) gateBeforePush(rc *runCtx) error {
 		return nil
 	}
 
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateAwaitingApproval, rc.actor,
+	gated, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateAwaitingApproval, rc.actor,
 		&task.TransitionOpts{Payload: map[string]any{
 			"gate_mode": rc.tk.GateMode,
 			"reason":    "验证已通过，按仓库的人工闸门设置等待确认后再开 PR",
-		}}); err != nil {
+		}})
+	if err != nil {
 		return fmt.Errorf("转移到 awaiting_approval 失败: %w", err)
 	}
+
+	// 这一条通知的价值最高：任务停在这里不动，除了等人别的什么都不会发生。
+	// 不发信就只能靠人主动去翻面板才发现「活早就干完了」。
+	p.mailTerminal(rc.ctx, gated,
+		"这个仓库配了人工闸门（gate_mode=manual）：到任务详情页点「确认开 PR」后才会推分支并开 PR。")
 
 	slog.Info("人工闸门拦住了开 PR，等人确认",
 		"task", rc.tk.ID, "issue", rc.tk.LinearIssueKey, "gate_mode", rc.tk.GateMode)
@@ -901,12 +916,16 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		slog.Warn("pr_number 落库失败", "task", rc.tk.ID, "err", err)
 	}
 
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StatePROpen, rc.actor, &task.TransitionOpts{
+	opened, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StatePROpen, rc.actor, &task.TransitionOpts{
 		PRURL:   &pr.URL,
 		Payload: map[string]any{"pr_number": pr.Number, "reused": pr.Existing},
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+
+	// 终态通知（T3）：活干完了，等人评审合并。
+	p.mailTerminal(rc.ctx, opened, "PR："+pr.URL+"\n\n"+verifySummary)
 
 	body := fmt.Sprintf("**Lathe 已完成并开出 PR**\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
 		pr.URL, verifySummary)
@@ -1153,9 +1172,17 @@ func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
 		FailureStage:  strPtr(string(stage)),
 		Payload:       map[string]any{"stage": string(stage)},
 	}
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateFailed, "system", opts); err != nil {
-		return fmt.Errorf("任务失败(%s)，且状态转移也失败: %w（原因: %v）", stage.label(), err, cause)
+	failed, terr := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateFailed, "system", opts)
+	if terr != nil {
+		return fmt.Errorf("任务失败(%s)，且状态转移也失败: %w（原因: %v）", stage.label(), terr, cause)
 	}
+
+	// 终态通知（T3）。放在转移之后：只有状态真的落库了，通知才不会说谎。
+	mailDetail := ""
+	if rc.wt != nil {
+		mailDetail = fmt.Sprintf("工作区已保留在 %s（分支 %s），可直接进去接手；重试会优先续跑该现场。", rc.wt.Path, rc.wt.Branch)
+	}
+	p.mailTerminal(rc.ctx, failed, mailDetail)
 
 	// 4) 失败传播（F2.3-AC1~AC4）：depends_on 链上所有传递后继里仍排队的
 	// 任务转 blocked_dep，并回帖说明是被本任务连累的。传播出错或某个
