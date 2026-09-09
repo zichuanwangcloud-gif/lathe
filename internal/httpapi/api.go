@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/Clouditera/lathe/internal/preview"
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
@@ -24,6 +26,14 @@ type SceneInspector interface {
 	Inspect(ctx context.Context, providerRepo, path, branch, base string) *runner.WorktreeState
 }
 
+// BaselineDetector 检测/部署仓库配置的基线目录（见 internal/preview/baseline.go）。
+// *preview.Manager 实现此接口；测试可注入假件。为 nil 时基线接口整体
+// 退化为「不可用」，不影响其余仓库配置功能。
+type BaselineDetector interface {
+	DetectBaseline(ctx context.Context, dir, defaultBranch string) (*preview.BaselineStatus, error)
+	DeployBaseline(ctx context.Context, dir, composeFile string) error
+}
+
 // API 提供管理界面所需的读写接口。
 type API struct {
 	Store *store.Store
@@ -34,6 +44,9 @@ type API struct {
 	// Scenes 体检失败任务的 worktree 现场，供重试预览（retry-plan）
 	// 与 resume 模式预检。为 nil 时预览退化为「无法体检」并保守决策。
 	Scenes SceneInspector
+
+	// Baselines 检测/部署仓库的基线目录。为 nil 时相关接口返回 503。
+	Baselines BaselineDetector
 
 	// ConfigStatus 返回凭据配置状态（不含 token 本身）。
 	ConfigStatus func() map[string]any
@@ -66,6 +79,8 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
 	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
+	mux.Handle("GET /api/repos/{id}/baseline", a.Auth.RequireFunc(a.repoBaseline))
+	mux.Handle("POST /api/repos/{id}/baseline/deploy", a.Auth.RequireFunc(a.deployRepoBaseline))
 }
 
 func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +443,8 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		ExcludeDirs []string `json:"excludeDirs"`
 		// 指针区分「未传」（不动）与「空串」（清回自动档）
 		VerifyTierOverride *string `json:"verifyTierOverride"`
+		// 指针区分「未传」（不动）与「空串」（清空基线目录）
+		BaselineDir *string `json:"baselineDir"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
@@ -454,6 +471,12 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.BaselineDir != nil && *body.BaselineDir != "" && !filepath.IsAbs(*body.BaselineDir) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "基线目录须为绝对路径（运行节点本机路径），如 /opt/CloudRouter",
+		})
+		return
+	}
 	// 受保护分支列表清空等于关掉最后一道闸门，必须拒绝
 	if body.ProtectedBranches != nil && len(body.ProtectedBranches) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -470,6 +493,7 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		GateMode:           body.GateMode,
 		ExcludeDirs:        body.ExcludeDirs,
 		VerifyTierOverride: body.VerifyTierOverride,
+		BaselineDir:        body.BaselineDir,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRepoNotFound) {
@@ -480,6 +504,70 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, repo)
+}
+
+// repoBaseline 检测仓库配置的基线目录：扫描 compose 文件、问 docker
+// compose 每个文件当前的服务运行状态。仓库未配置 baseline_dir 时返回
+// 400（不是"检测结果为空"，是"这个仓库压根没配"，两者语义不同）。
+func (a *API) repoBaseline(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if a.Baselines == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "基线检测未启用"})
+		return
+	}
+	repo, err := a.Store.GetRepo(r.Context(), id, CurrentUser(r).ID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "仓库不存在"})
+		return
+	}
+	if repo.BaselineDir == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "该仓库尚未配置基线目录"})
+		return
+	}
+	status, err := a.Baselines.DetectBaseline(r.Context(), repo.BaselineDir, repo.DefaultBranch)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// deployRepoBaseline 人工触发：把基线目录里指定的一个 compose 文件跑
+// 起来（`docker compose up -d`）。连不连、起不起共享中间件是有数据
+// 风险的决定，本接口不会被任何任务流水线自动调用。
+func (a *API) deployRepoBaseline(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if a.Baselines == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "基线检测未启用"})
+		return
+	}
+	repo, err := a.Store.GetRepo(r.Context(), id, CurrentUser(r).ID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "仓库不存在"})
+		return
+	}
+	if repo.BaselineDir == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "该仓库尚未配置基线目录"})
+		return
+	}
+	var body struct {
+		ComposeFile string `json:"composeFile"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
+		return
+	}
+	if err := a.Baselines.DeployBaseline(r.Context(), repo.BaselineDir, body.ComposeFile); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployed": true})
 }
 
 // ---------------------------------------------------------------- 辅助
