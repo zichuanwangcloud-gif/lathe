@@ -168,6 +168,17 @@ func serve(cfg config.Config) error {
 	}
 	go mergePoller.Run(ctx)
 
+	// T6 worktree TTL 收割机。复用 pipeline 那一份 Worktrees ——
+	// 两边不能是两套配置（同 MergePoller 的注释）。
+	reaper := &runner.WorktreeReaper{
+		Tasks:      task.NewMachine(st.Pool()),
+		Worktrees:  pipeline.Worktrees,
+		RepoLookup: runner.NewRepoLookup(st.Pool()),
+		TTL:        cfg.WorktreeTTL,
+		Interval:   cfg.ReapInterval,
+	}
+	go reaper.Run(ctx)
+
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
 	// （脚本调用，同时是把自己锁在门外时的应急入口）
 	auth := httpapi.NewAuth(os.Getenv("LATHE_ADMIN_TOKEN")).

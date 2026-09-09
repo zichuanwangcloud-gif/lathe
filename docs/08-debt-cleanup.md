@@ -69,7 +69,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
 | T4 | `verifications.log_ref` 落盘写入 | C | TODO |
 | T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
-| T6 | worktree TTL 收割机 | E | TODO |
+| T6 | worktree TTL 收割机 | E | **DONE** |
 | T7 | webhook 联动：标签接单 + issue 取消联动 | F | TODO |
 | T8 | per-task compose 隔离（验证阶段） | G | TODO |
 
@@ -509,3 +509,46 @@ repos / tasks / task_events / verifications / agent_events。
   email 以 `@example.com` 结尾）与 `make clean-test-db` 目标；
   Makefile 里那段「-p 1 就够了」的注释也改掉了 —— 它给的是虚假的安全感。
   顺带结清 roadmap §1.3 的 `repos` id=241 占位行（属 fixture 残留，被清理带走）。
+
+- 2026-09-09：**T6 实现完成**（PR E，分支 `feat/worktree-reaper`，base 在 A 上）。
+
+  **AC7 原先的假设被现实推翻。** 我把 9 个存量目录逐个对照了数据库，
+  它们分三类而不是「首轮 reaper 全清掉」：
+  - `cr-1454 / 1468 / 1469 / 1488`（failed/cancelled + 有路径）→ **会回收**
+  - `cr-1460 / 1465 / 1466 / 1467`（**pr_open，非终态**）→ **绝不回收**。
+    这是真实待合并的 PR，正是 AC2 在起作用
+  - `cr-1367`（failed 但 `worktree_path` 为 **NULL**）→ DB 驱动的回收
+    **结构上看不见它**
+
+  最后一条是真缺口，写完主路径才发现，于是补了**孤儿目录清扫**
+  （磁盘上有、数据库里没人认领的目录，按 mtime 判超期）。
+  **那条清扫里的 TTL 不只是策略，是安全机制**：worktree 目录先被 `Create`
+  建出来、之后才在转入 `implementing` 时把路径写进任务行，两步之间目录
+  无人认领。不看 mtime 就删，正在跑的任务会突然找不到自己的工作区。
+  `TestReaperSweepSparesFreshUnclaimedDirs` 专门钉这一条。
+
+  防呆（每条都有对应测试）：
+  - **路径安全用 `filepath.Rel` 判而非字符串前缀** —— 前缀判会把
+    `/root/workspaces-backup` 当成 `/root/workspaces` 的子目录。
+    测试专门造了这个同前缀兄弟目录
+  - **逐段拒绝 `.` 开头**：误删 `.mirrors/` 等于把所有仓库的镜像清了，
+    下一个任务要重新 clone
+  - **删分支前查 `HasLiveDependentOnBranch`**（F4.2-AC2），查询出错时
+    保守处理（只删目录留分支）
+  - **用 `Discard` 而非 `Remove`**：尸体可能残缺（目录被手工删过、
+    分支已不存在），`Remove` 在这种情形下会报错
+  - **孤儿清扫不碰被任务行认领的目录**：否则 `pr_open` 的现场被主路径
+    正确排除后又被 mtime 删掉，AC2 形同虚设
+
+  `worktree_path` 置空走专门的 `ClearWorktreePath`：`Transition` 的 UPDATE
+  是 `COALESCE` 语义（只增不清空），传 nil 表示「这次不改」。
+  刻意不清 `branch_name` —— 分支可能因还有活后继而保留，
+  且「这个分支叫什么」排障时仍有用。
+
+  AC9 顺带修了 `docs/02-design.md` §8 P0 一句**不实表述**：
+  那行声称「worktree 自动回收」已交付，实际只有「合并后回收」与
+  「同名尸体按需回收」两个被动触发点，失败/取消的现场只增不减 ——
+  那 9 个目录就是这么来的。
+
+  门禁：注入 21 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿。
+  reaper 11 条测试 + task 层 3 条（含 AC2「非终态绝不进候选」的六状态断言）。

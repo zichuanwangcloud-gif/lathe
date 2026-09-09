@@ -34,6 +34,19 @@ type Config struct {
 	WorkspaceRoot string // Lathe 创建 worktree 的根目录
 	PnpmStore     string // 共享 pnpm store，避免每任务装一份依赖
 
+	// WorktreeTTL 是终态任务的工作区现场保留时长（T6 收割机）。
+	//
+	// 默认三天：D4 保留现场是为了让人能进去接手，而 failed 可以转回
+	// queued —— 人下班前看到失败、第二天上班接手是正常节奏，
+	// 激进的 TTL 会把人正要重试的现场删掉。
+	//
+	// **注意 time.ParseDuration 不支持 d 单位**：配置里写 72h，不能写 3d。
+	// 默认值因此是 72*time.Hour 而不是解析出来的。
+	WorktreeTTL time.Duration
+	// ReapInterval 是收割机的扫描间隔。回收是低频维护动作，
+	// 不必像 mergepoll 那样 45 秒一轮。
+	ReapInterval time.Duration
+
 	// Agent 执行
 	ClaudeBin    string        // claude CLI 路径
 	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
@@ -131,6 +144,8 @@ func Load() (Config, error) {
 		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
 		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
+		WorktreeTTL:         envDuration("LATHE_WORKTREE_TTL", 72*time.Hour),
+		ReapInterval:        envDuration("LATHE_REAP_INTERVAL", time.Hour),
 		SettingSources:      env("LATHE_SETTING_SOURCES", "project"),
 		FixAttempts:         envInt("LATHE_FIX_ATTEMPTS", 2),
 		TriageChannel:       env("LATHE_TRIAGE_CHANNEL", ""),

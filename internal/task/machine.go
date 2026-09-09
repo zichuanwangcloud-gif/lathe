@@ -357,6 +357,88 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 	return out, rows.Err()
 }
 
+// ListReapableTasks 返回可被 TTL 收割机回收现场的任务（T6）：
+// 已进终态、还留着 worktree_path、且最后一次变更早于 olderThan。
+//
+// 时间基准用 updated_at 而不是 at/created_at：现场该不该回收取决于
+// 「多久没人动过它」，而不是「任务是什么时候建的」。tasks 上有
+// BEFORE UPDATE 触发器维护这一列。
+//
+// 只挑终态是硬约束：failed 可以转回 queued（人随时可能重试续跑，
+// 而 D4 保留现场的全部目的就是让人能接手），非终态的现场绝不能碰。
+func (m *Machine) ListReapableTasks(ctx context.Context, olderThan time.Time) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE state = ANY($1)
+		  AND worktree_path IS NOT NULL AND worktree_path <> ''
+		  AND updated_at < $2
+		ORDER BY id`,
+		[]string{string(StateMerged), string(StateFailed), string(StateCancelled)}, olderThan)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询可回收现场失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取可回收现场失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ReferencedWorktreePaths 返回**所有**任务行里非空的 worktree_path，
+// 不分状态。
+//
+// 给 T6 收割机的孤儿目录清扫用：磁盘上存在、却没有任何任务行指向它的
+// 目录，DB 驱动的回收路径结构上看不见（`ListReapableTasks` 要求
+// worktree_path 非空）。实测就有这种目录 —— 任务 649（cr-1367）是 failed
+// 但 worktree_path 为 NULL，磁盘上的目录因此永远没人回收。
+//
+// 刻意不按状态过滤：终态任务引用的路径由主回收路径处理，这里只回答
+// 「这个目录有没有人认领」这一个问题，别的判断留给调用方。
+func (m *Machine) ReferencedWorktreePaths(ctx context.Context) ([]string, error) {
+	rows, err := m.pool.Query(ctx,
+		`SELECT worktree_path FROM tasks
+		 WHERE worktree_path IS NOT NULL AND worktree_path <> ''`)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询已引用的工作区路径失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("task: 读取工作区路径失败: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ClearWorktreePath 把 worktree_path 置空，标记「现场已回收」。
+//
+// 需要一条专门的语句：Transition 的 UPDATE 用
+// worktree_path = COALESCE($n, worktree_path)，语义是「只增不清空」
+// —— 传 nil 表示「这次不改」，而不是「改成 NULL」。所以置空走不了那条路。
+//
+// 刻意不动 branch_name：分支可能因为还有活的后继依赖而被保留
+// （见 HasLiveDependentOnBranch），把它一起清掉会丢掉「这个分支叫什么」
+// 这个排障时仍然有用的信息。
+func (m *Machine) ClearWorktreePath(ctx context.Context, id int64) error {
+	_, err := m.pool.Exec(ctx,
+		`UPDATE tasks SET worktree_path = NULL WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("task: 清空任务 %d 的 worktree_path 失败: %w", id, err)
+	}
+	return nil
+}
+
 // HasLiveDependentOnBranch 报告是否存在非终结状态的任务，其当前
 // base_ref 等于 branchName —— F4.2-AC2 现场回收的判定条件：
 // "仍有未合并后继依赖该分支时，不删除该分支"。

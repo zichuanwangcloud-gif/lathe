@@ -94,6 +94,8 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 | `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
 | `LATHE_COOKIE_SECURE` | 覆盖会话 Cookie 的 Secure 标志，默认按 BaseURL 的协议推断 |
 | `LATHE_TRUSTED_PROXY` | 设为 `true` 才信任 `X-Forwarded-For`（限流按它取客户端 IP） |
+| `LATHE_WORKTREE_TTL` | 终态任务的工作区现场保留时长，默认 `72h`。注意 Go 的时长解析**不支持 `d`**，写 `72h` 不能写 `3d` |
+| `LATHE_REAP_INTERVAL` | 现场回收的扫描间隔，默认 `1h` |
 | `LATHE_LIGHT_SLOTS` | light 档验证并发上限，默认 2 |
 | `LATHE_HEAVY_SLOTS` | heavy 档验证并发上限，默认 1 |
 | `LATHE_SETTING_SOURCES` | agent 加载的配置源，默认 `project`（排除个人插件，见 §9） |

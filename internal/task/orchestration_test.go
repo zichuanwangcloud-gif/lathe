@@ -489,3 +489,129 @@ func TestWakeBlockedSuccessors(t *testing.T) {
 		t.Errorf("间接后继（孙节点）不该被这次调用唤醒，state = %s，期望仍是 blocked_dep", gotGrandchild.State)
 	}
 }
+
+// ---------------------------------------------------------------- T6 可回收查询
+
+// ★ T6-AC2：非终态任务的现场绝不进回收候选。
+//
+// failed 可以转回 queued —— 人随时可能重试续跑，而 D4 保留现场的
+// 全部目的就是让人能接手。把在跑的任务的现场删了是最坏的一种 bug：
+// 它会让一个正在工作的任务突然找不到自己的工作区。
+func TestListReapableOnlyTerminalStates(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	wt := "/tmp/reap-scene"
+	mk := func(key string, path []State) *Task {
+		tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: key})
+		if err != nil {
+			t.Fatalf("建任务 %s 失败: %v", key, err)
+		}
+		for i, st := range path {
+			opts := &TransitionOpts{}
+			if i == 0 {
+				opts.WorktreePath = &wt
+			}
+			if _, err := m.Transition(ctx, tk.ID, st, "test", opts); err != nil {
+				t.Fatalf("%s 转 %s 失败: %v", key, st, err)
+			}
+		}
+		return tk
+	}
+
+	// 三个终态 + 三个非终态，都带 worktree_path
+	failedTk := mk("RP-FAILED", []State{StateTriaging, StateImplementing, StateFailed})
+	cancelledTk := mk("RP-CANCELLED", []State{StateTriaging, StateCancelled})
+	implTk := mk("RP-IMPL", []State{StateTriaging, StateImplementing})
+	verifyTk := mk("RP-VERIFY", []State{StateTriaging, StateImplementing, StateVerifying})
+	prTk := mk("RP-PROPEN", []State{StateTriaging, StateImplementing, StateVerifying, StatePROpen})
+
+	// cutoff 取未来，让所有行都算「超期」，把状态过滤单独隔离出来
+	got, err := m.ListReapableTasks(ctx, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListReapableTasks 失败: %v", err)
+	}
+	in := map[int64]bool{}
+	for _, tk := range got {
+		in[tk.ID] = true
+	}
+
+	for _, tk := range []*Task{failedTk, cancelledTk} {
+		if !in[tk.ID] {
+			t.Errorf("终态任务 %d（%s）应进回收候选", tk.ID, tk.LinearIssueKey)
+		}
+	}
+	for _, tk := range []*Task{implTk, verifyTk, prTk} {
+		if in[tk.ID] {
+			t.Errorf("AC2：非终态任务 %d（%s）绝不该进回收候选", tk.ID, tk.LinearIssueKey)
+		}
+	}
+}
+
+// TTL 未到的现场不进候选。
+func TestListReapableRespectsCutoff(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	wt := "/tmp/reap-fresh"
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "RP-FRESH"})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, tk.ID, StateTriaging, "test", &TransitionOpts{WorktreePath: &wt}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Transition(ctx, tk.ID, StateFailed, "test", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// cutoff 取过去：刚刚更新过的行不该被选中
+	got, err := m.ListReapableTasks(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("ListReapableTasks 失败: %v", err)
+	}
+	for _, g := range got {
+		if g.ID == tk.ID {
+			t.Errorf("TTL 未到的现场 %d 不该进候选", tk.ID)
+		}
+	}
+}
+
+// ClearWorktreePath 必须真能置 NULL —— Transition 的 COALESCE 写法做不到，
+// 这也正是需要一条专门语句的原因。
+func TestClearWorktreePathSetsNull(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	wt, branch := "/tmp/reap-clear", "fix/rp-clear"
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "RP-CLEAR"})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, tk.ID, StateTriaging, "test",
+		&TransitionOpts{WorktreePath: &wt, BranchName: &branch}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.ClearWorktreePath(ctx, tk.ID); err != nil {
+		t.Fatalf("ClearWorktreePath 失败: %v", err)
+	}
+	after, err := m.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if after.WorktreePath != nil {
+		t.Errorf("worktree_path 应为 NULL，得到 %q", *after.WorktreePath)
+	}
+	// 分支名刻意保留：它可能因为还有活的后继依赖而没被删，
+	// 且「这个分支叫什么」在排障时仍然有用
+	if after.BranchName == nil || *after.BranchName != branch {
+		t.Errorf("branch_name 不该被一起清掉，得到 %v", after.BranchName)
+	}
+}
