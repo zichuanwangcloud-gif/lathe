@@ -69,6 +69,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
+	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
 
@@ -166,6 +167,20 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// costStats 返回 agent 花费的聚合视图（T5）。
+//
+// 独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
+// 不需要 5 秒新鲜度。四个跨 agent_events 的聚合查询压进那个轮询里纯属浪费
+// —— agent_events 是全表最大的一张（每任务成百上千行事件）。
+func (a *API) costStats(w http.ResponseWriter, r *http.Request) {
+	cs, err := a.Store.CostStatsFor(r.Context(), CurrentUser(r).ID)
+	if err != nil {
+		serverError(w, "成本统计失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cs)
 }
 
 func (a *API) listRepos(w http.ResponseWriter, r *http.Request) {
