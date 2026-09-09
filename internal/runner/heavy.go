@@ -235,6 +235,9 @@ type HeavyParams struct {
 	ReproErr error
 	// Regression 是受影响范围的回归步骤。
 	Regression []Step
+	// StackEnv 是 per-task 依赖隔离栈注入的连接串（T8）；
+	// 为空时验证命令用宿主环境跑，与本字段引入之前一致。
+	StackEnv map[string]string
 }
 
 // RunHeavy 执行 heavy 档验证。红阶段不过（复现失败）时整体即失败，
@@ -249,6 +252,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 			rep.Results = append(rep.Results, StepResult{Step: st, Status: StatusSkipped})
 			continue
 		}
+		st.StackEnv = p.StackEnv
 		res := v.runStep(ctx, p.TaskPath, st)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
@@ -273,7 +277,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 		return rep
 	}
 
-	redRes := v.runReproOn(ctx, p.BasePath, p.TaskPath, p.Repro, true)
+	redRes := v.runReproOn(ctx, p.BasePath, p.TaskPath, p.Repro, true, p.StackEnv)
 	rep.Results = append(rep.Results, redRes)
 	if redRes.Status != StatusPassed {
 		// 红没立起来：复现通过（bug 没复现）或跑不起来 ⇒ §5.3 转
@@ -282,7 +286,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 	}
 
 	// 3. 绿阶段：同一测试在改动后必须通过
-	greenRes := v.runReproOn(ctx, p.TaskPath, p.TaskPath, p.Repro, false)
+	greenRes := v.runReproOn(ctx, p.TaskPath, p.TaskPath, p.Repro, false, p.StackEnv)
 	rep.Results = append(rep.Results, greenRes)
 	if greenRes.Status != StatusPassed {
 		return rep
@@ -298,6 +302,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 	}
 	for _, st := range p.Regression {
 		st.Name = StepRegression
+		st.StackEnv = p.StackEnv
 		res := v.runStep(ctx, p.TaskPath, st)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
@@ -316,7 +321,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 // 红阶段会把测试文件的最新版本拷进基线工作区：基线上没有 agent 新写的
 // 测试文件，必须带过去。编译错误（如测试引用了还不存在的函数）在红阶段
 // 算「失败」—— 功能确实不存在（§5.4）。
-func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, tests []ReproTest, red bool) StepResult {
+func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, tests []ReproTest, red bool, stackEnv map[string]string) StepResult {
 	name := StepReproPass
 	if red {
 		name = StepReproFail
@@ -339,7 +344,7 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 	var outputs strings.Builder
 	var failed, passed int
 	for _, rt := range tests {
-		r := v.runStep(ctx, runRoot, Step{Name: name, Cmd: rt.Cmd, Dir: rt.Dir})
+		r := v.runStep(ctx, runRoot, Step{Name: name, Cmd: rt.Cmd, Dir: rt.Dir, StackEnv: stackEnv})
 		fmt.Fprintf(&outputs, "$ %s  [%s]\n%s\n---\n",
 			strings.Join(rt.Cmd, " "), rt.File, r.Output)
 		res.Duration += r.Duration

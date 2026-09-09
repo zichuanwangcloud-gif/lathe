@@ -248,6 +248,14 @@ func serve(cfg config.Config) error {
 	previewMgr := preview.NewManager(cfg.WorkspaceRoot, st.PreviewThresholds)
 	// AI 推荐：只读 agent 分析仓库后建议「起哪个候选、变量填什么」。
 	// 与分诊同级走便宜通道；推荐只是预填，启动仍是人拍板。
+	// T8：验证隔离栈复用同一个 preview.Manager —— 它们用的是同一套
+	// docker 能力与同一组资源阈值。另起一个实例等于两套配置，
+	// 迟早不一致（apiSrv.Baselines 复用它是同一个先例）。
+	//
+	// 在这里装配而不是 buildPipeline 里：Manager 到这一行才造出来，
+	// 而 buildPipeline 在 138 行就调过了。
+	pipeline.Stacks = verifyStacks{previewMgr}
+
 	previewMgr.SetRecommender(agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
 		cfg.TriageChannel, cfg.SettingSources)
 	previewAPI := &httpapi.PreviewAPI{
@@ -507,3 +515,38 @@ func gcSessions(ctx context.Context, sessions *store.Sessions) {
 		}
 	}
 }
+
+// verifyStacks 把 preview.Manager 适配成 runner.VerifyStackUp。
+//
+// 需要这层薄适配是因为 runner 的窄接口用自己的 VerifyStackHandle
+// （runner 不该 import preview 的具体类型），而 preview 返回的是
+// *preview.VerifyStack。适配器只做类型搬运与错误身份翻译。
+type verifyStacks struct{ m *preview.Manager }
+
+func (v verifyStacks) UpVerifyStack(ctx context.Context, taskID int64, infra []string) (runner.VerifyStackHandle, error) {
+	st, err := v.m.UpVerifyStack(ctx, taskID, infra)
+	if err != nil {
+		// 错误身份翻译：把 preview 的水位错误翻成 runner 认得的那一个，
+		// 让 runner 侧的 stackUnavailable 判定生效（决定降级还是判死）。
+		if errors.Is(err, preview.ErrVerifyStackOverThreshold) {
+			return nil, fmt.Errorf("%w: %v", runner.ErrStackOverThreshold, err)
+		}
+		return nil, err
+	}
+	if st == nil {
+		// 没声明依赖：返回 nil handle 而不是包着 nil 的接口值 ——
+		// 后者会让调用方的 `stack != nil` 判断意外为真，然后对
+		// nil 指针调方法。
+		return nil, nil
+	}
+	return verifyStackHandle{st}, nil
+}
+
+// verifyStackHandle 适配 *preview.VerifyStack 到 runner.VerifyStackHandle。
+//
+// StackEnv 从字段变方法：runner 的接口用方法是为了让测试能造假件，
+// 而 preview 侧用字段更直白 —— 两边各自合理，这里搬一下。
+type verifyStackHandle struct{ st *preview.VerifyStack }
+
+func (h verifyStackHandle) StackEnv() map[string]string    { return h.st.Env }
+func (h verifyStackHandle) Down(ctx context.Context) error { return h.st.Down(ctx) }

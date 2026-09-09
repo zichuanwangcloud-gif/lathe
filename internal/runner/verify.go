@@ -58,6 +58,12 @@ type Step struct {
 	Cmd  []string
 	// Dir 相对于工作区根目录；空表示根目录。
 	Dir string
+	// StackEnv 是 per-task 依赖隔离栈的连接串（T8）。
+	//
+	// 由 RunLight / RunHeavy 统一灌到每个步骤上，而不是让 Verifier
+	// 持有一份 —— Verifier 是并发任务共用的单实例，给它加可变字段
+	// 就是数据竞争（与 StepLogger 同一个理由）。
+	StackEnv map[string]string
 }
 
 // StepResult 是一条验证步骤的执行结果。
@@ -205,7 +211,7 @@ func DetectLightProfile(root string, exclude ...string) ([]Step, error) {
 // RunLight 顺序执行 light 档步骤，遇到第一个失败即停止后续。
 //
 // 早停的理由：构建都没过就没必要再跑 lint，且能更快把失败回帖给人。
-func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step) Report {
+func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step, stackEnv map[string]string) Report {
 	rep := Report{Tier: TierLight}
 
 	stopped := false
@@ -214,6 +220,7 @@ func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step) Repo
 			rep.Results = append(rep.Results, StepResult{Step: st, Status: StatusSkipped})
 			continue
 		}
+		st.StackEnv = stackEnv
 		res := v.runStep(ctx, root, st)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
@@ -246,7 +253,11 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step) StepResult
 
 	cmd := exec.Command(st.Cmd[0], st.Cmd[1:]...)
 	cmd.Dir = dir
-	cmd.Env = v.stepEnv()
+	// stackEnv 是 per-task 依赖隔离栈注入的连接串（T8）；为空时
+	// 与本项之前完全一致。放在 stepEnv 之后合并，让它能覆盖同名变量
+	// —— 隔离栈的连接串必须压过宿主环境里可能存在的同名值，
+	// 否则测试会连到共享的那个库上，隔离就白做了。
+	cmd.Env = mergeEnv(v.stepEnv(), st.StackEnv)
 	// 与 agent driver 同理：构建工具会派生子进程，用进程组保证能整棵杀掉
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -450,4 +461,30 @@ func (r Report) Summary() string {
 		fmt.Fprintf(&b, "  %s %s (%s) %v\n", mark, s.Step.Name, loc, s.Duration.Round(time.Millisecond))
 	}
 	return b.String()
+}
+
+// mergeEnv 把 extra 合并进 base，同名以 extra 为准。
+//
+// 隔离栈的连接串必须压过宿主环境里可能存在的同名值（比如开发机上
+// 导出过 DATABASE_URL 指向共享库）—— 否则测试会连到那个共享库上，
+// 隔离就白做了。这是本函数存在的唯一理由，不是通用工具。
+func mergeEnv(base []string, extra map[string]string) []string {
+	if len(extra) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	skip := make(map[string]bool, len(extra))
+	for k := range extra {
+		skip[k] = true
+	}
+	for _, kv := range base {
+		if i := strings.IndexByte(kv, '='); i > 0 && skip[kv[:i]] {
+			continue // 同名交给 extra
+		}
+		out = append(out, kv)
+	}
+	for k, v := range extra {
+		out = append(out, k+"="+v)
+	}
+	return out
 }

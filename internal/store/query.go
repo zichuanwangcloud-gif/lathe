@@ -279,6 +279,10 @@ type RepoRow struct {
 	// BaselineDir 是基线分支在本机（运行节点）的目录，如 /opt/CloudRouter。
 	// 空串 = 未配置——任务预览/起服务维持现有行为，不复用任何基线中间件。
 	BaselineDir string `json:"baselineDir"`
+	// VerifyInfra 是验证隔离栈要起的依赖（T8），取值是
+	// internal/preview.InfraCatalog 的键（postgres/redis/mysql）。
+	// 空 = 无隔离栈，验证命令直接用宿主环境跑。
+	VerifyInfra []string `json:"verifyInfra"`
 }
 
 // ListRepos 返回指定用户名下的仓库配置。
@@ -286,7 +290,8 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
-		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, '')
+		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
+		       verify_infra
 		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -298,7 +303,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		var r RepoRow
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir); err != nil {
+			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
@@ -334,6 +339,8 @@ type UpdateRepoParams struct {
 	ProtectedBranches []string
 	BranchPattern     string
 	GateMode          string
+	// VerifyInfra 与 ExcludeDirs 同语义：nil = 不修改，非 nil（含空）= 整体替换。
+	VerifyInfra []string
 	// ExcludeDirs 为 nil 表示不修改；非 nil（含空切片）表示整体替换 ——
 	// 空数组是"清回默认排除"的合法取值，不能走 nilIfEmpty 惯例。
 	ExcludeDirs []string
@@ -369,16 +376,18 @@ func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoPa
 				WHEN $10::text IS NULL THEN baseline_dir
 				WHEN $10::text = '' THEN NULL
 				ELSE $10::text
-			END
+			END,
+			verify_infra = COALESCE($11, verify_infra)
 		WHERE id = $1 AND user_id = $2
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
-		          exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, '')`,
+		          exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
+		          verify_infra`,
 		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
-		p.ExcludeDirs, p.VerifyTierOverride, p.BaselineDir,
+		p.ExcludeDirs, p.VerifyTierOverride, p.BaselineDir, p.VerifyInfra,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir)
+		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}

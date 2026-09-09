@@ -441,6 +441,11 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		// ExcludeDirs：nil（未传）= 不动；空数组 = 清回默认排除；
 		// 非空 = 整体替换。JSON 数组天然区分这三种语义，无需指针。
 		ExcludeDirs []string `json:"excludeDirs"`
+		// VerifyInfra 同语义：nil = 不动；空数组 = 清空（关闭隔离栈）。
+		// 取值域是 preview.InfraCatalog 的键，非法值在起栈时报错并列出
+		// 可选值 —— 刻意不在这里校验：那份目录在 Go 侧演进，
+		// API 层跟着抄一遍等于把同一份知识写两遍。
+		VerifyInfra []string `json:"verifyInfra"`
 		// 指针区分「未传」（不动）与「空串」（清回自动档）
 		VerifyTierOverride *string `json:"verifyTierOverride"`
 		// 指针区分「未传」（不动）与「空串」（清空基线目录）
@@ -492,6 +497,7 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		BranchPattern:      body.BranchPattern,
 		GateMode:           body.GateMode,
 		ExcludeDirs:        body.ExcludeDirs,
+		VerifyInfra:        body.VerifyInfra,
 		VerifyTierOverride: body.VerifyTierOverride,
 		BaselineDir:        body.BaselineDir,
 	})

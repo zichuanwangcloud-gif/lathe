@@ -471,12 +471,13 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 		pattern       string
 		tierOverride  string
 		excludeDirs   []string
+		verifyInfra   []string
 	)
 	err = q.store.Pool().QueryRow(ctx, `
 		SELECT provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
-		       COALESCE(verify_tier_override, ''), exclude_dirs
+		       COALESCE(verify_tier_override, ''), exclude_dirs, verify_infra
 		FROM repos WHERE id = $1`, repoID,
-	).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs)
+	).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs, &verifyInfra)
 	if err != nil {
 		return cfg, "", fmt.Errorf("读取仓库配置失败（repo_id=%d）: %w", repoID, err)
 	}
@@ -489,6 +490,7 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 		BranchPattern:      pattern,
 		ExcludeDirs:        excludeDirs,
 		VerifyTierOverride: tierOverride,
+		VerifyInfra:        verifyInfra,
 	}
 	return cfg, "git@github.com:" + providerRepo + ".git", nil
 }

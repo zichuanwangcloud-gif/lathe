@@ -130,6 +130,17 @@ type infraSpec struct {
 	// Ready 返回容器内的就绪探测命令（pw 同 Env）；应用 entrypoint
 	// 常在启动时跑迁移，库没就绪就起应用只会崩给人看。
 	Ready func(pw string) []string
+
+	// Port 是容器内的服务端口，验证隔离栈（T8）用它做 -p 0:<Port>
+	// 的随机端口发布。预览流不需要它 —— 那里应用容器与基础设施同网络，
+	// 按别名互访。
+	Port int
+	// HostEnv 返回**宿主口径**的连接串（T8）。
+	//
+	// 为什么不能复用 AppEnv：那一份里的主机名是任务网络内的别名
+	// （pg / redis / mysql），只有同网络的容器解析得了。而验证命令
+	// 跑在宿主上的 worktree 里 —— 它必须连 127.0.0.1:<随机宿主端口>。
+	HostEnv func(pw string, hostPort int) map[string]string
 }
 
 // InfraCatalog 是可附加基础设施的目录（键即界面选项）。
@@ -154,6 +165,16 @@ var InfraCatalog = map[string]infraSpec{
 			// —— 必须探测到目标库可查，才算就绪
 			return []string{"psql", "-U", "lathe", "-d", "app", "-tAc", "SELECT 1"}
 		},
+		Port: 5432,
+		HostEnv: func(pw string, hp int) map[string]string {
+			return map[string]string{
+				"DATABASE_HOST": "127.0.0.1", "DATABASE_PORT": strconv.Itoa(hp),
+				"DATABASE_USER": "lathe", "DATABASE_PASSWORD": pw, "DATABASE_DBNAME": "app",
+				"DATABASE_URL":  fmt.Sprintf("postgres://lathe:%s@127.0.0.1:%d/app?sslmode=disable", pw, hp),
+				"POSTGRES_HOST": "127.0.0.1", "POSTGRES_PORT": strconv.Itoa(hp),
+				"POSTGRES_USER": "lathe", "POSTGRES_PASSWORD": pw, "POSTGRES_DB": "app",
+			}
+		},
 	},
 	"redis": {
 		Image: "redis:8.4-alpine",
@@ -166,6 +187,13 @@ var InfraCatalog = map[string]infraSpec{
 			}
 		},
 		Ready: func(string) []string { return []string{"redis-cli", "ping"} },
+		Port:  6379,
+		HostEnv: func(_ string, hp int) map[string]string {
+			return map[string]string{
+				"REDIS_HOST": "127.0.0.1", "REDIS_PORT": strconv.Itoa(hp),
+				"REDIS_URL": fmt.Sprintf("redis://127.0.0.1:%d", hp),
+			}
+		},
 	},
 	"mysql": {
 		Image: "mysql:8.4",
@@ -182,6 +210,13 @@ var InfraCatalog = map[string]infraSpec{
 		Ready: func(pw string) []string {
 			// 同理：探到自建库可查（mysqladmin ping 在 init 阶段就会成功）
 			return []string{"mysql", "-uroot", "-p" + pw, "app", "-e", "SELECT 1"}
+		},
+		Port: 3306,
+		HostEnv: func(pw string, hp int) map[string]string {
+			return map[string]string{
+				"MYSQL_HOST": "127.0.0.1", "MYSQL_PORT": strconv.Itoa(hp),
+				"MYSQL_DATABASE": "app", "MYSQL_ROOT_PASSWORD": pw,
+			}
 		},
 	},
 }

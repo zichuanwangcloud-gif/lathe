@@ -1,0 +1,16 @@
+-- 0019_repo_verify_infra — 验证隔离栈要起哪些依赖（docs/08-debt-cleanup.md T8）
+--
+-- 为什么需要显式声明而不是自动推断：验证隔离栈起的是【依赖】
+-- （postgres/redis/mysql），而目标仓库的 compose 文件里既有依赖也有应用
+-- 自身，还可能有一堆与测试无关的东西（前端 dev server、监控、mock）。
+-- 自动推断必然要么起多了（浪费且慢）要么起少了（测试连不上）。
+-- 让人声明一次，之后每个任务照着起。
+--
+-- 默认 '{}' 即空：**不声明就没有隔离栈，行为与本迁移之前完全一致**。
+-- 这是「隔离不得成为硬门槛」（T8-AC6）的实现 —— 绝大多数仓库的测试
+-- 不需要外部依赖，不该被强迫配置什么。
+--
+-- 取值域是 internal/preview.InfraCatalog 的键。刻意不加 CHECK 约束：
+-- 那个目录在 Go 侧演进（加一种依赖只改 Go），数据库跟着改 CHECK
+-- 等于把同一份知识写两遍，迟早不一致。非法值在起栈时报错并列出可选值。
+ALTER TABLE repos ADD COLUMN verify_infra text[] NOT NULL DEFAULT '{}';

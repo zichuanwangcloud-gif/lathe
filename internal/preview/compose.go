@@ -23,8 +23,23 @@ import (
 )
 
 // ComposeProject 是任务预览用的 compose 项目名。
+//
+// 保留原签名不变：它是既有调用方（Manager.composeUp / Stop）的入口，
+// 改签名等于把撞车风险换成一次无谓的大改。
 func ComposeProject(taskID int64) string {
-	return fmt.Sprintf("lathe-preview-t%d", taskID)
+	return ComposeProjectFor("preview", taskID)
+}
+
+// ComposeProjectFor 按用途给出 compose 项目名（T8）。
+//
+// 为什么需要用途维度：Manager.Stop(taskID) 的清理不是 docker compose down，
+// 而是按标签查出容器/网络/镜像后逐个 rm -f，其中一路查的正是
+// com.docker.compose.project=<项目名>。两种用途共用一个项目名的话，
+// 人点一次「停止预览」就会把同一任务正在跑的验证栈一起删掉。
+//
+// 项目名里带用途，两路查询就自然不相交。
+func ComposeProjectFor(purpose string, taskID int64) string {
+	return fmt.Sprintf("lathe-%s-t%d", purpose, taskID)
 }
 
 // composeConfigJSON 是 docker compose config --format json 输出里

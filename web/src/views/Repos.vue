@@ -53,6 +53,7 @@ async function load() {
       ...x,
       protectedText: (x.protectedBranches || []).join(', '),
       excludeText: (x.excludeDirs || []).join(', '),
+      infraText: (x.verifyInfra || []).join(', '),
     }))
     error.value = ''
   } catch (e) {
@@ -80,6 +81,11 @@ async function save(repo) {
     .map((s) => s.trim())
     .filter(Boolean)
 
+  const verifyInfra = (repo.infraText || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
   try {
     await api.updateRepo(repo.id, {
       defaultBranch: repo.defaultBranch,
@@ -90,6 +96,7 @@ async function save(repo) {
       excludeDirs,
       verifyTierOverride: repo.verifyTierOverride || '',
       baselineDir: repo.baselineDir || '',
+      verifyInfra,
     })
     saved.value = repo.id
     setTimeout(() => (saved.value = null), 2000)
@@ -206,6 +213,19 @@ onMounted(load)
         <small class="faint">
           逗号分隔，相对仓库根的路径或目录名。停止维护的目录在这里排除，
           其存量问题不再参与构建/lint 扫描
+        </small>
+      </label>
+
+      <label class="full">
+        <span>验证依赖隔离</span>
+        <input v-model="repo.infraText" class="mono" placeholder="postgres, redis" />
+        <small class="faint">
+          逗号分隔，可选 <span class="mono">postgres</span> /
+          <span class="mono">redis</span> / <span class="mono">mysql</span>。
+          填上之后，heavy 档验证会给每个任务起一套自己的依赖（随机端口 +
+          独立库），连接串自动注入测试命令 —— 并发任务不再互相写脏对方的表。
+          <b>留空表示不起隔离栈</b>，测试直接用宿主环境跑（多数仓库的测试
+          不需要外部依赖，不必填）。
         </small>
       </label>
 
