@@ -2,7 +2,6 @@
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
-RUNNER_BIN := $(BIN_DIR)/lathe-runner
 UI_SRC     := web/dist
 UI_EMBED   := internal/webui/dist
 
@@ -30,11 +29,10 @@ ui-deps: ## 安装前端依赖（首次或依赖变更后执行）
 ui-dev: ## 前端热重载（需另起 make run）
 	cd web && node_modules/.bin/vite
 
-build: ## 编译控制面与节点代理（不重建界面，用 make all 一起构建）
+build: ## 编译控制面（不重建界面，用 make all 一起构建）
 	@mkdir -p $(BIN_DIR)
 	go build $(LDFLAGS) -o $(CTRL_BIN) ./cmd/lathe
-	go build $(LDFLAGS) -o $(RUNNER_BIN) ./cmd/lathe-runner
-	@echo "→ $(CTRL_BIN) $(RUNNER_BIN)"
+	@echo "→ $(CTRL_BIN)"
 
 all: ui build ## 构建界面与二进制
 

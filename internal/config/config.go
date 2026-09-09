@@ -19,7 +19,12 @@ type Config struct {
 	HTTPAddr string // 监听地址
 	Database Database
 
-	// 节点身份（lathe-runner 用）
+	// NodeName 是本实例的节点标识。
+	//
+	// 消费方：task_events 的 actor 前缀（cmd/lathe/queue.go 的 "node:"+NodeName，
+	// 用于在审计流里区分是哪个实例推进了状态）与管理界面的运行时状态面板
+	// （cmd/lathe/main.go 的 configStatus）。原先的节点代理已删除，
+	// 见 docs/08-debt-cleanup.md D8-1 —— 但这两个消费方与多节点无关，故保留。
 	NodeName string
 
 	// DataDir 存放运行时数据（凭据主密钥等）。
