@@ -365,6 +365,7 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		Notifier:         logNotifier{},
 		Mail:             taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
 		BaseURL:          cfg.PublicURL(),
+		LogDir:           cfg.DataDir,
 		Verifications:    st,
 		AgentEvents:      st,
 		Gates:            runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),

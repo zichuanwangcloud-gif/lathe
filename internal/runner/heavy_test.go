@@ -116,7 +116,7 @@ func TestRunReproOn_RedSemantics(t *testing.T) {
 
 	// 命令失败 ⇒ 红立起来
 	res := v.runReproOn(context.Background(), base, src,
-		[]ReproTest{{File: "repro.sh", Cmd: []string{"sh", "repro.sh"}}}, true)
+		[]ReproTest{{File: "repro.sh", Cmd: []string{"sh", "repro.sh"}}}, true, nil)
 	if res.Status != StatusPassed {
 		t.Errorf("复现失败应让红立起来，得到 %s: %v", res.Status, res.Err)
 	}
@@ -128,7 +128,7 @@ func TestRunReproOn_RedSemantics(t *testing.T) {
 	// 命令通过 ⇒ 红没立起来
 	writeFile(t, filepath.Join(src, "pass.sh"), "exit 0\n")
 	res = v.runReproOn(context.Background(), base, src,
-		[]ReproTest{{File: "pass.sh", Cmd: []string{"sh", "pass.sh"}}}, true)
+		[]ReproTest{{File: "pass.sh", Cmd: []string{"sh", "pass.sh"}}}, true, nil)
 	if res.Status != StatusFailed {
 		t.Errorf("复现通过应判红未立（bug 没复现），得到 %s", res.Status)
 	}
@@ -138,7 +138,7 @@ func TestRunReproOn_RedSemantics(t *testing.T) {
 
 	// 命令不存在 ⇒ error（跑不起来）
 	res = v.runReproOn(context.Background(), base, src,
-		[]ReproTest{{File: "repro.sh", Cmd: []string{"definitely-not-a-real-binary-lathe"}}}, true)
+		[]ReproTest{{File: "repro.sh", Cmd: []string{"definitely-not-a-real-binary-lathe"}}}, true, nil)
 	if res.Status != StatusError {
 		t.Errorf("命令不存在应为 StatusError，得到 %s", res.Status)
 	}
@@ -152,7 +152,7 @@ func TestRunReproOn_GreenSemantics(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "fail.sh"), "exit 1\n")
 
 	res := v.runReproOn(context.Background(), dir, dir,
-		[]ReproTest{{File: "pass.sh", Cmd: []string{"sh", "pass.sh"}}}, false)
+		[]ReproTest{{File: "pass.sh", Cmd: []string{"sh", "pass.sh"}}}, false, nil)
 	if res.Status != StatusPassed {
 		t.Errorf("全过应为 passed，得到 %s: %v", res.Status, res.Err)
 	}
@@ -161,7 +161,7 @@ func TestRunReproOn_GreenSemantics(t *testing.T) {
 		[]ReproTest{
 			{File: "pass.sh", Cmd: []string{"sh", "pass.sh"}},
 			{File: "fail.sh", Cmd: []string{"sh", "fail.sh"}},
-		}, false)
+		}, false, nil)
 	if res.Status != StatusFailed {
 		t.Errorf("有未通过应为 failed，得到 %s", res.Status)
 	}

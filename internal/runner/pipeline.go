@@ -69,7 +69,7 @@ type Notifier interface {
 // heavy 档的 repro_fail → repro_pass 是「红-绿证明」的可审计落痕，
 // 任务详情页直接展示。store.Store 实现此接口。
 type VerificationRecorder interface {
-	InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64) error
+	InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64, logRef string) error
 }
 
 // NewSessionID 生成会话 ID。抽成字段便于测试注入确定值。
@@ -93,6 +93,13 @@ type Pipeline struct {
 	// BaseURL 是本实例对外地址，通知邮件里的详情页链接用它拼。
 	// 空串时邮件省略链接那一行，而不是拼一个指向 localhost 的无用链接。
 	BaseURL string
+
+	// LogDir 是验证日志的落盘根目录（T4），实际写在
+	// <LogDir>/verify-logs/task-<id>/round-<n>/ 下。装配时传 cfg.DataDir。
+	//
+	// 刻意不放 worktree 里：worktree 会被回收，而日志的全部价值就在于
+	// 「现场没了之后还能查」。为空时不落盘，log_ref 留空。
+	LogDir string
 
 	// ClientFactory 非空时优先于 Clients：按任务属主解析客户端。
 	// 为 nil 时用静态 Clients（单用户部署与测试）。
@@ -738,14 +745,19 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	}
 
 	// 修复回路里要按最新 diff 重跑验证，抽成闭包共享判定逻辑。
-	runVerify := func() (Report, error) {
+	//
+	// round 参数决定日志落在哪个子目录：0 是首轮，1..N 对应修复回路的
+	// 第 N 轮。分目录是 T4-AC3 的要求 —— 同任务多轮不能互相覆盖，
+	// 否则「第一轮为什么挂」这个问题在第二轮跑完之后就永远回答不了了。
+	runVerify := func(round int) (Report, error) {
+		logs := p.stepLogger(rc.tk.ID, round)
 		if tier == TierHeavy {
-			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps, changedFiles, rc.params.Repo.ExcludeDirs)
+			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps, changedFiles, rc.params.Repo.ExcludeDirs, logs)
 		}
-		return p.Verifier.RunLight(rc.ctx, rc.wt.Path, steps), nil
+		return p.Verifier.RunLight(rc.ctx, rc.wt.Path, steps, logs), nil
 	}
 
-	report, err := runVerify()
+	report, err := runVerify(0)
 	if err != nil {
 		return p.fail(rc, StageVerifyRun, err)
 	}
@@ -808,7 +820,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		if nf, cerr := p.Worktrees.ChangedFiles(rc.ctx, rc.wt); cerr == nil {
 			changedFiles = nf
 		}
-		report, err = runVerify()
+		report, err = runVerify(attempt)
 		if err != nil {
 			return p.fail(rc, StageVerifyRun, err)
 		}
@@ -997,7 +1009,7 @@ func mergedExcludeDirs(global, repo []string) []string {
 	return append(out, repo...)
 }
 
-func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string) (Report, error) {
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, logs StepLogger) (Report, error) {
 	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
 	if err != nil {
 		return Report{}, err
@@ -1021,6 +1033,7 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 		Repro:      repro,
 		ReproErr:   reproErr,
 		Regression: regression,
+		Logs:       logs,
 	}), nil
 }
 
@@ -1082,7 +1095,7 @@ func (p *Pipeline) persistVerifications(ctx context.Context, taskID int64, rep R
 		if p.Verifications != nil {
 			if err := p.Verifications.InsertVerification(ctx, taskID,
 				string(rep.Tier), string(s.Step.Name), string(s.Status),
-				s.Duration.Milliseconds()); err != nil {
+				s.Duration.Milliseconds(), s.LogRef); err != nil {
 				slog.Warn("验证步骤落库失败", "task", taskID, "step", s.Step.Name, "err", err)
 			}
 		}

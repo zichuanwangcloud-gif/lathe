@@ -235,6 +235,9 @@ type HeavyParams struct {
 	ReproErr error
 	// Regression 是受影响范围的回归步骤。
 	Regression []Step
+	// Logs 落盘每一步的完整输出并返回 log_ref（T4）；为 nil 时不落盘，
+	// log_ref 留空，行为与本项之前一致。
+	Logs StepLogger
 }
 
 // RunHeavy 执行 heavy 档验证。红阶段不过（复现失败）时整体即失败，
@@ -249,7 +252,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 			rep.Results = append(rep.Results, StepResult{Step: st, Status: StatusSkipped})
 			continue
 		}
-		res := v.runStep(ctx, p.TaskPath, st)
+		res := v.runStep(ctx, p.TaskPath, st, p.Logs)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
 			stopped = true
@@ -273,7 +276,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 		return rep
 	}
 
-	redRes := v.runReproOn(ctx, p.BasePath, p.TaskPath, p.Repro, true)
+	redRes := v.runReproOn(ctx, p.BasePath, p.TaskPath, p.Repro, true, p.Logs)
 	rep.Results = append(rep.Results, redRes)
 	if redRes.Status != StatusPassed {
 		// 红没立起来：复现通过（bug 没复现）或跑不起来 ⇒ §5.3 转
@@ -282,7 +285,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 	}
 
 	// 3. 绿阶段：同一测试在改动后必须通过
-	greenRes := v.runReproOn(ctx, p.TaskPath, p.TaskPath, p.Repro, false)
+	greenRes := v.runReproOn(ctx, p.TaskPath, p.TaskPath, p.Repro, false, p.Logs)
 	rep.Results = append(rep.Results, greenRes)
 	if greenRes.Status != StatusPassed {
 		return rep
@@ -298,7 +301,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 	}
 	for _, st := range p.Regression {
 		st.Name = StepRegression
-		res := v.runStep(ctx, p.TaskPath, st)
+		res := v.runStep(ctx, p.TaskPath, st, p.Logs)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
 			return rep
@@ -316,7 +319,7 @@ func (v *Verifier) RunHeavy(ctx context.Context, p HeavyParams) Report {
 // 红阶段会把测试文件的最新版本拷进基线工作区：基线上没有 agent 新写的
 // 测试文件，必须带过去。编译错误（如测试引用了还不存在的函数）在红阶段
 // 算「失败」—— 功能确实不存在（§5.4）。
-func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, tests []ReproTest, red bool) StepResult {
+func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, tests []ReproTest, red bool, logs StepLogger) StepResult {
 	name := StepReproPass
 	if red {
 		name = StepReproFail
@@ -337,9 +340,17 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 	}
 
 	var outputs strings.Builder
+	// 复现阶段可能有多条测试，每条各自落一份完整日志（同一轮目录下按序号
+	// 区分）。res.LogRef 因此是【空格分隔的多个路径】而不是单个 ——
+	// 合并成一份会丢掉每条测试各自的完整输出：内层 runStep 返回的
+	// r.Output 已经被截断到 16KB，拿它拼出来的合并日志同样是残缺的。
+	var refs []string
 	var failed, passed int
 	for _, rt := range tests {
-		r := v.runStep(ctx, runRoot, Step{Name: name, Cmd: rt.Cmd, Dir: rt.Dir})
+		r := v.runStep(ctx, runRoot, Step{Name: name, Cmd: rt.Cmd, Dir: rt.Dir}, logs)
+		if r.LogRef != "" {
+			refs = append(refs, r.LogRef)
+		}
 		fmt.Fprintf(&outputs, "$ %s  [%s]\n%s\n---\n",
 			strings.Join(rt.Cmd, " "), rt.File, r.Output)
 		res.Duration += r.Duration
@@ -347,6 +358,7 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 			res.Status = StatusError
 			res.Err = fmt.Errorf("runner: 复现测试 %s 没能跑起来: %v", rt.File, r.Err)
 			res.Output = truncate(outputs.String(), maxStepOutput)
+			res.LogRef = strings.Join(refs, " ")
 			return res
 		}
 		if r.Status == StatusPassed {
@@ -356,6 +368,7 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 		}
 	}
 	res.Output = truncate(outputs.String(), maxStepOutput)
+	res.LogRef = strings.Join(refs, " ")
 
 	if red {
 		if passed > 0 {

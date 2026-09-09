@@ -27,7 +27,12 @@ type Config struct {
 	// 见 docs/08-debt-cleanup.md D8-1 —— 但这两个消费方与多节点无关，故保留。
 	NodeName string
 
-	// DataDir 存放运行时数据（凭据主密钥等）。
+	// DataDir 存放运行时数据：凭据主密钥（secret.key）与验证日志
+	// （verify-logs/task-<id>/round-<n>/，见 T4）。
+	//
+	// 验证日志刻意不放 worktree 里：worktree 会被回收（合并后回收、
+	// 同名尸体回收、TTL 收割），而日志的全部价值就在于「现场没了之后
+	// 还能查」—— 放在 worktree 里等于排障时正好没有。
 	DataDir string
 
 	// 工作区
