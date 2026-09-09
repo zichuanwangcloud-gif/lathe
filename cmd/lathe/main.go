@@ -274,6 +274,11 @@ func serve(cfg config.Config) error {
 	}
 	previewAPI.Routes(mux)
 
+	// 仓库配置页的「基线目录」检测/部署复用同一个 previewMgr——
+	// 检测/部署基线目录跟预览环境是同一套 docker/compose 能力，不必
+	// 另起一个 Manager 实例。
+	apiSrv.Baselines = previewMgr
+
 	credAPI := &httpapi.CredentialAPI{
 		Secrets:  secrets,
 		Verifier: creds.Verifier{},

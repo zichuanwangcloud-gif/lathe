@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Clouditera/lathe/internal/preview"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
 )
@@ -476,6 +477,128 @@ func TestAPICreateRepo(t *testing.T) {
 	resp = do(t, srv2, "POST", "/api/repos", `{"providerRepo":"acme/new-repo"}`, true)
 	if resp.StatusCode != http.StatusCreated {
 		t.Errorf("另一用户登记同名仓库应成功，得到 %d", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------- 基线目录
+
+// fakeBaselineDetector 记录调用并返回预设结果，供仓库基线检测/部署
+// 接口测试注入。
+type fakeBaselineDetector struct {
+	status     *preview.BaselineStatus
+	detectErr  error
+	deployErr  error
+	deployedTo string // 记录最近一次 DeployBaseline 的 composeFile 参数
+	calledDir  string
+}
+
+func (f *fakeBaselineDetector) DetectBaseline(ctx context.Context, dir, defaultBranch string) (*preview.BaselineStatus, error) {
+	f.calledDir = dir
+	if f.detectErr != nil {
+		return nil, f.detectErr
+	}
+	return f.status, nil
+}
+
+func (f *fakeBaselineDetector) DeployBaseline(ctx context.Context, dir, composeFile string) error {
+	f.calledDir = dir
+	f.deployedTo = composeFile
+	return f.deployErr
+}
+
+func TestAPIRepoBaselineUnavailableWithoutDetector(t *testing.T) {
+	api, _, _, repoID := apiFixture(t) // api.Baselines 未设置 = nil
+	srv := apiServer(t, api)
+
+	resp := do(t, srv, "GET", "/api/repos/"+itoa(repoID)+"/baseline", "", true)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("未配置 Baselines 应 503，得到 %d", resp.StatusCode)
+	}
+}
+
+func TestAPIRepoBaselineNotConfigured(t *testing.T) {
+	api, _, _, repoID := apiFixture(t)
+	api.Baselines = &fakeBaselineDetector{}
+	srv := apiServer(t, api)
+
+	resp := do(t, srv, "GET", "/api/repos/"+itoa(repoID)+"/baseline", "", true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("仓库未配置基线目录应 400，得到 %d", resp.StatusCode)
+	}
+}
+
+func TestAPIRepoBaselineDetectAndDeploy(t *testing.T) {
+	api, _, _, repoID := apiFixture(t)
+	fb := &fakeBaselineDetector{status: &preview.BaselineStatus{
+		Dir:          "/opt/CloudRouter",
+		Branch:       "dev",
+		ComposeFiles: []string{"infra/docker-compose.yml"},
+		Services: []preview.BaselineService{
+			{ComposeFile: "infra/docker-compose.yml", Service: "postgres",
+				ContainerName: "cloudrouter-postgres", Running: true, DBKind: "postgres"},
+		},
+	}}
+	api.Baselines = fb
+	srv := apiServer(t, api)
+
+	resp := do(t, srv, "PUT", "/api/repos/"+itoa(repoID), `{"baselineDir":"/opt/CloudRouter"}`, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("设置基线目录状态码 = %d", resp.StatusCode)
+	}
+	if body := decode(t, resp); body["baselineDir"] != "/opt/CloudRouter" {
+		t.Errorf("更新未生效: %+v", body)
+	}
+
+	// 检测：应把仓库配置的目录/默认分支传给 Baselines，原样透传结果
+	resp = do(t, srv, "GET", "/api/repos/"+itoa(repoID)+"/baseline", "", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("检测状态码 = %d", resp.StatusCode)
+	}
+	if fb.calledDir != "/opt/CloudRouter" {
+		t.Errorf("应把仓库配置的基线目录传给 DetectBaseline，得到 %q", fb.calledDir)
+	}
+	body := decode(t, resp)
+	svcs, _ := body["services"].([]any)
+	if len(svcs) != 1 {
+		t.Fatalf("应透传检测结果: %v", body)
+	}
+
+	// 部署：body 里的 composeFile 原样透传
+	resp = do(t, srv, "POST", "/api/repos/"+itoa(repoID)+"/baseline/deploy",
+		`{"composeFile":"infra/docker-compose.yml"}`, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("部署状态码 = %d: %v", resp.StatusCode, decode(t, resp))
+	}
+	if fb.deployedTo != "infra/docker-compose.yml" {
+		t.Errorf("应把 composeFile 传给 DeployBaseline，得到 %q", fb.deployedTo)
+	}
+
+	// 部署失败 → 400（人可读错误，不是服务端 500）
+	fb.deployErr = context.DeadlineExceeded
+	resp = do(t, srv, "POST", "/api/repos/"+itoa(repoID)+"/baseline/deploy",
+		`{"composeFile":"infra/docker-compose.yml"}`, true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("部署失败应 400，得到 %d", resp.StatusCode)
+	}
+}
+
+// 跨用户：基线接口与其余仓库配置接口同一隔离边界，非属主一律 404。
+func TestAPIRepoBaselineCrossUserIs404(t *testing.T) {
+	api, st, _, repoID := apiFixture(t)
+	api.Baselines = &fakeBaselineDetector{status: &preview.BaselineStatus{}}
+
+	other := mustUser(t, st, "baseline-other-"+t.Name()+"@example.com")
+	apiOther := &API{Store: st, Tasks: api.Tasks, Queue: &fakeEnqueuer{},
+		Auth: authAs(other, "baseline-other@example.com"), Baselines: api.Baselines}
+	srv := apiServer(t, apiOther)
+
+	resp := do(t, srv, "GET", "/api/repos/"+itoa(repoID)+"/baseline", "", true)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("非属主读取基线状态应 404，得到 %d", resp.StatusCode)
+	}
+	resp = do(t, srv, "POST", "/api/repos/"+itoa(repoID)+"/baseline/deploy", `{}`, true)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("非属主部署基线应 404，得到 %d", resp.StatusCode)
 	}
 }
 

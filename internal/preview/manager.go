@@ -62,10 +62,15 @@ type Selection struct {
 // DatabasePlan 是数据库策略（通常由 AI 推荐产生，人采用后随启动传入）。
 type DatabasePlan struct {
 	// Strategy: reuse=连主部署在跑的库（有 SQL 变更时会被拒绝）；
-	// clone=从源容器克隆一份独立库；fresh=全新空库；none=不需要。
+	// clone=从源容器克隆一份独立库；fresh=全新空库；none=不需要；
+	// baseline=连仓库配置的基线目录（见 baseline.go）已经在跑的中间件。
 	Strategy string `json:"strategy"`
-	Source   string `json:"source,omitempty"` // reuse/clone 的源容器名
+	Source   string `json:"source,omitempty"` // reuse/clone/baseline 的源容器名（baseline 唯一匹配时可留空）
 	DBName   string `json:"dbName,omitempty"` // clone 的源库名（空则取源容器配置）
+	// Dir 仅 baseline 策略使用：基线目录路径。只能由服务端从仓库配置注入
+	// （httpapi 层），不接受客户端直接传入——避免把任意路径检测暴露成
+	// 一个客户端可控的参数。
+	Dir string `json:"-"`
 }
 
 // resolvedDatabase 是 Start 校验后定案的数据库执行计划（内部态）。
@@ -528,34 +533,45 @@ func (m *Manager) resolveDatabase(ctx context.Context, taskID int64, worktree st
 	switch plan.Strategy {
 	case "fresh":
 		return r, nil // 全新空库 = infra postgres（Start 负责补进 infra 列表）
-	case "reuse", "clone":
+	case "reuse", "clone", "baseline":
 	default:
 		return nil, fmt.Errorf("preview: 未知的数据库策略 %q", plan.Strategy)
 	}
 
-	// 源容器必须真实在跑且是 DB 家族
-	containers := m.runningContainers(ctx)
+	// 源容器核查：baseline 从仓库配置的基线目录检测结果里找，
+	// reuse/clone 沿用现有的「在全机 docker ps 里按名字找」。
 	var src *RunningContainer
-	for i := range containers {
-		if containers[i].Name == plan.Source {
-			src = &containers[i]
-			break
+	if plan.Strategy == "baseline" {
+		s, err := m.resolveBaselineSource(ctx, plan)
+		if err != nil {
+			return nil, err
+		}
+		src = s
+	} else {
+		containers := m.runningContainers(ctx)
+		for i := range containers {
+			if containers[i].Name == plan.Source {
+				src = &containers[i]
+				break
+			}
+		}
+		if src == nil {
+			return nil, fmt.Errorf("preview: 数据库源容器 %q 不在运行中", plan.Source)
+		}
+		if src.DBKind == "" {
+			return nil, fmt.Errorf("preview: 源容器 %q（%s）不是数据库镜像", plan.Source, src.Image)
 		}
 	}
-	if src == nil {
-		return nil, fmt.Errorf("preview: 数据库源容器 %q 不在运行中", plan.Source)
-	}
-	if src.DBKind == "" {
-		return nil, fmt.Errorf("preview: 源容器 %q（%s）不是数据库镜像", plan.Source, src.Image)
-	}
 
-	if plan.Strategy == "reuse" {
+	if plan.Strategy == "reuse" || plan.Strategy == "baseline" {
 		// 复用走网络：源库必须有已发布端口，预览容器经宿主网关到达
 		if src.HostPort == 0 {
-			return nil, fmt.Errorf("preview: 源容器 %q 没有已发布的宿主端口，预览容器无法到达", plan.Source)
+			return nil, fmt.Errorf("preview: 源容器 %q 没有已发布的宿主端口，预览容器无法到达", src.Name)
 		}
 		// 硬护栏：有 SQL/迁移变更禁止复用共享库 —— 迁移可能改坏
 		// 别人在用的数据。推荐层会纠正，这里是执行前的最后防线。
+		// baseline 与 reuse 是同一条纪律：换个策略名字不能绕过它，
+		// 撞上时人需要显式改选克隆策略（同 reuse 现有行为）。
 		if prof := m.changeProfile(ctx, worktree); prof.HasSQL {
 			return nil, errors.New("preview: 检测到 SQL/迁移变更，不能复用共享库（请改用克隆策略）")
 		}
@@ -590,6 +606,53 @@ func (m *Manager) resolveDatabase(ctx context.Context, taskID int64, worktree st
 	r.cloneCname = fmt.Sprintf("lathe-preview-t%d-infra-postgres", taskID)
 	r.env = buildDBEnv("postgres", r.host, r.port, r.user, r.password, r.dbName)
 	return r, nil
+}
+
+// resolveBaselineSource 把 baseline 策略定案到 DetectBaseline 结果里
+// 一个具体的在跑服务：plan.Source 非空时按容器名/服务名精确匹配消歧；
+// 为空时要求"在跑且有 DBKind 的服务"里只能有唯一一个匹配，否则报错
+// 让人显式指定（不猜——基线目录理论上可以有多个数据库）。
+func (m *Manager) resolveBaselineSource(ctx context.Context, plan DatabasePlan) (*RunningContainer, error) {
+	if strings.TrimSpace(plan.Dir) == "" {
+		return nil, errors.New("preview: baseline 策略缺少基线目录（仓库未配置基线目录，或未正确注入）")
+	}
+	status, err := m.DetectBaseline(ctx, plan.Dir, "")
+	if err != nil {
+		return nil, fmt.Errorf("preview: 检测基线目录失败: %w", err)
+	}
+
+	var matches []BaselineService
+	for _, svc := range status.Services {
+		if !svc.Running || svc.DBKind == "" {
+			continue
+		}
+		if plan.Source != "" && svc.ContainerName != plan.Source && svc.Service != plan.Source {
+			continue
+		}
+		matches = append(matches, svc)
+	}
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf(
+			"preview: 基线目录 %s 里没有检测到在跑的中间件（先在仓库配置页部署基线，或改用其他数据库策略）",
+			plan.Dir)
+	case 1:
+		svc := matches[0]
+		if svc.HostPort == 0 {
+			return nil, fmt.Errorf("preview: 基线中间件 %q 没有已发布的宿主端口，预览容器无法到达", svc.ContainerName)
+		}
+		return &RunningContainer{
+			Name: svc.ContainerName, Image: svc.Image, DBKind: svc.DBKind,
+			HostPort: svc.HostPort, Env: svc.Env,
+		}, nil
+	default:
+		names := make([]string, 0, len(matches))
+		for _, s := range matches {
+			names = append(names, s.ContainerName)
+		}
+		return nil, fmt.Errorf("preview: 基线目录里有多个在跑的中间件匹配（%s），请指定 source 消歧",
+			strings.Join(names, ", "))
+	}
 }
 
 // dbCredentials 从源容器 env 提取连接三元组。

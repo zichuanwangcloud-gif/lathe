@@ -110,7 +110,9 @@ type RunningContainer struct {
 	HostPort int               `json:"hostPort,omitempty"` // 服务端口对应的宿主端口
 }
 
-// dbKindOf 从镜像名识别 DB 家族。
+// dbKindOf 从镜像名识别中间件家族。objectstore（rustfs/minio 等 S3 兼容
+// 对象存储）不参与 clone/fresh（InfraCatalog 不认识它），只用于基线目录
+// 的识别展示与 reuse/baseline 策略判断"有没有这个中间件"（见 baseline.go）。
 func dbKindOf(image string) string {
 	l := strings.ToLower(image)
 	switch {
@@ -122,11 +124,13 @@ func dbKindOf(image string) string {
 		return "redis"
 	case strings.Contains(l, "mongo"):
 		return "mongo"
+	case strings.Contains(l, "rustfs"), strings.Contains(l, "minio"):
+		return "objectstore"
 	}
 	return ""
 }
 
-// dbServicePort 是各 DB 家族的容器内服务端口。
+// dbServicePort 是各中间件家族的容器内服务端口。
 func dbServicePort(kind string) int {
 	switch kind {
 	case "postgres":
@@ -137,6 +141,8 @@ func dbServicePort(kind string) int {
 		return 6379
 	case "mongo":
 		return 27017
+	case "objectstore":
+		return 9000
 	}
 	return 0
 }
