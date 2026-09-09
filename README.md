@@ -62,6 +62,9 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 # 6. 「设置」页顶部有你的专属 Linear webhook 地址（/webhooks/linear/<你的随机段>），
 #    在 Linear → Settings → API → Webhooks 里指过去，勾选 Issue 事件
 # 7. 在「仓库配置」页登记目标仓库（owner/repo）并设置分支策略
+#
+# 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
+#    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
 ```
 
 ### 账号

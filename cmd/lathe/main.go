@@ -190,7 +190,7 @@ func serve(cfg config.Config) error {
 	// 每用户专属回调：/webhooks/linear/{slug}（设置页展示完整地址）。
 	// 旧路径保留，路由到内置管理员，老部署的 Linear webhook 配置不用改。
 	webhook := &httpapi.LinearWebhook{
-		Resolver:   &webhookResolver{users: users, factory: factory, admin: admin},
+		Resolver:   &webhookResolver{users: users, factory: factory, admin: admin, settings: st},
 		Deliveries: st,
 		Tasks:      q,
 	}
@@ -383,6 +383,8 @@ type webhookResolver struct {
 	users   *store.Users
 	factory *creds.Factory
 	admin   *store.User
+	// settings 用于现取标签驱动接单的标签名（T7）。
+	settings *store.Store
 }
 
 func (r *webhookResolver) Resolve(ctx context.Context, slug string) (*httpapi.WebhookTarget, error) {
@@ -407,6 +409,9 @@ func (r *webhookResolver) Resolve(ctx context.Context, slug string) (*httpapi.We
 		OwnerID:      u.ID,
 		Secret:       secret,
 		LinearUserID: p.LinearUserID(ctx),
+		// 现取标签名：改完即刻生效，不用重启服务
+		// （与 PreviewThresholds 同一套做法）。空串 = 该能力关闭。
+		TriggerLabel: r.settings.WebhookTriggerLabel(ctx),
 	}, nil
 }
 

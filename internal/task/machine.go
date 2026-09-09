@@ -357,6 +357,38 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 	return out, rows.Err()
 }
 
+// ActiveByIssueID 返回某属主名下、指定 Linear issue 的所有非终结任务（T7）。
+//
+// 谓词抄 flow/service.go 那条「同 issue 的活任务」查询，改成按
+// linear_issue_id（UUID）而不是 linear_issue_key —— webhook 手里权威的是
+// UUID，issue key 是人读标识、理论上可被重命名。
+//
+// 正常情况下最多一条（tasks_one_active_per_issue 部分唯一索引按
+// (repo_id, linear_issue_key) 挡住），但一个用户可能在多个仓库下登记了
+// 同一个 issue，所以返回切片、不假设恰好一条。
+func (m *Machine) ActiveByIssueID(ctx context.Context, userID int64, issueID string) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE user_id = $1 AND linear_issue_id = $2
+		  AND state NOT IN ('merged', 'failed', 'cancelled')
+		ORDER BY id`, userID, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询 issue %s 的在途任务失败: %w", issueID, err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取在途任务失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // HasLiveDependentOnBranch 报告是否存在非终结状态的任务，其当前
 // base_ref 等于 branchName —— F4.2-AC2 现场回收的判定条件：
 // "仍有未合并后继依赖该分支时，不删除该分支"。

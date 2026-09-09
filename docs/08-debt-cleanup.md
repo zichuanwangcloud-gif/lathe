@@ -70,7 +70,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T4 | `verifications.log_ref` 落盘写入 | C | TODO |
 | T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
 | T6 | worktree TTL 收割机 | E | TODO |
-| T7 | webhook 联动：标签接单 + issue 取消联动 | F | TODO |
+| T7 | webhook 联动：标签接单 + issue 取消联动 | F | **DONE** |
 | T8 | per-task compose 隔离（验证阶段） | G | TODO |
 
 ## 3. PR 拆分与理由
@@ -509,3 +509,41 @@ repos / tasks / task_events / verifications / agent_events。
   email 以 `@example.com` 结尾）与 `make clean-test-db` 目标；
   Makefile 里那段「-p 1 就够了」的注释也改掉了 —— 它给的是虚假的安全感。
   顺带结清 roadmap §1.3 的 `repos` id=241 占位行（属 fixture 残留，被清理带走）。
+
+- 2026-09-09：**T7 实现完成**（PR F，分支 `feat/webhook-triggers`，base 在 A 上）。
+  三个关键判断：
+  1. **取消分流必须在接单闸门之前。** 取消事件不是指派事件 —— 放在闸门之后
+     会被当成「非指派事件」直接 `ignored` 掉，整个功能静默失效。
+  2. **`completed` 刻意不算取消。** 只认 Linear 的 `canceled` 状态类型
+     （和 `remove`）。人手工把 issue 标成完成，不代表平台任务该作废 ——
+     那个任务可能正在跑，或已开出 PR 等人合并。判据用**状态类型**而非
+     状态名：名字是每个团队自己起的（Cancelled / 废弃 / 不做了），
+     类型才是 Linear 的稳定枚举。
+  3. **标签默认空串即关闭**（AC3 的实现方式）。默认给 `lathe:go` 的话，
+     某个早就在用这个标签表示别的意思的仓库会在升级后突然自动接单。
+     判定函数里 `label == ""` 直接返回 false。
+
+  payload 侧：`Labels`/`LabelIDs` 原本**根本不在结构体里**，得先加。
+  判定用**标签 name 而非 labelIds 里的 UUID**（人在界面上打的是名字），
+  且 `update` 事件必须看 `updatedFrom` 里有没有 `labelIds` ——
+  否则 issue 停在带标签状态时改个标题就会重复接单。这套路与现成的
+  `IsAssignedTo` 看 `assigneeId` 完全一致。
+
+  **AC6 的能力边界如实写进了代码与文档**：取消**只改数据库状态，不会停下
+  正在跑的 agent** —— runner 全包没有任何地方在执行中途回读 task state。
+  在途 agent 会白跑完一轮，然后在下一次状态转移时因 `cancelled` 是无出边
+  终态而被 `Validate` 拒绝。没有假装取消是即时的；真正的取消信号传播
+  列为后续项。
+
+  标签名走 `system_settings`（改完即刻生效，不用重启），并在「系统设置」页
+  加了输入框 —— 否则又是一个「有设置项但没地方填」的反面。
+  管理端刻意**不对标签名做格式校验**：Linear 的标签名可以是任意文本
+  （含空格、中文、emoji），定规则只会把合法标签挡在外面。
+
+  测试：18 条（11 条既有 + 7 条新增）。AC3 点名的两个回归护栏
+  （`TestWebhookIgnoresNonAssignment`、`TestWebhookIgnoresOtherUsersIssue`）
+  仍绿；AC5 那条「伪造签名的取消事件必须被拒绝」—— 取消分流放在验签
+  **之后**，所以没有在 ingress 上开新的免验签路径。
+  另有 linear 层 20+ 表驱动判定用例与 task 层跨用户隔离断言。
+
+  门禁：注入 23 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿。

@@ -45,6 +45,11 @@ type fakeEnqueuer struct {
 	owners   []int64
 	requeued []int64
 	err      error
+	// cancelledIssues 记录 T7 取消联动被调用时的 issue key；
+	// cancelIDs 是要返回的任务 id，cancelErr 用来模拟失败。
+	cancelledIssues []string
+	cancelIDs       []int64
+	cancelErr       error
 }
 
 func (f *fakeEnqueuer) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKey string) error {
@@ -62,6 +67,14 @@ func (f *fakeEnqueuer) Requeue(ctx context.Context, taskID int64, mode string) e
 	}
 	f.requeued = append(f.requeued, taskID)
 	return nil
+}
+
+func (f *fakeEnqueuer) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, issueKey string) ([]int64, error) {
+	if f.cancelErr != nil {
+		return nil, f.cancelErr
+	}
+	f.cancelledIssues = append(f.cancelledIssues, issueKey)
+	return f.cancelIDs, nil
 }
 
 const testSecret = "webhook-secret"
