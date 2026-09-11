@@ -442,9 +442,6 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		// 非空 = 整体替换。JSON 数组天然区分这三种语义，无需指针。
 		ExcludeDirs []string `json:"excludeDirs"`
 		// VerifyInfra 同语义：nil = 不动；空数组 = 清空（关闭隔离栈）。
-		// 取值域是 preview.InfraCatalog 的键，非法值在起栈时报错并列出
-		// 可选值 —— 刻意不在这里校验：那份目录在 Go 侧演进，
-		// API 层跟着抄一遍等于把同一份知识写两遍。
 		VerifyInfra []string `json:"verifyInfra"`
 		// 指针区分「未传」（不动）与「空串」（清回自动档）
 		VerifyTierOverride *string `json:"verifyTierOverride"`
@@ -488,6 +485,24 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 			"error": "受保护分支列表不能为空 —— 这是禁止直接推送的最后一道闸门",
 		})
 		return
+	}
+	// 验证隔离栈的依赖名必须在目录里。这里**不是**把知识抄两遍：
+	// preview.InfraCatalog 是导出的同一份 map，查表就是把校验指向那份
+	// 目录本身，Go 侧演进时两边自动保持一致。
+	//
+	// 不校验的代价不对称：把 "postgre" 敲错一个字母存进库，界面提示
+	// 保存成功，之后该仓库**每一个 heavy 任务**都在起栈失败上硬失败
+	// （未知依赖名走的是判死分支，不是降级），人得翻日志才知道是拼写。
+	if body.VerifyInfra != nil {
+		for _, name := range body.VerifyInfra {
+			if _, ok := preview.InfraCatalog[strings.TrimSpace(name)]; !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": fmt.Sprintf("验证隔离栈的依赖名 %q 不认识（可选：%s）",
+						name, strings.Join(preview.InfraNames(), " / ")),
+				})
+				return
+			}
+		}
 	}
 
 	repo, err := a.Store.UpdateRepo(r.Context(), id, CurrentUser(r).ID, store.UpdateRepoParams{

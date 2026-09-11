@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +14,12 @@ type fakeStackUp struct {
 	upErr     error
 	upCalls   [][]string
 	downCalls int
+	// downCtxDone 记录每次 Down 被调用时 ctx 是否已取消 —— 用来钉
+	// 「拆栈不该因根 ctx 取消而变成空操作」这条。
+	downCtxDone []bool
+	// onUp 在 UpVerifyStack 成功返回前调用。用来模拟「栈刚起来就收到
+	// SIGINT」这个真实现场（容器泄漏正是在这里发生的）。
+	onUp func()
 }
 
 func (f *fakeStackUp) UpVerifyStack(ctx context.Context, taskID int64, infra []string) (VerifyStackHandle, error) {
@@ -23,6 +30,9 @@ func (f *fakeStackUp) UpVerifyStack(ctx context.Context, taskID int64, infra []s
 	if len(infra) == 0 {
 		return nil, nil
 	}
+	if f.onUp != nil {
+		f.onUp()
+	}
 	return &fakeStackHandle{f: f}, nil
 }
 
@@ -31,6 +41,7 @@ type fakeStackHandle struct{ f *fakeStackUp }
 func (h *fakeStackHandle) StackEnv() map[string]string { return h.f.env }
 func (h *fakeStackHandle) Down(ctx context.Context) error {
 	h.f.downCalls++
+	h.f.downCtxDone = append(h.f.downCtxDone, ctx.Err() != nil)
 	return nil
 }
 
@@ -59,6 +70,27 @@ func TestOtherStackErrorsDoNotDegrade(t *testing.T) {
 		if stackUnavailable(err) {
 			t.Errorf("非水位错误不该降级：%v", err)
 		}
+	}
+}
+
+// ★ docker 守护进程不可用必须判死，绝不降级。
+//
+// CheckResources 的 switch 第一分支就是 !DockerOK → Allowed=false。
+// 若它与水位共用同一个错误身份，runner 侧就走降级分支、日志写
+// 「资源水位不允许」—— 把人引去调阈值，而真正该做的是把 docker 起来。
+// docker 不可用是比「镜像拉不下来」更根本的故障，本 PR 自己定的原则
+// （镜像拉不下来、就绪超时都该让人看见）在这里同样适用。
+func TestDockerDownDoesNotDegrade(t *testing.T) {
+	wrapped := fmt.Errorf("%w: docker 守护进程不可用", ErrStackDockerDown)
+
+	if stackUnavailable(wrapped) {
+		t.Error("docker 不可用不该走降级分支 —— 那会让日志写「资源水位不允许」，把人引去调阈值")
+	}
+	if errors.Is(wrapped, ErrStackOverThreshold) {
+		t.Error("docker 不可用与水位超阈值必须是两个错误身份")
+	}
+	if !errors.Is(wrapped, ErrStackDockerDown) {
+		t.Error("应可用 errors.Is 判定为 docker 不可用")
 	}
 }
 
@@ -165,5 +197,59 @@ func TestMergeEnvEmptyExtraIsIdentity(t *testing.T) {
 	got := mergeEnv(base, nil)
 	if len(got) != 2 || got[0] != "A=1" || got[1] != "B=2" {
 		t.Errorf("空 extra 应原样返回，得到 %v", got)
+	}
+}
+
+// ★ 降级留痕必须进 Report —— 回帖到 Linear 的那份里必须能看见。
+//
+// 原实现只把降级写进 agent_events，且 `if p.AgentEvents == nil` 时
+// 完全无声。而人最常看到的恰恰是 Linear 那条回帖：一次「验证通过」
+// 看起来与隔离完好时一模一样，无从知道它其实跑在共享环境上、
+// 并发污染风险回到了本项之前的水平。
+func TestSummaryShowsStackDegradedWarning(t *testing.T) {
+	rep := Report{
+		Tier:          TierHeavy,
+		StackDegraded: true,
+		Results: []StepResult{
+			{Step: Step{Name: StepReproFail}, Status: StatusPassed},
+			{Step: Step{Name: StepReproPass}, Status: StatusPassed},
+		},
+	}
+
+	s := rep.Summary()
+	if !strings.Contains(s, StackDegradedNote) {
+		t.Errorf("降级时回帖摘要必须带警示行，得到：\n%s", s)
+	}
+	// 警示要挨着结论那一行，别混在步骤列表末尾（那等于没写）
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	if len(lines) < 2 || !strings.Contains(lines[1], StackDegradedNote) {
+		t.Errorf("警示应在结论的下一行，得到：\n%s", s)
+	}
+}
+
+// 未降级时不该出现警示：默认形态（仓库没声明依赖）每条回帖都挂
+// 警示会让警示本身失效。
+func TestSummaryQuietWhenNotDegraded(t *testing.T) {
+	rep := Report{
+		Tier:    TierLight,
+		Results: []StepResult{{Step: Step{Name: StepBuild}, Status: StatusPassed}},
+	}
+	if s := rep.Summary(); strings.Contains(s, StackDegradedNote) {
+		t.Errorf("未降级时不该出现警示，得到：\n%s", s)
+	}
+}
+
+// 降级标记不影响红绿判定：它是「结论的适用范围」，不是结论本身。
+func TestStackDegradedDoesNotAffectPassed(t *testing.T) {
+	rep := Report{
+		Tier:          TierLight,
+		StackDegraded: true,
+		Results:       []StepResult{{Step: Step{Name: StepBuild}, Status: StatusPassed}},
+	}
+	if !rep.Passed() {
+		t.Error("降级不该把一次通过的验证判成不通过")
+	}
+	if !strings.HasPrefix(rep.Summary(), "验证通过") {
+		t.Errorf("结论行仍应是「验证通过」，得到：\n%s", rep.Summary())
 	}
 }

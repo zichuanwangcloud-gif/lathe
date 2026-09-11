@@ -273,6 +273,12 @@ type Manager struct {
 	// execStream 执行构建命令：逐行回调输出（docker build 的进度走
 	// stderr），返回输出尾部供错误展示。测试注入假件。
 	execStream func(ctx context.Context, name string, args []string, onLine func(string)) (string, error)
+	// hostProbe 探宿主侧 TCP 是否可连（验证隔离栈用）。
+	//
+	// NewManager 填成真实的 net.Dialer 实现。为 nil 时 waitHostPort
+	// 回落到真探针（fail-safe）—— 测试要免掉这次真拨号得显式注入
+	// 一个 no-op，见 newTestManager。
+	hostProbe func(ctx context.Context, port int) error
 
 	mu     sync.Mutex
 	ops    map[int64]*Op
@@ -292,6 +298,7 @@ func NewManager(workspaceRoot string, thresholds func(context.Context) (int, int
 		Thresholds:    thresholds,
 		exec:          realExec,
 		execStream:    realStreamExec,
+		hostProbe:     realHostProbe,
 		ops:           map[int64]*Op{},
 		recOps:        map[int64]*RecommendOp{},
 	}

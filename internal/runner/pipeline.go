@@ -955,17 +955,23 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 	//   - 水位超阈值 → **降级为无隔离执行并留痕**。机器忙不是任务的错，
 	//     回落仍能给出验证结论，只是并发污染风险回到本项之前的水平。
 	//     排队等待不合适：水位可能长时间不降，那会让验证槽位无限期挂着。
-	//   - 其它（未知依赖名、镜像拉不下来、就绪超时）→ 判死并留下
-	//     **独立的错误身份**（StageVerifyStack），绝不冒充「复现测试
-	//     跑不起来」。后者会被 redEnvError 归类成「环境问题、失败留现场」，
-	//     语义上恰好也对，但错误信息会误导人去查复现测试。
+	//   - 其它（未知依赖名、镜像拉不下来、就绪超时、docker 守护进程
+	//     不可用）→ 判死并留下**独立的错误身份**（StageVerifyStack），
+	//     绝不冒充「复现测试跑不起来」。后者会被 redEnvError 归类成
+	//     「环境问题、失败留现场」，语义上恰好也对，但错误信息会误导人
+	//     去查复现测试。
+	//
+	// 降级时把标记挂上 Report（而不是只落事件流）：回帖到 Linear 的
+	// Summary() 是绝大多数人唯一会读到的那一份，见 Report.StackDegraded。
 	var stackEnv map[string]string
+	stackDegraded := false
 	if p.Stacks != nil && len(repoInfra) > 0 {
 		stack, serr := p.Stacks.UpVerifyStack(ctx, taskID, repoInfra)
 		switch {
 		case serr != nil && stackUnavailable(serr):
 			slog.Warn("资源水位不允许起验证隔离栈，降级为无隔离执行",
 				"task", taskID, "err", serr)
+			stackDegraded = true
 			p.noteStackSkipped(ctx, taskID, serr)
 		case serr != nil:
 			return Report{}, fmt.Errorf("%w: %v", ErrVerifyStackUp, serr)
@@ -986,7 +992,7 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 	// reproErr 是契约违例（没交测试/声明不合法），不是流水线执行错误：
 	// 交给报告走红阶段的三分路由（修复回路/blocked_spec/失败），
 	// 不走 p.fail 的「验证执行失败」。
-	return p.Verifier.RunHeavy(ctx, HeavyParams{
+	heavy := p.Verifier.RunHeavy(ctx, HeavyParams{
 		TaskPath:   wt.Path,
 		BasePath:   base.Path,
 		Light:      lightSteps,
@@ -994,20 +1000,30 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 		ReproErr:   reproErr,
 		Regression: regression,
 		StackEnv:   stackEnv,
-	}), nil
+	})
+	// RunHeavy 不知道栈的事（它只认 StackEnv），降级标记在这里补上：
+	// 报告是要回帖的那份，标记必须跟着它走。
+	heavy.StackDegraded = stackDegraded
+	return heavy, nil
 }
 
 // noteStackSkipped 把「隔离栈被跳过」写进事件流（T8-AC5 的留痕要求）。
 //
 // 降级本身是合理的，但必须留痕：不然人看到的只是一次「通过了」的验证，
 // 无从知道它其实跑在共享环境上、并发污染风险回到了本项之前的水平。
+//
+// 没配事件记录器（AgentEvents == nil）时**不再直接 return**：事件流是
+// 锦上添花，日志是最后一道留痕，静默降级是最不该出现的结果。
+// 回帖那条路（Report.StackDegraded → Summary）由调用方补。
 func (p *Pipeline) noteStackSkipped(ctx context.Context, taskID int64, cause error) {
+	slog.Warn("验证隔离栈被跳过，本轮验证在共享环境上执行",
+		"task", taskID, "cause", cause)
 	if p.AgentEvents == nil {
 		return
 	}
 	entries := []agent.Entry{{
 		Kind: "verify_step",
-		Body: "验证隔离栈被跳过（资源水位超阈值），本轮验证在共享环境上执行：" + cause.Error(),
+		Body: "验证隔离栈被跳过（资源水位超阈值），" + StackDegradedNote + "：" + cause.Error(),
 	}}
 	if err := p.AgentEvents.InsertAgentEvents(ctx, taskID, "verify", entries); err != nil {
 		slog.Warn("隔离栈跳过留痕失败", "task", taskID, "err", err)
