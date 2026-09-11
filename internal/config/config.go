@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,39 @@ type Config struct {
 	// 工作区
 	WorkspaceRoot string // Lathe 创建 worktree 的根目录
 	PnpmStore     string // 共享 pnpm store，避免每任务装一份依赖
+
+	// WorktreeTTL 是终态任务的工作区现场保留时长（T6 收割机）。
+	//
+	// 默认三天：D4 保留现场是为了让人能进去接手，而 failed 可以转回
+	// queued —— 人下班前看到失败、第二天上班接手是正常节奏，
+	// 激进的 TTL 会把人正要重试的现场删掉。
+	//
+	// **注意 time.ParseDuration 不支持 d 单位**：配置里写 72h，不能写 3d。
+	// 默认值因此是 72*time.Hour 而不是解析出来的。
+	//
+	// 下限 MinWorktreeTTL：TTL 不只是「保留多久」的策略，它还是孤儿清扫
+	// 那层「新建目录绝不动」的安全机制 —— Create 建出目录到把路径写进
+	// 任务行之间有一个无人认领的窗口，只有 mtime 比 cutoff 老才会被删。
+	// TTL 配成分钟级，在途任务的现场就会落进那个窗口。想「先清一批存量
+	// 目录」是自然的运维动作，但正确的做法是 LATHE_REAP_DRY_RUN。
+	WorktreeTTL time.Duration
+	// ReapInterval 是收割机的扫描间隔。回收是低频维护动作，
+	// 不必像 mergepoll 那样 45 秒一轮。
+	ReapInterval time.Duration
+
+	// ReapEnabled 是收割机总开关（LATHE_REAP_ENABLED，默认开）。
+	//
+	// 这个组件会删磁盘目录与 git 分支，是控制面里破坏力最大的一环，
+	// 必须有一个能立刻关掉它的开关。false 时 main 根本不启动收割循环。
+	//
+	// 用字符串而不是 bool：`LATHE_REAP_ENABLED=false` 与「未设置」必须
+	// 能区分 —— 未设置取默认（开），而空字符串的 bool 解析只能是 false，
+	// 那会让「没配」变成「关了」。
+	ReapEnabled string
+	// ReapDryRun 为真时收割机只记「本轮会删什么」，不碰磁盘
+	// （LATHE_REAP_DRY_RUN=true）。首次启用或调整 TTL 后先干跑一轮，
+	// 看清候选再放它动手。
+	ReapDryRun string
 
 	// Agent 执行
 	ClaudeBin    string        // claude CLI 路径
@@ -113,6 +147,66 @@ func (d Database) DSN() string {
 		d.User, d.Password, d.Host, d.Port, d.Name, d.SSLMode)
 }
 
+// MinWorktreeTTL 是工作区现场保留时长的下限（1 小时）。
+//
+// 为什么是硬下限而不是「<=0 兜回默认」：TTL 同时是孤儿清扫的安全机制。
+// 收割机对「磁盘上有、没有任何任务行认领」的目录只按 mtime 判超期，
+// 而 Create 建出目录到转入 implementing 写进 worktree_path 之间有窗口
+// —— 正在跑的任务的目录在那个窗口里正是「无主的且很新」。1 小时足够
+// 盖住这个窗口（Create 本身只跑几条 git 命令），同时不挡「想尽快回收」
+// 的正常诉求；比它更激进的值换不来什么，只会把在途现场推进被删区间。
+const MinWorktreeTTL = time.Hour
+
+// validateBoolEnv 校验形如 `x == "true"` 的布尔环境变量。
+//
+// 拼错（"yes" / "1" / "TRUE"）会让开关静默失效 —— 对
+// LATHE_REAP_ENABLED 这种「必须能关掉」的开关，静默失效的后果是
+// 以为关了其实还在删。所以在启动时报错而不是猜。
+func validateBoolEnv(name, v string) error {
+	if v == "" || v == "true" || v == "false" {
+		return nil
+	}
+	return fmt.Errorf("config: %s 只能是 true 或 false，得到 %q", name, v)
+}
+
+// workspaceRootBlocklist 是绝不能当工作区根目录的路径。
+//
+// 孤儿清扫会删掉根下所有「非 . 开头、无人认领、mtime 超期」的顶层目录，
+// 配成这些值等于让收割机去清理系统目录。
+var workspaceRootBlocklist = map[string]bool{
+	"/": true, "/bin": true, "/boot": true, "/dev": true, "/etc": true,
+	"/home": true, "/lib": true, "/lib64": true, "/media": true, "/mnt": true,
+	"/opt": true, "/proc": true, "/root": true, "/run": true, "/sbin": true,
+	"/srv": true, "/sys": true, "/tmp": true, "/usr": true, "/var": true,
+}
+
+// validateWorkspaceRoot 校验工作区根目录足够「专用」。
+//
+// 只校验非空 + 绝对路径是不够的：配成 "/" 或 "/opt" 时，孤儿清扫会把
+// 下面所有顶层目录都当候选删掉。要求深度至少两层（/opt/lathe/workspaces
+// 这种形状），并显式拒绝一批系统目录。
+func validateWorkspaceRoot(root string) error {
+	clean := filepath.Clean(root)
+	if workspaceRootBlocklist[clean] {
+		return fmt.Errorf(
+			"config: WorkspaceRoot 不能是 %q —— 收割机会清掉根下无人认领的顶层目录", clean)
+	}
+	// 去掉开头与结尾的分隔符后按段计数："/opt/lathe/workspaces" 是 3 段。
+	// 要求 >= 2 段：一层（"/lathe"）意味着根下直接放的就是系统级目录。
+	trimmed := strings.Trim(clean, string(filepath.Separator))
+	if trimmed == "" || !strings.Contains(trimmed, string(filepath.Separator)) {
+		return fmt.Errorf(
+			"config: WorkspaceRoot 至少要是两层目录（如 /opt/lathe/workspaces），得到 %q", root)
+	}
+	return nil
+}
+
+// ReapingEnabled 报告 worktree 收割机是否启用（默认启用）。
+func (c Config) ReapingEnabled() bool { return c.ReapEnabled != "false" }
+
+// ReapingDryRun 报告收割机是否只干跑（默认关）。
+func (c Config) ReapingDryRun() bool { return c.ReapDryRun == "true" }
+
 // Load 从环境变量读取配置并校验。
 func Load() (Config, error) {
 	c := Config{
@@ -136,6 +230,10 @@ func Load() (Config, error) {
 		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
 		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
+		WorktreeTTL:         envDuration("LATHE_WORKTREE_TTL", 72*time.Hour),
+		ReapInterval:        envDuration("LATHE_REAP_INTERVAL", time.Hour),
+		ReapEnabled:         env("LATHE_REAP_ENABLED", "true"),
+		ReapDryRun:          env("LATHE_REAP_DRY_RUN", "false"),
 		SettingSources:      env("LATHE_SETTING_SOURCES", "project"),
 		FixAttempts:         envInt("LATHE_FIX_ATTEMPTS", 2),
 		TriageChannel:       env("LATHE_TRIAGE_CHANNEL", ""),
@@ -175,8 +273,30 @@ func (c Config) Validate() error {
 	if !strings.HasPrefix(c.WorkspaceRoot, "/") {
 		return fmt.Errorf("config: WorkspaceRoot 必须是绝对路径，得到 %q", c.WorkspaceRoot)
 	}
+	if err := validateWorkspaceRoot(c.WorkspaceRoot); err != nil {
+		return err
+	}
 	if c.AgentTimeout <= 0 {
 		return fmt.Errorf("config: AgentTimeout 必须为正，得到 %v", c.AgentTimeout)
+	}
+	// TTL 与扫描间隔都必须过下限。孤儿清扫的安全完全建立在「mtime 比
+	// cutoff 老才删」之上，而 cutoff = now - TTL —— TTL 太短，先建目录、
+	// 后写任务行那个无人认领的窗口就盖不住了。
+	if c.WorktreeTTL < MinWorktreeTTL {
+		return fmt.Errorf(
+			"config: WorktreeTTL 不得小于 %v，得到 %v。"+
+				"TTL 是孤儿清扫的安全机制而非单纯的保留时长：太短会把「刚建出来、还没记进任务行」的在途现场当孤儿删掉。"+
+				"想清存量目录请用 LATHE_REAP_DRY_RUN=true 先干跑一轮看清候选",
+			MinWorktreeTTL, c.WorktreeTTL)
+	}
+	if c.ReapInterval <= 0 {
+		return fmt.Errorf("config: ReapInterval 必须为正，得到 %v", c.ReapInterval)
+	}
+	if err := validateBoolEnv("LATHE_REAP_ENABLED", c.ReapEnabled); err != nil {
+		return err
+	}
+	if err := validateBoolEnv("LATHE_REAP_DRY_RUN", c.ReapDryRun); err != nil {
+		return err
 	}
 	// BaseURL 可以不配（此时由 HTTPAddr 兜底并告警），但配了就必须是
 	// 能直接放进邮件正文的绝对地址 —— 拼错的链接要在启动时炸，

@@ -169,7 +169,9 @@ type fakeWorktrees struct{}
 func (fakeWorktrees) Inspect(ctx context.Context, providerRepo, path, branch, base string) *runner.WorktreeState {
 	return nil
 }
-func (fakeWorktrees) Discard(ctx context.Context, providerRepo, path, branch string) {}
+func (fakeWorktrees) Discard(ctx context.Context, providerRepo, path, branch string) runner.DiscardResult {
+	return runner.DiscardResult{}
+}
 
 // testQueue 造一个可跑的 queue：真实的 store/task.Machine（连测试库），
 // 假的 pipeline（不碰 git/agent/Linear/GitHub）。

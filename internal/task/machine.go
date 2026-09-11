@@ -422,6 +422,40 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 	return out, rows.Err()
 }
 
+// ListReapableTasks 返回可被 TTL 收割机回收现场的任务（T6）：
+// 已进终态、还留着 worktree_path、且最后一次变更早于 olderThan。
+//
+// 时间基准用 updated_at 而不是 at/created_at：现场该不该回收取决于
+// 「多久没人动过它」，而不是「任务是什么时候建的」。tasks 上有
+// BEFORE UPDATE 触发器维护这一列。
+//
+// 只挑终态是硬约束：failed 可以转回 queued（人随时可能重试续跑，
+// 而 D4 保留现场的全部目的就是让人能接手），非终态的现场绝不能碰。
+func (m *Machine) ListReapableTasks(ctx context.Context, olderThan time.Time) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE state = ANY($1)
+		  AND worktree_path IS NOT NULL AND worktree_path <> ''
+		  AND updated_at < $2
+		ORDER BY id`,
+		[]string{string(StateMerged), string(StateFailed), string(StateCancelled)}, olderThan)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询可回收现场失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取可回收现场失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ActiveByIssueID 返回某属主名下、指定 Linear issue 的所有非终结任务（T7）。
 //
 // 谓词抄 flow/service.go 那条「同 issue 的活任务」查询，改成按
@@ -452,6 +486,159 @@ func (m *Machine) ActiveByIssueID(ctx context.Context, userID int64, issueID str
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ReferencedWorktreePaths 返回**所有**任务行里非空的 worktree_path，
+// 不分状态。
+//
+// 给 T6 收割机的孤儿目录清扫用：磁盘上存在、却没有任何任务行指向它的
+// 目录，DB 驱动的回收路径结构上看不见（`ListReapableTasks` 要求
+// worktree_path 非空）。实测就有这种目录 —— 任务 649（cr-1367）是 failed
+// 但 worktree_path 为 NULL，磁盘上的目录因此永远没人回收。
+//
+// 刻意不按状态过滤：终态任务引用的路径由主回收路径处理，这里只回答
+// 「这个目录有没有人认领」这一个问题，别的判断留给调用方。
+//
+// 主回收路径（reapTask）**不要**用这个集合做删盘前的最后一道闸：它把
+// 终态任务自己也算作认领者，而主路径恰恰就是在回收终态任务的路径。
+// 那道闸要的是 ClaimedWorktreePaths（只算非终态）。
+func (m *Machine) ReferencedWorktreePaths(ctx context.Context) ([]string, error) {
+	return m.queryPaths(ctx, `SELECT worktree_path FROM tasks
+		 WHERE worktree_path IS NOT NULL AND worktree_path <> ''`)
+}
+
+// ClaimedWorktreePaths 返回**非终态**任务当前认领的 worktree_path 集合。
+//
+// 这是收割机删盘前的最后一道闸（B1）：目录名只由 issue key 决定
+// （worktreeDirName），任何一次尝试、任何仓库、任何用户都落在同一个
+// <root>/<issue-key>。于是完全可能「任务 A 是 failed、还留着 worktree_path，
+// 而任务 B（同 issue 重开，或另一个 repo/user 的同一个 key）正在那个目录里
+// 跑」—— 此时 tasks_one_active_per_issue 拦不住（它只约束活任务之间，
+// 且把已进终态的旧行排除在索引之外），ListReapableTasks 照样把 A 交出来。
+//
+// 只算非终态：终态行引用的路径正是主路径要回收的对象，把它们算进来
+// 会让主路径永远不敢动手。在途任务是唯一需要保护的对象。
+//
+// 与孤儿清扫的关系：孤儿清扫用「有没有任何行认领」判无主；主路径用
+// 「有没有活任务认领」判能不能删。两个问题不同，用两个查询。
+func (m *Machine) ClaimedWorktreePaths(ctx context.Context) ([]string, error) {
+	return m.queryPaths(ctx, `SELECT worktree_path FROM tasks
+		 WHERE worktree_path IS NOT NULL AND worktree_path <> ''
+		   AND state NOT IN ('merged', 'failed', 'cancelled')`)
+}
+
+// queryPaths 是上面两个查询的公共执行体。
+func (m *Machine) queryPaths(ctx context.Context, sql string) ([]string, error) {
+	rows, err := m.pool.Query(ctx, sql)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询已引用的工作区路径失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("task: 读取工作区路径失败: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ErrReapClaimLost 表示这一次现场认领失败：任务行在候选快照之后被动过
+// （重试把它改回了 queued、worktree_path 被换掉、updated_at 变了），
+// 或已被另一轮收割认领。调用方必须**跳过磁盘操作**。
+var ErrReapClaimLost = errors.New("task: 现场认领失败（任务行已变动或已被认领）")
+
+// ClaimForReap 判断这一次收割是否还能认领该任务，并按需落账。
+//
+// 守卫的四个条件（全部满足才算认领成功）：
+//
+//   - state 仍是终态（failed → queued 的重试会让它失配）
+//   - worktree_path 仍等于快照里看到的那个（换成别的路径就失配）
+//   - updated_at 仍等于快照里看到的值（任何一次写入都会推进它——
+//     Transition 与本方法都会，由数据库触发器维护）
+//   - worktree_claimed_at IS NULL（幂等：同一行不被重复认领）
+//
+// 为什么用 updated_at 等值判定而不是时间不等式：要挡的是「快照之后有人
+// 动过这一行」，等值没有可乘之机，也不依赖时钟精度或时区换算。
+//
+// 两个阶段，因为「能不能删」和「删完了没有」是两件事：
+//
+//	commit == false（探测）：只读 FOR UPDATE 校验四个条件，不改任何状态。
+//	  收割机在删盘前用它确认「这条路径还归本次收割处置」，同时**不**
+//	  动 worktree_path —— 万一随后因为脏工作区/未推送分支决定保留现场，
+//	  任务行里的路径还在，孤儿清扫就不会把它当无主目录收走。
+//	commit == true（落账）：在同一个事务里置空 worktree_path、盖认领时刻、
+//	  写一条 task_events。删盘**之后**才调用它，让账目永远不多于事实。
+//
+// 返回 (false, nil) 表示认领失败，调用方必须跳过磁盘操作。返回
+// (false, err) 表示查询/落账出错，同样不能碰磁盘。
+//
+// 记账（commit 阶段）写的是非状态转移事件：from_state == to_state ==
+// 当前状态，事件流靠 payload 的 kind 区分。回收是删磁盘的动作，必须能
+// 在任务详情页答出「现场是谁在什么时候按什么规则删的」。
+func (m *Machine) ClaimForReap(ctx context.Context, id int64, path string, snapshotUpdatedAt time.Time, commit bool, actor string, reason map[string]any) (bool, error) {
+	if actor == "" {
+		actor = "system"
+	}
+
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("task: 开启事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 行锁 + 四项守卫的只读校验。FOR UPDATE 让并发的 Transition
+	//（人点重试）与本次认领串行化：谁先拿到锁谁先说话，后到的会看到
+	// 前者改完的状态，据此失配退出。
+	var (
+		fromState string
+		claimedAt *time.Time
+		updatedAt time.Time
+		curPath   *string
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT state, worktree_claimed_at, updated_at, worktree_path
+		FROM tasks WHERE id = $1 FOR UPDATE`, id).Scan(&fromState, &claimedAt, &updatedAt, &curPath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("task: 锁定任务 %d 失败: %w", id, err)
+	}
+
+	st := State(fromState)
+	if !st.Terminal() ||
+		curPath == nil || *curPath != path ||
+		claimedAt != nil ||
+		!updatedAt.Equal(snapshotUpdatedAt) {
+		return false, nil
+	}
+
+	if !commit {
+		// 探测阶段：什么都不改，直接回滚（defer 里的 Rollback）。
+		return true, nil
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks SET worktree_path = NULL, worktree_claimed_at = now()
+		WHERE id = $1`, id); err != nil {
+		return false, fmt.Errorf("task: 认领任务 %d 的现场失败: %w", id, err)
+	}
+
+	payload := map[string]any{"kind": "worktree_reaped"}
+	for k, v := range reason {
+		payload[k] = v
+	}
+	if err := insertEvent(ctx, tx, id, &st, st, actor, payload); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("task: 提交现场认领失败: %w", err)
+	}
+	return true, nil
 }
 
 // HasLiveDependentOnBranch 报告是否存在非终结状态的任务，其当前

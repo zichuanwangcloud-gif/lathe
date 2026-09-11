@@ -500,9 +500,23 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	resume := rc.plan != nil && rc.plan.Entry == EntryImplement
 
 	if !resume {
+		// 活任务认领：目录名带 task_id 之后同任务/同 issue 的撞名已经
+		// 消失，但老命名留下的存量目录仍可能被另一个在途任务占着 ——
+		// Create 会把它当尸体回收。把「谁在用哪条路径」交给 Create，
+		// 让它拒绝接管在途现场，而不是删掉别人的工作区。
+		//
+		// 查询失败只 warn 不判死：此时 Create 退回旧行为（把同名目录
+		// 当尸体），而 tasks_one_active_per_issue 与新目录名已经把绝大
+		// 多数撞名挡住了。
+		claimed, cerr := p.Tasks.ClaimedWorktreePaths(rc.ctx)
+		if cerr != nil {
+			slog.Warn("建工作区前查活任务占用失败（继续，Create 退回旧行为）",
+				"task", rc.tk.ID, "err", cerr)
+		}
 		wt, err := p.Worktrees.Create(rc.ctx, CreateParams{
 			Repo: rc.params.Repo, CloneURL: rc.params.CloneURL,
 			Kind: rc.kind, IssueKey: rc.issue.Identifier, Title: rc.issue.Title,
+			TaskID: rc.tk.ID, ClaimedPaths: claimed,
 		})
 		if err != nil {
 			return p.fail(rc, StageCreateWorktree, err)
