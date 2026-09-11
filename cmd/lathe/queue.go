@@ -394,6 +394,13 @@ func lastEventString(events []task.Event, key string) string {
 // 由 runOneClaimed 从事件流回读得到（见其注释）。
 func (q *queue) planRetry(ctx context.Context, tk *task.Task, repoCfg runner.RepoConfig, mode string, interruptedState task.State) runner.RetryPlan {
 	m := runner.RetryMode(mode)
+	// 这里用 Valid 而不是 UserSelectable，是有意的【不对称】，别顺手
+	// 改成后者：此处 mode 不是外部入参，是从任务事件流里回读的、平台
+	// 自己写下的值。approved 只有 approveTask 会写（它先验属主、再验
+	// 任务当前确实停在 awaiting_approval），retryTask 那条路已被
+	// UserSelectable 挡住。要是在这里也把 approved 判掉、降级成 auto，
+	// 人点了确认反而会重跑实现与验证 —— 既把 token 重烧一遍，又让最终
+	// 开出 PR 的 diff 不再是人点头时看的那一份。
 	if !m.Valid() {
 		m = runner.RetryAuto
 	}
