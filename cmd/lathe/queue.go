@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -133,6 +134,15 @@ func (q *queue) Requeue(ctx context.Context, taskID int64, mode string) error {
 // actor 口径照 mergepoll 的 "system:merge-poll"，写成 "system:webhook" ——
 // 审计流里要能看出这次取消是系统替人做的决定，不是人自己点的。
 func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, issueKey string) ([]int64, error) {
+	// 空 issueID 直接拒绝。这条路径由外部 webhook 触发，构造一个
+	// {"type":"Issue","action":"remove","data":{}} 就能让空串进到
+	// `WHERE linear_issue_id = ''` —— 眼下打不中任何行（存量是 NULL，
+	// 而 `= ''` 不匹配 NULL），但「打不中」是数据凑巧，不是防线。
+	if strings.TrimSpace(issueID) == "" {
+		slog.Warn("取消联动收到空 issueID，忽略", "owner", ownerUserID, "issue", issueKey)
+		return nil, nil
+	}
+
 	active, err := q.tasks.ActiveByIssueID(ctx, ownerUserID, issueID)
 	if err != nil {
 		return nil, err
@@ -166,6 +176,15 @@ func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, 
 		if len(blocked) > 0 {
 			ids := make([]int64, 0, len(blocked))
 			for _, b := range blocked {
+				// 与 pipeline.fail 的同名防御对称：PropagateBlocked 的递归
+				// CTE 只按 depends_on 遍历，全程不带 user_id 过滤。同一 flow
+				// 下的任务理应同属主，出现不一致说明建图或数据有问题 ——
+				// 先告警观察，不静默假设。这条调用尤其需要它：它挂在**外部
+				// 可触发**的 webhook 上，而 pipeline.fail 那条不是。
+				if b.UserID != tk.UserID {
+					slog.Warn("取消传播发现跨属主后继", "task", tk.ID, "taskOwner", tk.UserID,
+						"blockedTask", b.ID, "blockedOwner", b.UserID)
+				}
 				ids = append(ids, b.ID)
 			}
 			slog.Info("issue 取消已传播给后继", "task", tk.ID, "blocked", ids)

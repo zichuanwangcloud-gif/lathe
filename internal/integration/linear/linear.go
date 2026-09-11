@@ -506,6 +506,16 @@ func (e *WebhookEvent) IsLabelTriggered(label string) bool {
 // hasLabel 报告 issue 当前是否带这个标签（按名字，大小写不敏感）。
 func (e *WebhookEvent) hasLabel(label string) bool {
 	want := strings.ToLower(strings.TrimSpace(label))
+	// trim 之后为空则一律不匹配。IsLabelTriggered 判的是 `label == ""`，
+	// 纯空白的 " " 能穿过那道判断，到这里 want 变成空串，于是任何**空名**
+	// 标签都会命中 —— 等于在没配置的部署上悄悄打开自动接单。
+	//
+	// 生产上够不到（唯一入口 settings.WebhookTriggerLabel 与写入侧 admin
+	// 各自 TrimSpace 过），但「关闭」这条语义不该寄托在两个上游都记得
+	// trim；判据放在使用点才是真防线。
+	if want == "" {
+		return false
+	}
 	for _, l := range e.Data.Labels {
 		if strings.ToLower(strings.TrimSpace(l.Name)) == want {
 			return true

@@ -100,3 +100,26 @@ func TestLabelMatchingUsesNameNotID(t *testing.T) {
 		t.Error("不该拿 labelIds 里的 UUID 当标签名匹配")
 	}
 }
+
+// TestIsLabelTriggeredIgnoresWhitespaceOnlyLabel 钉住「关闭」这条语义的纵深防御。
+//
+// IsLabelTriggered 判的是 label == ""，纯空白的 " " 穿得过去；若 hasLabel
+// 不自己兜一道，want 会变成空串并匹配上任何**空名**标签 —— 在一个没配置
+// 标签的部署上悄悄打开自动接单。生产上靠上游两道 TrimSpace 够不到这里，
+// 这条测试保的是「以后有人新加一个忘了 trim 的入口」。
+func TestIsLabelTriggeredIgnoresWhitespaceOnlyLabel(t *testing.T) {
+	// issue 上带着空名与纯空白名的标签（Linear 不该产生这种数据，
+	// 但判定逻辑不能依赖对端的自律）。
+	e := ev("create", []string{"", "   "}, "", nil)
+	for _, label := range []string{" ", "   ", "\t", "\n"} {
+		if e.IsLabelTriggered(label) {
+			t.Errorf("标签配成纯空白 %q 时不该接单（等同未配置）", label)
+		}
+	}
+
+	// 反向：正常标签仍然要能命中，别把防御做成一刀切。
+	ok := ev("create", []string{"lathe:go"}, "", nil)
+	if !ok.IsLabelTriggered(" lathe:go ") {
+		t.Error("正常标签（配置值两侧带空白）仍应命中")
+	}
+}
