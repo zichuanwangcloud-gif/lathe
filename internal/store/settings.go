@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -21,6 +22,17 @@ const (
 	DefaultPreviewMemThreshold  = 90
 	DefaultPreviewDiskThreshold = 90
 )
+
+// SettingWebhookTriggerLabel 是标签驱动接单的标签名（T7）。
+//
+// 消费方：cmd/lathe 的 webhookResolver —— 每次解析投递目标时现取，
+// 改完即刻生效、不用重启服务。
+//
+// **默认空串，即该能力默认关闭。** 这是「未配置时行为与现状一致」的
+// 实现（T7-AC3）：不能让存量部署因为升级就突然开始按标签接单 ——
+// 某个仓库可能早就在用 lathe:go 这个标签表示别的意思。
+// 想开就在系统设置里填上标签名。
+const SettingWebhookTriggerLabel = "webhook_trigger_label"
 
 // SettingFlowMaxChainLength 是链长约束（PRD 07 §F3.3）的系统设置键名：
 // 一条 depends_on 链允许的最大深度。消费方：internal/flow.Service —— 建
@@ -102,4 +114,18 @@ func (s *Store) FlowMaxChainLength(ctx context.Context) (int, error) {
 		return DefaultFlowMaxChainLength, nil
 	}
 	return n, nil
+}
+
+// WebhookTriggerLabel 现取标签驱动接单的标签名（T7）。
+//
+// 未配置或读失败时返回空串 —— 空串的语义是「该能力关闭」，
+// 所以「读不出来」和「没配」可以合并处理：两种情况下都不该接单。
+// 这与 PreviewThresholds「值损坏回退默认」是同一套立场：
+// 配置读不出来时退到最保守的行为，而不是报错让主流程挂掉。
+func (s *Store) WebhookTriggerLabel(ctx context.Context) string {
+	v, err := s.Setting(ctx, SettingWebhookTriggerLabel)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(v)
 }

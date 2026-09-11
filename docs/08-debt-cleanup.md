@@ -70,7 +70,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T4 | `verifications.log_ref` 落盘写入 | C | **DONE** |
 | T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
 | T6 | worktree TTL 收割机 | E | TODO |
-| T7 | webhook 联动：标签接单 + issue 取消联动 | F | TODO |
+| T7 | webhook 联动：标签接单 + issue 取消联动 | F | **DONE** |
 | T8 | per-task compose 隔离（验证阶段） | G | TODO |
 
 ## 3. PR 拆分与理由
@@ -651,3 +651,59 @@ repos / tasks / task_events / verifications / agent_events。
 
   门禁：注入 16 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
   `go vet` 与 `gofmt` 干净。
+
+- 2026-09-09：**T7 实现完成**（PR F，分支 `feat/webhook-triggers`，base 在 A 上）。
+  三个关键判断：
+  1. **取消分流必须在接单闸门之前。** 取消事件不是指派事件 —— 放在闸门之后
+     会被当成「非指派事件」直接 `ignored` 掉，整个功能静默失效。
+  2. **`completed` 刻意不算取消。** 只认 Linear 的 `canceled` 状态类型
+     （和 `remove`）。人手工把 issue 标成完成，不代表平台任务该作废 ——
+     那个任务可能正在跑，或已开出 PR 等人合并。判据用**状态类型**而非
+     状态名：名字是每个团队自己起的（Cancelled / 废弃 / 不做了），
+     类型才是 Linear 的稳定枚举。
+  3. **标签默认空串即关闭**（AC3 的实现方式）。默认给 `lathe:go` 的话，
+     某个早就在用这个标签表示别的意思的仓库会在升级后突然自动接单。
+     判定函数里 `label == ""` 直接返回 false。
+
+  payload 侧：`Labels`/`LabelIDs` 原本**根本不在结构体里**，得先加。
+  判定用**标签 name 而非 labelIds 里的 UUID**（人在界面上打的是名字），
+  且 `update` 事件必须看 `updatedFrom` 里有没有 `labelIds` ——
+  否则 issue 停在带标签状态时改个标题就会重复接单。这套路与现成的
+  `IsAssignedTo` 看 `assigneeId` 完全一致。
+
+  **AC6 的能力边界如实写进了代码与文档**：取消**只改数据库状态，不会停下
+  正在跑的 agent** —— runner 全包没有任何地方在执行中途回读 task state。
+  在途 agent 会白跑完一轮，然后在下一次状态转移时因 `cancelled` 是无出边
+  终态而被 `Validate` 拒绝。没有假装取消是即时的；真正的取消信号传播
+  列为后续项。
+
+  标签名走 `system_settings`（改完即刻生效，不用重启），并在「系统设置」页
+  加了输入框 —— 否则又是一个「有设置项但没地方填」的反面。
+  管理端刻意**不对标签名做格式校验**：Linear 的标签名可以是任意文本
+  （含空格、中文、emoji），定规则只会把合法标签挡在外面。
+
+  测试：18 条（11 条既有 + 7 条新增）。AC3 点名的两个回归护栏
+  （`TestWebhookIgnoresNonAssignment`、`TestWebhookIgnoresOtherUsersIssue`）
+  仍绿；AC5 那条「伪造签名的取消事件必须被拒绝」—— 取消分流放在验签
+  **之后**，所以没有在 ingress 上开新的免验签路径。
+  另有 linear 层 20+ 表驱动判定用例与 task 层跨用户隔离断言。
+
+  门禁：注入 23 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿。
+
+  **合并前审计后的加固（三处，均为「目前够不到但防线该在使用点」）**：
+  ① `CancelForIssue` 拒绝空 `issueID` —— 构造 `data:{}` 能让空串进到
+  `WHERE linear_issue_id = ''`，眼下打不中是因为存量为 NULL 而 `= ''`
+  不匹配 NULL，那是数据凑巧不是防线；② 取消传播补跨属主告警 ——
+  `PropagateBlocked` 的递归 CTE 不带 `user_id` 过滤，`pipeline.fail`
+  对同一调用有告警而这条没有，且这条挂在**外部可触发**的 webhook 上，
+  更需要；③ `hasLabel` 在 trim 后为空时一律不匹配 —— `IsLabelTriggered`
+  只判 `label == ""`，纯空白的 `" "` 穿得过去并让**任何空名标签**命中，
+  等于在没配置的部署上悄悄打开接单，正是 AC3 要保证的语义。生产上靠
+  两道上游 `TrimSpace` 够不到，但这条语义不该寄托在两个上游都记得 trim。
+
+  两条已知项未在本 PR 收口，如实记账：`linear_issue_id` 无索引（取消路径
+  在 webhook 热路径上全表扫 `tasks`，属性能项，加索引要新迁移会与同期 PR
+  抢编号）；AC6 披露不全 —— 取消发生在 verifying 阶段时在途 agent 仍会
+  真的开出 PR（`CreatePR` 在 `Transition(pr_open)` 之前），随后转移被拒，
+  于是一个已开的 PR 挂在 `cancelled` 任务上，而 MergePoller 只扫 `pr_open`
+  所以它永不被回收。这属于「取消信号传播」后续项，不是本 PR 能收口的。

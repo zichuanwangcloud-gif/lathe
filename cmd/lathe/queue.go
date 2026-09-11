@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -117,6 +118,80 @@ func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKe
 // 不在这里消费。
 func (q *queue) Requeue(ctx context.Context, taskID int64, mode string) error {
 	return nil
+}
+
+// CancelForIssue 实现 httpapi.TaskEnqueuer：issue 被取消时联动取消在途任务（T7）。
+//
+// **语义边界（必须知道，AC6）**：这里只改数据库状态，**不会停下正在跑的
+// agent** —— runner 全包没有任何地方在执行中途回读 task state。后果是：
+//
+//   - 在途 agent 会继续跑到自己结束（白烧一轮 token）
+//   - 它跑完时会调 Transition 转下一状态，而 cancelled 是无出边终态，
+//     那次转移会被 Validate 拒绝并返回错误
+//
+// 本轮接受这个行为并把它写清楚，而不是假装取消是即时的。真正的取消信号
+// 传播（让 pipeline 在阶段边界回读状态、主动收手）列为后续项。
+//
+// actor 口径照 mergepoll 的 "system:merge-poll"，写成 "system:webhook" ——
+// 审计流里要能看出这次取消是系统替人做的决定，不是人自己点的。
+func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, issueKey string) ([]int64, error) {
+	// 空 issueID 直接拒绝。这条路径由外部 webhook 触发，构造一个
+	// {"type":"Issue","action":"remove","data":{}} 就能让空串进到
+	// `WHERE linear_issue_id = ''` —— 眼下打不中任何行（存量是 NULL，
+	// 而 `= ''` 不匹配 NULL），但「打不中」是数据凑巧，不是防线。
+	if strings.TrimSpace(issueID) == "" {
+		slog.Warn("取消联动收到空 issueID，忽略", "owner", ownerUserID, "issue", issueKey)
+		return nil, nil
+	}
+
+	active, err := q.tasks.ActiveByIssueID(ctx, ownerUserID, issueID)
+	if err != nil {
+		return nil, err
+	}
+	if len(active) == 0 {
+		return nil, nil
+	}
+
+	reason := fmt.Sprintf("Linear issue %s 已被取消", issueKey)
+	var cancelled []int64
+	for _, tk := range active {
+		if _, err := q.tasks.Transition(ctx, tk.ID, task.StateCancelled, "system:webhook",
+			&task.TransitionOpts{
+				FailureReason: &reason,
+				Payload:       map[string]any{"reason": "issue_cancelled", "issue": issueKey},
+			}); err != nil {
+			// 单个任务转移失败不该毁掉整批：别的任务照样该取消。
+			// 常见原因是这一瞬间它自己刚进了终态（与 pipeline 抢同一行）。
+			slog.Warn("联动取消任务失败（继续处理其余）", "task", tk.ID, "issue", issueKey, "err", err)
+			continue
+		}
+		cancelled = append(cancelled, tk.ID)
+
+		// 失败传播：这个任务作废了，depends_on 链上排队等它的后继
+		// 也没有意义了（与 pipeline.fail 和 mergepoll 的取消路径一致）。
+		blocked, perr := q.tasks.PropagateBlocked(ctx, tk.ID, reason)
+		if perr != nil {
+			slog.Warn("取消联动的阻塞传播失败", "task", tk.ID, "err", perr)
+			continue
+		}
+		if len(blocked) > 0 {
+			ids := make([]int64, 0, len(blocked))
+			for _, b := range blocked {
+				// 与 pipeline.fail 的同名防御对称：PropagateBlocked 的递归
+				// CTE 只按 depends_on 遍历，全程不带 user_id 过滤。同一 flow
+				// 下的任务理应同属主，出现不一致说明建图或数据有问题 ——
+				// 先告警观察，不静默假设。这条调用尤其需要它：它挂在**外部
+				// 可触发**的 webhook 上，而 pipeline.fail 那条不是。
+				if b.UserID != tk.UserID {
+					slog.Warn("取消传播发现跨属主后继", "task", tk.ID, "taskOwner", tk.UserID,
+						"blockedTask", b.ID, "blockedOwner", b.UserID)
+				}
+				ids = append(ids, b.ID)
+			}
+			slog.Info("issue 取消已传播给后继", "task", tk.ID, "blocked", ids)
+		}
+	}
+	return cancelled, nil
 }
 
 // Reconcile 在启动时把"进程重启=agent 子进程已死"这一事实同步进状态机

@@ -416,6 +416,15 @@ type WebhookEvent struct {
 			Name string `json:"name"`
 			Type string `json:"type"`
 		} `json:"state"`
+		// LabelIDs / Labels 是 T7 标签驱动接单需要的字段。
+		// Linear 的 issue webhook 同时给这两种形态（前者只有 id，
+		// 后者带 name），按 name 判定更符合人的直觉 ——
+		// 人在界面上打的是「lathe:go」这个名字，不是一个 UUID。
+		LabelIDs []string `json:"labelIds"`
+		Labels   []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"labels"`
 	} `json:"data"`
 	UpdatedFrom map[string]any `json:"updatedFrom"`
 }
@@ -462,6 +471,91 @@ func (e *WebhookEvent) IsAssignedTo(userID string) bool {
 	default:
 		return false
 	}
+}
+
+// IsLabelTriggered 判断该事件是否表示 issue 被打上了触发标签（T7）。
+//
+// label 为空时**恒返回 false** —— 这是「未配置时行为与现状一致」的实现：
+// 不能让存量部署因为升级就突然开始按标签接单，尤其是某个仓库可能早就
+// 在用 lathe:go 这个标签表示别的意思。
+//
+// 判定套路与 IsAssignedTo 对齐：create 直接算，update 必须看
+// updatedFrom 里有没有 labelIds —— 否则 issue 的任何一次编辑
+// （改标题、改描述）都会因为标签还在而重复接单。
+func (e *WebhookEvent) IsLabelTriggered(label string) bool {
+	if e == nil || e.Type != "Issue" || label == "" {
+		return false
+	}
+	if !e.hasLabel(label) {
+		return false
+	}
+	switch e.Action {
+	case "create":
+		return true
+	case "update":
+		if e.UpdatedFrom == nil {
+			return false
+		}
+		_, changed := e.UpdatedFrom["labelIds"]
+		return changed
+	default:
+		return false
+	}
+}
+
+// hasLabel 报告 issue 当前是否带这个标签（按名字，大小写不敏感）。
+func (e *WebhookEvent) hasLabel(label string) bool {
+	want := strings.ToLower(strings.TrimSpace(label))
+	// trim 之后为空则一律不匹配。IsLabelTriggered 判的是 `label == ""`，
+	// 纯空白的 " " 能穿过那道判断，到这里 want 变成空串，于是任何**空名**
+	// 标签都会命中 —— 等于在没配置的部署上悄悄打开自动接单。
+	//
+	// 生产上够不到（唯一入口 settings.WebhookTriggerLabel 与写入侧 admin
+	// 各自 TrimSpace 过），但「关闭」这条语义不该寄托在两个上游都记得
+	// trim；判据放在使用点才是真防线。
+	if want == "" {
+		return false
+	}
+	for _, l := range e.Data.Labels {
+		if strings.ToLower(strings.TrimSpace(l.Name)) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// IsCancelled 判断该事件是否表示 issue 被取消（T7 取消联动）。
+//
+// 判据是 Linear 的工作流状态类型 canceled，而不是状态名 ——
+// 状态名是每个团队自己起的（「Cancelled」「废弃」「不做了」），
+// 类型才是 Linear 的稳定枚举
+// （triage/backlog/unstarted/started/completed/canceled）。
+//
+// 刻意**不把 completed 也算作取消**：issue 被人手工标记完成，
+// 不代表平台这边的任务该作废 —— 那个任务可能正在跑，或者已经开出了 PR
+// 等人合并。「取消」是明确的作废意图，「完成」不是。
+//
+// remove（issue 被删）也算：目标都不存在了，在途任务没有意义。
+func (e *WebhookEvent) IsCancelled() bool {
+	if e == nil || e.Type != "Issue" {
+		return false
+	}
+	if e.Action == "remove" {
+		return true
+	}
+	if e.Action != "update" || e.Data.State == nil {
+		return false
+	}
+	if strings.ToLower(e.Data.State.Type) != "canceled" {
+		return false
+	}
+	// 与 IsAssignedTo 同理：必须是【这次】改的状态，否则 issue 停在
+	// 取消态时的任何一次编辑都会重复触发取消。
+	if e.UpdatedFrom == nil {
+		return false
+	}
+	_, changed := e.UpdatedFrom["stateId"]
+	return changed
 }
 
 func truncate(s string, n int) string {
