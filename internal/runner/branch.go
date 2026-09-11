@@ -43,6 +43,12 @@ type RepoConfig struct {
 	// VerifyTierOverride 强制验证档位（light|heavy）；空表示按 §5.1 规则
 	// 在 diff 产出后自动判定。对应 repos.verify_tier_override。
 	VerifyTierOverride string
+	// VerifyInfra 是验证隔离栈要起的依赖（T8），取值是
+	// internal/preview.InfraCatalog 的键。对应 repos.verify_infra。
+	//
+	// **为空即无隔离栈**，验证命令直接用宿主环境跑 —— 与本字段引入之前
+	// 完全一致。绝大多数仓库的测试不需要外部依赖，不该被强迫配置什么。
+	VerifyInfra []string
 	// BaseRefOverride 非空时代表"这是栈式 PR 的后继任务，应该从这个分支
 	// 分叉，而不是从 repos 配置的默认分支"，值来自 tasks.base_ref，由
 	// 调度器在派发前填充——本文件不关心是谁填的。

@@ -1,8 +1,11 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,4 +147,71 @@ func TestPipelineAgentVisibilityFailPath(t *testing.T) {
 	if len(rec.summaries) != 1 || !strings.Contains(rec.summaries[0], "没改代码") {
 		t.Errorf("失败路径的摘要也应落库: %v", rec.summaries)
 	}
+}
+
+// ---------------------------------------------------------------- T8 降级留痕
+
+// ★ 降级留痕：没配 AgentEvents 时也不该完全无声。
+//
+// 原实现 noteStackSkipped 第一行就是 `if p.AgentEvents == nil { return }`
+// —— 于是没配事件记录器的部署里，降级一个字都不留。静默降级是最坏的
+// 结果：人看到的只是一次「验证通过」，无从知道它跑在共享环境上。
+//
+// 修法有两条腿：日志（这里）+ Report 挂标记进回帖（stack_test.go 里
+// 的 TestSummaryShowsStackDegradedWarning）。
+func TestNoteStackSkippedWithoutRecorderStillLogs(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	p := &Pipeline{} // AgentEvents 为 nil：这正是原实现静默的那条路
+	p.noteStackSkipped(context.Background(), 77,
+		fmt.Errorf("%w: 磁盘占用 95%% 已达阈值 90%%", ErrStackOverThreshold))
+
+	out := buf.String()
+	if !strings.Contains(out, "共享环境") {
+		t.Errorf("没配事件记录器时也必须留下日志，得到：%q", out)
+	}
+	if !strings.Contains(out, "77") {
+		t.Errorf("日志应带任务号，得到：%q", out)
+	}
+}
+
+// 配了记录器时，事件体里应带上与回帖同一句话（两处别各写一份，会漂）。
+func TestNoteStackSkippedEventCarriesSharedNote(t *testing.T) {
+	rec := &captureEvents{}
+	p := &Pipeline{AgentEvents: rec}
+	p.noteStackSkipped(context.Background(), 88,
+		fmt.Errorf("%w: 内存占用 95%% 已达阈值 90%%", ErrStackOverThreshold))
+
+	if len(rec.entries) != 1 {
+		t.Fatalf("应落一条事件，实际 %d 条", len(rec.entries))
+	}
+	body := rec.entries[0].Body
+	if !strings.Contains(body, StackDegradedNote) {
+		t.Errorf("事件体应复用与回帖同一句话（常量 StackDegradedNote），得到：%q", body)
+	}
+	if !strings.Contains(body, "内存占用") {
+		t.Errorf("事件体应带上真实原因，得到：%q", body)
+	}
+	if rec.phase != "verify" {
+		t.Errorf("phase 应为 verify，得到 %q", rec.phase)
+	}
+}
+
+// captureEvents 是 AgentEventRecorder 的最小假件。
+type captureEvents struct {
+	phase   string
+	entries []agent.Entry
+}
+
+func (c *captureEvents) InsertAgentEvents(ctx context.Context, taskID int64, phase string, entries []agent.Entry) error {
+	c.phase = phase
+	c.entries = append(c.entries, entries...)
+	return nil
+}
+
+func (c *captureEvents) SetAgentSummary(context.Context, int64, string, float64, int64, int) error {
+	return nil
 }

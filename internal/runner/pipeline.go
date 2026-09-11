@@ -112,6 +112,13 @@ type Pipeline struct {
 	// （docs/04-agent-visibility.md）；为 nil 时整个可见性机制关闭。
 	AgentEvents AgentEventRecorder
 
+	// Stacks 起 per-task 依赖隔离栈（T8）；为 nil 时不起栈，
+	// 验证命令用宿主环境跑 —— 与本字段引入之前完全一致。
+	//
+	// 声明窄接口而不是直接吃 *preview.Manager：runner 不该依赖 preview 的
+	// 全部方法集（那里还有 AI 推荐、基线部署之类与验证无关的东西）。
+	Stacks VerifyStackUp
+
 	// Gates 是验证阶段的双通道闸门（§6.2）；为 nil 时不限流。
 	// 档位在 diff 产出后才可判定（§5.1），因此闸门落在验证阶段而非
 	// 派发时：实现可以并发，真正稀缺的验证资源按档位排队。
@@ -766,9 +773,13 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	runVerify := func(round int) (Report, error) {
 		logs := p.stepLogger(rc.tk.ID, round)
 		if tier == TierHeavy {
-			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps, changedFiles, rc.params.Repo.ExcludeDirs, logs)
+			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps,
+				changedFiles, rc.params.Repo.ExcludeDirs, rc.params.Repo.VerifyInfra, logs)
 		}
-		return p.Verifier.RunLight(rc.ctx, rc.wt.Path, steps, logs), nil
+		// light 档设计上「不起栈」（verify.go 的 TierLight 注释）：
+		// 构建/lint/类型检查不连外部依赖。起一个用不上的 postgres
+		// 只是白烧资源。
+		return p.Verifier.RunLight(rc.ctx, rc.wt.Path, steps, nil, logs), nil
 	}
 
 	report, err := runVerify(0)
@@ -1023,7 +1034,7 @@ func mergedExcludeDirs(global, repo []string) []string {
 	return append(out, repo...)
 }
 
-func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, logs StepLogger) (Report, error) {
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string, logs StepLogger) (Report, error) {
 	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
 	if err != nil {
 		return Report{}, err
@@ -1034,21 +1045,88 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 		}
 	}()
 
+	// per-task 依赖隔离栈（T8）。挂在这里是因为基线工作区的
+	// CreateDetached + defer Remove 已经是「起—拆」的对称结构，
+	// 栈的生命周期与它完全一致：都是这一轮验证专用、用完即拆。
+	//
+	// 起栈失败分两种处理（见 stack.go 的 stackUnavailable）：
+	//   - 水位超阈值 → **降级为无隔离执行并留痕**。机器忙不是任务的错，
+	//     回落仍能给出验证结论，只是并发污染风险回到本项之前的水平。
+	//     排队等待不合适：水位可能长时间不降，那会让验证槽位无限期挂着。
+	//   - 其它（未知依赖名、镜像拉不下来、就绪超时、docker 守护进程
+	//     不可用）→ 判死并留下**独立的错误身份**（StageVerifyStack），
+	//     绝不冒充「复现测试跑不起来」。后者会被 redEnvError 归类成
+	//     「环境问题、失败留现场」，语义上恰好也对，但错误信息会误导人
+	//     去查复现测试。
+	//
+	// 降级时把标记挂上 Report（而不是只落事件流）：回帖到 Linear 的
+	// Summary() 是绝大多数人唯一会读到的那一份，见 Report.StackDegraded。
+	var stackEnv map[string]string
+	stackDegraded := false
+	if p.Stacks != nil && len(repoInfra) > 0 {
+		stack, serr := p.Stacks.UpVerifyStack(ctx, taskID, repoInfra)
+		switch {
+		case serr != nil && stackUnavailable(serr):
+			slog.Warn("资源水位不允许起验证隔离栈，降级为无隔离执行",
+				"task", taskID, "err", serr)
+			stackDegraded = true
+			p.noteStackSkipped(ctx, taskID, serr)
+		case serr != nil:
+			return Report{}, fmt.Errorf("%w: %v", ErrVerifyStackUp, serr)
+		case stack != nil:
+			defer func() {
+				if derr := stack.Down(ctx); derr != nil {
+					slog.Warn("拆验证隔离栈失败", "task", taskID, "err", derr)
+				}
+			}()
+			stackEnv = stack.StackEnv()
+			slog.Info("验证隔离栈已就绪", "task", taskID, "infra", repoInfra, "vars", len(stackEnv))
+		}
+	}
+
 	repro, reproErr := ResolveReproTests(wt.Path, changedFiles)
 	regression := DetectRegression(wt.Path, changedFiles, mergedExcludeDirs(p.ExcludeDirs, repoExclude)...)
 
 	// reproErr 是契约违例（没交测试/声明不合法），不是流水线执行错误：
 	// 交给报告走红阶段的三分路由（修复回路/blocked_spec/失败），
 	// 不走 p.fail 的「验证执行失败」。
-	return p.Verifier.RunHeavy(ctx, HeavyParams{
+	heavy := p.Verifier.RunHeavy(ctx, HeavyParams{
 		TaskPath:   wt.Path,
 		BasePath:   base.Path,
 		Light:      lightSteps,
 		Repro:      repro,
 		ReproErr:   reproErr,
 		Regression: regression,
+		StackEnv:   stackEnv,
 		Logs:       logs,
-	}), nil
+	})
+	// RunHeavy 不知道栈的事（它只认 StackEnv），降级标记在这里补上：
+	// 报告是要回帖的那份，标记必须跟着它走。
+	heavy.StackDegraded = stackDegraded
+	return heavy, nil
+}
+
+// noteStackSkipped 把「隔离栈被跳过」写进事件流（T8-AC5 的留痕要求）。
+//
+// 降级本身是合理的，但必须留痕：不然人看到的只是一次「通过了」的验证，
+// 无从知道它其实跑在共享环境上、并发污染风险回到了本项之前的水平。
+//
+// 没配事件记录器（AgentEvents == nil）时**不再直接 return**：事件流是
+// 锦上添花，日志是最后一道留痕，静默降级是最不该出现的结果。
+// 回帖那条路（Report.StackDegraded → Summary）由调用方补。
+func (p *Pipeline) noteStackSkipped(ctx context.Context, taskID int64, cause error) {
+	slog.Warn("验证隔离栈被跳过，本轮验证在共享环境上执行",
+		"task", taskID, "cause", cause)
+	if p.AgentEvents == nil {
+		return
+	}
+	entries := []agent.Entry{{
+		Kind: "verify_step",
+		Body: "验证隔离栈被跳过（资源水位超阈值），" + StackDegradedNote + "：" + cause.Error(),
+	}}
+	if err := p.AgentEvents.InsertAgentEvents(ctx, taskID, "verify", entries); err != nil {
+		slog.Warn("隔离栈跳过留痕失败", "task", taskID, "err", err)
+	}
 }
 
 // redStepFailure 在 heavy 报告里找应转 blocked_spec 的红阶段结果：

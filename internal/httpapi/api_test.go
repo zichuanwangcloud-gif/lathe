@@ -315,6 +315,62 @@ func TestAPIUpdateRepo(t *testing.T) {
 	}
 }
 
+// ★ verifyInfra 必须按 preview.InfraCatalog 校验（T8）。
+//
+// 不校验的代价不对称：把 "postgre" 敲错一个字母存进库，界面提示保存
+// 成功，之后该仓库**每一个 heavy 任务**都在起栈失败上硬失败 —— 未知
+// 依赖名走的是判死分支（不是降级），人得翻日志才知道是拼写问题。
+//
+// 而这不是「把知识抄两遍」：InfraCatalog 是导出的同一份 map，查表就是
+// 把校验指向那份目录本身，Go 侧演进时两边自动一致。
+func TestAPIUpdateRepoValidatesVerifyInfra(t *testing.T) {
+	api, _, _, repoID := apiFixture(t)
+	srv := apiServer(t, api)
+
+	// 合法值（目录里真有的键）必须放行
+	for _, name := range preview.InfraNames() {
+		resp := do(t, srv, "PUT", "/api/repos/"+itoa(repoID),
+			`{"verifyInfra":["`+name+`"]}`, true)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("目录里的依赖名 %q 应被接受，得到 %d", name, resp.StatusCode)
+		}
+	}
+
+	// 错拼一个字母 —— 这正是那个会让整个仓库的 heavy 任务永久红的输入
+	resp := do(t, srv, "PUT", "/api/repos/"+itoa(repoID), `{"verifyInfra":["postgre"]}`, true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("错拼的依赖名应在保存时就被拒绝（否则该仓库每个 heavy 任务都会硬失败），得到 %d", resp.StatusCode)
+	}
+	msg, _ := decode(t, resp)["error"].(string)
+	if !strings.Contains(msg, "postgre") {
+		t.Errorf("错误信息应点名那个值，得到 %q", msg)
+	}
+	// 报错要顺手列出可选值，人不用去翻源码
+	for _, name := range preview.InfraNames() {
+		if !strings.Contains(msg, name) {
+			t.Errorf("错误信息应列出可选值 %q，得到 %q", name, msg)
+		}
+	}
+
+	// 混进一个非法值也要整体拒绝：部分生效比全不生效更难排查
+	resp = do(t, srv, "PUT", "/api/repos/"+itoa(repoID), `{"verifyInfra":["postgres","不存在的东西"]}`, true)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("列表里混进非法值应整体拒绝，得到 %d", resp.StatusCode)
+	}
+
+	// 空数组 = 显式关闭隔离栈，是合法语义，必须放行
+	resp = do(t, srv, "PUT", "/api/repos/"+itoa(repoID), `{"verifyInfra":[]}`, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("空数组表示关闭隔离栈（合法语义），应放行，得到 %d", resp.StatusCode)
+	}
+
+	// 未传 = 不动，同样放行
+	resp = do(t, srv, "PUT", "/api/repos/"+itoa(repoID), `{"gateMode":"direct"}`, true)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("未传 verifyInfra 应不受校验影响，得到 %d", resp.StatusCode)
+	}
+}
+
 // 配置接口绝不能返回 token 本身。
 func TestAPIConfigNeverLeaksSecrets(t *testing.T) {
 	api, _, _, _ := apiFixture(t)

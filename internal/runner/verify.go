@@ -58,6 +58,12 @@ type Step struct {
 	Cmd  []string
 	// Dir 相对于工作区根目录；空表示根目录。
 	Dir string
+	// StackEnv 是 per-task 依赖隔离栈的连接串（T8）。
+	//
+	// 由 RunLight / RunHeavy 统一灌到每个步骤上，而不是让 Verifier
+	// 持有一份 —— Verifier 是并发任务共用的单实例，给它加可变字段
+	// 就是数据竞争（与 StepLogger 同一个理由）。
+	StackEnv map[string]string
 }
 
 // StepResult 是一条验证步骤的执行结果。
@@ -79,6 +85,19 @@ type StepResult struct {
 type Report struct {
 	Tier    VerifyTier
 	Results []StepResult
+
+	// StackDegraded 标记本轮验证**声明了依赖却没能起隔离栈**，
+	// 因此跑在共享环境上（当前唯一的成因是资源水位超阈值降级）。
+	//
+	// 为什么要让它进 Report 而不只落 agent_events：留痕只进事件流时，
+	// 人最常看到的 Linear 回帖（Summary）里一个字都没有，于是「验证
+	// 通过」看起来和隔离完好时完全一样。降级是合理决策，但结论的
+	// 适用范围必须跟着结论一起走。
+	//
+	// 零值 false 的含义是「不必警示」：仓库压根没声明依赖（最常见的
+	// 情形）与栈正常起来了，都落在这里 —— 前者每条回帖都挂警示会让
+	// 警示本身失效，只有「声明了却没起成」才标。
+	StackDegraded bool
 }
 
 // Passed 报告本次验证是否整体通过。
@@ -211,7 +230,7 @@ func DetectLightProfile(root string, exclude ...string) ([]Step, error) {
 // RunLight 顺序执行 light 档步骤，遇到第一个失败即停止后续。
 //
 // 早停的理由：构建都没过就没必要再跑 lint，且能更快把失败回帖给人。
-func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step, logs StepLogger) Report {
+func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step, stackEnv map[string]string, logs StepLogger) Report {
 	rep := Report{Tier: TierLight}
 
 	stopped := false
@@ -220,6 +239,7 @@ func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step, logs
 			rep.Results = append(rep.Results, StepResult{Step: st, Status: StatusSkipped})
 			continue
 		}
+		st.StackEnv = stackEnv
 		res := v.runStep(ctx, root, st, logs)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
@@ -252,7 +272,11 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step, logs StepL
 
 	cmd := exec.Command(st.Cmd[0], st.Cmd[1:]...)
 	cmd.Dir = dir
-	cmd.Env = v.stepEnv()
+	// stackEnv 是 per-task 依赖隔离栈注入的连接串（T8）；为空时
+	// 与本项之前完全一致。放在 stepEnv 之后合并，让它能覆盖同名变量
+	// —— 隔离栈的连接串必须压过宿主环境里可能存在的同名值，
+	// 否则测试会连到共享的那个库上，隔离就白做了。
+	cmd.Env = mergeEnv(v.stepEnv(), st.StackEnv)
 	// 与 agent driver 同理：构建工具会派生子进程，用进程组保证能整棵杀掉
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -441,6 +465,12 @@ func readPackageScripts(path string) (map[string]string, error) {
 	return pkg.Scripts, nil
 }
 
+// StackDegradedNote 是本轮验证跑在共享环境上时，随结论一起回帖的那一行。
+//
+// 常量而不是就地拼串：事件流留痕与回帖用的是同一句话，两处各写一份
+// 迟早会漂。测试与文档都引用它。
+const StackDegradedNote = "⚠ 本轮在共享环境执行（未起 per-task 依赖隔离栈，并发任务可能互相写脏依赖）"
+
 // Summary 生成可回帖到 Linear 的验证结论摘要。
 func (r Report) Summary() string {
 	var b strings.Builder
@@ -448,6 +478,11 @@ func (r Report) Summary() string {
 		fmt.Fprintf(&b, "验证通过（%s 档）\n", r.Tier)
 	} else {
 		fmt.Fprintf(&b, "验证未通过（%s 档）\n", r.Tier)
+	}
+	// 降级警示放在结论紧接着的下一行：回帖是绝大多数人唯一会读到的
+	// 那一份，混在步骤列表末尾等于没写。
+	if r.StackDegraded {
+		fmt.Fprintf(&b, "%s\n", StackDegradedNote)
 	}
 	for _, s := range r.Results {
 		mark := map[StepStatus]string{
@@ -461,4 +496,30 @@ func (r Report) Summary() string {
 		fmt.Fprintf(&b, "  %s %s (%s) %v\n", mark, s.Step.Name, loc, s.Duration.Round(time.Millisecond))
 	}
 	return b.String()
+}
+
+// mergeEnv 把 extra 合并进 base，同名以 extra 为准。
+//
+// 隔离栈的连接串必须压过宿主环境里可能存在的同名值（比如开发机上
+// 导出过 DATABASE_URL 指向共享库）—— 否则测试会连到那个共享库上，
+// 隔离就白做了。这是本函数存在的唯一理由，不是通用工具。
+func mergeEnv(base []string, extra map[string]string) []string {
+	if len(extra) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	skip := make(map[string]bool, len(extra))
+	for k := range extra {
+		skip[k] = true
+	}
+	for _, kv := range base {
+		if i := strings.IndexByte(kv, '='); i > 0 && skip[kv[:i]] {
+			continue // 同名交给 extra
+		}
+		out = append(out, kv)
+	}
+	for k, v := range extra {
+		out = append(out, k+"="+v)
+	}
+	return out
 }

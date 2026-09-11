@@ -20,6 +20,9 @@ type fakeDocker struct {
 	outputs map[string]fakeResult
 	// stream 自定义构建行为；nil 时默认喂两行进度并返回成功。
 	stream func(ctx context.Context, args []string, onLine func(string)) (string, error)
+	// runHook 非空时接管 exec（在建栈失败路径的测试里模拟「探测一直
+	// 不成功」这类行为）；nil 时走 outputs 的正常分发。
+	runHook func(ctx context.Context, name string, args ...string) (string, error)
 }
 
 type fakeResult struct {
@@ -32,6 +35,10 @@ func (f *fakeDocker) run(ctx context.Context, name string, args ...string) (stri
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]string{name}, args...))
 	f.mu.Unlock()
+	if f.runHook != nil {
+		out, err := f.runHook(ctx, name, args...)
+		return out, "", err
+	}
 	// 先按子命令（args[0]）精确匹配；git/sh 这类 args[0] 是 -C/-c 的，
 	// 退而按「任一参数整词等于 key」匹配（rev-parse / diff / show 等）。
 	if r, ok := f.outputs[args[0]]; ok {
@@ -88,8 +95,11 @@ func newTestManager(t *testing.T, fd *fakeDocker, memTh, diskTh int) (*Manager, 
 		Thresholds:    func(context.Context) (int, int, error) { return memTh, diskTh, nil },
 		exec:          fd.run,
 		execStream:    fd.runStream,
-		ops:           map[int64]*Op{},
-		recOps:        map[int64]*RecommendOp{},
+		// 假 docker 回读到的端口上当然没人接听：默认不探，别让每个单测
+		// 白等满 30s 超时。测探活本身的用例自己注入 realHostProbe。
+		hostProbe: func(context.Context, int) error { return nil },
+		ops:       map[int64]*Op{},
+		recOps:    map[int64]*RecommendOp{},
 	}
 	return m, wt
 }
