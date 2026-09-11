@@ -42,9 +42,12 @@ type pipelineExecutor interface {
 // worktreeInspector 是 queue 依赖的工作区体检面：智能重试决策要
 // Inspect 现场，Fresh 重建前要 Discard 旧现场。同样只取用到的两个
 // 方法，出于与 pipelineExecutor 一致的可测试性考虑。
+//
+// Discard 的返回值是「实际删掉了什么」，这里用不上（重建路径不在乎
+// 旧现场清得干不干净，只在乎别挡道），但接口必须与实现一致。
 type worktreeInspector interface {
 	Inspect(ctx context.Context, providerRepo, path, branch, base string) *runner.WorktreeState
-	Discard(ctx context.Context, providerRepo, path, branch string)
+	Discard(ctx context.Context, providerRepo, path, branch string) runner.DiscardResult
 }
 
 // queue 是任务执行队列：DB 领单调度器（docs/06-orchestration.md §2.1）。

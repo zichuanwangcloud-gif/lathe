@@ -228,7 +228,7 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 
 - AC1 终态任务的 worktree 超过 TTL 后被回收（目录 + 分支 + git worktree 注册项三形态）
 - AC2 非终态任务的 worktree **绝不回收**（单测：`implementing` 中的任务，跑 reaper 后目录仍在）
-- AC3 TTL 可配（`LATHE_WORKTREE_TTL`，默认 `7*24*time.Hour`，记进 README 环境变量表）。
+- AC3 TTL 可配（`LATHE_WORKTREE_TTL`，实际落地为 `72*time.Hour`，下限 `1h`，记进 README 环境变量表）。
   若判断需要运行时可调则改走 `system_settings` 表（照 `PreviewThresholds` 的现取现用套路）
 - AC4 回收动作留痕（日志 + task_events）
 - AC5 **绝不触碰 `.` 开头的目录**（单测：造一个 `.mirrors/` 与 `.verify/`，跑 reaper 后仍在）
@@ -237,6 +237,115 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 - AC7 `workspaces/` 里 9 个存量 `cr-*` 遗留目录被首轮 reaper 清掉，或明确说明为何不该清
 - AC8 与 T4 联动：日志不在 worktree 里，回收后仍可读
 - AC9 02-design §8 P0 的「worktree 自动回收」表述改成与实现一致
+
+**首版 review 拍出来的四个阻断项与最小修复集**（2026-09-10，随 T6 一并合入）：
+
+首版通过了上面 9 条 AC，但那 9 条没覆盖「误删」这一类失效。逐条如下。
+
+**B1 · 删盘前不校验路径当前归属，而目录名只由 issue key 决定。**
+`worktreeDirName` 是 `strings.ToLower(issueKey)`，不含 repo_id / user_id / task_id
+—— issue `CR-100` 的任何一次尝试、任何仓库、任何用户都落在同一个 `<root>/cr-100`。
+而 `tasks_one_active_per_issue` 是 `(repo_id, linear_issue_key) WHERE state NOT IN (终态)`：
+老的 failed 行不受约束，两个不同 repo（乃至不同用户）也可同时各有一个活任务。
+误删推演（默认 72h，无需任何配置错误）：任务 A（CR-100，repo X）failed 超期、
+`worktree_path` 仍在；issue 重开建出任务 B，`Create` 复用同名目录，B 正在里面跑；
+`ListReapableTasks` 返回 A；`reapTask(A)` 通过 `safeToRemove`，
+`HasLiveDependentOnBranch` 查的是别的任务的 base_ref（B 不是栈式后继）返回 false，
+于是 `Discard` 把 B 正在跑的工作区连同未提交改动删掉并 `git branch -D`。
+放大变体：`ClearWorktreePath` 失败时只 warn 留到下一轮，A 的路径永远留在候选里，
+收割机**每小时**对那个目录执行一次 Discard —— 定时炸弹。
+
+修复三层：① 目录名加 task_id 维度（`cr-100-t1234`），根治跨任务/仓库/用户共用；
+② 删盘前查 `ClaimedWorktreePaths`（**非终态**任务引用的路径集合，与同一轮已在查的
+`ReferencedWorktreePaths` 是两个不同的问题：后者判「有没有人指着」，用于孤儿清扫；
+前者判「有没有在途任务在用」，用于主路径）；③ `Create` 也吃这个集合，
+拒绝接管在途现场而不是把它当尸体删掉。
+
+**B2 · 候选快照与真正删除之间没有 compare-and-swap。**
+`failed → queued` 是合法转移，pipeline 的断点续跑复用现场、不经过 `Create`。
+「人点重试」与「收割机删除」并发时，正在运行的现场被删、分支被强删、
+`worktree_path` 被置 NULL。窗口不是毫秒级：循环里每个任务跑若干条 git 命令
+（`gitTimeout` 15 分钟）。
+
+修复：新增 `task.Machine.ClaimForReap`，一条带四项守卫的语句
+（`state = ANY(终态)` ∧ `worktree_path = $快照路径` ∧ `updated_at = $快照时刻`
+∧ `worktree_claimed_at IS NULL`，行锁 `FOR UPDATE`），**认领成功才碰磁盘**。
+`updated_at` 用等值而非不等式：要挡的是「快照之后有人动过这一行」，
+等值没有可乘之机，也不依赖时钟精度。新增 `tasks.worktree_claimed_at`
+（migration 0020）既作幂等标记，也让「谁在什么时候认领的」可查。
+
+认领分两阶段（`commit` 参数）：校验阶段只读、不改任何状态；落账阶段在删盘
+**之后**才置空 `worktree_path` 并写 `task_events`。顺序反了的后果是：校验若顺手
+置空了路径，随后因为脏现场决定保留时，那份现场就变成「磁盘上有、没人认领」的
+孤儿，被下一轮清扫收走 —— D4 的意图被 TTL 回收路径悄悄取消。
+
+**B3 · 主路径既不看目录 mtime 也不看工作区是否 dirty，`Discard` 用的是 `--force`。**
+`worktree.go` 的 `Remove(force=false)` 注释写得很明白：「git 会拒绝删除有未提交
+改动的工作区 —— 这正是失败任务『保留现场』（D4）所需的保护」。收割机走 Discard
+绕开的就是这条保护。孤儿清扫那条路径反而看了 mtime，两条路径安全标准不对称。
+
+修复：主路径改用与孤儿路径相同的判据（`updated_at < cutoff` **且** 目录
+mtime `< cutoff`，两把尺子都超期才删）；删之前用现成的 `Inspect` 体检 ——
+`Dirty` 则整份现场保留只告警，`HasCommits && !RemoteBranch`（有未推送提交）
+则只删目录、保留分支（那些提交的唯一副本在分支里）。
+
+**B4 · TTL 无下限校验，且没有关停/干跑开关。**
+`Validate()` 对 `AgentTimeout` 有 `<= 0` 检查，对 WorktreeTTL / ReapInterval 一个都没有；
+`reaper.go` 只把 `<= 0` 兜回默认。把 TTL 配成 `1m`（想「先清一批存量目录」是很自然
+的运维动作）会让孤儿清扫失去那层「安全得离谱」的宽裕：`Create` 建目录与写入
+`worktree_path` 之间那个无人认领窗口，正好是在途任务的目录会被当成孤儿删掉的时机。
+而 `LATHE_WORKTREE_TTL=0` 不是关停而是回落 72h —— 这个最具破坏力的组件没有任何
+办法关停。
+
+修复：`config.MinWorktreeTTL = 1h` 硬下限（配得更小启动直接报错，错误信息指向
+干跑而不是让人去改代码里的下限）；`ReapInterval` 必须为正；
+新增 `LATHE_REAP_ENABLED`（默认 `true`，`false` 时 main 根本不启动收割循环）
+与 `LATHE_REAP_DRY_RUN`（只打「本轮会删什么」，零副作用零成本 —— 刻意不做认领
+校验也不做工作区体检，代价是干跑列出的候选里可能有几条实跑会被保留，日志里
+说明了这点）。两个开关都是「拼错就报错」而非静默失效：对「必须能关掉」的开关，
+静默失效意味着以为关了其实还在删。
+
+**一并修掉的四处低成本高收益项：**
+
+- **日志要说真话、且删前就记。** `Discard` 原本无返回值，`os.Stat(mirror)` 失败时
+  直接 return，什么都没删却照样打「已回收超期现场」并清空 `worktree_path`。
+  现在它返回 `DiscardResult`（`MirrorMissing` / `DirRemoved` / `BranchDeleted` /
+  `Errs`），三个布尔都是「确实做成了」而非「尝试过」——`BranchDeleted` 删前先
+  `rev-parse` 确认分支真的在。日志改成删前（「即将删除 X，因为 Y」）+ 删后
+  （「真删掉了什么」）两条。
+- **回收动作进任务事件流。** `ClaimForReap` 的落账阶段写一条 `task_events`
+  （`from_state == to_state == 当前状态`，靠 `payload.kind = "worktree_reaped"` 区分），
+  payload 带 issue / state / path / branch / ttl_seconds / cutoff / rule /
+  dir_removed / branch_deleted / branch_kept_because。actor 是 `node:<NodeName>`，
+  与队列派发同形 —— 任务详情页要能答出「现场是谁在什么时候按什么规则删的、
+  删成了什么样」。
+- **`WorkspaceRoot` 加专用目录校验。** 原先只校验非空 + 绝对路径。配成 `/` 或
+  `/opt` 时孤儿清扫会删掉所有「非 `.` 开头、无人认领、mtime 超期」的顶层目录。
+  现在要求至少两层，且拒绝一批系统目录黑名单。
+- **symlink 越界。** `filepath.Rel` 是纯字符串运算，看不见符号链接：一条
+  `<root>/evil → /etc` 会被判成「在根下」，`os.RemoveAll` 顺着它删到根外。
+  现在 root 与候选路径各过一次 `EvalSymlinks`（root 也要解析 —— `/opt/lathe/workspaces`
+  指向另一块盘是常见挂载手法，只解析候选会让每条正常路径都被误拒，收割机彻底罢工），
+  候选不存在时退回「解析已存在的父链 + 保留末段」，堵住
+  `<root>/link-to-outside/not-yet-created` 这种形状。
+
+**存量目录名的兼容方案**（改 `worktreeDirName` 带来的唯一迁移面）：
+
+1. **老任务行不受影响。** 它们存的是完整路径 `worktree_path`，找自己的现场从来
+   不走命名规则（`Inspect` / 断点续跑 / `Discard` 都直接吃路径）。
+2. **孤儿清扫不需要认识老命名。** 它按「在 `<root>` 下 + 名字不以 `.` 开头 +
+   没有任何任务行指着 + mtime 超期」四条判，与目录叫什么无关。所以改命名规则
+   **不会**让任何存量目录被误判成孤儿而提前清掉；反方向（老目录被无限期遗留）
+   才是真风险，见下一条。
+3. **`Create` 顺带探测老路径。** 新任务落在 `<issue>-t<id>`，但同 issue 的老现场
+   躺在 `<issue>`。若不认它，那个目录会变成「谁都不需要这个槽位、也没人认领」的
+   永久垃圾（虽然最终会被孤儿清扫收走，但要多等一个 TTL）。所以 `Create` 在
+   接管槽位时同时看新旧两条路径，老路径存在且**没有在途任务占用**时一并回收。
+4. **老槽位被在途任务占着时跳过、不报错。** 老槽位不是本任务要用的路径，
+   别人在里面跑与我们无关；报错会让一个无关任务把本任务卡死。
+5. **`TaskID <= 0` 退回老命名**（而不是拼一个 `-t0`）：退回来的路径是
+   `legacyWorktreeDirName` 认得的形状，收割机与 `Create` 都能正常处理。
+
 
 ### T7 webhook 联动
 
@@ -544,6 +653,13 @@ repos / tasks / task_events / verifications / agent_events。
   是 `COALESCE` 语义（只增不清空），传 nil 表示「这次不改」。
   刻意不清 `branch_name` —— 分支可能因还有活后继而保留，
   且「这个分支叫什么」排障时仍有用。
+
+  > **⚠ 上一段已过时**（2026-09-10 加固后）：`ClearWorktreePath` 是无守卫的
+  > 裸 UPDATE，正是 B2 竞态的一半根因，已连同其测试一并删除，**现在没有
+  > 无守卫的置空原语**。置空统一走 `ClaimForReap` 的落账阶段（带
+  > state / worktree_path / updated_at 三项守卫 + 行锁）。`COALESCE` 那条
+  > schema 事实仍然成立，由 `TestClaimForReapTwoPhases` 两头钉住
+  > （校验阶段不动路径、落账后置 NULL）。详见上面的四个阻断项一节。
 
   AC9 顺带修了 `docs/02-design.md` §8 P0 一句**不实表述**：
   那行声称「worktree 自动回收」已交付，实际只有「合并后回收」与

@@ -581,37 +581,285 @@ func TestListReapableRespectsCutoff(t *testing.T) {
 	}
 }
 
-// ClearWorktreePath 必须真能置 NULL —— Transition 的 COALESCE 写法做不到，
-// 这也正是需要一条专门语句的原因。
-func TestClearWorktreePathSetsNull(t *testing.T) {
+// ---------------------------------------------------------------- 现场认领（B1/B2）
+
+// reapFixture 造一条「终态、留现场、可被回收」的任务行，返回它与快照
+// 时刻的 updated_at（认领的等值守卫要用）。
+func reapFixture(t *testing.T, m *Machine, userID, repoID int64, key, path, branch string, final State) *Task {
+	t.Helper()
+	ctx := context.Background()
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: key})
+	if err != nil {
+		t.Fatalf("建任务 %s 失败: %v", key, err)
+	}
+	if _, err := m.Transition(ctx, tk.ID, StateTriaging, "test",
+		&TransitionOpts{WorktreePath: &path, BranchName: &branch}); err != nil {
+		t.Fatal(err)
+	}
+	if final == StateFailed {
+		if _, err := m.Transition(ctx, tk.ID, StateImplementing, "test", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := m.Transition(ctx, tk.ID, final, "test", nil)
+	if err != nil {
+		t.Fatalf("%s 转 %s 失败: %v", key, final, err)
+	}
+	return got
+}
+
+// ★ B2：认领是两阶段的 —— 校验（commit=false）不改任何状态，
+// 落账（commit=true）才置空 worktree_path 并写事件。
+//
+// 顺序必须是「校验 → 删盘 → 落账」：校验若顺手置空了路径，随后因为脏
+// 现场决定保留时，那份现场就变成了「磁盘上有、没人认领」的孤儿，会被
+// 下一轮清扫收走 —— D4 保留现场的意图被 TTL 回收路径悄悄取消。
+func TestClaimForReapTwoPhases(t *testing.T) {
 	pool := testPool(t)
 	m := NewMachine(pool)
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	wt, branch := "/tmp/reap-clear", "fix/rp-clear"
-	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "RP-CLEAR"})
-	if err != nil {
-		t.Fatalf("建任务失败: %v", err)
-	}
-	if _, err := m.Transition(ctx, tk.ID, StateTriaging, "test",
-		&TransitionOpts{WorktreePath: &wt, BranchName: &branch}); err != nil {
-		t.Fatal(err)
-	}
+	path, branch := "/tmp/claim-two-phase", "fix/claim-two-phase"
+	tk := reapFixture(t, m, userID, repoID, "CLM-TWO", path, branch, StateFailed)
 
-	if err := m.ClearWorktreePath(ctx, tk.ID); err != nil {
-		t.Fatalf("ClearWorktreePath 失败: %v", err)
+	// 阶段一：只校验，不改状态
+	ok, err := m.ClaimForReap(ctx, tk.ID, path, tk.UpdatedAt, false, "node:test", nil)
+	if err != nil {
+		t.Fatalf("认领校验失败: %v", err)
+	}
+	if !ok {
+		t.Fatal("终态、路径匹配、updated_at 匹配时校验应通过")
 	}
 	after, err := m.Get(ctx, tk.ID)
 	if err != nil {
-		t.Fatalf("Get 失败: %v", err)
+		t.Fatal(err)
+	}
+	if after.WorktreePath == nil || *after.WorktreePath != path {
+		t.Errorf("校验阶段不该动 worktree_path，得到 %v", after.WorktreePath)
+	}
+	if !after.UpdatedAt.Equal(tk.UpdatedAt) {
+		t.Error("校验阶段不该推进 updated_at（否则紧跟的落账会自己失配）")
+	}
+
+	// 阶段二：落账
+	ok, err = m.ClaimForReap(ctx, tk.ID, path, tk.UpdatedAt, true, "node:test",
+		map[string]any{"ttl_seconds": int64(259200)})
+	if err != nil {
+		t.Fatalf("认领落账失败: %v", err)
+	}
+	if !ok {
+		t.Fatal("落账应成功")
+	}
+	after, err = m.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if after.WorktreePath != nil {
-		t.Errorf("worktree_path 应为 NULL，得到 %q", *after.WorktreePath)
+		t.Errorf("落账后 worktree_path 应为 NULL，得到 %q", *after.WorktreePath)
 	}
-	// 分支名刻意保留：它可能因为还有活的后继依赖而没被删，
-	// 且「这个分支叫什么」在排障时仍然有用
+	// 分支名刻意保留（排障时仍然有用）
 	if after.BranchName == nil || *after.BranchName != branch {
 		t.Errorf("branch_name 不该被一起清掉，得到 %v", after.BranchName)
 	}
+
+	// ★ 回收动作要进任务事件流：「现场是谁在什么时候按什么规则删的」
+	events, err := m.Events(ctx, tk.ID)
+	if err != nil {
+		t.Fatalf("Events 失败: %v", err)
+	}
+	last := events[len(events)-1]
+	if last.Payload["kind"] != "worktree_reaped" {
+		t.Errorf("最后一条事件应是 worktree_reaped，得到 payload=%v", last.Payload)
+	}
+	if last.Actor != "node:test" {
+		t.Errorf("事件的 actor 应是收割者，得到 %q", last.Actor)
+	}
+	if last.FromState == nil || *last.FromState != StateFailed || last.ToState != StateFailed {
+		t.Errorf("回收不是状态转移，from/to 都该是当前状态，得到 %v → %v", last.FromState, last.ToState)
+	}
+	if _, has := last.Payload["ttl_seconds"]; !has {
+		t.Errorf("规则依据（ttl_seconds）应落进 payload，得到 %v", last.Payload)
+	}
+
+	// 幂等：worktree_claimed_at 已盖，同一行不再被认领
+	ok, err = m.ClaimForReap(ctx, tk.ID, path, tk.UpdatedAt, false, "node:test", nil)
+	if err != nil {
+		t.Fatalf("重复认领不该报错: %v", err)
+	}
+	if ok {
+		t.Error("已认领的行不该被再认一次")
+	}
+}
+
+// ★ B2 核心：failed → queued 的重试与收割并发时，认领必须失配。
+//
+// 这一条钉的是最危险的竞态：候选快照取出后、删盘之前，人点了重试，
+// 任务回到 queued 并复用现场续跑。没有 CAS 时收割机会把正在运行的现场
+// 删掉、分支强删、worktree_path 置 NULL。
+func TestClaimForReapLostToRetry(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	path, branch := "/tmp/claim-retry", "fix/claim-retry"
+	tk := reapFixture(t, m, userID, repoID, "CLM-RETRY", path, branch, StateFailed)
+	snapshot := tk.UpdatedAt
+
+	// 人点重试：failed → queued（state.go 允许这条边）
+	if _, err := m.Transition(ctx, tk.ID, StateQueued, "user:1", nil); err != nil {
+		t.Fatalf("重试转移失败: %v", err)
+	}
+
+	// 收割机拿着旧快照来认领：必须失配
+	ok, err := m.ClaimForReap(ctx, tk.ID, path, snapshot, false, "node:test", nil)
+	if err != nil {
+		t.Fatalf("认领不该报错: %v", err)
+	}
+	if ok {
+		t.Fatal("B2：重试已把任务转回 queued，认领必须失败（否则会删掉正在续跑的现场）")
+	}
+
+	// 现场必须完好：路径还在，等着 pipeline 复用
+	after, err := m.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.WorktreePath == nil || *after.WorktreePath != path {
+		t.Errorf("认领失败时不该动 worktree_path，得到 %v", after.WorktreePath)
+	}
+}
+
+// updated_at 变了（任务行被任何写入动过）就失配 —— 不必是重试。
+func TestClaimForReapLostToAnyUpdate(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	path, branch := "/tmp/claim-touched", "fix/claim-touched"
+	tk := reapFixture(t, m, userID, repoID, "CLM-TOUCH", path, branch, StateFailed)
+	snapshot := tk.UpdatedAt
+
+	// 一次与状态无关的字段记账（SetPRNumber 走裸 UPDATE，触发器推进 updated_at）
+	if err := m.SetPRNumber(ctx, tk.ID, 4242); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+
+	ok, err := m.ClaimForReap(ctx, tk.ID, path, snapshot, false, "node:test", nil)
+	if err != nil {
+		t.Fatalf("认领不该报错: %v", err)
+	}
+	if ok {
+		t.Error("updated_at 已变（快照过期），认领必须失败")
+	}
+}
+
+// worktree_path 被换成别的路径时失配 —— 决不能删「现在那条路径」。
+func TestClaimForReapLostToPathChange(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	path, branch := "/tmp/claim-old", "fix/claim-path"
+	tk := reapFixture(t, m, userID, repoID, "CLM-PATH", path, branch, StateFailed)
+
+	ok, err := m.ClaimForReap(ctx, tk.ID, "/tmp/claim-somewhere-else", tk.UpdatedAt, false, "node:test", nil)
+	if err != nil {
+		t.Fatalf("认领不该报错: %v", err)
+	}
+	if ok {
+		t.Error("认领的路径与任务行不符时必须失败")
+	}
+}
+
+// 不存在的任务：返回 (false, nil)，不报错。
+func TestClaimForReapMissingTask(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+
+	ok, err := m.ClaimForReap(ctx, 999999999, "/tmp/nope", time.Now(), false, "node:test", nil)
+	if err != nil {
+		t.Errorf("任务不存在不该报错，得到: %v", err)
+	}
+	if ok {
+		t.Error("任务不存在时认领必须失败")
+	}
+}
+
+// ★ B1 的判据：ClaimedWorktreePaths 只算非终态任务。
+//
+// 收割机删盘前要问的是「这条路径现在有没有在途任务在用」。用
+// ReferencedWorktreePaths（任何状态）会把主路径要回收的终态行自己算进来，
+// 主路径就永远不敢动手；只算非终态才是正确的闸。
+func TestClaimedWorktreePathsOnlyLiveTasks(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	// 同一条路径：一个 failed（老尝试）+ 一个 pr_open（在途）
+	shared := "/tmp/claimed-shared"
+	branch := "fix/claimed-shared"
+	deadTk := reapFixture(t, m, userID, repoID, "CLM-DEAD", shared, branch, StateFailed)
+
+	liveTk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CLM-LIVE"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	livePath := shared
+	if _, err := m.Transition(ctx, liveTk.ID, StateTriaging, "test",
+		&TransitionOpts{WorktreePath: &livePath}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Transition(ctx, liveTk.ID, StateImplementing, "test", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := m.ClaimedWorktreePaths(ctx)
+	if err != nil {
+		t.Fatalf("ClaimedWorktreePaths 失败: %v", err)
+	}
+	found := false
+	for _, p := range claimed {
+		if p == shared {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("在途任务 %d 认领的路径应出现在集合里，得到 %v", liveTk.ID, claimed)
+	}
+
+	// 把在途任务推进终态后，这条路径就不再算「被认领」
+	if _, err := m.Transition(ctx, liveTk.ID, StateCancelled, "test", nil); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = m.ClaimedWorktreePaths(ctx)
+	if err != nil {
+		t.Fatalf("ClaimedWorktreePaths 失败: %v", err)
+	}
+	for _, p := range claimed {
+		if p == shared {
+			t.Errorf("全是终态时这条路径不该算被认领（否则主路径永远不敢动手），得到 %v", claimed)
+		}
+	}
+
+	// 而 ReferencedWorktreePaths（判孤儿用）仍然认它 —— 两个问题不同
+	referenced, err := m.ReferencedWorktreePaths(ctx)
+	if err != nil {
+		t.Fatalf("ReferencedWorktreePaths 失败: %v", err)
+	}
+	found = false
+	for _, p := range referenced {
+		if p == shared {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("终态行引用的路径仍是「有人指着」，孤儿清扫不该收它，得到 %v", referenced)
+	}
+	_ = deadTk
 }

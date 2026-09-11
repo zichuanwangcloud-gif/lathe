@@ -412,6 +412,14 @@ type CreateParams struct {
 	Kind     TaskKind
 	IssueKey string
 	Title    string
+	// TaskID 参与目录名（<issue-key>-t<taskID>），让每个任务有自己的
+	// 槽位。<=0 时退回只有 issue key 的老命名 —— 调用方应尽量传。
+	TaskID int64
+	// ClaimedPaths 是**其他活任务**当前占用的工作区路径集合
+	// （task.Machine.ClaimedWorktreePaths）。Create 接管同名槽位时会
+	// 用它判断目标目录是否仍属于在途任务 —— 是则拒绝，而不是把别人
+	// 正在跑的工作区当尸体回收。为空表示不做这道检查（测试与单次调用）。
+	ClaimedPaths []string
 }
 
 // Create 建立任务工作区：更新 mirror → 计算基线与分支名 → 新建 worktree。
@@ -441,28 +449,62 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 		return nil, fmt.Errorf("runner: 基线分支 %q 在仓库 %s 中不存在", base, p.Repo.ProviderRepo)
 	}
 
-	path := filepath.Join(m.root, worktreeDirName(p.IssueKey, branch))
+	path := filepath.Join(m.root, worktreeDirName(p.IssueKey, p.TaskID, branch))
+
+	// 活任务认领检查：目标路径（新命名的本任务槽位，以及老命名的共用
+	// 槽位）若正被另一个**非终态**任务占用，说明我们要接管的是别人正在
+	// 跑的工作区 —— 绝不能回收，报错让人来看。
+	//
+	// 为什么需要：老命名下同 issue 的两次尝试共用一个目录，而
+	// tasks_one_active_per_issue 只管活任务之间（且带 repo_id 维度），
+	// 另一个 repo 或另一个用户的同名 issue 仍是合法活任务。那条路径上
+	// Create 会把在途现场当尸体删掉。
+	if claimedBy(p.ClaimedPaths, path) {
+		return nil, fmt.Errorf(
+			"runner: 工作区 %s 仍被一个在途任务占用，拒绝接管（请先处理那个任务，或等它结束）", path)
+	}
+
+	// 老命名的共用槽位（存量兼容）：只有它与本任务槽位不是同一个目录时
+	// 才需要额外照顾。TaskID<=0 退回老命名，此时两者相同，走单一路径。
+	legacy := filepath.Join(m.root, legacyWorktreeDirName(p.IssueKey, branch))
+	legacyUsable := legacy != path
+	if legacyUsable && claimedBy(p.ClaimedPaths, legacy) {
+		// 老槽位被在途任务占着就不碰它，也不认它为可接管的尸体 ——
+		// 本任务在自己的新槽位里跑，互不干扰。
+		//
+		// 注意这里**不**报错：老槽位不是本任务要用的路径，别人在里面跑
+		// 与我们无关。报错会让一个无关任务把本任务卡死。
+		slog.Info("老命名的共用槽位仍被在途任务占用，跳过它（本任务用自己的槽位）",
+			"legacy", legacy, "path", path)
+		legacyUsable = false
+	}
 
 	// 尸体回收：目标目录或同名分支已存在时，回收后再建，而非报错卡死。
 	//
-	// 能走到 Create 的都是全新执行（断点续跑复用现场、不经过这里），
-	// 而 tasks_one_active_per_issue 保证同 (repo, issue) 没有第二个活
-	// 任务 —— 同名残留只会是上一个失败/取消任务按 D4 保留的现场。
-	// D4 的语义不变：现场一直留到「同 issue 的下一次尝试需要这个槽位」
-	// 为止；此时不回收，同 issue 的重试与重新触发会永久撞名
-	//（任务 #345/#466：worktree 尸体阻塞重试）。分支尸体也要清：目录
-	// 被人手工删掉后 refs/heads/<branch> 还在，worktree add -b 会报
-	// branch already exists。
-	_, pathErr := os.Stat(path)
+	// D4 的语义：现场一直留到「需要这个槽位的人来了」为止。加 task_id
+	// 维度之后，本任务的槽位只可能被**本任务自己**的上一次尝试占用
+	// （重跑同一任务），老槽位则可能躺着老命名时代的现场 —— 两种都回收。
+	// 分支尸体也要清：目录被人手工删掉后 refs/heads/<branch> 还在，
+	// worktree add -b 会报 branch already exists。
 	branchExists := false
 	if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch+"^{commit}"); err == nil {
 		branchExists = true
 	}
-	if pathErr == nil || branchExists {
+
+	var corpse string
+	if _, pathErr := os.Stat(path); pathErr == nil {
+		corpse = path
+	} else if legacyUsable {
+		if _, legErr := os.Stat(legacy); legErr == nil {
+			corpse = legacy
+		}
+	}
+
+	if corpse != "" || branchExists {
 		slog.Warn("回收同名工作区尸体（上一任务保留的现场）",
-			"path", path, "branch", branch,
-			"pathExists", pathErr == nil, "branchExists", branchExists)
-		m.discardLocked(ctx, mirror, path, branch)
+			"path", corpse, "branch", branch, "branchExists", branchExists,
+			"legacy", corpse != "" && corpse != path)
+		m.discardLocked(ctx, mirror, corpse, branch)
 	}
 
 	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", "-b", branch, path, baseRef); err != nil {
@@ -499,43 +541,110 @@ func (m *WorktreeManager) Remove(ctx context.Context, wt *Worktree, force bool) 
 	return nil
 }
 
+// DiscardResult 报告一次丢弃动作实际做成了什么。
+//
+// 为什么 Discard 必须返回结果而不是「尽力而为、无返回值」：收割机要
+// 记的账是「这个现场被回收了」，而它此前无论 Discard 是否真的碰过磁盘
+// 都照样打一条「已回收」并清空 worktree_path。mirror 不存在时 Discard
+// 直接 return（什么都没删）、Path 为空时跳过删目录 —— 这些情形下记的
+// 账都是假的，日志会告诉运维「清理干净了」，而目录还躺在盘上。
+//
+// 各字段都是「确实做成了」的布尔事实，不是「尝试过」：
+//   - DirRemoved：目录此前存在、现在不存在了
+//   - BranchDeleted：此前 refs/heads/<branch> 存在、现在不存在了
+//   - MirrorMissing：mirror 不在，什么都没做（调用方据此别记账为已回收）
+//   - Err：过程中遇到的非致命错误（已尽力继续），供日志与排障
+type DiscardResult struct {
+	MirrorMissing bool
+	DirRemoved    bool
+	BranchDeleted bool
+	Errs          []error
+}
+
+// Removed 报告这次丢弃是否真的清掉了东西（目录或分支）。
+//
+// MirrorMissing 为真时恒为 false：连 mirror 都没有，谈不上删除动作，
+// 调用方不应当据此清空任务行的 worktree_path（那会让这条路径彻底
+// 脱离收割机的视野）。
+func (r DiscardResult) Removed() bool {
+	return !r.MirrorMissing && (r.DirRemoved || r.BranchDeleted)
+}
+
 // Discard 丢弃一个工作区及其分支（重试与启动恢复场景：旧现场作废）。
 //
 // 与 Remove 的区别在于容错：现场可能是残缺的（目录被手动删过、分支
 // 已不存在），Discard 尽力清理每一步并继续，最后 prune 兑底。
 // 不清理的话，同名分支会让下一次 worktree add -b 直接失败。
-func (m *WorktreeManager) Discard(ctx context.Context, providerRepo, path, branch string) {
+//
+// 返回 DiscardResult 说明实际做成了什么 —— 调用方（收割机）据此决定
+// 日志与记账，不再无条件宣称「已回收」。
+func (m *WorktreeManager) Discard(ctx context.Context, providerRepo, path, branch string) DiscardResult {
 	mirror := m.MirrorPath(providerRepo)
 	if _, err := os.Stat(mirror); err != nil {
-		return // 没有 mirror 就没什么可丢的
+		// 没有 mirror 就没什么可丢的。这**不是**一次成功的回收：
+		// 目录可能还完整地待在盘上。
+		return DiscardResult{MirrorMissing: true}
 	}
 	unlock := m.lockMirror(mirror)
 	defer unlock()
-	m.discardLocked(ctx, mirror, path, branch)
+	return m.discardLocked(ctx, mirror, path, branch)
 }
 
 // discardLocked 是 Discard 的持锁版本，调用方必须已持有 mirror 锁
 // （Create 的尸体回收在锁内调用；sync.Mutex 不可重入，直接调 Discard
 // 会自死锁）。
-func (m *WorktreeManager) discardLocked(ctx context.Context, mirror, path, branch string) {
+func (m *WorktreeManager) discardLocked(ctx context.Context, mirror, path, branch string) DiscardResult {
+	res := DiscardResult{}
 	if path != "" {
+		// 删之前先记下「原本在不在」。
+		//
+		// ⚠ 这一步不能省：`git worktree remove --force` **成功时会自己把
+		// 目录删掉**。原实现只在 git remove 之后 os.Stat 一次，把「目录还在」
+		// 当作 DirRemoved 的判据 —— 于是最常见的正常路径（git 删成功）反而
+		// 被判成「什么都没删」，DirRemoved 恒为 false。后果是收割机主路径
+		// 的 res.Removed() 为 false（分支被保留时 BranchDeleted 也是 false），
+		// 回收计数永远是 0，日志说「没清掉任何东西」而目录其实已经没了。
+		//
+		// DirRemoved 的语义是「原本在、现在不在了」，所以要两头各判一次。
+		_, statErr := os.Stat(path)
+		existedBefore := statErr == nil
+
 		if _, err := m.git(ctx, mirror, "worktree", "remove", "--force", path); err != nil {
 			slog.Warn("丢弃工作区失败（继续清理）", "path", path, "err", err)
+			res.Errs = append(res.Errs, err)
 		}
 		// 目录可能不是注册的 worktree（手工建的/半残的），git 拒绝删除；
 		// 兜底直接删目录，否则下一步 worktree add 还会撞「目录已存在」。
 		if _, err := os.Stat(path); err == nil {
 			if rerr := os.RemoveAll(path); rerr != nil {
 				slog.Warn("删除工作区目录失败（继续）", "path", path, "err", rerr)
+				res.Errs = append(res.Errs, rerr)
+			}
+		}
+		// 现在再判一次：原本在、且此刻不在了，才算真删掉了。
+		// 兜底的 RemoveAll 失败时目录仍在，这里自然为 false。
+		if existedBefore {
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				res.DirRemoved = true
 			}
 		}
 	}
 	_, _ = m.git(ctx, mirror, "worktree", "prune")
 	if branch != "" {
+		// 删之前先看它到底在不在 —— 否则「删掉了」这个记账可能是假的
+		// （分支原本就不存在，git branch -D 会报错，而错误被吞掉）。
+		branchExisted := false
+		if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet",
+			"refs/heads/"+branch+"^{commit}"); err == nil {
+			branchExisted = true
+		}
 		if _, err := m.git(ctx, mirror, "branch", "-D", branch); err != nil {
 			slog.Warn("删除残留分支失败（继续）", "branch", branch, "err", err)
+			res.Errs = append(res.Errs, err)
 		}
+		res.BranchDeleted = branchExisted
 	}
+	return res
 }
 
 // WorktreeState 是 Inspect 对一份任务现场的体检结果。
@@ -664,8 +773,72 @@ func (m *WorktreeManager) List(ctx context.Context, providerRepo string) ([]stri
 	return paths, nil
 }
 
-// worktreeDirName 生成工作区目录名：优先用 issue 编号，保证一眼能看出归属。
-func worktreeDirName(issueKey, branch string) string {
+// claimedBy 报告 path 是否出现在活任务认领的路径集合里。
+//
+// 两侧都过 filepath.Abs + Clean 再比：数据库里存的是 Create 写进去的
+// 绝对路径，而根目录配置可能有尾斜杠或符号链接。比较失败（Abs 出错）
+// 一律按「已认领」处理 —— 保守方向是少删。
+func claimedBy(claimed []string, path string) bool {
+	if len(claimed) == 0 {
+		return false
+	}
+	target, err := filepath.Abs(path)
+	if err != nil {
+		return true
+	}
+	target = filepath.Clean(target)
+	for _, c := range claimed {
+		abs, aerr := filepath.Abs(c)
+		if aerr != nil {
+			continue
+		}
+		if filepath.Clean(abs) == target {
+			return true
+		}
+	}
+	return false
+}
+
+// worktreeDirName 生成工作区目录名。
+//
+// **目录名必须带维度。** 原实现是 strings.ToLower(issueKey)，于是 issue
+// CR-100 的任何一次尝试、任何仓库、任何用户都落在同一个 <root>/cr-100。
+// 数据库的 tasks_one_active_per_issue 只约束 (repo_id, issue_key) 上的
+// 活任务，两个不同 repo（乃至不同用户）可以同时各有一个活任务、issue
+// key 相同 —— 它们会占用同一个目录，而收割机只认字符串路径，看到老任务
+// 行指着它就删。加上 task_id 之后每个任务有自己的槽位，跨任务/仓库/用户
+// 撞名从根上消失（收割机那道活任务认领闸是第二道防线，不是唯一防线）。
+//
+// 保留 issue key 前缀（而不是只用 task_id）是为了排障：`ls workspaces/`
+// 一眼能看出哪个目录对应哪个单子。
+func worktreeDirName(issueKey string, taskID int64, branch string) string {
+	name := strings.ToLower(strings.TrimSpace(issueKey))
+	if name == "" {
+		name = strings.ReplaceAll(branch, "/", "-")
+	}
+	if taskID <= 0 {
+		// 拿不到任务号就没有维度可用。退回老命名而不是拼一个 "-t0"：
+		// 老命名的路径是 legacyWorktreeDirName 认得的形状，仍然能被
+		// 收割机正常处理。
+		return name
+	}
+	return fmt.Sprintf("%s-t%d", name, taskID)
+}
+
+// legacyWorktreeDirName 是加 task_id 维度之前的命名（只有 issue key）。
+//
+// 存量目录都长这样，而每一条老任务行里存的是**完整路径**，所以老任务
+// 找自己的现场不受影响（它们不走命名规则，直接读 worktree_path）。
+// 需要这个函数的只有两处：
+//
+//   - Create 接管同名槽位时顺带探测老路径（老现场可能是上一个失败任务
+//     按 D4 保留的，不认它就会遗留一个永远没人回收、也永远挡不住任何
+//     东西的目录）；
+//   - 收割机的孤儿清扫**不**需要它：老目录本来就在 <root> 下、名字不以
+//     . 开头、没人认领、mtime 一过 TTL 就照原规则回收。换句话说，改命名
+//     规则不会让任何存量目录被误判 —— 误判的风险在另一个方向（把老目录
+//     当"无主"提前删掉），而那一侧靠 mtime + 认领闸兜着。
+func legacyWorktreeDirName(issueKey, branch string) string {
 	name := strings.ToLower(strings.TrimSpace(issueKey))
 	if name == "" {
 		name = strings.ReplaceAll(branch, "/", "-")

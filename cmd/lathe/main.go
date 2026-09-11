@@ -170,14 +170,30 @@ func serve(cfg config.Config) error {
 
 	// T6 worktree TTL 收割机。复用 pipeline 那一份 Worktrees ——
 	// 两边不能是两套配置（同 MergePoller 的注释）。
-	reaper := &runner.WorktreeReaper{
-		Tasks:      task.NewMachine(st.Pool()),
-		Worktrees:  pipeline.Worktrees,
-		RepoLookup: runner.NewRepoLookup(st.Pool()),
-		TTL:        cfg.WorktreeTTL,
-		Interval:   cfg.ReapInterval,
+	//
+	// 这个组件会删磁盘目录与 git 分支，是控制面里破坏力最大的一环，
+	// 因此有两个开关（docs/04-operations）：
+	//   LATHE_REAP_ENABLED=false —— 干脆不启动它
+	//   LATHE_REAP_DRY_RUN=true  —— 只打「本轮会删什么」，不碰任何东西
+	if !cfg.ReapingEnabled() {
+		slog.Warn("worktree 收割机已被 LATHE_REAP_ENABLED=false 关闭：终态现场不会自动回收")
+	} else {
+		reaper := &runner.WorktreeReaper{
+			Tasks:      task.NewMachine(st.Pool()),
+			Worktrees:  pipeline.Worktrees,
+			RepoLookup: runner.NewRepoLookup(st.Pool()),
+			TTL:        cfg.WorktreeTTL,
+			Interval:   cfg.ReapInterval,
+			DryRun:     cfg.ReapingDryRun(),
+			// 事件流的 actor 与队列派发同形（"node:"+NodeName），
+			// 审计时能看出是哪个实例删的现场。
+			Actor: "node:" + cfg.NodeName,
+		}
+		if cfg.ReapingDryRun() {
+			slog.Warn("worktree 收割机运行在干跑模式（LATHE_REAP_DRY_RUN=true）：只记日志，不删任何东西")
+		}
+		go reaper.Run(ctx)
 	}
-	go reaper.Run(ctx)
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
 	// （脚本调用，同时是把自己锁在门外时的应急入口）
