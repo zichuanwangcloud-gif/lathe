@@ -490,6 +490,76 @@ func TestWakeBlockedSuccessors(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------- T7 按 issue 找在途任务
+
+// ActiveByIssueID 只返回非终结任务，且按属主隔离。
+func TestActiveByIssueIDFiltersTerminalAndOwner(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+	userA, repoA := fixture(t, pool)
+
+	issueID := "uuid-cancel-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	// 同一 issue 在两个仓库下各一条活任务（一个用户可以登记多个仓库，
+	// tasks_one_active_per_issue 是按 (repo_id, key) 挡的，挡不住这种）
+	var repoA2 int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
+		userA, "acme/second-"+issueID).Scan(&repoA2); err != nil {
+		t.Fatalf("建第二个 repo 失败: %v", err)
+	}
+
+	live1, err := m.Create(ctx, CreateParams{
+		UserID: userA, RepoID: repoA, LinearIssueKey: "AC-1", LinearIssueID: issueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live2, err := m.Create(ctx, CreateParams{
+		UserID: userA, RepoID: repoA2, LinearIssueKey: "AC-1", LinearIssueID: issueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 一条已终结的同 issue 任务，不该被返回
+	done, err := m.Create(ctx, CreateParams{
+		UserID: userA, RepoID: repoA, LinearIssueKey: "AC-DONE", LinearIssueID: issueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Transition(ctx, done.ID, StateCancelled, "test", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// 另一个用户的同 issue 任务，绝不该被返回
+	userB, repoB := fixture(t, pool)
+	other, err := m.Create(ctx, CreateParams{
+		UserID: userB, RepoID: repoB, LinearIssueKey: "AC-OTHER", LinearIssueID: issueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.ActiveByIssueID(ctx, userA, issueID)
+	if err != nil {
+		t.Fatalf("ActiveByIssueID 失败: %v", err)
+	}
+	in := map[int64]bool{}
+	for _, tk := range got {
+		in[tk.ID] = true
+	}
+	if !in[live1.ID] || !in[live2.ID] {
+		t.Errorf("两条在途任务都该返回，实际 %v", in)
+	}
+	if in[done.ID] {
+		t.Error("已终结的任务不该返回")
+	}
+	if in[other.ID] {
+		t.Error("别人的任务绝不该返回（跨用户隔离）")
+	}
+	if len(got) != 2 {
+		t.Errorf("应恰好返回 2 条，得到 %d", len(got))
+	}
+}
+
 // ---------------------------------------------------------------- T6 可回收查询
 
 // ★ T6-AC2：非终态任务的现场绝不进回收候选。

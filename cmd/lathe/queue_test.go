@@ -838,3 +838,53 @@ func TestClaimOwnIgnoresForeignInflightTasks(t *testing.T) {
 		t.Fatalf("应领到 %d，得到 %d", tk.ID, claimed.ID)
 	}
 }
+
+// ---------------------------------------------------------------- T2 闸门配置复制
+
+// Enqueue 必须把 repos.gate_mode 复制进任务行。
+//
+// 这是 gate_mode「配了没接线」的真正断点：列早就存在、pipeline 也能读
+// tasks.gate_mode，但建任务时从来没人把仓库配置复制过去，所以该列永远是
+// 'direct'，人在仓库配置页选了 manual 也毫无效果
+// （docs/08-debt-cleanup.md T2 AC6）。
+//
+// 复制而不是每次现查 repos，是为了把任务创建那一刻的配置【钉死】——
+// 与 repo_id 的语义保持一致：任务在途期间人改了仓库配置，
+// 不该改变这个任务的行为。
+func TestEnqueueCopiesRepoGateMode(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	q := testQueue(st, &fakePipeline{})
+
+	userID, repoID := fixture(t, st)
+	if _, err := st.Pool().Exec(ctx,
+		`UPDATE repos SET gate_mode='manual' WHERE id=$1`, repoID); err != nil {
+		t.Fatalf("设置 repos.gate_mode 失败: %v", err)
+	}
+
+	issueKey := uniqueKey("Q-GATE")
+	if err := q.Enqueue(ctx, userID, uniqueKey("uuid-gate"), issueKey); err != nil {
+		t.Fatalf("Enqueue 失败: %v", err)
+	}
+
+	tk := claimOwn(t, q, ctx, userID)
+	if tk == nil {
+		t.Fatal("应能领到刚建的任务")
+	}
+	if tk.GateMode != task.GateManual {
+		t.Fatalf("AC6：任务的 gate_mode 应从仓库复制为 manual，得到 %q", tk.GateMode)
+	}
+
+	// 钉死语义：事后改仓库配置不影响已建的任务
+	if _, err := st.Pool().Exec(ctx,
+		`UPDATE repos SET gate_mode='direct' WHERE id=$1`, repoID); err != nil {
+		t.Fatalf("改回 repos.gate_mode 失败: %v", err)
+	}
+	again, err := q.tasks.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if again.GateMode != task.GateManual {
+		t.Errorf("AC6：仓库配置事后改动不该影响在途任务，任务 gate_mode 变成了 %q", again.GateMode)
+	}
+}

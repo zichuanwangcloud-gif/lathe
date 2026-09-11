@@ -45,6 +45,7 @@ async function saveThresholds() {
     await api.saveAdminSettings({
       previewMemThreshold: Number(thresholds.value.previewMemThreshold),
       previewDiskThreshold: Number(thresholds.value.previewDiskThreshold),
+      webhookTriggerLabel: thresholds.value.webhookTriggerLabel || '',
     })
     thresholdSaved.value = true
   } catch (e) {
@@ -255,7 +256,19 @@ onMounted(() => {
         <span>磁盘占用阈值（%）</span>
         <input type="number" min="1" max="100" v-model.number="thresholds.previewDiskThreshold" required />
       </label>
+      <label>
+        <span>标签驱动接单</span>
+        <input
+          type="text"
+          v-model="thresholds.webhookTriggerLabel"
+          placeholder="留空则关闭，例如 lathe:go"
+        />
+      </label>
     </form>
+    <p class="faint">
+      填上标签名后，Linear issue 被打上这个标签就会接单 —— 不必改指派人。
+      <b>留空表示关闭</b>：升级不会让存量部署突然开始按标签接单。
+    </p>
     <button class="primary" :disabled="busy === 'thresholds'" @click="saveThresholds">
       {{ busy === 'thresholds' ? '保存中……' : '保存阈值' }}
     </button>

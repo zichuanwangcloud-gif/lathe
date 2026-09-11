@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, inject } from 'vue'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime } from '../api'
 import { hasLinearToken } from '../auth'
 import PreviewDialog from '../components/PreviewDialog.vue'
+import CostPanel from '../components/CostPanel.vue'
 
 const tasks = ref([])
 const stats = ref(null)
@@ -81,6 +82,8 @@ onUnmounted(() => clearInterval(timer))
       <button :class="{ primary: filter === 'merged' }" @click="setFilter('merged')">已合并</button>
     </div>
   </div>
+
+  <CostPanel />
 
   <div class="card scroll-x" style="padding: 0">
     <table v-if="tasks.length">

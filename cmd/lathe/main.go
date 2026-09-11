@@ -67,6 +67,25 @@ func run() error {
 	return serve(cfg)
 }
 
+// MigrateTimeoutDefault 是 migrate 子命令的默认超时。
+//
+// 见 runMigrate 的注释：值之所以从 2 分钟放宽到这里，是因为非事务迁移
+// （0018 的 CREATE INDEX CONCURRENTLY）在大表上远超 2 分钟。
+const MigrateTimeoutDefault = 10 * time.Minute
+
+// migrateTimeout 返回迁移超时：环境变量 LATHE_MIGRATE_TIMEOUT 优先，
+// 解析失败或未设置时回退到 MigrateTimeoutDefault。
+func migrateTimeout() time.Duration {
+	if v := os.Getenv("LATHE_MIGRATE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("LATHE_MIGRATE_TIMEOUT 无法解析，回退到默认值",
+			"value", v, "default", MigrateTimeoutDefault)
+	}
+	return MigrateTimeoutDefault
+}
+
 func runMigrate(cfg config.Config, args []string) error {
 	dir := "up"
 	if len(args) > 0 {
@@ -76,7 +95,28 @@ func runMigrate(cfg config.Config, args []string) error {
 		return fmt.Errorf("migrate 方向须为 up 或 down，得到 %q", dir)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	slog.Info("开始迁移", "direction", dir, "timeout", migrateTimeout())
+
+	// 迁移超时。
+	//
+	// 原来是硬编码的 2 分钟，理由是「迁移都是小 DDL，跑不了这么久」。
+	// 加了 CONCURRENTLY 之后这个前提不成立：并发建索引为了不阻塞写入，
+	// 要把表扫两遍（第一遍建、第二遍校验并接上并发写），在大表上耗时是
+	// 普通 CREATE INDEX 的数倍，线性的分钟级可能变成十几分钟。
+	//
+	// 方案：默认放宽到 10 分钟，并允许用 LATHE_MIGRATE_TIMEOUT 覆盖
+	// （time.ParseDuration 语法，如 30m、1h）。三个候选方案的取舍：
+	//   - 干脆不可配置：部署方遇到超大表时没有出路，只能去改代码重发版。
+	//   - 让非事务迁移不受超时约束：看上去最省事，实则是把「无上限等待」
+	//     写死进框架 —— 连接卡住（锁等待、网络半开）时 migrate 会永远挂着，
+	//     而这正是 context 存在的意义。宁可失败也别静默挂死。
+	//   - 放宽默认 + 可配置（采用）：默认值覆盖绝大多数实例，例外能自救。
+	//
+	// 超时/取消在这里是安全的，不是「断了就烂」：非事务迁移的版本记录写在
+	// 全部语句成功之后（见 store.applyOneNoTx），中断的迁移不会被记成已应用；
+	// 而 CONCURRENTLY 被打断留下的 INVALID 索引，会被迁移脚本开头的
+	// DROP INDEX IF EXISTS 在重跑时清掉。所以重跑即恢复。
+	ctx, cancel := context.WithTimeout(context.Background(), migrateTimeout())
 	defer cancel()
 
 	st, err := store.Open(ctx, cfg.Database.DSN())
@@ -135,7 +175,7 @@ func serve(cfg config.Config) error {
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID)
 
-	pipeline, err := buildPipeline(cfg, st, factory)
+	pipeline, err := buildPipeline(cfg, st, secrets, factory)
 	if err != nil {
 		return err
 	}
@@ -217,7 +257,7 @@ func serve(cfg config.Config) error {
 	// 每用户专属回调：/webhooks/linear/{slug}（设置页展示完整地址）。
 	// 旧路径保留，路由到内置管理员，老部署的 Linear webhook 配置不用改。
 	webhook := &httpapi.LinearWebhook{
-		Resolver:   &webhookResolver{users: users, factory: factory, admin: admin},
+		Resolver:   &webhookResolver{users: users, factory: factory, admin: admin, settings: st},
 		Deliveries: st,
 		Tasks:      q,
 	}
@@ -377,7 +417,7 @@ func serve(cfg config.Config) error {
 // 刻意不在此校验 Linear/GitHub 凭据：凭据现在可在界面里配置，
 // 缺凭据不该阻止服务启动 —— 否则新用户连配置页都打不开。
 // 真正需要凭据时（执行任务）才会报错，并指引去设置页。
-func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFactory) (*runner.Pipeline, error) {
+func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, factory runner.ClientFactory) (*runner.Pipeline, error) {
 	wm, err := runner.NewWorktreeManager(cfg.WorkspaceRoot)
 	if err != nil {
 		return nil, err
@@ -390,6 +430,9 @@ func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFact
 		Agent:            agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
 		ClientFactory:    factory,
 		Notifier:         logNotifier{},
+		Mail:             taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
+		BaseURL:          cfg.PublicURL(),
+		LogDir:           cfg.DataDir,
 		Verifications:    st,
 		AgentEvents:      st,
 		Gates:            runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
@@ -410,6 +453,8 @@ type webhookResolver struct {
 	users   *store.Users
 	factory *creds.Factory
 	admin   *store.User
+	// settings 用于现取标签驱动接单的标签名（T7）。
+	settings *store.Store
 }
 
 func (r *webhookResolver) Resolve(ctx context.Context, slug string) (*httpapi.WebhookTarget, error) {
@@ -434,6 +479,9 @@ func (r *webhookResolver) Resolve(ctx context.Context, slug string) (*httpapi.We
 		OwnerID:      u.ID,
 		Secret:       secret,
 		LinearUserID: p.LinearUserID(ctx),
+		// 现取标签名：改完即刻生效，不用重启服务
+		// （与 PreviewThresholds 同一套做法）。空串 = 该能力关闭。
+		TriggerLabel: r.settings.WebhookTriggerLabel(ctx),
 	}, nil
 }
 
@@ -466,6 +514,37 @@ func configStatus(cfg config.Config) func() map[string]any {
 
 // logNotifier 是 P0 的占位通知实现：先写日志。
 // 真正的推送通道（终端/手机）留到 P2 随 Web UI 一起做。
+// taskMailer 实现 runner.TaskMail：把「任务终态」翻译成一封发给属主的信。
+//
+// 放在 cmd/lathe 而不是 runner 里，是因为这里同时拿得到 store（解析收件人）
+// 与 internal/mail（发信）。runner 只依赖它声明的窄接口，不 import
+// internal/mail —— 与 VerificationRecorder / AgentEventRecorder 同一套做法。
+type taskMailer struct {
+	store  *store.Store
+	sender *mail.Sender
+}
+
+// SendTaskMail 向任务属主投一封信。
+//
+// **SMTP 未配置时返回 nil（静默跳过）而非错误**：没配邮件是默认状态、
+// 不是异常。把它当错误上报会让日志里每个终态都刷一条 WARN，
+// 真正的发信故障反而被淹没。
+func (t taskMailer) SendTaskMail(ctx context.Context, taskID int64, subject, body string) error {
+	if t.sender == nil || !t.sender.Ready(ctx) {
+		return nil
+	}
+	to, err := t.store.NotifyEmailForTask(ctx, taskID)
+	if err != nil {
+		// 收件人查不到（任务不存在、属主已删）也不是发信故障，
+		// 没有可投递的对象而已。
+		if errors.Is(err, store.ErrNoRecipient) {
+			return nil
+		}
+		return err
+	}
+	return t.sender.Send(ctx, to, subject, body)
+}
+
 type logNotifier struct{}
 
 func (logNotifier) Notify(ctx context.Context, msg string) error {

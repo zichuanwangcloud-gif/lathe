@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/Clouditera/lathe/internal/auth"
 	"github.com/Clouditera/lathe/internal/store"
@@ -44,14 +45,17 @@ func (a *AdminAPI) getSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"previewMemThreshold":  mem,
 		"previewDiskThreshold": disk,
+		// 空串 = 标签驱动接单关闭（T7）
+		"webhookTriggerLabel": a.Store.WebhookTriggerLabel(r.Context()),
 	})
 }
 
 // putSettings 保存系统设置。阈值口径 1..100（100 = 不启用该闸门）。
 func (a *AdminAPI) putSettings(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		PreviewMemThreshold  int `json:"previewMemThreshold"`
-		PreviewDiskThreshold int `json:"previewDiskThreshold"`
+		PreviewMemThreshold  int    `json:"previewMemThreshold"`
+		PreviewDiskThreshold int    `json:"previewDiskThreshold"`
+		WebhookTriggerLabel  string `json:"webhookTriggerLabel"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxJSONBody)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体不是合法 JSON"})
@@ -74,7 +78,22 @@ func (a *AdminAPI) putSettings(w http.ResponseWriter, r *http.Request) {
 		serverError(w, "保存磁盘阈值失败", err)
 		return
 	}
-	slog.Info("系统设置已更新", "previewMem", body.PreviewMemThreshold, "previewDisk", body.PreviewDiskThreshold, "by", actorOf(r))
+	// 标签名：空串是合法值，语义是「关闭标签驱动接单」。
+	// 刻意不做格式校验 —— Linear 的标签名可以是任意文本（含空格、中文、
+	// emoji），这里定规则只会把合法的标签挡在外面。
+	label := strings.TrimSpace(body.WebhookTriggerLabel)
+	if len(label) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "触发标签名过长（上限 200 字符）"})
+		return
+	}
+	if err := a.Store.SetSetting(ctx, store.SettingWebhookTriggerLabel, label); err != nil {
+		serverError(w, "保存触发标签失败", err)
+		return
+	}
+
+	slog.Info("系统设置已更新",
+		"previewMem", body.PreviewMemThreshold, "previewDisk", body.PreviewDiskThreshold,
+		"webhookTriggerLabel", label, "by", actorOf(r))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 

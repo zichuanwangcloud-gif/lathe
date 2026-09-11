@@ -106,6 +106,9 @@ nodes(id, name, capabilities_json, -- {docker, cpu, mem_mb, disk_mb, repos_cache
       last_heartbeat_at, status)
 tasks(id, user_id, repo_id, linear_issue_key, state,
       gate_mode,             -- direct | guarded | plan-first | manual
+                             -- 2026-09-09：只有 manual 有实现语义（验证通过后停在
+                             -- awaiting_approval 等人放行）；guarded/plan-first 当前
+                             -- 按 direct 处理，见 08-debt-cleanup.md T2
       verify_tier,           -- light | heavy  (§5 判定后写入)
       agent_session_id,      -- ★ resume 用
       worktree_path, branch_name, pr_url,
