@@ -35,3 +35,6 @@ coverage.*
 /internal/webui/dist/*
 !/internal/webui/dist/.gitkeep
 .pnpm-store/
+
+# Claude Code 本地工作树与产物
+/.claude/

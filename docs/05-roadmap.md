@@ -33,7 +33,7 @@
 | 02-design §7 | `PR 评论 → review_feedback → implementing(--resume) → 重新验证` | 状态机跑到 `pr_open` 即止（pipeline.go:69），review 回路无入口 |
 | 02-design §7 | `合并 → merged → 回收 worktree` | `merged` 状态存在但没有代码设置它 |
 | 02-design §8 P1 | per-task compose 隔离（红绿阶段） | 未做，红绿目前在 worktree 里直接跑 |
-| 02-design §8 P3 | 多节点：`cmd/lathe-runner` 节点代理 | 54 行骨架，TODO(task#5/#6) 未装配 —— **决策点：推进还是删除** |
+| 02-design §8 P3 | 多节点：`cmd/lathe-runner` 节点代理 | ~~54 行骨架，TODO 未装配~~ —— **已决：删除**，见 [08-debt-cleanup.md](./08-debt-cleanup.md) D8-1 |
 
 ### 1.2 本次会话诊断出但未修的
 
@@ -50,8 +50,17 @@
 
 ### 1.3 数据残留
 
-- `repos` id=241（`acme/member-repo`，user 535 的占位行）—— 无真实仓库，建议清理
+- ~~`repos` id=241（`acme/member-repo`，user 535 的占位行）~~ —— 已清理（2026-09-09）
 - ~~task #217（SMOKE-2 排队尸体）~~ —— 已清理，无需处理
+
+**2026-09-09 补记**：这类残留不是偶发，是**测试 fixture 被中断后的必然产物**
+（测试进程被杀 → `t.Cleanup` 不执行 → user/repo/task 三张表的行原样留下）。
+而且它会让下一轮测试变红，因为 `ClaimReady`／`Reconcile` 都是全局查询 ——
+实测过两种崩法，取证见 [08-debt-cleanup.md](./08-debt-cleanup.md) §7。
+
+治法分两层：测试侧已经免疫（fixture 加随机量、断言按归属过滤、领单前排空），
+库里的存量用 `make clean-test-db` 清（判别条件是 email 以 `@example.com` 结尾，
+RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 ### 1.4 已纠正的误判
 
@@ -125,6 +134,9 @@
 - [ ] 准入档位实测校准（继承）
 - [ ] `light` 档是否强制要求新增测试（继承）
 - [ ] heavy 档磁盘余量纳入闸门（继承）
-- [ ] `cmd/lathe-runner` 骨架：推进 P3 还是删除（新增）
+- [x] ~~`cmd/lathe-runner` 骨架：推进 P3 还是删除~~ —— **已决：删除**（08 D8-1）。
+      当前无多机场景，且它违反 §0 纪律的加强版：不是「字段无消费方」，是整个二进制无消费方。
+      真有多机需求时从 git 历史捞回。注意 `config.NodeName` **保留**——它的两个消费方
+      （task_events 的 actor 前缀、管理界面运行时面板）与多节点无关。
 - [ ] 修复回路的次数上限与升级策略：N 次失败后是放弃还是换模型/换思路重试（新增）
 - [ ] 跨包破坏的回归覆盖：包级收敛后跨包破坏靠仓库自己的 CI，平台是否要可选的"全模块回归"开关（新增）

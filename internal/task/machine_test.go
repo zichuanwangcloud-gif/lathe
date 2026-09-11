@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -41,17 +42,27 @@ func fixture(t *testing.T, pool *pgxpool.Pool) (userID, repoID int64) {
 	t.Helper()
 	ctx := context.Background()
 
-	email := "test-" + t.Name() + "@example.com"
+	// email 必须带随机量。原先是 "test-<测试名>@example.com" —— 确定值 ——
+	// 再配 ON CONFLICT DO UPDATE，于是上一轮被中断（测试进程被杀，t.Cleanup
+	// 没执行）留下的孤儿 user 会被【复用】，连带它名下的 repo 与那些用固定
+	// issue key（CR-1001 / CR-ORCH-ROOT 之类）建的非终态任务，
+	// 下一轮 Create 就撞上部分唯一索引 tasks_one_active_per_issue。
+	//
+	// 新 user 天然给出新 repo_id（repos 唯一键是 (user_id, provider_repo)），
+	// 固定 issue key 也就被限定在这个 repo 内，不会跨轮次撞车。
+	// provider_repo 保持原值：调用方有断言依赖它。
+	//
+	// 两处 ON CONFLICT 一并去掉：带了随机量就不该再有冲突，
+	// 真撞上了应该大声报错，而不是静默复用别人的行。
+	// 见 docs/08-debt-cleanup.md §7。
+	email := "test-" + t.Name() + "-" + strconv.FormatInt(time.Now().UnixNano(), 10) + "@example.com"
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO users (email) VALUES ($1)
-		 ON CONFLICT (email) DO UPDATE SET updated_at = now()
-		 RETURNING id`, email).Scan(&userID); err != nil {
+		`INSERT INTO users (email) VALUES ($1) RETURNING id`, email).Scan(&userID); err != nil {
 		t.Fatalf("建 user 失败: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO repos (user_id, provider_repo) VALUES ($1, $2)
-		 ON CONFLICT (user_id, provider_repo) DO UPDATE SET updated_at = now()
-		 RETURNING id`, userID, "Clouditera/CloudRouter").Scan(&repoID); err != nil {
+		`INSERT INTO repos (user_id, provider_repo) VALUES ($1, $2) RETURNING id`,
+		userID, "Clouditera/CloudRouter").Scan(&repoID); err != nil {
 		t.Fatalf("建 repo 失败: %v", err)
 	}
 
@@ -60,6 +71,40 @@ func fixture(t *testing.T, pool *pgxpool.Pool) (userID, repoID int64) {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID)
 	})
 	return userID, repoID
+}
+
+// drainForeignQueue 把当前所有可领取的任务用长租约领空，为「本用例随后创建的
+// 任务是唯一候选」建立前提。**必须在创建自己的 fixture 任务之前调用。**
+//
+// 为什么需要它：ClaimReady 是【全局】查询 —— 单机调度器就该看全局队列，
+// 这在生产上是正确语义，不能为了测试给它加 owner 过滤。但这让
+// 「断言领到的就是自己那条」变得脆弱：开发库里任何一条别人的 queued 行都会
+// 按 (priority DESC, id) 排在前面被优先领走。而别人的行是常态不是异常 ——
+// 测试进程被杀（Ctrl-C、CI 超时）时 t.Cleanup 不执行，孤儿行就留下了。
+//
+// 在建自己的任务之前排空，比事后按 owner 过滤更简单：那一刻所有候选都必然
+// 不属于本用例。ClaimReady 只写 lease_expires_at 与 node_id、不改 state，
+// 所以领走别人的行几乎无副作用，且租约会过期。
+//
+// 见 docs/08-debt-cleanup.md §7。
+func drainForeignQueue(t *testing.T, m *Machine, ctx context.Context) {
+	t.Helper()
+	const maxDrain = 200
+	n := 0
+	for i := 0; i < maxDrain; i++ {
+		tk, err := m.ClaimReady(ctx, time.Hour)
+		if err != nil {
+			t.Fatalf("排空全局队列时 ClaimReady 失败: %v", err)
+		}
+		if tk == nil {
+			if n > 0 {
+				t.Logf("排空了 %d 条外来 queued 行（疑似上一轮中断留下的孤儿）", n)
+			}
+			return
+		}
+		n++
+	}
+	t.Fatalf("连续领走 %d 条仍未排空全局队列，开发库里的孤儿行过多", maxDrain)
 }
 
 func ptr[T any](v T) *T { return &v }
