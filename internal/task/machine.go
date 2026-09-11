@@ -72,6 +72,20 @@ func NewMachine(pool *pgxpool.Pool) *Machine {
 // ErrTaskNotFound 表示目标任务不存在。
 var ErrTaskNotFound = errors.New("task: 任务不存在")
 
+// ErrStateMismatch 表示 TransitionFrom 的前置状态条件不成立：任务在
+// 调用方那次读之后、拿到行锁之前被改成了别的状态。
+//
+// 这是一次【并发下的正常拒绝】，不是内部故障 —— 调用方应当把它转成
+// 一个语义准确的冲突响应（如 409「任务已经不在等待确认的状态了」），
+// 而不是 500。想要的状态与实际状态都带上，消息才能直接给人看。
+type ErrStateMismatch struct {
+	Want, Got State
+}
+
+func (e ErrStateMismatch) Error() string {
+	return fmt.Sprintf("task: 状态已变化，期望 %s，实际 %s", e.Want, e.Got)
+}
+
 // ErrSessionRequired 表示该转移必须已持有 agent_session_id。
 //
 // 对应 docs/02-design.md §3 约束①：review 二轮必须 --resume 原会话。
@@ -130,12 +144,29 @@ func nilIfEmptyJSON(b []byte) []byte {
 	return b
 }
 
+// 闸门模式（repos.gate_mode / tasks.gate_mode）。取值域由数据库的
+// repos_gate_mode_check 与 tasks_gate_mode_check 约束定义，四个值。
+//
+// 本轮（docs/08-debt-cleanup.md T2）只有 GateManual 有拦截语义：
+// 验证通过后停在 awaiting_approval 等人确认。其余三个一律按 GateDirect
+// 处理 —— 不给它们编造语义，假装实现了又是一次「配了没接线」。
+const (
+	// GateDirect 验证通过即推分支开 PR（默认）。
+	GateDirect = "direct"
+	// GateManual 验证通过后停下等人确认（T2 接线的那一个）。
+	GateManual = "manual"
+	// GateGuarded 已在 CHECK 约束里，但尚无实现语义，当前按 direct 处理。
+	GateGuarded = "guarded"
+	// GatePlanFirst 已在 CHECK 约束里，但尚无实现语义，当前按 direct 处理。
+	GatePlanFirst = "plan-first"
+)
+
 // Create 新建任务（初始状态 queued）并记录创建事件。
 //
 // 若同一 issue 已有活任务，数据库的部分唯一索引会拒绝插入。
 func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 	if p.GateMode == "" {
-		p.GateMode = "direct"
+		p.GateMode = GateDirect
 	}
 	dependsOnAt := p.DependsOnAt
 	if dependsOnAt == "" {
@@ -213,6 +244,30 @@ type TransitionOpts struct {
 // 因此并发调用不会出现"两边都读到旧状态各自转移"的竞态。
 // 非法转移会被拒绝且不产生任何写入。
 func (m *Machine) Transition(ctx context.Context, id int64, to State, actor string, opts *TransitionOpts) (*Task, error) {
+	return m.transition(ctx, id, "", to, actor, opts)
+}
+
+// TransitionFrom 是 Transition 的带前置状态版本：只有当任务【此刻】仍
+// 处于 from 时才转移，否则返回 ErrStateMismatch。
+//
+// 为什么需要它：调用方先 Get 校验状态、再调 Transition，中间有一段
+// 不加锁的窗口（TOCTOU）。对人工作用的端点而言这不是纯粹的洁癖 ——
+// 拿 gate 放行来说，「先读到 awaiting_approval」与「真的把它转走」之间
+// 任务可能已经被另一个并发请求转走或被人取消，此时按第一次读到的旧
+// 状态放行，放行依据就不再成立。把前置状态交给持行锁的这次 UPDATE
+// 一起判定（WHERE state = $3），判定与写入在同一把锁下原子完成，
+// 窗口消失。
+//
+// 注意这里返回的是 ErrStateMismatch 而不是让调用方自己回读比对：
+// 「状态对不上」是并发下的正常结果，不是错误，调用方据此回一个
+// 语义准确的冲突响应即可（见 ErrStateMismatch 的注释）。
+func (m *Machine) TransitionFrom(ctx context.Context, id int64, from, to State, actor string, opts *TransitionOpts) (*Task, error) {
+	return m.transition(ctx, id, from, to, actor, opts)
+}
+
+// transition 是 Transition / TransitionFrom 的实现。from 为空串表示
+// 不附加前置状态条件（只走合法转移表）。
+func (m *Machine) transition(ctx context.Context, id int64, from, to State, actor string, opts *TransitionOpts) (*Task, error) {
 	if opts == nil {
 		opts = &TransitionOpts{}
 	}
@@ -236,6 +291,12 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 		return nil, fmt.Errorf("task: 锁定任务 %d 失败: %w", id, err)
 	}
 
+	// 前置状态：在行锁下比对。调用方要求的那次读发生在锁外，此刻
+	// 状态可能已经被别的请求改掉了，那一读不能作为放行依据。
+	if from != "" && cur.State != from {
+		return nil, ErrStateMismatch{Want: from, Got: cur.State}
+	}
+
 	if err := Validate(cur.State, to); err != nil {
 		return nil, err
 	}
@@ -249,6 +310,9 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 		}
 	}
 
+	// from 为空串时该条件恒真，与旧行为一致。上面的行锁保证了本条
+	// UPDATE 必然命中一行：状态条件若在锁下不成立，前面已经返回
+	// ErrStateMismatch，走不到这里 —— 所以不需要再处理零行。
 	updated, err := scanTask(tx.QueryRow(ctx, `
 		UPDATE tasks SET
 			state             = $2,
@@ -262,19 +326,20 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 			failure_stage     = COALESCE($10, failure_stage),
 			node_id           = COALESCE($11, node_id),
 			lease_expires_at  = COALESCE($12, lease_expires_at)
-		WHERE id = $1
+		WHERE id = $1 AND ($13 = '' OR state = $13)
 		RETURNING `+taskColumns,
 		id, to,
 		opts.AgentSessionID, opts.WorktreePath, opts.BranchName, opts.PRURL,
 		opts.VerifyTier, opts.TaskKind, opts.FailureReason, opts.FailureStage,
 		opts.NodeID, opts.LeaseExpiresAt,
+		string(from),
 	))
 	if err != nil {
 		return nil, fmt.Errorf("task: 更新任务 %d 失败: %w", id, err)
 	}
 
-	from := cur.State
-	if err := insertEvent(ctx, tx, id, &from, to, actor, opts.Payload); err != nil {
+	was := cur.State
+	if err := insertEvent(ctx, tx, id, &was, to, actor, opts.Payload); err != nil {
 		return nil, err
 	}
 
@@ -351,6 +416,38 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 		t, err := scanTask(rows)
 		if err != nil {
 			return nil, fmt.Errorf("task: 读取 pr_open 任务失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ActiveByIssueID 返回某属主名下、指定 Linear issue 的所有非终结任务（T7）。
+//
+// 谓词抄 flow/service.go 那条「同 issue 的活任务」查询，改成按
+// linear_issue_id（UUID）而不是 linear_issue_key —— webhook 手里权威的是
+// UUID，issue key 是人读标识、理论上可被重命名。
+//
+// 正常情况下最多一条（tasks_one_active_per_issue 部分唯一索引按
+// (repo_id, linear_issue_key) 挡住），但一个用户可能在多个仓库下登记了
+// 同一个 issue，所以返回切片、不假设恰好一条。
+func (m *Machine) ActiveByIssueID(ctx context.Context, userID int64, issueID string) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE user_id = $1 AND linear_issue_id = $2
+		  AND state NOT IN ('merged', 'failed', 'cancelled')
+		ORDER BY id`, userID, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询 issue %s 的在途任务失败: %w", issueID, err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取在途任务失败: %w", err)
 		}
 		out = append(out, t)
 	}

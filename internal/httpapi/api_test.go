@@ -121,6 +121,7 @@ func TestAPIRequiresAuth(t *testing.T) {
 		{"POST", "/api/tasks", `{"issueKey":"CR-1"}`},
 		{"POST", "/api/tasks/1/retry", ""},
 		{"POST", "/api/tasks/1/cancel", ""},
+		{"POST", "/api/tasks/1/approve", ""},
 		{"POST", "/api/repos", `{"providerRepo":"acme/x"}`},
 		{"PUT", "/api/repos/" + itoa(repoID), `{"gateMode":"direct"}`},
 	}
