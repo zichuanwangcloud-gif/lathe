@@ -15,7 +15,7 @@
 // 全部 PASS。亮色模式下 aqua 对 surface 对比度 2.82:1 低于 3:1，触发
 // relief 规则 —— 所以堆叠条**始终带可见直接标签**，且提供表格视图，
 // 颜色永远不是唯一的信息通道。
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { api, formatDuration } from '../api.js'
 
 const cost = ref(null)
@@ -26,8 +26,22 @@ const showTable = ref(false)
 // 图表实际像素宽度：用 ResizeObserver 量出来再按真实尺寸画 SVG，
 // 而不是给 viewBox 配 preserveAspectRatio 缩放 —— 那样 2px 描边会跟着
 // 被拉伸，「细线」这条规格就失效了。
+//
+// 观测目标 plotBox 挂在 `v-else-if="cost"` 的子树里，而首屏渲染时 cost
+// 还是 null（走的「加载中…」分支），所以 onMounted 那一刻 plotBox.value
+// 必定是 null。**不能**在 onMounted 里建 observer：那里会直接短路，
+// observer 永远建不起来，SVG 宽度就停在初值 640，窗口 resize 与首次
+// 拿到数据都不会重算。
+//
+// 改成 watch 模板 ref：Vue 3 的模板 ref 是响应式的，盒子出现（cost 到位）
+// 或消失（切到表格视图）都会推过来 —— 这才是「观测时机」的正确表达。
+//
+// 兜底下限与初值必须同源：初值 640 是「还没量到」时的合理宽度，下限 320 是
+// 「盒子被压到极窄时仍要画得出来」的保护。两者都走常量，避免改一处漏一处。
+const MIN_PLOT_W = 320
+const DEFAULT_PLOT_W = 640
 const plotBox = ref(null)
-const plotW = ref(640)
+const plotW = ref(DEFAULT_PLOT_W)
 let ro = null
 
 async function load() {
@@ -42,17 +56,61 @@ async function load() {
   }
 }
 
-onMounted(() => {
-  load()
-  if (plotBox.value && typeof ResizeObserver !== 'undefined') {
-    ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect?.width
-      if (w) plotW.value = Math.max(320, Math.floor(w))
-    })
-    ro.observe(plotBox.value)
+// 断开当前 observer —— 卸载、盒子消失、重新观测前都要先走这一步，
+// 否则窗口 resize 回调会越挂越多（每次 load 一轮就多一份）。
+function stopObserving() {
+  if (ro) {
+    ro.disconnect()
+    ro = null
   }
-})
-onUnmounted(() => ro && ro.disconnect())
+}
+
+// 观测的生命周期全在这一个 watch 里，三种迁移各自对应：
+//   null → el ：盒子出现（首次拿到数据，或从表格视图切回图表）→ 建 observer
+//   el → el'  ：盒子被重建（数据刷新导致子树替换）→ 先断旧的再观测新的
+//   el → null ：盒子消失（切到表格视图）→ 断开
+// 每条路径开头都先 stopObserving，所以轮询刷新不会叠加 observer；
+// 元素消失时 ResizeObserver 也不会自己解绑（它仍持有节点引用），留着就是泄漏。
+//
+// flush: 'post' 是关键：模板 ref 在 DOM patch 阶段赋值，post 时机保证
+// 回调跑在 DOM 更新之后，量到的宽度是真实布局宽度而不是 0。
+// 用它而不是在回调里 await nextTick()，还顺手消掉一个竞态 ——
+// 异步回调在快速切换视图时可能在 await 之后给一个已被移除的元素挂 observer。
+watch(plotBox, (el) => {
+  stopObserving()
+  if (!el) return
+
+  if (typeof ResizeObserver === 'undefined') {
+    // 老浏览器（Safari < 13.1）没有 ResizeObserver：退回监听 window resize。
+    // 布局变宽窄多半伴随窗口变化，够用；卸载时按同一个 disconnect 契约解绑。
+    //
+    // clientWidth 为 0（元素还没布局、或被 display:none 的祖先藏着）时不写，
+    // 保留 DEFAULT_PLOT_W —— 直接 Math.max(320, 0) 会把图压到 320，
+    // 比「还没量到就先按 640 画」更糟。
+    const measure = () => {
+      const w = Math.floor(el.clientWidth)
+      if (w > 0) plotW.value = Math.max(MIN_PLOT_W, w)
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    ro = { disconnect: () => window.removeEventListener('resize', measure) }
+    return
+  }
+
+  ro = new ResizeObserver((entries) => {
+    // 同一个 if (w) 守卫：contentRect.width 为 0 时（切到表格视图的那一帧、
+    // 或元素被隐藏）不动 plotW，避免图被压到下限又弹回来的闪跳。
+    const w = entries[0]?.contentRect?.width
+    if (w) plotW.value = Math.max(MIN_PLOT_W, Math.floor(w))
+  })
+  ro.observe(el)
+}, { flush: 'post' })
+
+// onMounted 只负责取数：观测的挂载时机交给上面的 watch。
+// （原来 onMounted 里那条建 observer 的路径已删除 —— 它必然短路：
+// 首屏 cost 还是 null，plotBox 在 v-else-if="cost" 子树里，量不到元素。）
+onMounted(load)
+onUnmounted(stopObserving)
 
 // ---------------------------------------------------------------- 格式化
 
