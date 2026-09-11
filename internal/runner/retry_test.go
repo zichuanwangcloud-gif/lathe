@@ -161,13 +161,38 @@ func TestPlanRetryDecisionTable(t *testing.T) {
 
 // 非法模式与空模式。
 func TestRetryModeValid(t *testing.T) {
-	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh} {
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved} {
 		if !m.Valid() {
 			t.Errorf("模式 %q 应合法", m)
 		}
 	}
 	if RetryMode("bogus").Valid() {
 		t.Error("未知模式应非法")
+	}
+}
+
+// 外部入参的选择域比已知模式集合小：approved 是人工闸门放行的内部信号，
+// 只由 approveTask 构造，绝不允许从请求体传进来。
+//
+// 这条断言是安全控制本身，不是格式检查：一旦它变红，说明持 token 的用户
+// 又能对任意自己名下的任务 POST {"mode":"approved"} 绕过闸门走 EntryPush。
+func TestRetryModeUserSelectableExcludesApproved(t *testing.T) {
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh} {
+		if !m.UserSelectable() {
+			t.Errorf("模式 %q 应可由用户选择", m)
+		}
+	}
+	if RetryApproved.UserSelectable() {
+		t.Error("approved 只许 approveTask 内部构造，不能是用户入参")
+	}
+	if RetryMode("bogus").UserSelectable() {
+		t.Error("未知模式应不可选")
+	}
+	// 白名单式判据：UserSelectable 为真的一定也在 Valid 里，反向不成立。
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, "bogus"} {
+		if m.UserSelectable() && !m.Valid() {
+			t.Errorf("模式 %q 可选却不是已知模式：UserSelectable 的白名单漏了 Valid 的约束", m)
+		}
 	}
 }
 
