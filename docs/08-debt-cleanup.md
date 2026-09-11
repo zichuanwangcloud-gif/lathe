@@ -68,7 +68,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | **DONE** |
 | T3 | 任务终态邮件通知（接 `notify_email`） | C | **DONE** |
 | T4 | `verifications.log_ref` 落盘写入 | C | **DONE** |
-| T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
+| T5 | 成本聚合面板（store 聚合 + API + 前端） | D | **DONE** |
 | T6 | worktree TTL 收割机 | E | TODO |
 | T7 | webhook 联动：标签接单 + issue 取消联动 | F | **DONE** |
 | T8 | per-task compose 隔离（验证阶段） | G | TODO |
@@ -652,6 +652,49 @@ repos / tasks / task_events / verifications / agent_events。
   门禁：注入 16 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
   `go vet` 与 `gofmt` 干净。
 
+- 2026-09-09：**T5 实现完成**（PR D，分支 `feat/cost-panel`，base 在 A 上）。
+  核心是躲开那个会让面板从第一天起就说谎的坑：**不用 `tasks.agent_cost_usd`**。
+  最关键的测试 `TestCostStatsSumsEventsNotTaskColumn` 就是钉这一条 ——
+  造「分诊 + 实现 + 2 轮 fix」共 $0.90，把 `tasks.agent_cost_usd` 设成
+  最后一轮的 `0.08`，断言聚合值是 0.90 而不是 0.08。
+
+  后端：`store.CostStatsFor` 四个聚合（总计 / 按阶段 / 按日 / 任务排行），
+  全部 `JOIN tasks` 按 `user_id` 过滤 —— `agent_events` 没有 `user_id` 列，
+  漏掉 JOIN 就是跨用户求和，P1.5 数据隔离的红线。`fix-N` 归入 implement 桶：
+  修复回路是实现的延续，分开看没有决策价值。加 migration 0018 的部分索引
+  `agent_events (task_id) WHERE kind='result'` —— 既有的
+  `agent_events_task_id` 服务 SSE 增量拉取，谓词里没有 kind，帮不上聚合。
+
+  **偏离了我自己写的 AC1**：AC1 说「`/api/stats` 返回成本聚合」，实际做成
+  独立端点 `GET /api/stats/cost`。理由：`Board.vue` 每 5 秒轮询 `/api/stats`，
+  而 `agent_events` 是全表最大的一张，四个聚合压进那个轮询纯属浪费；
+  成本是决策视图，不需要 5 秒新鲜度。理由写进了代码注释。
+
+  前端 `CostPanel.vue`（零新依赖，内联 SVG）。按 dataviz 规范走完整流程：
+  - **先定形态再定颜色**：总花费是一个数字 → stat tile，不是「只有一根柱子
+    的柱状图」；阶段占比用水平堆叠条不是饼图；任务排行**刻意不按值上色** ——
+    那会把条长重复编码成色相，白占掉唯一的空闲通道
+  - **配色跑校验器而不是靠眼睛**：按项目**实际** surface（亮 `#ffffff`、
+    暗 `#171a21`，与参考默认不同）两个模式都跑，CVD 相邻分离度
+    ΔE 9.2/9.4（门限 8）、常视力 27.6/26.5（门限 15）全 PASS。
+    亮色下 aqua 对比度 2.82:1 触发 relief 规则 → 堆叠条始终带可见直接标签
+    且提供表格视图，颜色永不是唯一通道
+  - 沿用项目的暗色优先约定（`:root` 即暗色，亮色走 `prefers-color-scheme`），
+    不另立门户
+
+  **没能真截图**：环境里没有无头浏览器也没有 SVG 转换器。退一步把组件的几何
+  数学原样搬进 node 脚本做数值核查，覆盖宽屏/窄屏/单日/三日/过千/全零六个场景，
+  断言「标签不溢出、不裁切、坐标都在画布内、容器高度含 x 轴文字带」。
+  **这一步真查出一个 bug**：y 轴刻度用 `fmtUSD` 会渲染成 `$0.0000`
+  （7 字符 ≈46px @11px），右对齐在 `PAD.left-8` 处向左溢出容器 8px。
+  已改成专用的 `fmtAxis`（干净刻度 `$0.90`）并把左内边距 46 → 52，
+  现在余量 11–17.6px。核查脚本本身也报错过一次（`worst` 初值设成 0，
+  取 min 永远 ≤0，把真实余量报成 0.0px）—— 断言逻辑是对的，报告是错的，
+  一并修了。
+
+  门禁：注入 18 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净、`make ui` 通过。
+
 - 2026-09-09：**T7 实现完成**（PR F，分支 `feat/webhook-triggers`，base 在 A 上）。
   三个关键判断：
   1. **取消分流必须在接单闸门之前。** 取消事件不是指派事件 —— 放在闸门之后
@@ -707,3 +750,25 @@ repos / tasks / task_events / verifications / agent_events。
   真的开出 PR（`CreatePR` 在 `Transition(pr_open)` 之前），随后转移被拒，
   于是一个已开的 PR 挂在 `cancelled` 任务上，而 MergePoller 只扫 `pr_open`
   所以它永不被回收。这属于「取消信号传播」后续项，不是本 PR 能收口的。
+
+  **合并前审计后的加固（两个阻断项）**：
+  ① **迁移锁表，且 CONCURRENTLY 在本框架下结构性不可用。** 0018 不带
+  CONCURRENTLY 会在建索引期间阻塞 `agent_events` 写入 —— 而它是全表最大的
+  一张，被挡住的正是所有在跑任务的事件流写入。更根本的是 `applyOne` 把每条
+  迁移包在事务里，而 Postgres 禁止在事务块内执行 `CREATE INDEX CONCURRENTLY`，
+  所以**后续任何加索引的迁移都得面对同一件事**。修的是框架：新增
+  `-- lathe:no-transaction` 标记（必须独占一行，避免注释里提到它的迁移被误判），
+  非事务路径逐条发语句（pgx 简单协议发多语句会被服务端当成隐式事务，
+  CONCURRENTLY 照样报 25001），版本记录写在全部语句成功之后 —— 这是幂等性的
+  支点：中断不记账，下次仍视为待应用。0018 首句无条件 `DROP INDEX IF EXISTS`，
+  因为 `CREATE INDEX CONCURRENTLY IF NOT EXISTS` 遇到 INVALID 索引会因
+  「名字已存在」直接跳过、**永远修不好**；结尾 DO 块查 `indisvalid`，把
+  「索引存在但无效」变成响亮的失败而不是哑巴残骸。`runMigrate` 的 2 分钟超时
+  放宽到 10 分钟并可配。
+  ② **前端 ResizeObserver 从不挂载。** `ref="plotBox"` 在 `v-else-if="cost"`
+  子树里，而 `onMounted` 执行时 `cost` 还是 null、渲染的是「加载中…」，
+  `plotBox.value` 必为 null → observer 从未创建 → SVG 宽度永远停在 640。
+  改用 `watch(plotBox, cb, { flush: 'post' })`（同步回调，没有 async 版本
+  那个「给已移除元素挂 observer」的窗口）。这一条同时修正原自述的一处不实：
+  几何核查「覆盖窄屏 360px」核的是几何函数在 `plotW=360` 时的正确性，而运行时
+  `plotW` **永远到不了 360** —— 数学验对了，接线没通。

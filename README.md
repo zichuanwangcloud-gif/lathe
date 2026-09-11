@@ -102,6 +102,7 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 | `LATHE_SETTING_SOURCES` | agent 加载的配置源，默认 `project`（排除个人插件，见 §9） |
 | `LATHE_TRIAGE_CHANNEL` | 分诊的 cc-switch 通道名（模型路由：分诊走便宜通道），空 = 跟随激活通道 |
 | `LATHE_IMPLEMENT_CHANNEL` | 实现/修复回路的 cc-switch 通道名（走强通道），空 = 跟随激活通道 |
+| `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。

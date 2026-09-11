@@ -67,6 +67,25 @@ func run() error {
 	return serve(cfg)
 }
 
+// MigrateTimeoutDefault 是 migrate 子命令的默认超时。
+//
+// 见 runMigrate 的注释：值之所以从 2 分钟放宽到这里，是因为非事务迁移
+// （0018 的 CREATE INDEX CONCURRENTLY）在大表上远超 2 分钟。
+const MigrateTimeoutDefault = 10 * time.Minute
+
+// migrateTimeout 返回迁移超时：环境变量 LATHE_MIGRATE_TIMEOUT 优先，
+// 解析失败或未设置时回退到 MigrateTimeoutDefault。
+func migrateTimeout() time.Duration {
+	if v := os.Getenv("LATHE_MIGRATE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("LATHE_MIGRATE_TIMEOUT 无法解析，回退到默认值",
+			"value", v, "default", MigrateTimeoutDefault)
+	}
+	return MigrateTimeoutDefault
+}
+
 func runMigrate(cfg config.Config, args []string) error {
 	dir := "up"
 	if len(args) > 0 {
@@ -76,7 +95,28 @@ func runMigrate(cfg config.Config, args []string) error {
 		return fmt.Errorf("migrate 方向须为 up 或 down，得到 %q", dir)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	slog.Info("开始迁移", "direction", dir, "timeout", migrateTimeout())
+
+	// 迁移超时。
+	//
+	// 原来是硬编码的 2 分钟，理由是「迁移都是小 DDL，跑不了这么久」。
+	// 加了 CONCURRENTLY 之后这个前提不成立：并发建索引为了不阻塞写入，
+	// 要把表扫两遍（第一遍建、第二遍校验并接上并发写），在大表上耗时是
+	// 普通 CREATE INDEX 的数倍，线性的分钟级可能变成十几分钟。
+	//
+	// 方案：默认放宽到 10 分钟，并允许用 LATHE_MIGRATE_TIMEOUT 覆盖
+	// （time.ParseDuration 语法，如 30m、1h）。三个候选方案的取舍：
+	//   - 干脆不可配置：部署方遇到超大表时没有出路，只能去改代码重发版。
+	//   - 让非事务迁移不受超时约束：看上去最省事，实则是把「无上限等待」
+	//     写死进框架 —— 连接卡住（锁等待、网络半开）时 migrate 会永远挂着，
+	//     而这正是 context 存在的意义。宁可失败也别静默挂死。
+	//   - 放宽默认 + 可配置（采用）：默认值覆盖绝大多数实例，例外能自救。
+	//
+	// 超时/取消在这里是安全的，不是「断了就烂」：非事务迁移的版本记录写在
+	// 全部语句成功之后（见 store.applyOneNoTx），中断的迁移不会被记成已应用；
+	// 而 CONCURRENTLY 被打断留下的 INVALID 索引，会被迁移脚本开头的
+	// DROP INDEX IF EXISTS 在重跑时清掉。所以重跑即恢复。
+	ctx, cancel := context.WithTimeout(context.Background(), migrateTimeout())
 	defer cancel()
 
 	st, err := store.Open(ctx, cfg.Database.DSN())

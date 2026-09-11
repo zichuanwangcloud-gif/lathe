@@ -82,6 +82,9 @@ export const api = {
   taskEvents: (id, after = 0, limit = 200) =>
     request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`),
   stats: () => request('/api/stats'),
+  // 成本聚合独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
+  // 不需要 5 秒新鲜度（后端注释里有完整理由）。
+  costStats: () => request('/api/stats/cost'),
   repos: () => request('/api/repos'),
   config: () => request('/api/config'),
 
