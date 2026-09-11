@@ -33,6 +33,15 @@ type TaskEnqueuer interface {
 	// mode 是重试模式（auto/resume/fresh，见 runner.RetryMode），
 	// 空串按 auto（智能决策）处理。
 	Requeue(ctx context.Context, taskID int64, mode string) error
+	// CancelForIssue 把该 issue 名下所有在途任务转 cancelled（T7 取消联动），
+	// 返回被取消的任务 id。
+	//
+	// **语义边界必须明确**：它只改数据库状态，【不会停下正在跑的 agent】——
+	// runner 全包没有任何地方在执行中途回读 task state。在途 agent 会继续
+	// 跑到自己结束，然后在下一次状态转移时因为 cancelled 是无出边终态而
+	// 被 Validate 拒绝。真正的取消信号传播是后续项，见
+	// docs/08-debt-cleanup.md T7-AC6。
+	CancelForIssue(ctx context.Context, ownerUserID int64, issueID, issueKey string) ([]int64, error)
 }
 
 // WebhookTarget 是一个 slug 解析出的投递目标。
@@ -43,6 +52,12 @@ type WebhookTarget struct {
 	Secret string
 	// LinearUserID 用于「指派给我了吗」的接单判定（D2）。
 	LinearUserID string
+	// TriggerLabel 是标签驱动接单的标签名（T7）。
+	//
+	// **空串表示关闭该能力**，这是「未配置时行为与现状一致」的实现：
+	// 不能让存量部署因为升级就突然开始按标签接单 —— 某个仓库可能早就
+	// 在用 lathe:go 这个标签表示别的意思。
+	TriggerLabel string
 }
 
 // TargetResolver 把回调路径里的 slug 解析成投递目标。
@@ -121,10 +136,33 @@ func (h *LinearWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// D2：只处理「指派给绑定用户」的事件；其余一律确认后忽略
-	if !ev.IsAssignedTo(target.LinearUserID) {
+	// 取消联动（T7）必须分流在接单闸门【之前】：取消事件不是指派事件，
+	// 走到下面那个闸门会被当成「非指派事件」直接 ignored 掉。
+	if ev.IsCancelled() {
+		ids, cerr := h.Tasks.CancelForIssue(ctx, target.OwnerID, ev.Data.ID, ev.Data.Identifier)
+		if cerr != nil {
+			slog.Error("issue 取消联动失败", "issue", ev.Data.Identifier, "owner", target.OwnerID, "err", cerr)
+			_ = h.Deliveries.FinishDelivery(ctx, deliveryID, cerr.Error())
+			// 已登记去重，重投不会再处理，返回 200 避免 Linear 无谓重试
+			writeJSON(w, http.StatusOK, map[string]any{"status": "error", "error": cerr.Error()})
+			return
+		}
 		_ = h.Deliveries.FinishDelivery(ctx, deliveryID, "")
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "非指派给本用户的事件"})
+		slog.Info("issue 已取消，联动取消在途任务",
+			"issue", ev.Data.Identifier, "owner", target.OwnerID, "tasks", ids)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "cancelled", "issue": ev.Data.Identifier, "tasks": ids,
+		})
+		return
+	}
+
+	// 接单闸门：D2 的「指派给我」，或 T7 的「打上触发标签」。
+	// 两者是或关系 —— 标签是给「不想改指派人、只想让平台跑一下」这种
+	// 用法留的入口。TriggerLabel 为空时 IsLabelTriggered 恒为 false，
+	// 于是整个判定退化成与本项之前逐字节一致的行为。
+	if !ev.IsAssignedTo(target.LinearUserID) && !ev.IsLabelTriggered(target.TriggerLabel) {
+		_ = h.Deliveries.FinishDelivery(ctx, deliveryID, "")
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ignored", "reason": "既非指派给本用户，也未打上触发标签"})
 		return
 	}
 

@@ -1,0 +1,11 @@
+-- lathe:no-transaction
+-- 0018_agent_events_result_index.down.sql
+--
+-- 用 DROP INDEX CONCURRENTLY 而不是普通 DROP INDEX：这张索引的父表是
+-- agent_events，普通 DROP 会拿 ACCESS EXCLUSIVE 锁，回滚时同样会阻塞
+-- runner 的事件写入 —— 与 up 侧避开长时间锁的动机一致。
+--
+-- 因此 down 也带 no-transaction 标记（框架按 up 脚本读标记，up 已标记，
+-- 这里只是把「为什么 down 也不需要事务」写清楚）。CONCURRENTLY 的 DROP
+-- 失败不会留下任何残骸（要么索引还在，要么没了），重跑天然幂等。
+DROP INDEX CONCURRENTLY IF EXISTS agent_events_result;

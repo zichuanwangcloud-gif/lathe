@@ -126,10 +126,14 @@ func (f *fakeNotifier) Notify(ctx context.Context, m string) error {
 // fakeVerifications 记录落库的验证步骤，供断言红-绿证据链完整。
 type fakeVerifications struct {
 	rows []string // "tier/step/status"
+	// logRefs 与 rows 平行：logRefs[i] 是 rows[i] 那一步落库的 log_ref
+	// （T4 —— 断言它真的被写进去了，而不是又一个「有列没消费方」）。
+	logRefs []string
 }
 
-func (f *fakeVerifications) InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64) error {
+func (f *fakeVerifications) InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64, logRef string) error {
 	f.rows = append(f.rows, tier+"/"+step+"/"+status)
+	f.logRefs = append(f.logRefs, logRef)
 	return nil
 }
 
@@ -1127,5 +1131,151 @@ func TestPipelineFixtureSurvivesInterruptedRun(t *testing.T) {
 	_, _, tkID, _, _ := pipelineFixture(t)
 	if tkID == 0 {
 		t.Fatal("pipelineFixture 应返回可用的 task id")
+	}
+}
+
+// ---------------------------------------------------------------- T2 人工闸门
+
+// manualGateAgent 造一个能走完分诊→实现→验证的 agent 假件（与 happy path 同款）。
+func manualGateAgent() *fakeAgent {
+	return &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"有现象和期望行为","question":""}`},
+			{Success: true, Text: "补了 greet 函数与复现测试"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
+					[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"hello\" }\n"), 0o644)
+			},
+		},
+	}
+}
+
+// gate_mode=manual 的完整闸门周期：验证通过后停在 awaiting_approval 且
+// 【不推分支、不开 PR】；人工确认后以 EntryPush 续跑，才真正开 PR。
+//
+// 这是 T2 的核心断言（docs/08-debt-cleanup.md T2 AC1/AC3/AC4）。
+// 两段合在一个测试里，是因为「停住」和「批准后能继续」是同一个契约的
+// 两半 —— 只验前者会漏掉「停住之后再也走不动了」这种更糟的实现。
+func TestPipelineManualGateHaltsBeforePRThenResumesOnApproval(t *testing.T) {
+	pool, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+
+	// 把这个任务标成人工闸门。gate_mode 列早就存在（migration 0001），
+	// 缺的只是消费方。
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET gate_mode='manual' WHERE id=$1`, taskID); err != nil {
+		t.Fatalf("设置 gate_mode 失败: %v", err)
+	}
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{Number: 42, URL: "https://github.com/acme/demo/pull/42"}}
+	p := newPipeline(t, m, lin, gh, manualGateAgent(), &fakeNotifier{})
+	p.SettingSources = "project"
+
+	// ---- 第一段：验证通过后必须停住 ----
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+	}); err != nil {
+		t.Fatalf("闸门停机是正常终止，不该返回错误: %v", err)
+	}
+
+	gated, err := m.Get(ctx, taskID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if gated.State != task.StateAwaitingApproval {
+		t.Fatalf("AC1：gate_mode=manual 验证通过后应停在 awaiting_approval，得到 %s", gated.State)
+	}
+	if len(gh.params) != 0 {
+		t.Errorf("AC1：闸门未放行时不该开 PR，却调了 CreatePR %d 次：%+v", len(gh.params), gh.params)
+	}
+	if gated.PRURL != nil {
+		t.Errorf("AC1：闸门未放行时不该有 PR URL，得到 %v", *gated.PRURL)
+	}
+	// 验证确实跑过（不是在验证之前就被挡住了）—— 档位落库即证据
+	if gated.VerifyTier == nil || *gated.VerifyTier == "" {
+		t.Error("AC1：闸门应在【验证通过之后】才拦住，验证档位却没落库")
+	}
+
+	// ---- 第二段：人工确认后续跑，只补 push + 开 PR ----
+	if _, err := m.Transition(ctx, taskID, task.StateQueued, "user:1", &task.TransitionOpts{
+		Payload: map[string]any{"mode": string(RetryApproved)},
+	}); err != nil {
+		t.Fatalf("AC4：awaiting_approval → queued 应是合法转移: %v", err)
+	}
+
+	plan := PlanRetry(RetryApproved, RetryInput{
+		WT: &WorktreeState{Exists: true, Registered: true, BranchExists: true, HasCommits: true, Commits: 1},
+	})
+	if plan.Entry != EntryPush {
+		t.Fatalf("AC3：批准后应从推送处续跑，得到 %s（理由 %v）", plan.Entry, plan.Reasons)
+	}
+	if plan.Fresh {
+		t.Fatal("AC3：批准后不该重建现场——验证已经过了，重跑等于白烧一遍 agent 与验证")
+	}
+
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		Retry: &plan,
+	}); err != nil {
+		t.Fatalf("批准后续跑失败: %v", err)
+	}
+
+	final, err := m.Get(ctx, taskID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if final.State != task.StatePROpen {
+		t.Fatalf("AC3：批准后应走到 pr_open，得到 %s", final.State)
+	}
+	if len(gh.params) != 1 {
+		t.Errorf("AC3：批准后应恰好开一次 PR，实际 %d 次", len(gh.params))
+	}
+	// 防呆：EntryPush 重入时闸门绝不能再次触发，否则 awaiting_approval
+	// → queued → awaiting_approval 会变成死循环，人点一次批准永远开不出 PR。
+	if final.PRURL == nil {
+		t.Error("AC3：PR URL 应已落库")
+	}
+}
+
+// gate_mode 的其余三个取值（direct/guarded/plan-first）行为必须与现状
+// 逐字节一致 —— 本轮只赋予 manual 语义，不假装实现了另两个
+// （docs/08-debt-cleanup.md T2 AC2；假装实现又是一次「配了没接线」）。
+func TestPipelineNonManualGateModesUnchanged(t *testing.T) {
+	for _, mode := range []string{"direct", "guarded", "plan-first"} {
+		t.Run(mode, func(t *testing.T) {
+			pool, m, taskID, repo, src := pipelineFixture(t)
+			ctx := context.Background()
+			if _, err := pool.Exec(ctx, `UPDATE tasks SET gate_mode=$2 WHERE id=$1`, taskID, mode); err != nil {
+				t.Fatalf("设置 gate_mode 失败: %v", err)
+			}
+
+			lin := &fakeLinear{issue: demoIssue()}
+			gh := &fakeGitHub{pr: &github.PullRequest{Number: 7, URL: "https://github.com/acme/demo/pull/7"}}
+			p := newPipeline(t, m, lin, gh, manualGateAgent(), &fakeNotifier{})
+			p.SettingSources = "project"
+
+			if err := p.Execute(ctx, ExecuteParams{
+				TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+			}); err != nil {
+				t.Fatalf("Execute 失败: %v", err)
+			}
+			final, err := m.Get(ctx, taskID)
+			if err != nil {
+				t.Fatalf("Get 失败: %v", err)
+			}
+			if final.State != task.StatePROpen {
+				t.Errorf("gate_mode=%s 应与现状一致走到 pr_open，得到 %s", mode, final.State)
+			}
+			if len(gh.params) != 1 {
+				t.Errorf("gate_mode=%s 应正常开 PR，CreatePR 调用 %d 次", mode, len(gh.params))
+			}
+		})
 	}
 }

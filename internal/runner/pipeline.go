@@ -69,7 +69,7 @@ type Notifier interface {
 // heavy 档的 repro_fail → repro_pass 是「红-绿证明」的可审计落痕，
 // 任务详情页直接展示。store.Store 实现此接口。
 type VerificationRecorder interface {
-	InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64) error
+	InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64, logRef string) error
 }
 
 // NewSessionID 生成会话 ID。抽成字段便于测试注入确定值。
@@ -84,6 +84,22 @@ type Pipeline struct {
 	Clients   Clients
 	Notifier  Notifier
 	NewID     NewSessionID
+
+	// Mail 给任务属主发终态通知信（T3）。为 nil 时不发信 ——
+	// 通知是副作用，缺了不影响任何流程。实现在 cmd/lathe，
+	// 见 notify.go 的 TaskMail 注释。
+	Mail TaskMail
+
+	// BaseURL 是本实例对外地址，通知邮件里的详情页链接用它拼。
+	// 空串时邮件省略链接那一行，而不是拼一个指向 localhost 的无用链接。
+	BaseURL string
+
+	// LogDir 是验证日志的落盘根目录（T4），实际写在
+	// <LogDir>/verify-logs/task-<id>/round-<n>/ 下。装配时传 cfg.DataDir。
+	//
+	// 刻意不放 worktree 里：worktree 会被回收，而日志的全部价值就在于
+	// 「现场没了之后还能查」。为空时不落盘，log_ref 留空。
+	LogDir string
 
 	// ClientFactory 非空时优先于 Clients：按任务属主解析客户端。
 	// 为 nil 时用静态 Clients（单用户部署与测试）。
@@ -249,7 +265,66 @@ func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
 			return unwind(err)
 		}
 	}
+
+	// 人工闸门（gate_mode=manual）：验证已过，但推分支/开 PR 前先停下等人。
+	//
+	// 只在【走过验证】的这一轮拦；entry == EntryPush 说明这一轮就是人点了
+	// 确认之后的续跑，此时绝不能再拦 —— 否则 awaiting_approval → queued
+	// → awaiting_approval 变成死循环，人点一次批准永远开不出 PR。
+	if entry != EntryPush {
+		if err := p.gateBeforePush(rc); err != nil {
+			return unwind(err)
+		}
+	}
+
 	return p.stagePushAndPR(rc)
+}
+
+// gateBeforePush 实现 repos.gate_mode 的人工闸门（05-roadmap §3.3 第 10 条）。
+//
+// 这个字段从 P0 就可配，但 pipeline 一直不读它 —— roadmap §0 记的
+// 「配置了但没接线」清单里就有它。本函数是它的消费方。
+//
+// 只有 manual 有拦截语义。CHECK 约束允许的另外三个值
+// （direct / guarded / plan-first）一律按 direct 处理：本轮不给它们
+// 编造语义，假装实现了又是一次「配了没接线」。真要做 guarded/plan-first
+// 时在这里补分支，届时它们各自的语义要先在设计文档里定下来。
+//
+// gate_mode 读的是 tasks.gate_mode（任务创建那刻从 repos 复制、从此钉死），
+// 不是现在的 repos.gate_mode —— 与 repo_id 的语义保持一致：
+// 任务在途期间人改了仓库配置，不该改变这个任务的行为。
+func (p *Pipeline) gateBeforePush(rc *runCtx) error {
+	if rc.tk.GateMode != task.GateManual {
+		return nil
+	}
+
+	gated, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateAwaitingApproval, rc.actor,
+		&task.TransitionOpts{Payload: map[string]any{
+			"gate_mode": rc.tk.GateMode,
+			"reason":    "验证已通过，按仓库的人工闸门设置等待确认后再开 PR",
+		}})
+	if err != nil {
+		return fmt.Errorf("转移到 awaiting_approval 失败: %w", err)
+	}
+
+	// 这一条通知的价值最高：任务停在这里不动，除了等人别的什么都不会发生。
+	// 不发信就只能靠人主动去翻面板才发现「活早就干完了」。
+	p.mailTerminal(rc.ctx, gated,
+		"这个仓库配了人工闸门（gate_mode=manual）：到任务详情页点「确认开 PR」后才会推分支并开 PR。")
+
+	slog.Info("人工闸门拦住了开 PR，等人确认",
+		"task", rc.tk.ID, "issue", rc.tk.LinearIssueKey, "gate_mode", rc.tk.GateMode)
+
+	// 回帖告诉人「活干完了，等你点」—— 否则人得盯着面板才知道该去确认。
+	if rc.lin != nil {
+		body := "验证已通过，但这个仓库配了人工闸门（gate_mode=manual）：确认后才会推分支并开 PR。\n\n请到 Lathe 任务详情页点「确认开 PR」。"
+		if _, err := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); err != nil {
+			// 回帖失败不该影响闸门本身 —— 状态已经落库了，人在面板上照样能看到。
+			slog.Warn("人工闸门回帖失败", "task", rc.tk.ID, "err", err)
+		}
+	}
+
+	return errHalt
 }
 
 // unwind 把阶段正常终止的哨兵翻译为 nil。
@@ -432,9 +507,23 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	resume := rc.plan != nil && rc.plan.Entry == EntryImplement
 
 	if !resume {
+		// 活任务认领：目录名带 task_id 之后同任务/同 issue 的撞名已经
+		// 消失，但老命名留下的存量目录仍可能被另一个在途任务占着 ——
+		// Create 会把它当尸体回收。把「谁在用哪条路径」交给 Create，
+		// 让它拒绝接管在途现场，而不是删掉别人的工作区。
+		//
+		// 查询失败只 warn 不判死：此时 Create 退回旧行为（把同名目录
+		// 当尸体），而 tasks_one_active_per_issue 与新目录名已经把绝大
+		// 多数撞名挡住了。
+		claimed, cerr := p.Tasks.ClaimedWorktreePaths(rc.ctx)
+		if cerr != nil {
+			slog.Warn("建工作区前查活任务占用失败（继续，Create 退回旧行为）",
+				"task", rc.tk.ID, "err", cerr)
+		}
 		wt, err := p.Worktrees.Create(rc.ctx, CreateParams{
 			Repo: rc.params.Repo, CloneURL: rc.params.CloneURL,
 			Kind: rc.kind, IssueKey: rc.issue.Identifier, Title: rc.issue.Title,
+			TaskID: rc.tk.ID, ClaimedPaths: claimed,
 		})
 		if err != nil {
 			return p.fail(rc, StageCreateWorktree, err)
@@ -677,18 +766,23 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	}
 
 	// 修复回路里要按最新 diff 重跑验证，抽成闭包共享判定逻辑。
-	runVerify := func() (Report, error) {
+	//
+	// round 参数决定日志落在哪个子目录：0 是首轮，1..N 对应修复回路的
+	// 第 N 轮。分目录是 T4-AC3 的要求 —— 同任务多轮不能互相覆盖，
+	// 否则「第一轮为什么挂」这个问题在第二轮跑完之后就永远回答不了了。
+	runVerify := func(round int) (Report, error) {
+		logs := p.stepLogger(rc.tk.ID, round)
 		if tier == TierHeavy {
 			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps,
-				changedFiles, rc.params.Repo.ExcludeDirs, rc.params.Repo.VerifyInfra)
+				changedFiles, rc.params.Repo.ExcludeDirs, rc.params.Repo.VerifyInfra, logs)
 		}
 		// light 档设计上「不起栈」（verify.go 的 TierLight 注释）：
 		// 构建/lint/类型检查不连外部依赖。起一个用不上的 postgres
 		// 只是白烧资源。
-		return p.Verifier.RunLight(rc.ctx, rc.wt.Path, steps, nil), nil
+		return p.Verifier.RunLight(rc.ctx, rc.wt.Path, steps, nil, logs), nil
 	}
 
-	report, err := runVerify()
+	report, err := runVerify(0)
 	if err != nil {
 		return p.fail(rc, StageVerifyRun, err)
 	}
@@ -751,7 +845,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		if nf, cerr := p.Worktrees.ChangedFiles(rc.ctx, rc.wt); cerr == nil {
 			changedFiles = nf
 		}
-		report, err = runVerify()
+		report, err = runVerify(attempt)
 		if err != nil {
 			return p.fail(rc, StageVerifyRun, err)
 		}
@@ -859,12 +953,16 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		slog.Warn("pr_number 落库失败", "task", rc.tk.ID, "err", err)
 	}
 
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StatePROpen, rc.actor, &task.TransitionOpts{
+	opened, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StatePROpen, rc.actor, &task.TransitionOpts{
 		PRURL:   &pr.URL,
 		Payload: map[string]any{"pr_number": pr.Number, "reused": pr.Existing},
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+
+	// 终态通知（T3）：活干完了，等人评审合并。
+	p.mailTerminal(rc.ctx, opened, "PR："+pr.URL+"\n\n"+verifySummary)
 
 	body := fmt.Sprintf("**Lathe 已完成并开出 PR**\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
 		pr.URL, verifySummary)
@@ -936,7 +1034,7 @@ func mergedExcludeDirs(global, repo []string) []string {
 	return append(out, repo...)
 }
 
-func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string) (Report, error) {
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string, logs StepLogger) (Report, error) {
 	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
 	if err != nil {
 		return Report{}, err
@@ -1000,6 +1098,7 @@ func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo stri
 		ReproErr:   reproErr,
 		Regression: regression,
 		StackEnv:   stackEnv,
+		Logs:       logs,
 	})
 	// RunHeavy 不知道栈的事（它只认 StackEnv），降级标记在这里补上：
 	// 报告是要回帖的那份，标记必须跟着它走。
@@ -1088,7 +1187,7 @@ func (p *Pipeline) persistVerifications(ctx context.Context, taskID int64, rep R
 		if p.Verifications != nil {
 			if err := p.Verifications.InsertVerification(ctx, taskID,
 				string(rep.Tier), string(s.Step.Name), string(s.Status),
-				s.Duration.Milliseconds()); err != nil {
+				s.Duration.Milliseconds(), s.LogRef); err != nil {
 				slog.Warn("验证步骤落库失败", "task", taskID, "step", s.Step.Name, "err", err)
 			}
 		}
@@ -1178,9 +1277,17 @@ func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
 		FailureStage:  strPtr(string(stage)),
 		Payload:       map[string]any{"stage": string(stage)},
 	}
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateFailed, "system", opts); err != nil {
-		return fmt.Errorf("任务失败(%s)，且状态转移也失败: %w（原因: %v）", stage.label(), err, cause)
+	failed, terr := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateFailed, "system", opts)
+	if terr != nil {
+		return fmt.Errorf("任务失败(%s)，且状态转移也失败: %w（原因: %v）", stage.label(), terr, cause)
 	}
+
+	// 终态通知（T3）。放在转移之后：只有状态真的落库了，通知才不会说谎。
+	mailDetail := ""
+	if rc.wt != nil {
+		mailDetail = fmt.Sprintf("工作区已保留在 %s（分支 %s），可直接进去接手；重试会优先续跑该现场。", rc.wt.Path, rc.wt.Branch)
+	}
+	p.mailTerminal(rc.ctx, failed, mailDetail)
 
 	// 4) 失败传播（F2.3-AC1~AC4）：depends_on 链上所有传递后继里仍排队的
 	// 任务转 blocked_dep，并回帖说明是被本任务连累的。传播出错或某个

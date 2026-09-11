@@ -414,3 +414,258 @@ func TestMirrorPathIsStableAndSafe(t *testing.T) {
 		t.Error("不同 owner 的仓库不应映射到同一 mirror")
 	}
 }
+
+// ---------------------------------------------------------------- 目录名维度
+
+// ★ B1 根治：目录名必须带 task_id，不同任务不共用同一个槽位。
+//
+// 原实现是 strings.ToLower(issueKey)，于是 issue CR-100 的任何一次尝试、
+// 任何仓库、任何用户都落在同一个 <root>/cr-100。tasks_one_active_per_issue
+// 只约束 (repo_id, issue_key) 上的活任务，两个不同 repo（乃至不同用户）
+// 可以同时各有一个活任务、issue key 相同 —— 它们会占用同一个目录，
+// 而收割机只认字符串路径，看到老任务行指着它就删。
+func TestWorktreeDirNameCarriesTaskID(t *testing.T) {
+	if got := worktreeDirName("CR-100", 1234, "fix/cr-100-x"); got != "cr-100-t1234" {
+		t.Errorf("目录名 = %q，期望 cr-100-t1234", got)
+	}
+	// 同 issue、不同任务：必须是两个不同的槽位
+	a := worktreeDirName("CR-100", 1, "fix/cr-100-x")
+	b := worktreeDirName("CR-100", 2, "fix/cr-100-x")
+	if a == b {
+		t.Errorf("同 issue 的两个任务不该共用目录，都是 %q", a)
+	}
+	// issue key 缺失时退回分支名派生，仍带维度
+	if got := worktreeDirName("", 7, "fix/some-branch"); got != "fix-some-branch-t7" {
+		t.Errorf("无 issue key 时目录名 = %q，期望 fix-some-branch-t7", got)
+	}
+	// 拿不到任务号时退回老命名（而不是拼一个 -t0）
+	if got := worktreeDirName("CR-100", 0, "fix/cr-100-x"); got != "cr-100" {
+		t.Errorf("taskID<=0 时应退回老命名，得到 %q", got)
+	}
+	if got := legacyWorktreeDirName("CR-100", "fix/cr-100-x"); got != "cr-100" {
+		t.Errorf("老命名 = %q，期望 cr-100", got)
+	}
+}
+
+// 存量兼容：老命名的目录仍能被 Create 当尸体接管，不会被遗留成永久垃圾。
+//
+// 老任务行里存的是完整路径，它们找自己的现场不受命名规则影响；需要照顾的
+// 只有「老现场还在盘上，同 issue 又来了新任务」这一种。
+func TestCreateReclaimsLegacyNamedCorpse(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	// 造一个老命名的现场（<root>/cr-1，没有 -t<id> 后缀）
+	legacy := filepath.Join(m.Root(), "cr-1")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "old.txt"), []byte("上一代现场\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wt, err := m.Create(ctx, CreateParams{
+		Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-1", Title: "t", TaskID: 42,
+	})
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+	// 新任务落在自己的槽位里
+	if filepath.Base(wt.Path) != "cr-1-t42" {
+		t.Errorf("新任务应落在 cr-1-t42，实际 %q", wt.Path)
+	}
+	// 老目录被当尸体回收（否则它永远没人管）
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("老命名的尸体应被接管回收，实际仍在（err=%v）", err)
+	}
+}
+
+// ★ 活任务认领：老槽位正被在途任务占着时，Create 不动它。
+func TestCreateSparesLegacyCorpseClaimedByLiveTask(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	legacy := filepath.Join(m.Root(), "cr-1")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inflight := filepath.Join(legacy, "inflight.txt")
+	if err := os.WriteFile(inflight, []byte("另一个任务正在跑\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wt, err := m.Create(ctx, CreateParams{
+		Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-1", Title: "t",
+		TaskID: 42, ClaimedPaths: []string{legacy},
+	})
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+	if _, err := os.Stat(inflight); err != nil {
+		t.Errorf("被在途任务占用的老槽位被回收了！%v", err)
+	}
+	if filepath.Base(wt.Path) != "cr-1-t42" {
+		t.Errorf("新任务应落在自己的槽位，实际 %q", wt.Path)
+	}
+}
+
+// 目标槽位被在途任务占着时，Create 报错而不是把别人的现场删掉。
+func TestCreateRejectsClaimedTargetPath(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	target := filepath.Join(m.Root(), "cr-1-t42")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(target, "running.txt")
+	if err := os.WriteFile(sentinel, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := m.Create(ctx, CreateParams{
+		Repo: repo, CloneURL: src, Kind: KindFix, IssueKey: "CR-1", Title: "t",
+		TaskID: 42, ClaimedPaths: []string{target},
+	})
+	if err == nil {
+		t.Fatal("目标槽位被在途任务占用时 Create 应报错")
+	}
+	if !strings.Contains(err.Error(), "在途任务") {
+		t.Errorf("错误应说明是在途任务占用，得到: %v", err)
+	}
+	if _, serr := os.Stat(sentinel); serr != nil {
+		t.Errorf("在途任务的现场被删了！%v", serr)
+	}
+}
+
+// ---------------------------------------------------------------- Discard 返回值
+
+// ★ 日志要说真话：Discard 必须报告实际做成了什么。
+//
+// 旧实现无返回值，且 os.Stat(mirror) 失败时直接 return —— 什么都没删，
+// 而调用方（收割机）照样打「已回收超期现场」并清空 worktree_path。
+func TestDiscardReportsWhatItActuallyDid(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+
+	// ① mirror 不存在：什么都没做，Removed() 必须是 false
+	res := m.Discard(ctx, "never/mirrored", filepath.Join(m.Root(), "nope"), "fix/x")
+	if !res.MirrorMissing {
+		t.Error("mirror 不存在时应报 MirrorMissing")
+	}
+	if res.Removed() {
+		t.Error("mirror 不存在时 Removed() 必须为 false —— 否则调用方会谎报已回收")
+	}
+
+	// ② 真现场：目录与分支都在，都该被删掉且被报告
+	wt, err := m.Create(ctx, CreateParams{
+		Repo: DefaultRepoConfig("acme/demo"), CloneURL: src,
+		Kind: KindFix, IssueKey: "CR-1", Title: "t", TaskID: 1,
+	})
+	if err != nil {
+		t.Fatalf("Create 失败: %v", err)
+	}
+	res = m.Discard(ctx, "acme/demo", wt.Path, wt.Branch)
+	if !res.DirRemoved {
+		t.Error("目录被删掉了，DirRemoved 应为 true")
+	}
+	if !res.BranchDeleted {
+		t.Error("分支被删掉了，BranchDeleted 应为 true")
+	}
+	if !res.Removed() {
+		t.Error("Removed() 应为 true")
+	}
+
+	// ③ 幂等重放：第二次调用什么都没得删，必须如实报告
+	res = m.Discard(ctx, "acme/demo", wt.Path, wt.Branch)
+	if res.DirRemoved {
+		t.Error("目录早已不在，DirRemoved 不该为 true")
+	}
+	if res.BranchDeleted {
+		t.Error("分支早已不在，BranchDeleted 不该为 true —— branch_deleted 字段要反映真删掉了")
+	}
+	if res.Removed() {
+		t.Error("什么都没删时 Removed() 必须为 false")
+	}
+
+	// ④ 只有目录、没有分支
+	bare := filepath.Join(m.Root(), "cr-2-t2")
+	if err := os.MkdirAll(bare, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res = m.Discard(ctx, "acme/demo", bare, "fix/never-existed")
+	if !res.DirRemoved {
+		t.Error("手工建的目录也该被兜底 RemoveAll 掉并报告")
+	}
+	if res.BranchDeleted {
+		t.Error("分支本来就不存在，不该报 BranchDeleted")
+	}
+}
+
+// 同一任务重跑（同 TaskID）时复用自己的槽位并回收上次的现场 ——
+// 加了 task_id 维度之后这是唯一还会撞名的合法情形。
+func TestCreateReusesOwnSlotAcrossAttempts(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	p := CreateParams{Repo: repo, CloneURL: src, Kind: KindFix,
+		IssueKey: "CR-1", Title: "t", TaskID: 77}
+	wt1, err := m.Create(ctx, p)
+	if err != nil {
+		t.Fatalf("首次 Create 失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt1.Path, "wip.txt"), []byte("half\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wt2, err := m.Create(ctx, p)
+	if err != nil {
+		t.Fatalf("重跑同一任务时 Create 应回收重建: %v", err)
+	}
+	if wt2.Path != wt1.Path {
+		t.Errorf("同一任务应复用同一槽位: %q vs %q", wt2.Path, wt1.Path)
+	}
+	if _, err := os.Stat(filepath.Join(wt2.Path, "wip.txt")); !os.IsNotExist(err) {
+		t.Error("上次尝试的未提交改动应随尸体一起被回收")
+	}
+}
+
+// 不同任务、同 issue：两个槽位互不干扰（老命名下这两个会撞在一起）。
+func TestCreateDifferentTasksSameIssueGetSeparateSlots(t *testing.T) {
+	src := sourceRepo(t)
+	m := newManager(t)
+	ctx := context.Background()
+	repo := DefaultRepoConfig("acme/demo")
+
+	// 两个任务、同 issue key、不同 title（分支名也不同，避免分支尸体互删）
+	wtA, err := m.Create(ctx, CreateParams{Repo: repo, CloneURL: src, Kind: KindFix,
+		IssueKey: "CR-1", Title: "alpha", TaskID: 11})
+	if err != nil {
+		t.Fatalf("Create A 失败: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wtA.Path, "a.txt"), []byte("A\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wtB, err := m.Create(ctx, CreateParams{Repo: repo, CloneURL: src, Kind: KindFix,
+		IssueKey: "CR-1", Title: "beta", TaskID: 22})
+	if err != nil {
+		t.Fatalf("Create B 失败: %v", err)
+	}
+	if wtA.Path == wtB.Path {
+		t.Fatalf("同 issue 的两个任务不该共用槽位，都是 %q", wtA.Path)
+	}
+	// ★ A 的现场必须完好：老命名下 B 的 Create 会把它当尸体删掉
+	if _, err := os.Stat(filepath.Join(wtA.Path, "a.txt")); err != nil {
+		t.Errorf("B1：另一个任务的现场被删了！%v", err)
+	}
+}

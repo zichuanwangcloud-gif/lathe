@@ -65,12 +65,12 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T0 | v0.1.0 发布准备（staged 文件入库） | A | **DONE** |
 | T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | **DONE** |
 | **T9** | **测试基线可信化（前置，见 §7）** | **A** | **DONE** |
-| T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | TODO |
-| T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
-| T4 | `verifications.log_ref` 落盘写入 | C | TODO |
-| T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
-| T6 | worktree TTL 收割机 | E | TODO |
-| T7 | webhook 联动：标签接单 + issue 取消联动 | F | TODO |
+| T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | **DONE** |
+| T3 | 任务终态邮件通知（接 `notify_email`） | C | **DONE** |
+| T4 | `verifications.log_ref` 落盘写入 | C | **DONE** |
+| T5 | 成本聚合面板（store 聚合 + API + 前端） | D | **DONE** |
+| T6 | worktree TTL 收割机 | E | **DONE** |
+| T7 | webhook 联动：标签接单 + issue 取消联动 | F | **DONE** |
 | T8 | per-task 依赖隔离栈（验证阶段） | G | **DONE** |
 
 ## 3. PR 拆分与理由
@@ -80,7 +80,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 
 | PR | 内容 | 聚合理由 |
 |---|---|---|
-| **A** `chore/release-and-prune` | T0 发布准备 + T1 删骨架 | 都是清理类，不碰运行逻辑，可最先合 |
+| **A** `chore/debt-cleanup-baseline` | T0 发布准备 + T1 删骨架 + T9 测试基线 | 都是清理类，不碰运行逻辑，可最先合；且后面每个 PR 都需要它的可信测试基线 |
 | **B** `feat/gate-mode` | T2 闸门 | 动状态机（新增可达状态），独立评审 |
 | **C** `feat/notify-and-logref` | T3 通知 + T4 日志指针 | 都是「终态时补一个副作用」，共享 pipeline 终态落点 |
 | **D** `feat/cost-panel` | T5 成本面板 | 纯读侧聚合 + 前端，零运行风险 |
@@ -88,7 +88,16 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | **F** `feat/webhook-triggers` | T7 webhook 联动 | 只动 ingress 层 |
 | **G** `feat/verify-isolation` | T8 compose 隔离 | 动验证主路径，风险最高，**最后合** |
 
-顺序：A → B/C/D/E/F（互不依赖，可并行推）→ G。
+顺序：A → B → C → D/E/F（互不依赖）→ G。
+
+**2026-09-09 修正**：原先写的「B/C/D/E/F 互不依赖，可并行推」是错的。
+**C 依赖 B**：T3-AC1 把 `awaiting_approval` 列为通知触发状态之一，
+而那个状态只有 T2 才让它可达 —— 我在 baseline 上开 C 的分支之后才发现
+`gateBeforePush` 根本不在场。C 已改栈到 B 之上。
+
+D/E/F 与 B/C 确实互不依赖（成本面板是读侧、收割机是独立轮询器、
+webhook 联动只动 ingress 层），但都 base 在 A 上，因为都需要那个测试基线。
+教训：拆 PR 时「模块不重叠」不等于「无依赖」，还得看**验收标准之间**有没有引用。
 
 ## 4. 验收标准
 
@@ -228,7 +237,7 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 
 - AC1 终态任务的 worktree 超过 TTL 后被回收（目录 + 分支 + git worktree 注册项三形态）
 - AC2 非终态任务的 worktree **绝不回收**（单测：`implementing` 中的任务，跑 reaper 后目录仍在）
-- AC3 TTL 可配（`LATHE_WORKTREE_TTL`，默认 `7*24*time.Hour`，记进 README 环境变量表）。
+- AC3 TTL 可配（`LATHE_WORKTREE_TTL`，实际落地为 `72*time.Hour`，下限 `1h`，记进 README 环境变量表）。
   若判断需要运行时可调则改走 `system_settings` 表（照 `PreviewThresholds` 的现取现用套路）
 - AC4 回收动作留痕（日志 + task_events）
 - AC5 **绝不触碰 `.` 开头的目录**（单测：造一个 `.mirrors/` 与 `.verify/`，跑 reaper 后仍在）
@@ -237,6 +246,115 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 - AC7 `workspaces/` 里 9 个存量 `cr-*` 遗留目录被首轮 reaper 清掉，或明确说明为何不该清
 - AC8 与 T4 联动：日志不在 worktree 里，回收后仍可读
 - AC9 02-design §8 P0 的「worktree 自动回收」表述改成与实现一致
+
+**首版 review 拍出来的四个阻断项与最小修复集**（2026-09-10，随 T6 一并合入）：
+
+首版通过了上面 9 条 AC，但那 9 条没覆盖「误删」这一类失效。逐条如下。
+
+**B1 · 删盘前不校验路径当前归属，而目录名只由 issue key 决定。**
+`worktreeDirName` 是 `strings.ToLower(issueKey)`，不含 repo_id / user_id / task_id
+—— issue `CR-100` 的任何一次尝试、任何仓库、任何用户都落在同一个 `<root>/cr-100`。
+而 `tasks_one_active_per_issue` 是 `(repo_id, linear_issue_key) WHERE state NOT IN (终态)`：
+老的 failed 行不受约束，两个不同 repo（乃至不同用户）也可同时各有一个活任务。
+误删推演（默认 72h，无需任何配置错误）：任务 A（CR-100，repo X）failed 超期、
+`worktree_path` 仍在；issue 重开建出任务 B，`Create` 复用同名目录，B 正在里面跑；
+`ListReapableTasks` 返回 A；`reapTask(A)` 通过 `safeToRemove`，
+`HasLiveDependentOnBranch` 查的是别的任务的 base_ref（B 不是栈式后继）返回 false，
+于是 `Discard` 把 B 正在跑的工作区连同未提交改动删掉并 `git branch -D`。
+放大变体：`ClearWorktreePath` 失败时只 warn 留到下一轮，A 的路径永远留在候选里，
+收割机**每小时**对那个目录执行一次 Discard —— 定时炸弹。
+
+修复三层：① 目录名加 task_id 维度（`cr-100-t1234`），根治跨任务/仓库/用户共用；
+② 删盘前查 `ClaimedWorktreePaths`（**非终态**任务引用的路径集合，与同一轮已在查的
+`ReferencedWorktreePaths` 是两个不同的问题：后者判「有没有人指着」，用于孤儿清扫；
+前者判「有没有在途任务在用」，用于主路径）；③ `Create` 也吃这个集合，
+拒绝接管在途现场而不是把它当尸体删掉。
+
+**B2 · 候选快照与真正删除之间没有 compare-and-swap。**
+`failed → queued` 是合法转移，pipeline 的断点续跑复用现场、不经过 `Create`。
+「人点重试」与「收割机删除」并发时，正在运行的现场被删、分支被强删、
+`worktree_path` 被置 NULL。窗口不是毫秒级：循环里每个任务跑若干条 git 命令
+（`gitTimeout` 15 分钟）。
+
+修复：新增 `task.Machine.ClaimForReap`，一条带四项守卫的语句
+（`state = ANY(终态)` ∧ `worktree_path = $快照路径` ∧ `updated_at = $快照时刻`
+∧ `worktree_claimed_at IS NULL`，行锁 `FOR UPDATE`），**认领成功才碰磁盘**。
+`updated_at` 用等值而非不等式：要挡的是「快照之后有人动过这一行」，
+等值没有可乘之机，也不依赖时钟精度。新增 `tasks.worktree_claimed_at`
+（migration 0020）既作幂等标记，也让「谁在什么时候认领的」可查。
+
+认领分两阶段（`commit` 参数）：校验阶段只读、不改任何状态；落账阶段在删盘
+**之后**才置空 `worktree_path` 并写 `task_events`。顺序反了的后果是：校验若顺手
+置空了路径，随后因为脏现场决定保留时，那份现场就变成「磁盘上有、没人认领」的
+孤儿，被下一轮清扫收走 —— D4 的意图被 TTL 回收路径悄悄取消。
+
+**B3 · 主路径既不看目录 mtime 也不看工作区是否 dirty，`Discard` 用的是 `--force`。**
+`worktree.go` 的 `Remove(force=false)` 注释写得很明白：「git 会拒绝删除有未提交
+改动的工作区 —— 这正是失败任务『保留现场』（D4）所需的保护」。收割机走 Discard
+绕开的就是这条保护。孤儿清扫那条路径反而看了 mtime，两条路径安全标准不对称。
+
+修复：主路径改用与孤儿路径相同的判据（`updated_at < cutoff` **且** 目录
+mtime `< cutoff`，两把尺子都超期才删）；删之前用现成的 `Inspect` 体检 ——
+`Dirty` 则整份现场保留只告警，`HasCommits && !RemoteBranch`（有未推送提交）
+则只删目录、保留分支（那些提交的唯一副本在分支里）。
+
+**B4 · TTL 无下限校验，且没有关停/干跑开关。**
+`Validate()` 对 `AgentTimeout` 有 `<= 0` 检查，对 WorktreeTTL / ReapInterval 一个都没有；
+`reaper.go` 只把 `<= 0` 兜回默认。把 TTL 配成 `1m`（想「先清一批存量目录」是很自然
+的运维动作）会让孤儿清扫失去那层「安全得离谱」的宽裕：`Create` 建目录与写入
+`worktree_path` 之间那个无人认领窗口，正好是在途任务的目录会被当成孤儿删掉的时机。
+而 `LATHE_WORKTREE_TTL=0` 不是关停而是回落 72h —— 这个最具破坏力的组件没有任何
+办法关停。
+
+修复：`config.MinWorktreeTTL = 1h` 硬下限（配得更小启动直接报错，错误信息指向
+干跑而不是让人去改代码里的下限）；`ReapInterval` 必须为正；
+新增 `LATHE_REAP_ENABLED`（默认 `true`，`false` 时 main 根本不启动收割循环）
+与 `LATHE_REAP_DRY_RUN`（只打「本轮会删什么」，零副作用零成本 —— 刻意不做认领
+校验也不做工作区体检，代价是干跑列出的候选里可能有几条实跑会被保留，日志里
+说明了这点）。两个开关都是「拼错就报错」而非静默失效：对「必须能关掉」的开关，
+静默失效意味着以为关了其实还在删。
+
+**一并修掉的四处低成本高收益项：**
+
+- **日志要说真话、且删前就记。** `Discard` 原本无返回值，`os.Stat(mirror)` 失败时
+  直接 return，什么都没删却照样打「已回收超期现场」并清空 `worktree_path`。
+  现在它返回 `DiscardResult`（`MirrorMissing` / `DirRemoved` / `BranchDeleted` /
+  `Errs`），三个布尔都是「确实做成了」而非「尝试过」——`BranchDeleted` 删前先
+  `rev-parse` 确认分支真的在。日志改成删前（「即将删除 X，因为 Y」）+ 删后
+  （「真删掉了什么」）两条。
+- **回收动作进任务事件流。** `ClaimForReap` 的落账阶段写一条 `task_events`
+  （`from_state == to_state == 当前状态`，靠 `payload.kind = "worktree_reaped"` 区分），
+  payload 带 issue / state / path / branch / ttl_seconds / cutoff / rule /
+  dir_removed / branch_deleted / branch_kept_because。actor 是 `node:<NodeName>`，
+  与队列派发同形 —— 任务详情页要能答出「现场是谁在什么时候按什么规则删的、
+  删成了什么样」。
+- **`WorkspaceRoot` 加专用目录校验。** 原先只校验非空 + 绝对路径。配成 `/` 或
+  `/opt` 时孤儿清扫会删掉所有「非 `.` 开头、无人认领、mtime 超期」的顶层目录。
+  现在要求至少两层，且拒绝一批系统目录黑名单。
+- **symlink 越界。** `filepath.Rel` 是纯字符串运算，看不见符号链接：一条
+  `<root>/evil → /etc` 会被判成「在根下」，`os.RemoveAll` 顺着它删到根外。
+  现在 root 与候选路径各过一次 `EvalSymlinks`（root 也要解析 —— `/opt/lathe/workspaces`
+  指向另一块盘是常见挂载手法，只解析候选会让每条正常路径都被误拒，收割机彻底罢工），
+  候选不存在时退回「解析已存在的父链 + 保留末段」，堵住
+  `<root>/link-to-outside/not-yet-created` 这种形状。
+
+**存量目录名的兼容方案**（改 `worktreeDirName` 带来的唯一迁移面）：
+
+1. **老任务行不受影响。** 它们存的是完整路径 `worktree_path`，找自己的现场从来
+   不走命名规则（`Inspect` / 断点续跑 / `Discard` 都直接吃路径）。
+2. **孤儿清扫不需要认识老命名。** 它按「在 `<root>` 下 + 名字不以 `.` 开头 +
+   没有任何任务行指着 + mtime 超期」四条判，与目录叫什么无关。所以改命名规则
+   **不会**让任何存量目录被误判成孤儿而提前清掉；反方向（老目录被无限期遗留）
+   才是真风险，见下一条。
+3. **`Create` 顺带探测老路径。** 新任务落在 `<issue>-t<id>`，但同 issue 的老现场
+   躺在 `<issue>`。若不认它，那个目录会变成「谁都不需要这个槽位、也没人认领」的
+   永久垃圾（虽然最终会被孤儿清扫收走，但要多等一个 TTL）。所以 `Create` 在
+   接管槽位时同时看新旧两条路径，老路径存在且**没有在途任务占用**时一并回收。
+4. **老槽位被在途任务占着时跳过、不报错。** 老槽位不是本任务要用的路径，
+   别人在里面跑与我们无关；报错会让一个无关任务把本任务卡死。
+5. **`TaskID <= 0` 退回老命名**（而不是拼一个 `-t0`）：退回来的路径是
+   `legacyWorktreeDirName` 认得的形状，收割机与 `Create` 都能正常处理。
+
 
 ### T7 webhook 联动
 
@@ -510,6 +628,347 @@ repos / tasks / task_events / verifications / agent_events。
   Makefile 里那段「-p 1 就够了」的注释也改掉了 —— 它给的是虚假的安全感。
   顺带结清 roadmap §1.3 的 `repos` id=241 占位行（属 fixture 残留，被清理带走）。
 
+- 2026-09-09：**T2 实现完成**（PR B，分支 `feat/gate-mode`）。
+  真正的断点确认在 `Enqueue` 而非 pipeline —— 它从不把 `repos.gate_mode`
+  复制进任务行，所以 `tasks.gate_mode` 永远是 `direct`，人在仓库配置页
+  选了 manual 也毫无效果。改动：
+  - `resolveRepoID` → `resolveRepo`，顺带取出 `gate_mode` 并复制进
+    `CreateParams`（任务创建那刻**钉死**，与 `repo_id` 语义一致）
+  - `internal/task` 新增 `GateDirect/GateManual/GateGuarded/GatePlanFirst`
+    四个常量，并在注释里写明**只有 manual 有实现语义**，另三个按 direct 处理
+  - 状态机加两条边：`verifying → awaiting_approval`（闸门落点）与
+    `awaiting_approval → queued`（放行路径）
+  - `Pipeline.gateBeforePush`：验证通过后按 `tk.GateMode` 决定是否停机；
+    停机时转 `awaiting_approval` + 回帖告诉人「活干完了等你点」
+  - `RetryApproved` 重试模式 + `PlanRetry` 分支 → `EntryPush`
+  - `POST /api/tasks/{id}/approve`：只放行真的停在闸门上的任务
+    （其余状态 409 —— 否则「确认」就是个能把任意任务推去开 PR 的后门），
+    跨用户返回 404，转回 `queued` 并写 `mode=approved`，重派**原任务行**
+  - 前端：详情页「确认开 PR」按钮 + 一张说明卡（`awaiting_approval`
+    的状态文案「待放行」本来就在全站状态表里，无需新增）
+  - 鉴权回归表补登 `/approve` —— 本仓纪律是「所有 API 端点都必须要求认证」，
+    漏登记等于没有护栏
+
+  **一个必须防的死循环**：批准后以 `EntryPush` 重入时闸门不能再次触发，
+  否则 `awaiting_approval → queued → awaiting_approval` 无限转圈，
+  人点一次批准永远开不出 PR。实现上用 `entry != EntryPush` 守卫，
+  并在核心测试里显式断言「批准后恰好开一次 PR」。
+
+  测试：`TestPipelineManualGateHaltsBeforePRThenResumesOnApproval` 覆盖完整
+  闸门周期（停住→批准→补开 PR，两半合在一个测试里，只验前者会漏掉
+  「停住之后再也走不动了」这种更糟的实现）；
+  `TestPipelineNonManualGateModesUnchanged` 对三个非 manual 取值逐个断言
+  行为与现状一致（AC2）；`TestEnqueueCopiesRepoGateMode` 含「事后改仓库配置
+  不影响在途任务」的钉死语义断言；三条 approve 端点测试（正常/错状态/跨用户）。
+
+  门禁：注入 12 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净、`make ui` 通过。另外顺手核了一次「绿是不是真的」：
+  `cmd/lathe` 只用了 0.438s（之前 2.5s）显得可疑 —— 该包连不上库时走
+  `t.Skipf`，而 skip 也显示 `ok`。用 `-v` 数了一遍：14 个用例 RUN、
+  14 个 PASS、0 个 SKIP，绿是真的。**这一类核对以后每轮都做**，
+  本轮已经被假绿骗过两次（`| tail` 取错退出码、无条件打印的「gofmt 干净」）。
+
+- 2026-09-09：记一笔**遗留隐患**（不在本轮范围，但已确认存在）：
+  `internal/httpapi` 的 `apiFixture` 与 `mustUser` 也是「确定性 email +
+  `ON CONFLICT DO UPDATE` + 固定 repo `acme/api-test` + 固定 issue key
+  （`CR-R1`/`CR-EV`/`CR-PV`）」的组合 —— 与 T9 修掉的那两个包同款。
+  它目前不红是因为这个包不用全局 `ClaimReady`，但一旦有非终态孤儿残留，
+  `Create` 同样会撞 `tasks_one_active_per_issue`。没有混进 PR B 是为了
+  不让一个动状态机的 PR 里夹带无关的测试重构。**建议单独一个小 PR 修掉。**
+
+- 2026-09-09：**T3 实现完成**（PR C，分支 `feat/notify-and-logref`，栈在 B 之上）。
+  两个设计约束贯穿全程：
+  1. **runner 不 import `internal/mail`**。runner 只声明窄接口 `TaskMail`
+     （`internal/runner/notify.go`），实现 `taskMailer` 放在 `cmd/lathe`
+     —— 那里同时拿得到 store（解析收件人）与 mail（发信）。
+     这与既有的 `VerificationRecorder`/`AgentEventRecorder` 是同一套做法。
+  2. **发信绝不影响状态流转**。`mailTerminal` 刻意**不返回 error**：
+     调用方都在「任务已进终态」之后调它，返回错误只会诱导调用方去处理一个
+     不该影响主流程的东西。SMTP 没配、投递失败、收件人查不到 ——
+     一律只记日志。把通知做成能让任务卡住的东西，等于用一个「锦上添花」
+     的功能给主流程加了一个新的失败点。
+
+  收件人口径（`store.NotifyEmailForTask`）：优先 `notify_email`，
+  **NULL 与空串都回退登录邮箱**（界面上清空通知邮箱存下来的是空串，
+  不能因此发出一封收件人为 `""` 的信）。与密码重置刻意不同 ——
+  重置邮件永远发登录邮箱，因为那封信的意义就是「证明你拥有这个登录邮箱」。
+  单次 JOIN 而非「先查任务再查用户」：通知在终态转移后的热路径上。
+  查不到收件人返回 `ErrNoRecipient`，调用方据此静默跳过，
+  不把「没人可发」当成发信故障刷日志。
+
+  六个落点全接：`p.fail`（pipeline 所有失败路径的汇流处）、
+  `stagePushAndPR` 的 `pr_open`、`gateBeforePush` 的 `awaiting_approval`、
+  以及 mergepoll 的 `merged` / rebase 冲突 `failed` / PR 关闭 `cancelled`。
+  mergepoll 走 `p.Pipeline.mailTerminal` 而不是自己再拼一套 ——
+  同一份渲染逻辑只该有一处，否则两边正文迟早不一致。
+
+  **AC7（人工取消不发信）由构造保证**：`httpapi` 侧根本没有 `Mail` 依赖，
+  `cancelTask` 无从发信。人自己点的取消不需要通知自己。
+
+  测试：`terminalMail` 是纯函数，脱离 SMTP 断言「issue key／终态／失败原因／
+  失败阶段／补充信息／详情链接」都在正文里，以及 BaseURL 为空时**省略**
+  链接那一行（而不是拼一个指向 localhost 的无用链接）；
+  `TestPipelineFailureNotifiesOwnerAndSurvivesSMTPOutage` 是本项最重要的一条 ——
+  SMTP 全程报错，断言任务依然干净落在 `failed`；
+  另有闸门通知、pr_open 通知、`stateSubject` 全终态覆盖、
+  以及 4 条 store 收件人测试（优先/回退/空串/任务不存在）。
+
+  门禁：注入 14 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净。store 那 4 条用 `-v` 数过：4 RUN / 4 PASS / 0 SKIP。
+
+- 2026-09-09：**修正一处 PR 拆分判断错误**。原先写的「B/C/D/E/F 互不依赖，
+  可并行推」是错的：C 依赖 B，因为 T3-AC1 把 `awaiting_approval` 列为通知
+  触发状态之一，而那个状态只有 T2 才让它可达。我在 baseline 上开了 C 的分支、
+  写到一半才发现 `gateBeforePush` 根本不在场，已改栈到 B 之上。
+  教训：拆 PR 时「模块不重叠」不等于「无依赖」，还得看**验收标准之间**
+  有没有互相引用。
+
+- 2026-09-09：**T4 实现完成**（PR C 的第二半）。光在 INSERT 里补一列远远不够，
+  真正的坑在上游两处：
+  1. 输出在 `runStep` 里就已被 `truncate` 到 16KB。那个截断理由是对的
+     （别把整个构建日志灌进数据库），但结果是**完整日志从来没在任何地方
+     存在过** —— 所以落盘必须发生在截断之前。
+  2. **通过的步骤的输出直接丢弃**（只有失败步骤的前 4KB 进 `agent_events`），
+     而排障时最想看的往往正是「上一次通过时是什么样」。
+
+  设计选择：
+  - **做成注入的 `StepLogger` 而不是给 `Verifier` 加 `logDir` 字段**。
+    `Verifier` 是并发任务共用的单实例（`cmd/lathe` 里只 `NewVerifier` 一次），
+    加可变字段再在每轮验证前改一下，就是一个货真价实的数据竞争。
+    每轮由 `Pipeline.stepLogger(taskID, round)` 现造一个已把 taskID 与轮次
+    烘进去的 logger 传进去，`Verifier` 自己保持无状态。
+  - **日志落 `DataDir` 而非 worktree**（AC5）。worktree 会被回收
+    （合并后回收、同名尸体回收、T6 收割机），而日志的全部价值就在于
+    「现场没了之后还能查」。放 worktree 里等于排障时正好没有。
+  - **`log_ref` 存相对 `DataDir` 的路径**，不是绝对路径：`DataDir` 可配
+    （`LATHE_DATA_DIR`），绝对路径写进库会让部署目录一变、历史记录全失效。
+  - **分轮次目录**（AC3）：同任务多轮互相覆盖的话，「第一轮为什么挂」
+    这个问题在第二轮跑完之后就永远回答不了了 —— 而那恰恰是修复回路
+    最需要回答的问题。
+  - **复现阶段的 `log_ref` 是空格分隔的多个路径**：一个复现阶段可能有多条
+    测试，每条各自落一份完整日志。合并成一份会丢信息 —— 内层 `runStep`
+    返回的 `Output` 已被截断到 16KB，拿它拼出来的合并日志同样残缺。
+  - 顺手加了 `sanitizeLogName`：复现测试的步骤名来自测试文件路径，
+    直接拼进路径就是一个目录穿越，测试里用 `../../etc/passwd` 这类输入断言。
+
+  **一条值得记的教训**：串参时漏了 `HeavyParams{... Logs: logs}` 这一个字段，
+  而**单元测试全绿** —— 是端到端测试（`TestPipelineWritesLogRefForEveryVerifyStep`）
+  把它抓出来的。如果只写单元测试，T4 就会变成又一个「有列没消费方」，
+  正是这一轮要治的病本身。根因是那次批量替换只对函数签名加了 `assert`、
+  对 struct literal 没加，于是静默失败。**以后每处替换都要有断言**，
+  否则「改了」和「以为改了」分不开。
+
+  门禁：注入 16 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净。
+
+- 2026-09-09：**T5 实现完成**（PR D，分支 `feat/cost-panel`，base 在 A 上）。
+  核心是躲开那个会让面板从第一天起就说谎的坑：**不用 `tasks.agent_cost_usd`**。
+  最关键的测试 `TestCostStatsSumsEventsNotTaskColumn` 就是钉这一条 ——
+  造「分诊 + 实现 + 2 轮 fix」共 $0.90，把 `tasks.agent_cost_usd` 设成
+  最后一轮的 `0.08`，断言聚合值是 0.90 而不是 0.08。
+
+  后端：`store.CostStatsFor` 四个聚合（总计 / 按阶段 / 按日 / 任务排行），
+  全部 `JOIN tasks` 按 `user_id` 过滤 —— `agent_events` 没有 `user_id` 列，
+  漏掉 JOIN 就是跨用户求和，P1.5 数据隔离的红线。`fix-N` 归入 implement 桶：
+  修复回路是实现的延续，分开看没有决策价值。加 migration 0018 的部分索引
+  `agent_events (task_id) WHERE kind='result'` —— 既有的
+  `agent_events_task_id` 服务 SSE 增量拉取，谓词里没有 kind，帮不上聚合。
+
+  **偏离了我自己写的 AC1**：AC1 说「`/api/stats` 返回成本聚合」，实际做成
+  独立端点 `GET /api/stats/cost`。理由：`Board.vue` 每 5 秒轮询 `/api/stats`，
+  而 `agent_events` 是全表最大的一张，四个聚合压进那个轮询纯属浪费；
+  成本是决策视图，不需要 5 秒新鲜度。理由写进了代码注释。
+
+  前端 `CostPanel.vue`（零新依赖，内联 SVG）。按 dataviz 规范走完整流程：
+  - **先定形态再定颜色**：总花费是一个数字 → stat tile，不是「只有一根柱子
+    的柱状图」；阶段占比用水平堆叠条不是饼图；任务排行**刻意不按值上色** ——
+    那会把条长重复编码成色相，白占掉唯一的空闲通道
+  - **配色跑校验器而不是靠眼睛**：按项目**实际** surface（亮 `#ffffff`、
+    暗 `#171a21`，与参考默认不同）两个模式都跑，CVD 相邻分离度
+    ΔE 9.2/9.4（门限 8）、常视力 27.6/26.5（门限 15）全 PASS。
+    亮色下 aqua 对比度 2.82:1 触发 relief 规则 → 堆叠条始终带可见直接标签
+    且提供表格视图，颜色永不是唯一通道
+  - 沿用项目的暗色优先约定（`:root` 即暗色，亮色走 `prefers-color-scheme`），
+    不另立门户
+
+  **没能真截图**：环境里没有无头浏览器也没有 SVG 转换器。退一步把组件的几何
+  数学原样搬进 node 脚本做数值核查，覆盖宽屏/窄屏/单日/三日/过千/全零六个场景，
+  断言「标签不溢出、不裁切、坐标都在画布内、容器高度含 x 轴文字带」。
+  **这一步真查出一个 bug**：y 轴刻度用 `fmtUSD` 会渲染成 `$0.0000`
+  （7 字符 ≈46px @11px），右对齐在 `PAD.left-8` 处向左溢出容器 8px。
+  已改成专用的 `fmtAxis`（干净刻度 `$0.90`）并把左内边距 46 → 52，
+  现在余量 11–17.6px。核查脚本本身也报错过一次（`worst` 初值设成 0，
+  取 min 永远 ≤0，把真实余量报成 0.0px）—— 断言逻辑是对的，报告是错的，
+  一并修了。
+
+  门禁：注入 18 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净、`make ui` 通过。
+
+- 2026-09-09：**T6 实现完成**（PR E，分支 `feat/worktree-reaper`，base 在 A 上）。
+
+  **AC7 原先的假设被现实推翻。** 我把 9 个存量目录逐个对照了数据库，
+  它们分三类而不是「首轮 reaper 全清掉」：
+  - `cr-1454 / 1468 / 1469 / 1488`（failed/cancelled + 有路径）→ **会回收**
+  - `cr-1460 / 1465 / 1466 / 1467`（**pr_open，非终态**）→ **绝不回收**。
+    这是真实待合并的 PR，正是 AC2 在起作用
+  - `cr-1367`（failed 但 `worktree_path` 为 **NULL**）→ DB 驱动的回收
+    **结构上看不见它**
+
+  最后一条是真缺口，写完主路径才发现，于是补了**孤儿目录清扫**
+  （磁盘上有、数据库里没人认领的目录，按 mtime 判超期）。
+  **那条清扫里的 TTL 不只是策略，是安全机制**：worktree 目录先被 `Create`
+  建出来、之后才在转入 `implementing` 时把路径写进任务行，两步之间目录
+  无人认领。不看 mtime 就删，正在跑的任务会突然找不到自己的工作区。
+  `TestReaperSweepSparesFreshUnclaimedDirs` 专门钉这一条。
+
+  防呆（每条都有对应测试）：
+  - **路径安全用 `filepath.Rel` 判而非字符串前缀** —— 前缀判会把
+    `/root/workspaces-backup` 当成 `/root/workspaces` 的子目录。
+    测试专门造了这个同前缀兄弟目录
+  - **逐段拒绝 `.` 开头**：误删 `.mirrors/` 等于把所有仓库的镜像清了，
+    下一个任务要重新 clone
+  - **删分支前查 `HasLiveDependentOnBranch`**（F4.2-AC2），查询出错时
+    保守处理（只删目录留分支）
+  - **用 `Discard` 而非 `Remove`**：尸体可能残缺（目录被手工删过、
+    分支已不存在），`Remove` 在这种情形下会报错
+  - **孤儿清扫不碰被任务行认领的目录**：否则 `pr_open` 的现场被主路径
+    正确排除后又被 mtime 删掉，AC2 形同虚设
+
+  `worktree_path` 置空走专门的 `ClearWorktreePath`：`Transition` 的 UPDATE
+  是 `COALESCE` 语义（只增不清空），传 nil 表示「这次不改」。
+  刻意不清 `branch_name` —— 分支可能因还有活后继而保留，
+  且「这个分支叫什么」排障时仍有用。
+
+  > **⚠ 上一段已过时**（2026-09-10 加固后）：`ClearWorktreePath` 是无守卫的
+  > 裸 UPDATE，正是 B2 竞态的一半根因，已连同其测试一并删除，**现在没有
+  > 无守卫的置空原语**。置空统一走 `ClaimForReap` 的落账阶段（带
+  > state / worktree_path / updated_at 三项守卫 + 行锁）。`COALESCE` 那条
+  > schema 事实仍然成立，由 `TestClaimForReapTwoPhases` 两头钉住
+  > （校验阶段不动路径、落账后置 NULL）。详见上面的四个阻断项一节。
+
+  AC9 顺带修了 `docs/02-design.md` §8 P0 一句**不实表述**：
+  那行声称「worktree 自动回收」已交付，实际只有「合并后回收」与
+  「同名尸体按需回收」两个被动触发点，失败/取消的现场只增不减 ——
+  那 9 个目录就是这么来的。
+
+  门禁：注入 21 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿。
+  reaper 11 条测试 + task 层 3 条（含 AC2「非终态绝不进候选」的六状态断言）。
+
+- 2026-09-09：**T7 实现完成**（PR F，分支 `feat/webhook-triggers`，base 在 A 上）。
+  三个关键判断：
+  1. **取消分流必须在接单闸门之前。** 取消事件不是指派事件 —— 放在闸门之后
+     会被当成「非指派事件」直接 `ignored` 掉，整个功能静默失效。
+  2. **`completed` 刻意不算取消。** 只认 Linear 的 `canceled` 状态类型
+     （和 `remove`）。人手工把 issue 标成完成，不代表平台任务该作废 ——
+     那个任务可能正在跑，或已开出 PR 等人合并。判据用**状态类型**而非
+     状态名：名字是每个团队自己起的（Cancelled / 废弃 / 不做了），
+     类型才是 Linear 的稳定枚举。
+  3. **标签默认空串即关闭**（AC3 的实现方式）。默认给 `lathe:go` 的话，
+     某个早就在用这个标签表示别的意思的仓库会在升级后突然自动接单。
+     判定函数里 `label == ""` 直接返回 false。
+
+  payload 侧：`Labels`/`LabelIDs` 原本**根本不在结构体里**，得先加。
+  判定用**标签 name 而非 labelIds 里的 UUID**（人在界面上打的是名字），
+  且 `update` 事件必须看 `updatedFrom` 里有没有 `labelIds` ——
+  否则 issue 停在带标签状态时改个标题就会重复接单。这套路与现成的
+  `IsAssignedTo` 看 `assigneeId` 完全一致。
+
+  **AC6 的能力边界如实写进了代码与文档**：取消**只改数据库状态，不会停下
+  正在跑的 agent** —— runner 全包没有任何地方在执行中途回读 task state。
+  在途 agent 会白跑完一轮，然后在下一次状态转移时因 `cancelled` 是无出边
+  终态而被 `Validate` 拒绝。没有假装取消是即时的；真正的取消信号传播
+  列为后续项。
+
+  标签名走 `system_settings`（改完即刻生效，不用重启），并在「系统设置」页
+  加了输入框 —— 否则又是一个「有设置项但没地方填」的反面。
+  管理端刻意**不对标签名做格式校验**：Linear 的标签名可以是任意文本
+  （含空格、中文、emoji），定规则只会把合法标签挡在外面。
+
+  测试：18 条（11 条既有 + 7 条新增）。AC3 点名的两个回归护栏
+  （`TestWebhookIgnoresNonAssignment`、`TestWebhookIgnoresOtherUsersIssue`）
+  仍绿；AC5 那条「伪造签名的取消事件必须被拒绝」—— 取消分流放在验签
+  **之后**，所以没有在 ingress 上开新的免验签路径。
+  另有 linear 层 20+ 表驱动判定用例与 task 层跨用户隔离断言。
+
+  门禁：注入 23 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿。
+
+  **合并前审计后的加固（三处，均为「目前够不到但防线该在使用点」）**：
+  ① `CancelForIssue` 拒绝空 `issueID` —— 构造 `data:{}` 能让空串进到
+  `WHERE linear_issue_id = ''`，眼下打不中是因为存量为 NULL 而 `= ''`
+  不匹配 NULL，那是数据凑巧不是防线；② 取消传播补跨属主告警 ——
+  `PropagateBlocked` 的递归 CTE 不带 `user_id` 过滤，`pipeline.fail`
+  对同一调用有告警而这条没有，且这条挂在**外部可触发**的 webhook 上，
+  更需要；③ `hasLabel` 在 trim 后为空时一律不匹配 —— `IsLabelTriggered`
+  只判 `label == ""`，纯空白的 `" "` 穿得过去并让**任何空名标签**命中，
+  等于在没配置的部署上悄悄打开接单，正是 AC3 要保证的语义。生产上靠
+  两道上游 `TrimSpace` 够不到，但这条语义不该寄托在两个上游都记得 trim。
+
+  两条已知项未在本 PR 收口，如实记账：`linear_issue_id` 无索引（取消路径
+  在 webhook 热路径上全表扫 `tasks`，属性能项，加索引要新迁移会与同期 PR
+  抢编号）；AC6 披露不全 —— 取消发生在 verifying 阶段时在途 agent 仍会
+  真的开出 PR（`CreatePR` 在 `Transition(pr_open)` 之前），随后转移被拒，
+  于是一个已开的 PR 挂在 `cancelled` 任务上，而 MergePoller 只扫 `pr_open`
+  所以它永不被回收。这属于「取消信号传播」后续项，不是本 PR 能收口的。
+
+  **合并前审计后的加固（两个阻断项）**：
+  ① **迁移锁表，且 CONCURRENTLY 在本框架下结构性不可用。** 0018 不带
+  CONCURRENTLY 会在建索引期间阻塞 `agent_events` 写入 —— 而它是全表最大的
+  一张，被挡住的正是所有在跑任务的事件流写入。更根本的是 `applyOne` 把每条
+  迁移包在事务里，而 Postgres 禁止在事务块内执行 `CREATE INDEX CONCURRENTLY`，
+  所以**后续任何加索引的迁移都得面对同一件事**。修的是框架：新增
+  `-- lathe:no-transaction` 标记（必须独占一行，避免注释里提到它的迁移被误判），
+  非事务路径逐条发语句（pgx 简单协议发多语句会被服务端当成隐式事务，
+  CONCURRENTLY 照样报 25001），版本记录写在全部语句成功之后 —— 这是幂等性的
+  支点：中断不记账，下次仍视为待应用。0018 首句无条件 `DROP INDEX IF EXISTS`，
+  因为 `CREATE INDEX CONCURRENTLY IF NOT EXISTS` 遇到 INVALID 索引会因
+  「名字已存在」直接跳过、**永远修不好**；结尾 DO 块查 `indisvalid`，把
+  「索引存在但无效」变成响亮的失败而不是哑巴残骸。`runMigrate` 的 2 分钟超时
+  放宽到 10 分钟并可配。
+  ② **前端 ResizeObserver 从不挂载。** `ref="plotBox"` 在 `v-else-if="cost"`
+  子树里，而 `onMounted` 执行时 `cost` 还是 null、渲染的是「加载中…」，
+  `plotBox.value` 必为 null → observer 从未创建 → SVG 宽度永远停在 640。
+  改用 `watch(plotBox, cb, { flush: 'post' })`（同步回调，没有 async 版本
+  那个「给已移除元素挂 observer」的窗口）。这一条同时修正原自述的一处不实：
+  几何核查「覆盖窄屏 360px」核的是几何函数在 `plotW=360` 时的正确性，而运行时
+  `plotW` **永远到不了 360** —— 数学验对了，接线没通。
+
+  **合并前审计后的加固（4 条阻断项）。** 审计的判词值得原样记下：原有防呆
+  （`filepath.Rel`、逐段拒绝 `.` 开头、活依赖检查）都真实存在且正确，
+  但**全部防的是「路径写错了」，没有一条防「这条路径现在还归这条任务行吗」**。
+  ① 目录名只由 issue key 决定（`worktreeDirName` 不含 repo_id/user_id/task_id），
+  而 `tasks_one_active_per_issue` 只约束非终态行 —— 于是老的 failed 行能与新的
+  活任务共存并共用 `<root>/cr-100`，默认 72h 下就能把新任务正在跑的工作区连同
+  未提交改动删掉。加 taskID 根治，并在删盘前查 `ClaimedWorktreePaths`（只算
+  非终态，与含终态行的 `ReferencedWorktreePaths` 是两个不同问题）、认领后再查
+  一次。② 候选快照与删除之间没有 CAS，而 `failed → queued` 合法且断点续跑
+  复用现场不经过 `Create` —— 人点重试与收割机并发时现场被删。新增
+  `worktree_claimed_at`（0020）与 `ClaimForReap`，四项守卫在行锁内，
+  `updated_at` 用**等值**而非不等式（要挡的是「快照之后有人动过」，等值没有
+  可乘之机也不依赖时钟精度）；两阶段设计——落账放在删盘之后，否则「决定保留
+  脏现场」时那份现场会变成孤儿被清扫收走，D4 的意图被 TTL 路径悄悄取消。
+  ③ 主路径既不看 mtime 也不看 dirty，而 `Discard` 用的是 `--force` ——
+  恰好绕开 `Remove(force=false)` 那条「git 拒绝删除有未提交改动的工作区」
+  保护，也就是 D4 本身。补双尺子 + `Inspect` 体检。④ TTL 无下限，且
+  `LATHE_WORKTREE_TTL=0` 不是关闭而是回落 72h —— 这个最具破坏力的组件没有
+  任何办法关停。加 1h 硬下限 + `LATHE_REAP_ENABLED` / `LATHE_REAP_DRY_RUN`
+  （字符串型、拼错就报错：对「必须能关掉」的开关，静默失效意味着以为关了
+  其实还在删）。
+
+  修复过程里修掉两个自己的 bug，都值得记：`discardLocked` 的 `DirRemoved`
+  恒为 false —— `git worktree remove --force` 成功时会自己删掉目录，于是
+  随后的 `os.Stat` 失败、整个 if 块被跳过；这是**最常见的正常路径**，后果是
+  记账全错、`Removed()` 为 false 导致主路径回收计数为 0。另一个是测试夹具
+  没还原生产语义（假件的 `ReferencedWorktreePaths` 不含终态行），于是主路径
+  正确跳过的现场被同一轮的孤儿清扫删掉 —— 改成让假件返回
+  `referenced ∪ reapable 的非空路径`，让「忘了设」从结构上不可能出现。
+  新增守卫 `TestReaperSkippedSceneIsNotSweptAsOrphan`（表驱动覆盖四种跳过
+  成因）+ 反证 `TestReaperStillSweepsTrulyUnreferencedDir`：这条语义是上面
+  全部修复的隐含前提，此前没有任何测试保护。
+
+  顺带删掉 `Machine.ClearWorktreePath`（`ClaimForReap` 的无守卫版本、生产
+  零调用方，而 `TestClaimForReapTwoPhases` 已两头钉住那条 schema 事实）。
+  留着是个 footgun，而本轮还的正是「配了没接线」这条纪律。
+
 - 2026-09-09：**T8 实现完成**（PR G，分支 `feat/verify-isolation`，base 在 A 上）。
   **开工第一件事是纠正我自己对这一项的理解**，它直接决定可行性。
 
@@ -599,3 +1058,48 @@ repos / tasks / task_events / verifications / agent_events。
 1. **退出码取错**：`cmd \| tail` 取到的是 `tail` 的。共犯 4 次（含 push 那次）。一律用 `$?` 显式捕获或 `PIPESTATUS[0]`。
 2. **无断言的替换**：`str.replace` 静默失败，「改了」与「以为改了」分不开。在 T4 记录过，T8 又犯。
 3. **绿是不是真的**：`t.Skipf` 也显示 `ok`；单元测试全绿掩盖过一个漏掉的字段（T4 的 `Logs: logs`）。每轮用 `-v` 数 RUN/PASS/SKIP，且端到端断言不可省。
+
+  **合并前审计后的加固（3 条阻断项，全部与「栈起来了没有、拆掉了没有」有关）。**
+  标签隔离方案本身经审计核实是**正确**的（`Manager.Stop` 的三处六条过滤器与
+  `lathe.verify` 全不相交，反向也不会误删预览容器），命令注入面也干净 ——
+  这些没动。
+  ① **worker 先跑、Stacks 后装。** `go q.work(ctx)` 在 main.go:153，而
+  `pipeline.Stacks = ...` 在 257 —— worker goroutine 读它、main goroutine
+  无同步地写它，是 Go data race（interface 值两个字，撕裂读可能读到非 nil 的
+  itab 配 nil 的 data，然后在验证主路径上 panic；`go test -race` 抓不到，
+  因为 `serve()` 没有测试覆盖）。更实的影响：这两行之间被领走的任务
+  `Stacks == nil` → **既不起栈也不留痕**，而这个窗口恰恰是最热的时刻 ——
+  150 行的 `Reconcile` 刚把所有在途任务重新入队。原注释意识到了「Manager
+  造得晚」这个别扭，但没意识到 worker 已经在跑了。修法刻意不取最小改动
+  （把两个 `go` 挪到最后）：那修得了这一次，下一个人在中间插一行 `go xxx`
+  就又破了，约束仍只活在注释里。改成 `buildPipeline` 返回 Manager 且
+  `Stacks` 写在**构造字面量**里 —— 语言层面拿不到一个 `Stacks == nil` 的
+  Pipeline；后台执行者收敛到单一启动点 `startWorkers`，放在所有装配之后。
+  ② **用已取消的 ctx 拆栈 = 容器泄漏。** `Manager.exec` 是
+  `exec.CommandContext`，ctx 取消后 `docker rm -f` 一条都执行不了；而
+  `defer stack.Down(ctx)` 用的正是优雅退出时会被取消的那个根 ctx。
+  Ctrl-C 重启一次就永久留下 postgres 容器 + 网络。在 `Down` **内部**
+  用 `context.WithoutCancel` 自己解绑，一处覆盖四条失败路径。
+  ③ **没有任何 `lathe.verify` 的兜底清扫。** 不打 `lathe.task` 是对的，
+  代价是它掉出所有既有清理路径：预览容器泄漏了人还能点停止，验证容器
+  泄漏了**没有任何出口**。而容器名是确定性的，于是泄漏一次之后同一任务的
+  每次重试都撞 `Conflict. The container name is already in use` → 判死 →
+  **任务永久红**，修复回路每轮重跑验证也会重新起栈，`Down` 失败一次就把
+  后续所有轮次锁死。补起栈前按精确名字回收（不按标签批量删 —— 那会误删
+  同一任务另一个并发栈）+ 开机清扫（放在 `Reconcile` 之后、worker 启动
+  之前，此刻不可能有本进程起的栈，无条件全清安全）。
+
+  另有一条顺带项**直接反噬本项的立项理由**，值得单独记：就绪探测走 unix
+  socket、探不到 TCP。postgres 官方 entrypoint 首次初始化时先起一个
+  `listen_addresses=''` 的临时服务器建库，跑完 initdb.d 后**停掉再以正常
+  配置重启**；而探测命令无 `-h`、走的正是 unix socket，它在临时服务器阶段
+  就会成功。此时回读端口、验证命令立刻连 `127.0.0.1:<port>`，而 postgres
+  正在重启中 → connection refused → 测试红。「让并发任务的红绿结论可信」
+  正是 T8 的立项理由，这个偶发红直接抵掉它。补宿主侧 TCP 探活 —— 而不是
+  给探测命令加 `-h 127.0.0.1`：后者只让容器内那次走 TCP，仍测不到宿主侧
+  端口有没有发布好，而验证命令跑在宿主上。
+
+  原自述有一处不实，如实修正：「项目名走 `ComposeProjectFor("verify", id)`」
+  —— 生产代码里验证栈走 `docker run`，根本没有 compose 项目名，那个调用
+  只出现在测试里。隔离结论不受影响（不打反而更彻底），但描述与代码不符，
+  且那条断言因此是空的。

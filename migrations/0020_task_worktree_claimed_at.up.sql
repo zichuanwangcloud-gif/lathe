@@ -1,0 +1,26 @@
+-- 0020_task_worktree_claimed_at.up.sql — 现场回收的认领时刻
+--
+-- 背景：T6 收割机原先是「一次性取出候选列表，然后逐个删盘」。候选快照与
+-- 真正删除之间没有 compare-and-swap，而 failed 可以转回 queued
+-- （state.go 的合法转移表），pipeline 的断点续跑复用现场、不经过 Create
+-- —— 人点一下重试，收割机正好在同一轮里把这个正在被重新接管的现场删掉，
+-- 目录、分支、未提交改动一起没。窗口不是毫秒级：循环里每个任务要跑若干
+-- 条 git 命令（gitTimeout 15 分钟）。
+--
+-- 这一列的取值是「本次现场被收割机认领（删除）的时刻」。它的作用不是
+-- 审计，而是把状态判定与磁盘删除放进同一个条件里：收割机的认领语句是
+--
+--   UPDATE tasks SET worktree_path = NULL, worktree_claimed_at = now()
+--    WHERE id = $1 AND state = ANY(终态) AND worktree_path = $2
+--      AND updated_at = $3 AND worktree_claimed_at IS NULL
+--   RETURNING worktree_path
+--
+-- 返回 0 行就说明这一行在候选快照之后被动过（重试把 state 改回了 queued、
+-- worktree_path 被换掉、或另有收割者已经认领），跳过、不碰磁盘。
+-- `IS NULL` 那一条同时让认领幂等：同一行不会被两轮重复记账。
+--
+-- 反向的竞态也一并挡住：认领成功后 state 仍是终态，任何人在磁盘删除完成
+-- 前点重试，都会撞上 worktree_path 已经是 NULL 的现场，走全新重建而不是
+-- 复用一份正在被删的目录。
+
+ALTER TABLE tasks ADD COLUMN worktree_claimed_at timestamptz;

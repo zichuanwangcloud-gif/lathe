@@ -69,6 +69,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
+	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
 
@@ -77,6 +78,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/tasks/{id}/retry", a.Auth.RequireFunc(a.retryTask))
 	mux.Handle("GET /api/tasks/{id}/retry-plan", a.Auth.RequireFunc(a.retryPlan))
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
+	mux.Handle("POST /api/tasks/{id}/approve", a.Auth.RequireFunc(a.approveTask))
 	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
 	mux.Handle("GET /api/repos/{id}/baseline", a.Auth.RequireFunc(a.repoBaseline))
@@ -168,6 +170,20 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+// costStats 返回 agent 花费的聚合视图（T5）。
+//
+// 独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
+// 不需要 5 秒新鲜度。四个跨 agent_events 的聚合查询压进那个轮询里纯属浪费
+// —— agent_events 是全表最大的一张（每任务成百上千行事件）。
+func (a *API) costStats(w http.ResponseWriter, r *http.Request) {
+	cs, err := a.Store.CostStatsFor(r.Context(), CurrentUser(r).ID)
+	if err != nil {
+		serverError(w, "成本统计失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, cs)
+}
+
 func (a *API) listRepos(w http.ResponseWriter, r *http.Request) {
 	repos, err := a.Store.ListRepos(r.Context(), CurrentUser(r).ID)
 	if err != nil {
@@ -233,6 +249,13 @@ func (a *API) triggerTask(w http.ResponseWriter, r *http.Request) {
 //     静默重建是违背意图；
 //   - fresh  强制丢弃现场从头重建。
 //
+// 这三个是【全部】用户可传的模式：校验走 UserSelectable 而不是
+// Valid。Valid 还认 RetryApproved，而那是人工闸门放行的内部信号 ——
+// 用 Valid 校验等于让持 token 的用户对任意自己名下的任务 POST
+// {"mode":"approved"} 就能走 EntryPush（跳过实现与验证直接补 push +
+// 开 PR），把 approveTask 的三道防线连同人工闸门一起绕过去。
+// 放行只能从 approveTask 那条路径进来，它自己构造 RetryApproved。
+//
 // 最终决策在派发侧（queue）执行前还会重做一次（TOCTOU：预检到执行
 // 之间现场可能失效），决策理由落任务事件流。
 func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +272,7 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := runner.RetryMode(strings.TrimSpace(body.Mode))
-	if !mode.Valid() {
+	if !mode.UserSelectable() {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "mode 必须是 auto / resume / fresh"})
 		return
 	}
@@ -283,6 +306,65 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 	// 状态已回到 queued，重派【原任务行】（不新建 —— 新建会撞同一 issue
 	// 的活任务唯一索引，重试因此永远卡死；任务 #313 的教训）
 	if err := a.Queue.Requeue(r.Context(), id, string(mode)); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "queued", "taskId": id})
+}
+
+// approveTask 是 gate_mode=manual 的人工放行（T2，docs/08-debt-cleanup.md）。
+//
+// 语义：任务已经走完验证、停在 awaiting_approval；人看过之后点确认，
+// 平台才去推分支、开 PR。
+//
+// 实现上不在这里同步做 push + 开 PR —— 那是要跑 git 与调 GitHub 的活，
+// 压在 HTTP 处理器里会让请求挂很久，且失败没有重试路径。改为：转回
+// queued 并在事件 payload 里写下 mode=approved，DB 领单调度器捡起来后
+// runOneClaimed 回读它、PlanRetry 据此给出 EntryPush（只补 push + 开 PR，
+// 两者都幂等），走的是与手动重试完全一样的成熟通道。
+func (a *API) approveTask(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		// 不是自己的任务 = 不存在（与 taskDetail 同一原则）
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return
+	}
+
+	// 只放行真的停在闸门上的任务。不加这道检查，「确认」就成了一个能把
+	// 任意状态的任务直接推去开 PR 的后门。
+	if tk.State != task.StateAwaitingApproval {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "只有等待确认的任务可以放行，当前状态：" + string(tk.State),
+		})
+		return
+	}
+
+	// 上面那次读没有加锁，它只用于快速失败与提示文案。真正的判据是
+	// 这一次带前置状态的转移：awaiting_approval 的条件在行锁下复核，
+	// 与写入原子完成。
+	//
+	// 为什么必须这样：两个并发的确认请求会双双读到 awaiting_approval
+	// 并双双走过上面那道检查，此时「确认」所依据的事实（任务确实还停在
+	// 闸门上等人）对其中一个已经不成立了。两个都放行会让同一个任务被
+	// 重派两次；闸门放行是个副作用不幂等的动作（重派意味着再推一次
+	// 分支、再开一次 PR），不能让「先读后写」的窗口来决定谁有权执行。
+	// 第二个请求在锁下读到的是 queued，直接以冲突拒绝。
+	if _, err := a.Tasks.TransitionFrom(r.Context(), id,
+		task.StateAwaitingApproval, task.StateQueued, actorOf(r), &task.TransitionOpts{
+			Payload: map[string]any{"reason": "manual_approve", "mode": string(runner.RetryApproved)},
+		}); err != nil {
+		transitionError(w, err)
+		return
+	}
+
+	// 重派【原任务行】，不新建 —— 新建会撞同一 issue 的活任务唯一索引
+	//（任务 #313 的教训，与 retryTask 同一处理）。
+	if err := a.Queue.Requeue(r.Context(), id, string(runner.RetryApproved)); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}
@@ -608,6 +690,14 @@ func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 func transitionError(w http.ResponseWriter, err error) {
 	var illegal task.ErrIllegalTransition
 	if errors.As(err, &illegal) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	// 前置状态不成立（并发下被别人先转走了）：也是冲突，不是内部故障。
+	// 单独判一档，免得落到最后的 500 —— 那是把一次正常的并发拒绝报成
+	// 服务端出错，让人误以为可以重试出不同结果。
+	var mismatch task.ErrStateMismatch
+	if errors.As(err, &mismatch) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}

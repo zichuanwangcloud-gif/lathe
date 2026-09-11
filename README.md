@@ -62,6 +62,9 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 # 6. 「设置」页顶部有你的专属 Linear webhook 地址（/webhooks/linear/<你的随机段>），
 #    在 Linear → Settings → API → Webhooks 里指过去，勾选 Issue 事件
 # 7. 在「仓库配置」页登记目标仓库（owner/repo）并设置分支策略
+#
+# 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
+#    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
 ```
 
 ### 账号
@@ -94,11 +97,17 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 | `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
 | `LATHE_COOKIE_SECURE` | 覆盖会话 Cookie 的 Secure 标志，默认按 BaseURL 的协议推断 |
 | `LATHE_TRUSTED_PROXY` | 设为 `true` 才信任 `X-Forwarded-For`（限流按它取客户端 IP） |
+| `LATHE_WORKTREE_TTL` | 终态任务的工作区现场保留时长，默认 `72h`，**下限 `1h`**（配得更小启动直接报错）。注意 Go 的时长解析**不支持 `d`**，写 `72h` 不能写 `3d` |
+| `LATHE_REAP_INTERVAL` | 现场回收的扫描间隔，默认 `1h`，必须为正 |
+| `LATHE_REAP_ENABLED` | 现场回收总开关，默认 `true`。设 `false` 时收割机根本不启动 —— 它会删磁盘目录与 git 分支，必须能一键关掉 |
+| `LATHE_REAP_DRY_RUN` | 设 `true` 时收割机只打「本轮会删什么」的日志，不碰任何东西。首次启用或调整 TTL 后先干跑一轮 |
+| `LATHE_WORKSPACE_ROOT` | worktree 与 `.mirrors/` 的根目录，默认 `/opt/lathe/workspaces`。必须是**至少两层**的专用目录，且不能是 `/`、`/opt`、`/home` 这类系统目录 —— 孤儿清扫会删掉根下无人认领且超期的顶层目录 |
 | `LATHE_LIGHT_SLOTS` | light 档验证并发上限，默认 2 |
 | `LATHE_HEAVY_SLOTS` | heavy 档验证并发上限，默认 1 |
 | `LATHE_SETTING_SOURCES` | agent 加载的配置源，默认 `project`（排除个人插件，见 §9） |
 | `LATHE_TRIAGE_CHANNEL` | 分诊的 cc-switch 通道名（模型路由：分诊走便宜通道），空 = 跟随激活通道 |
 | `LATHE_IMPLEMENT_CHANNEL` | 实现/修复回路的 cc-switch 通道名（走强通道），空 = 跟随激活通道 |
+| `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。

@@ -115,11 +115,13 @@ func TestAPIRequiresAuth(t *testing.T) {
 		{"GET", "/api/tasks/1", ""},
 		{"GET", "/api/tasks/1/events", ""},
 		{"GET", "/api/stats", ""},
+		{"GET", "/api/stats/cost", ""},
 		{"GET", "/api/repos", ""},
 		{"GET", "/api/config", ""},
 		{"POST", "/api/tasks", `{"issueKey":"CR-1"}`},
 		{"POST", "/api/tasks/1/retry", ""},
 		{"POST", "/api/tasks/1/cancel", ""},
+		{"POST", "/api/tasks/1/approve", ""},
 		{"POST", "/api/repos", `{"providerRepo":"acme/x"}`},
 		{"PUT", "/api/repos/" + itoa(repoID), `{"gateMode":"direct"}`},
 	}

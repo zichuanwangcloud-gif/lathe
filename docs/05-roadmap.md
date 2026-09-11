@@ -14,11 +14,11 @@
 | 字段/组件 | 状态 | 发现方式 |
 |---|---|---|
 | `repos.exclude_dirs` | 字段存在、配置层不 SELECT → 已修复（dd1cb09） | 任务 #316 验证挂在不维护目录 |
-| `repos.gate_mode` | 可配、pipeline 从不读 | 代码走查 |
+| `repos.gate_mode` | ~~可配、pipeline 从不读~~ → 已接线（2026-09-09，08 T2）| 代码走查 |
 | `notify_email` | 字段有了、`internal/mail` 只接了密码重置 | 代码走查 |
 | `agent_session_id` | 注释明说为 `--resume` 留的、无 resume 逻辑 | pipeline.go:201 |
 | `internal/scheduler/` | 空目录 | §6 调度设计的占位 |
-| `verifications.log_ref` | 从不写入 | 任务 #466 排障时无日志可查 |
+| `verifications.log_ref` | ~~从不写入~~ → 已接线（2026-09-09，08 T4）| 任务 #466 排障时无日志可查 |
 
 **结论：每个可配置字段必须有消费方。** 把这条加进 PR 自查清单，比任何单点修复都值钱。
 
@@ -95,9 +95,22 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 ### 3.3 生命周期与现场管理
 
-8. **worktree 收割机**：失败现场 TTL 回收（解决磁盘占用；同名撞车已由 Create 尸体回收覆盖，本条只剩 TTL 清理价值）。
+8. ~~**worktree 收割机**~~（已交付，08 T6）：终态任务的现场按 TTL 回收（默认 72h）。
+    实际比原估的多一块：DB 驱动的回收看不见「磁盘上有、没有任务行指向」的孤儿目录
+    （任务 649 是 failed 但 `worktree_path` 为 NULL，`cr-1367` 因此永远没人回收），
+    所以补了一条按 mtime 判超期的孤儿清扫。那个 TTL 不只是策略是**安全机制**：
+    worktree 目录先被 Create 建出来、之后才把路径写进任务行，两步之间无人认领，
+    不看 mtime 就删会让在途任务突然找不到自己的工作区。
 9. **通知闭环**：任务终态（失败/待 review）接 `internal/mail` 发 `notify_email` —— 不用盯面板。
-10. **GateMode 接线**：`gate=manual` 时验证通过后停下、人工确认再推 PR（"开 PR 前让我看一眼"）。
+10. ~~**GateMode 接线**~~（已交付，08 T2）：`gate=manual` 时验证通过后停在
+    `awaiting_approval`，人在详情页点「确认开 PR」才推分支开 PR。
+    放行走的是与手动重试同一条成熟通道（转回 `queued` + payload 里
+    `mode=approved` → `PlanRetry` 给出 `EntryPush`，只补 push + 开 PR，均幂等），
+    不在 HTTP 处理器里同步跑 git／调 GitHub。
+    真正的断点原来不在 pipeline 而在 `Enqueue`：它从不把 `repos.gate_mode`
+    复制进任务行，所以 `tasks.gate_mode` 永远是 `direct`。
+    另三个取值（`guarded`/`plan-first`）**仍按 `direct` 处理并在代码里写明** ——
+    不给它们编造语义，那又是一次「配了没接线」。
 
 ~~**任务预览环境**~~（已交付）：看板一键在 worktree 里构建 Dockerfile 镜像、起容器、
 随机端口映射，人手动点完一键停止并清理；内存/磁盘占用超阈值（系统设置可配，
@@ -105,7 +118,18 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 ### 3.4 集成深度 —— 从手动触发到事件驱动
 
-11. **webhook 联动加深**（ingress 已有）：标签驱动接单（如 `lathe:go`）、issue 取消联动取消任务。
+11. ~~**webhook 联动加深**~~（已交付，08 T7）：标签驱动接单 + issue 取消联动。
+    两处实现上的要点：
+    - 标签名在系统设置里配，**默认空串即关闭** —— 不能让存量部署因为升级
+      就突然开始按标签接单（某个仓库可能早就在用 `lathe:go` 表示别的意思）
+    - 取消分流必须在接单闸门**之前**：取消事件不是指派事件，走到那个闸门
+      会被当成「非指派事件」直接 ignored 掉
+    - `completed` **刻意不算取消**：人手工标完成不代表平台任务该作废 ——
+      那个任务可能正在跑，或已开出 PR 等人合并
+    **已知边界**：取消只改数据库状态，**不会停下正在跑的 agent**（runner
+    全包没有任何地方在执行中途回读 task state）。在途 agent 会白跑完一轮，
+    然后在下一次状态转移时因 `cancelled` 是无出边终态而被 `Validate` 拒绝。
+    真正的取消信号传播列为后续项。
 12. **PR 生命周期回流**（§7 已设计）：(a) PR review comment → `review_feedback` → resume 续跑修复；(b) PR merged → 任务 `merged` + worktree 回收；(c) base 分支前进自动 rebase。
 
 ### 3.5 安全与隔离 —— 自用也要防手滑
@@ -124,7 +148,7 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 |---|---|---|
 | **B1** | 修复回路（1）+ 重试语义（2）+ 启动 reconcile（3）+ env 白名单（13）+ EventSink UTF8 修复 | 闭环自愈 + 堵安全洞 |
 | **B2** | ~~模型路由（6）~~ + ~~分诊目录（7）~~ 已交付；剩成本面板（5）+ 通知（9）+ worktree reaper（8） | 日常用得爽 |
-| **B3** | GateMode（10）+ webhook 联动（11）+ PR 回流（12） | 自动化加深 |
+| **B3** | ~~GateMode（10）~~ 已交付；剩 webhook 联动（11）+ PR 回流（12） | 自动化加深 |
 | **持续** | 度量（15）先行一点，每批落地后看数据决定下一批 | 数据驱动 |
 
 ## 5. 未决（继承 02-design §9 并增补）

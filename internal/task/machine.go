@@ -72,6 +72,20 @@ func NewMachine(pool *pgxpool.Pool) *Machine {
 // ErrTaskNotFound 表示目标任务不存在。
 var ErrTaskNotFound = errors.New("task: 任务不存在")
 
+// ErrStateMismatch 表示 TransitionFrom 的前置状态条件不成立：任务在
+// 调用方那次读之后、拿到行锁之前被改成了别的状态。
+//
+// 这是一次【并发下的正常拒绝】，不是内部故障 —— 调用方应当把它转成
+// 一个语义准确的冲突响应（如 409「任务已经不在等待确认的状态了」），
+// 而不是 500。想要的状态与实际状态都带上，消息才能直接给人看。
+type ErrStateMismatch struct {
+	Want, Got State
+}
+
+func (e ErrStateMismatch) Error() string {
+	return fmt.Sprintf("task: 状态已变化，期望 %s，实际 %s", e.Want, e.Got)
+}
+
 // ErrSessionRequired 表示该转移必须已持有 agent_session_id。
 //
 // 对应 docs/02-design.md §3 约束①：review 二轮必须 --resume 原会话。
@@ -130,12 +144,29 @@ func nilIfEmptyJSON(b []byte) []byte {
 	return b
 }
 
+// 闸门模式（repos.gate_mode / tasks.gate_mode）。取值域由数据库的
+// repos_gate_mode_check 与 tasks_gate_mode_check 约束定义，四个值。
+//
+// 本轮（docs/08-debt-cleanup.md T2）只有 GateManual 有拦截语义：
+// 验证通过后停在 awaiting_approval 等人确认。其余三个一律按 GateDirect
+// 处理 —— 不给它们编造语义，假装实现了又是一次「配了没接线」。
+const (
+	// GateDirect 验证通过即推分支开 PR（默认）。
+	GateDirect = "direct"
+	// GateManual 验证通过后停下等人确认（T2 接线的那一个）。
+	GateManual = "manual"
+	// GateGuarded 已在 CHECK 约束里，但尚无实现语义，当前按 direct 处理。
+	GateGuarded = "guarded"
+	// GatePlanFirst 已在 CHECK 约束里，但尚无实现语义，当前按 direct 处理。
+	GatePlanFirst = "plan-first"
+)
+
 // Create 新建任务（初始状态 queued）并记录创建事件。
 //
 // 若同一 issue 已有活任务，数据库的部分唯一索引会拒绝插入。
 func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 	if p.GateMode == "" {
-		p.GateMode = "direct"
+		p.GateMode = GateDirect
 	}
 	dependsOnAt := p.DependsOnAt
 	if dependsOnAt == "" {
@@ -213,6 +244,30 @@ type TransitionOpts struct {
 // 因此并发调用不会出现"两边都读到旧状态各自转移"的竞态。
 // 非法转移会被拒绝且不产生任何写入。
 func (m *Machine) Transition(ctx context.Context, id int64, to State, actor string, opts *TransitionOpts) (*Task, error) {
+	return m.transition(ctx, id, "", to, actor, opts)
+}
+
+// TransitionFrom 是 Transition 的带前置状态版本：只有当任务【此刻】仍
+// 处于 from 时才转移，否则返回 ErrStateMismatch。
+//
+// 为什么需要它：调用方先 Get 校验状态、再调 Transition，中间有一段
+// 不加锁的窗口（TOCTOU）。对人工作用的端点而言这不是纯粹的洁癖 ——
+// 拿 gate 放行来说，「先读到 awaiting_approval」与「真的把它转走」之间
+// 任务可能已经被另一个并发请求转走或被人取消，此时按第一次读到的旧
+// 状态放行，放行依据就不再成立。把前置状态交给持行锁的这次 UPDATE
+// 一起判定（WHERE state = $3），判定与写入在同一把锁下原子完成，
+// 窗口消失。
+//
+// 注意这里返回的是 ErrStateMismatch 而不是让调用方自己回读比对：
+// 「状态对不上」是并发下的正常结果，不是错误，调用方据此回一个
+// 语义准确的冲突响应即可（见 ErrStateMismatch 的注释）。
+func (m *Machine) TransitionFrom(ctx context.Context, id int64, from, to State, actor string, opts *TransitionOpts) (*Task, error) {
+	return m.transition(ctx, id, from, to, actor, opts)
+}
+
+// transition 是 Transition / TransitionFrom 的实现。from 为空串表示
+// 不附加前置状态条件（只走合法转移表）。
+func (m *Machine) transition(ctx context.Context, id int64, from, to State, actor string, opts *TransitionOpts) (*Task, error) {
 	if opts == nil {
 		opts = &TransitionOpts{}
 	}
@@ -236,6 +291,12 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 		return nil, fmt.Errorf("task: 锁定任务 %d 失败: %w", id, err)
 	}
 
+	// 前置状态：在行锁下比对。调用方要求的那次读发生在锁外，此刻
+	// 状态可能已经被别的请求改掉了，那一读不能作为放行依据。
+	if from != "" && cur.State != from {
+		return nil, ErrStateMismatch{Want: from, Got: cur.State}
+	}
+
 	if err := Validate(cur.State, to); err != nil {
 		return nil, err
 	}
@@ -249,6 +310,9 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 		}
 	}
 
+	// from 为空串时该条件恒真，与旧行为一致。上面的行锁保证了本条
+	// UPDATE 必然命中一行：状态条件若在锁下不成立，前面已经返回
+	// ErrStateMismatch，走不到这里 —— 所以不需要再处理零行。
 	updated, err := scanTask(tx.QueryRow(ctx, `
 		UPDATE tasks SET
 			state             = $2,
@@ -262,19 +326,20 @@ func (m *Machine) Transition(ctx context.Context, id int64, to State, actor stri
 			failure_stage     = COALESCE($10, failure_stage),
 			node_id           = COALESCE($11, node_id),
 			lease_expires_at  = COALESCE($12, lease_expires_at)
-		WHERE id = $1
+		WHERE id = $1 AND ($13 = '' OR state = $13)
 		RETURNING `+taskColumns,
 		id, to,
 		opts.AgentSessionID, opts.WorktreePath, opts.BranchName, opts.PRURL,
 		opts.VerifyTier, opts.TaskKind, opts.FailureReason, opts.FailureStage,
 		opts.NodeID, opts.LeaseExpiresAt,
+		string(from),
 	))
 	if err != nil {
 		return nil, fmt.Errorf("task: 更新任务 %d 失败: %w", id, err)
 	}
 
-	from := cur.State
-	if err := insertEvent(ctx, tx, id, &from, to, actor, opts.Payload); err != nil {
+	was := cur.State
+	if err := insertEvent(ctx, tx, id, &was, to, actor, opts.Payload); err != nil {
 		return nil, err
 	}
 
@@ -355,6 +420,225 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// ListReapableTasks 返回可被 TTL 收割机回收现场的任务（T6）：
+// 已进终态、还留着 worktree_path、且最后一次变更早于 olderThan。
+//
+// 时间基准用 updated_at 而不是 at/created_at：现场该不该回收取决于
+// 「多久没人动过它」，而不是「任务是什么时候建的」。tasks 上有
+// BEFORE UPDATE 触发器维护这一列。
+//
+// 只挑终态是硬约束：failed 可以转回 queued（人随时可能重试续跑，
+// 而 D4 保留现场的全部目的就是让人能接手），非终态的现场绝不能碰。
+func (m *Machine) ListReapableTasks(ctx context.Context, olderThan time.Time) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE state = ANY($1)
+		  AND worktree_path IS NOT NULL AND worktree_path <> ''
+		  AND updated_at < $2
+		ORDER BY id`,
+		[]string{string(StateMerged), string(StateFailed), string(StateCancelled)}, olderThan)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询可回收现场失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取可回收现场失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ActiveByIssueID 返回某属主名下、指定 Linear issue 的所有非终结任务（T7）。
+//
+// 谓词抄 flow/service.go 那条「同 issue 的活任务」查询，改成按
+// linear_issue_id（UUID）而不是 linear_issue_key —— webhook 手里权威的是
+// UUID，issue key 是人读标识、理论上可被重命名。
+//
+// 正常情况下最多一条（tasks_one_active_per_issue 部分唯一索引按
+// (repo_id, linear_issue_key) 挡住），但一个用户可能在多个仓库下登记了
+// 同一个 issue，所以返回切片、不假设恰好一条。
+func (m *Machine) ActiveByIssueID(ctx context.Context, userID int64, issueID string) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE user_id = $1 AND linear_issue_id = $2
+		  AND state NOT IN ('merged', 'failed', 'cancelled')
+		ORDER BY id`, userID, issueID)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询 issue %s 的在途任务失败: %w", issueID, err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取在途任务失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ReferencedWorktreePaths 返回**所有**任务行里非空的 worktree_path，
+// 不分状态。
+//
+// 给 T6 收割机的孤儿目录清扫用：磁盘上存在、却没有任何任务行指向它的
+// 目录，DB 驱动的回收路径结构上看不见（`ListReapableTasks` 要求
+// worktree_path 非空）。实测就有这种目录 —— 任务 649（cr-1367）是 failed
+// 但 worktree_path 为 NULL，磁盘上的目录因此永远没人回收。
+//
+// 刻意不按状态过滤：终态任务引用的路径由主回收路径处理，这里只回答
+// 「这个目录有没有人认领」这一个问题，别的判断留给调用方。
+//
+// 主回收路径（reapTask）**不要**用这个集合做删盘前的最后一道闸：它把
+// 终态任务自己也算作认领者，而主路径恰恰就是在回收终态任务的路径。
+// 那道闸要的是 ClaimedWorktreePaths（只算非终态）。
+func (m *Machine) ReferencedWorktreePaths(ctx context.Context) ([]string, error) {
+	return m.queryPaths(ctx, `SELECT worktree_path FROM tasks
+		 WHERE worktree_path IS NOT NULL AND worktree_path <> ''`)
+}
+
+// ClaimedWorktreePaths 返回**非终态**任务当前认领的 worktree_path 集合。
+//
+// 这是收割机删盘前的最后一道闸（B1）：目录名只由 issue key 决定
+// （worktreeDirName），任何一次尝试、任何仓库、任何用户都落在同一个
+// <root>/<issue-key>。于是完全可能「任务 A 是 failed、还留着 worktree_path，
+// 而任务 B（同 issue 重开，或另一个 repo/user 的同一个 key）正在那个目录里
+// 跑」—— 此时 tasks_one_active_per_issue 拦不住（它只约束活任务之间，
+// 且把已进终态的旧行排除在索引之外），ListReapableTasks 照样把 A 交出来。
+//
+// 只算非终态：终态行引用的路径正是主路径要回收的对象，把它们算进来
+// 会让主路径永远不敢动手。在途任务是唯一需要保护的对象。
+//
+// 与孤儿清扫的关系：孤儿清扫用「有没有任何行认领」判无主；主路径用
+// 「有没有活任务认领」判能不能删。两个问题不同，用两个查询。
+func (m *Machine) ClaimedWorktreePaths(ctx context.Context) ([]string, error) {
+	return m.queryPaths(ctx, `SELECT worktree_path FROM tasks
+		 WHERE worktree_path IS NOT NULL AND worktree_path <> ''
+		   AND state NOT IN ('merged', 'failed', 'cancelled')`)
+}
+
+// queryPaths 是上面两个查询的公共执行体。
+func (m *Machine) queryPaths(ctx context.Context, sql string) ([]string, error) {
+	rows, err := m.pool.Query(ctx, sql)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询已引用的工作区路径失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("task: 读取工作区路径失败: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ErrReapClaimLost 表示这一次现场认领失败：任务行在候选快照之后被动过
+// （重试把它改回了 queued、worktree_path 被换掉、updated_at 变了），
+// 或已被另一轮收割认领。调用方必须**跳过磁盘操作**。
+var ErrReapClaimLost = errors.New("task: 现场认领失败（任务行已变动或已被认领）")
+
+// ClaimForReap 判断这一次收割是否还能认领该任务，并按需落账。
+//
+// 守卫的四个条件（全部满足才算认领成功）：
+//
+//   - state 仍是终态（failed → queued 的重试会让它失配）
+//   - worktree_path 仍等于快照里看到的那个（换成别的路径就失配）
+//   - updated_at 仍等于快照里看到的值（任何一次写入都会推进它——
+//     Transition 与本方法都会，由数据库触发器维护）
+//   - worktree_claimed_at IS NULL（幂等：同一行不被重复认领）
+//
+// 为什么用 updated_at 等值判定而不是时间不等式：要挡的是「快照之后有人
+// 动过这一行」，等值没有可乘之机，也不依赖时钟精度或时区换算。
+//
+// 两个阶段，因为「能不能删」和「删完了没有」是两件事：
+//
+//	commit == false（探测）：只读 FOR UPDATE 校验四个条件，不改任何状态。
+//	  收割机在删盘前用它确认「这条路径还归本次收割处置」，同时**不**
+//	  动 worktree_path —— 万一随后因为脏工作区/未推送分支决定保留现场，
+//	  任务行里的路径还在，孤儿清扫就不会把它当无主目录收走。
+//	commit == true（落账）：在同一个事务里置空 worktree_path、盖认领时刻、
+//	  写一条 task_events。删盘**之后**才调用它，让账目永远不多于事实。
+//
+// 返回 (false, nil) 表示认领失败，调用方必须跳过磁盘操作。返回
+// (false, err) 表示查询/落账出错，同样不能碰磁盘。
+//
+// 记账（commit 阶段）写的是非状态转移事件：from_state == to_state ==
+// 当前状态，事件流靠 payload 的 kind 区分。回收是删磁盘的动作，必须能
+// 在任务详情页答出「现场是谁在什么时候按什么规则删的」。
+func (m *Machine) ClaimForReap(ctx context.Context, id int64, path string, snapshotUpdatedAt time.Time, commit bool, actor string, reason map[string]any) (bool, error) {
+	if actor == "" {
+		actor = "system"
+	}
+
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("task: 开启事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 行锁 + 四项守卫的只读校验。FOR UPDATE 让并发的 Transition
+	//（人点重试）与本次认领串行化：谁先拿到锁谁先说话，后到的会看到
+	// 前者改完的状态，据此失配退出。
+	var (
+		fromState string
+		claimedAt *time.Time
+		updatedAt time.Time
+		curPath   *string
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT state, worktree_claimed_at, updated_at, worktree_path
+		FROM tasks WHERE id = $1 FOR UPDATE`, id).Scan(&fromState, &claimedAt, &updatedAt, &curPath)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("task: 锁定任务 %d 失败: %w", id, err)
+	}
+
+	st := State(fromState)
+	if !st.Terminal() ||
+		curPath == nil || *curPath != path ||
+		claimedAt != nil ||
+		!updatedAt.Equal(snapshotUpdatedAt) {
+		return false, nil
+	}
+
+	if !commit {
+		// 探测阶段：什么都不改，直接回滚（defer 里的 Rollback）。
+		return true, nil
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks SET worktree_path = NULL, worktree_claimed_at = now()
+		WHERE id = $1`, id); err != nil {
+		return false, fmt.Errorf("task: 认领任务 %d 的现场失败: %w", id, err)
+	}
+
+	payload := map[string]any{"kind": "worktree_reaped"}
+	for k, v := range reason {
+		payload[k] = v
+	}
+	if err := insertEvent(ctx, tx, id, &st, st, actor, payload); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("task: 提交现场认领失败: %w", err)
+	}
+	return true, nil
 }
 
 // HasLiveDependentOnBranch 报告是否存在非终结状态的任务，其当前
