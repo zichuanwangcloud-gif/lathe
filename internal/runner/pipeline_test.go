@@ -126,10 +126,14 @@ func (f *fakeNotifier) Notify(ctx context.Context, m string) error {
 // fakeVerifications 记录落库的验证步骤，供断言红-绿证据链完整。
 type fakeVerifications struct {
 	rows []string // "tier/step/status"
+	// logRefs 与 rows 平行：logRefs[i] 是 rows[i] 那一步落库的 log_ref
+	// （T4 —— 断言它真的被写进去了，而不是又一个「有列没消费方」）。
+	logRefs []string
 }
 
-func (f *fakeVerifications) InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64) error {
+func (f *fakeVerifications) InsertVerification(ctx context.Context, taskID int64, tier, step, status string, durationMS int64, logRef string) error {
 	f.rows = append(f.rows, tier+"/"+step+"/"+status)
+	f.logRefs = append(f.logRefs, logRef)
 	return nil
 }
 

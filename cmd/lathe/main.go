@@ -135,7 +135,7 @@ func serve(cfg config.Config) error {
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID)
 
-	pipeline, err := buildPipeline(cfg, st, factory)
+	pipeline, err := buildPipeline(cfg, st, secrets, factory)
 	if err != nil {
 		return err
 	}
@@ -350,7 +350,7 @@ func serve(cfg config.Config) error {
 // 刻意不在此校验 Linear/GitHub 凭据：凭据现在可在界面里配置，
 // 缺凭据不该阻止服务启动 —— 否则新用户连配置页都打不开。
 // 真正需要凭据时（执行任务）才会报错，并指引去设置页。
-func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFactory) (*runner.Pipeline, error) {
+func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, factory runner.ClientFactory) (*runner.Pipeline, error) {
 	wm, err := runner.NewWorktreeManager(cfg.WorkspaceRoot)
 	if err != nil {
 		return nil, err
@@ -363,6 +363,9 @@ func buildPipeline(cfg config.Config, st *store.Store, factory runner.ClientFact
 		Agent:            agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
 		ClientFactory:    factory,
 		Notifier:         logNotifier{},
+		Mail:             taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
+		BaseURL:          cfg.PublicURL(),
+		LogDir:           cfg.DataDir,
 		Verifications:    st,
 		AgentEvents:      st,
 		Gates:            runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
@@ -439,6 +442,37 @@ func configStatus(cfg config.Config) func() map[string]any {
 
 // logNotifier 是 P0 的占位通知实现：先写日志。
 // 真正的推送通道（终端/手机）留到 P2 随 Web UI 一起做。
+// taskMailer 实现 runner.TaskMail：把「任务终态」翻译成一封发给属主的信。
+//
+// 放在 cmd/lathe 而不是 runner 里，是因为这里同时拿得到 store（解析收件人）
+// 与 internal/mail（发信）。runner 只依赖它声明的窄接口，不 import
+// internal/mail —— 与 VerificationRecorder / AgentEventRecorder 同一套做法。
+type taskMailer struct {
+	store  *store.Store
+	sender *mail.Sender
+}
+
+// SendTaskMail 向任务属主投一封信。
+//
+// **SMTP 未配置时返回 nil（静默跳过）而非错误**：没配邮件是默认状态、
+// 不是异常。把它当错误上报会让日志里每个终态都刷一条 WARN，
+// 真正的发信故障反而被淹没。
+func (t taskMailer) SendTaskMail(ctx context.Context, taskID int64, subject, body string) error {
+	if t.sender == nil || !t.sender.Ready(ctx) {
+		return nil
+	}
+	to, err := t.store.NotifyEmailForTask(ctx, taskID)
+	if err != nil {
+		// 收件人查不到（任务不存在、属主已删）也不是发信故障，
+		// 没有可投递的对象而已。
+		if errors.Is(err, store.ErrNoRecipient) {
+			return nil
+		}
+		return err
+	}
+	return t.sender.Send(ctx, to, subject, body)
+}
+
 type logNotifier struct{}
 
 func (logNotifier) Notify(ctx context.Context, msg string) error {

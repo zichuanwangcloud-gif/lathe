@@ -18,7 +18,7 @@
 | `notify_email` | 字段有了、`internal/mail` 只接了密码重置 | 代码走查 |
 | `agent_session_id` | 注释明说为 `--resume` 留的、无 resume 逻辑 | pipeline.go:201 |
 | `internal/scheduler/` | 空目录 | §6 调度设计的占位 |
-| `verifications.log_ref` | 从不写入 | 任务 #466 排障时无日志可查 |
+| `verifications.log_ref` | ~~从不写入~~ → 已接线（2026-09-09，08 T4）| 任务 #466 排障时无日志可查 |
 
 **结论：每个可配置字段必须有消费方。** 把这条加进 PR 自查清单，比任何单点修复都值钱。
 
