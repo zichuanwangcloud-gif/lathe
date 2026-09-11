@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -30,6 +31,8 @@ import (
 
 	"github.com/Clouditera/lathe/internal/config"
 	"github.com/Clouditera/lathe/internal/runner"
+	"github.com/Clouditera/lathe/internal/secret"
+	"github.com/Clouditera/lathe/internal/store"
 )
 
 // ★ B1 第一层：buildPipeline 返回的 Pipeline 必须已经装好 Stacks。
@@ -51,7 +54,7 @@ func TestBuildPipelineReturnsStacksAlreadyWired(t *testing.T) {
 		HeavySlots:    1,
 	}
 
-	p, pm, err := buildPipeline(cfg, st, nil)
+	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -239,7 +242,7 @@ var _ runner.VerifyStackUp = verifyStacks{}
 func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -285,7 +288,7 @@ func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 func TestVerifyStacksReturnsTrueNilWithoutInfra(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -297,4 +300,22 @@ func TestVerifyStacksReturnsTrueNilWithoutInfra(t *testing.T) {
 	if h != nil {
 		t.Errorf("无依赖应返回真正的 nil 接口值，得到 %#v（会让调用方对 nil 指针调方法）", h)
 	}
+}
+
+// testSecrets 造一个可用的 Secrets。
+//
+// 传 nil 也不会 panic（`secrets.LoadSMTP` 是方法值，nil 接收者只是绑定，
+// 不解引用），但那是在赌 buildPipeline 以后也不解引用它。造一个真的更便宜：
+// 随机主密钥即可，不必走 secret.LoadKey 那条会读写 DataDir 的路径。
+func testSecrets(t *testing.T, st *store.Store) *store.Secrets {
+	t.Helper()
+	key := make([]byte, secret.KeySize)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("生成测试主密钥失败: %v", err)
+	}
+	sealer, err := secret.New(key)
+	if err != nil {
+		t.Fatalf("构造 sealer 失败: %v", err)
+	}
+	return st.NewSecrets(sealer)
 }

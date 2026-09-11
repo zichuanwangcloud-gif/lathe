@@ -53,7 +53,7 @@ func TestRunHeavyDegradesAndMarksReport(t *testing.T) {
 	}
 
 	rep, err := p.runHeavy(context.Background(), taskID, providerRepo, wt,
-		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"})
+		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"}, nil)
 	if err != nil {
 		t.Fatalf("水位超阈值应降级而不是返回错误: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestRunHeavyFailsHardOnStackErrors(t *testing.T) {
 			p.Stacks = &fakeStackUp{upErr: tc.err}
 
 			_, err := p.runHeavy(context.Background(), taskID, providerRepo, wt,
-				[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"})
+				[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"}, nil)
 			if err == nil {
 				t.Fatal("应判死而不是降级")
 			}
@@ -116,7 +116,7 @@ func TestRunHeavyInjectsStackEnvAndTearsDown(t *testing.T) {
 	p.Stacks = f
 
 	rep, err := p.runHeavy(context.Background(), taskID, providerRepo, wt,
-		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"})
+		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"}, nil)
 	if err != nil {
 		t.Fatalf("runHeavy 失败: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestRunHeavyTearsDownEvenWhenRootCtxCancelled(t *testing.T) {
 	p.Stacks = f
 
 	_, _ = p.runHeavy(ctx, taskID, providerRepo, wt,
-		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"})
+		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"}, nil)
 
 	if f.downCalls != 1 {
 		t.Fatalf("根 ctx 取消也必须拆栈（否则容器永久留在机器上），Down 调用次数 %d", f.downCalls)
@@ -187,7 +187,7 @@ func TestRunHeavyWithoutStacksIsUnchanged(t *testing.T) {
 	p.Stacks = nil
 
 	rep, err := p.runHeavy(context.Background(), taskID, providerRepo, wt,
-		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"})
+		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, []string{"postgres"}, nil)
 	if err != nil {
 		t.Fatalf("未装配 Stacks 时不该报错: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestRunHeavySkipsStackWithoutRepoInfra(t *testing.T) {
 	p.Stacks = f
 
 	rep, err := p.runHeavy(context.Background(), taskID, providerRepo, wt,
-		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, nil)
+		[]Step{{Name: StepBuild, Cmd: []string{"true"}}}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("没声明依赖不该报错: %v", err)
 	}

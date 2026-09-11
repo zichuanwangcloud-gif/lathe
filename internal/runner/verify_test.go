@@ -210,7 +210,7 @@ func TestRunLightAllPass(t *testing.T) {
 	rep := v.RunLight(context.Background(), root, []Step{
 		{Name: StepBuild, Cmd: []string{"true"}},
 		{Name: StepLint, Cmd: []string{"true"}},
-	}, nil)
+	}, nil, nil)
 
 	if !rep.Passed() {
 		t.Errorf("全部通过时 Passed() 应为 true: %s", rep.Summary())
@@ -232,7 +232,7 @@ func TestRunLightStopsAtFirstFailure(t *testing.T) {
 		{Name: StepBuild, Cmd: []string{"false"}},
 		{Name: StepLint, Cmd: []string{"true"}},
 		{Name: StepTypecheck, Cmd: []string{"true"}},
-	}, nil)
+	}, nil, nil)
 
 	if rep.Passed() {
 		t.Error("有失败步骤时 Passed() 应为 false")
@@ -259,7 +259,7 @@ func TestRunStepMissingBinaryIsError(t *testing.T) {
 
 	rep := v.RunLight(context.Background(), root, []Step{
 		{Name: StepBuild, Cmd: []string{"definitely-not-a-real-binary-xyz"}},
-	}, nil)
+	}, nil, nil)
 
 	if got := rep.Results[0].Status; got != StatusError {
 		t.Errorf("命令不存在应为 error，得到 %s", got)
@@ -275,7 +275,7 @@ func TestRunStepMissingDirIsError(t *testing.T) {
 
 	rep := v.RunLight(context.Background(), root, []Step{
 		{Name: StepBuild, Cmd: []string{"true"}, Dir: "no/such/dir"},
-	}, nil)
+	}, nil, nil)
 	if rep.Results[0].Status != StatusError {
 		t.Errorf("目录不存在应为 error，得到 %s", rep.Results[0].Status)
 	}
@@ -283,7 +283,7 @@ func TestRunStepMissingDirIsError(t *testing.T) {
 
 func TestRunStepEmptyCmdIsError(t *testing.T) {
 	v := NewVerifier(time.Second, "")
-	rep := v.RunLight(context.Background(), t.TempDir(), []Step{{Name: StepBuild}}, nil)
+	rep := v.RunLight(context.Background(), t.TempDir(), []Step{{Name: StepBuild}}, nil, nil)
 	if rep.Results[0].Status != StatusError {
 		t.Errorf("空命令应为 error，得到 %s", rep.Results[0].Status)
 	}
@@ -295,7 +295,7 @@ func TestRunStepCapturesOutput(t *testing.T) {
 
 	rep := v.RunLight(context.Background(), root, []Step{
 		{Name: StepBuild, Cmd: []string{"sh", "-c", "echo 到标准输出; echo 到标准错误 >&2; exit 1"}},
-	}, nil)
+	}, nil, nil)
 
 	out := rep.Results[0].Output
 	if !strings.Contains(out, "到标准输出") || !strings.Contains(out, "到标准错误") {
@@ -313,7 +313,7 @@ func TestRunStepTimeoutKillsProcessTree(t *testing.T) {
 	rep := v.RunLight(context.Background(), root, []Step{{
 		Name: StepBuild,
 		Cmd:  []string{"sh", "-c", "sleep 120 & echo $! > " + pidFile + "; sleep 120"},
-	}}, nil)
+	}}, nil, nil)
 	elapsed := time.Since(start)
 
 	if rep.Results[0].Status != StatusError {
