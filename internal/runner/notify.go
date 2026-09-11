@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/Clouditera/lathe/internal/task"
 )
@@ -89,18 +90,63 @@ func stateSubject(s task.State) string {
 	return string(s)
 }
 
+// notifyTimeout 是一封终态通知的发信总预算。
+//
+// 独立于调用方的 ctx 与超时：发信是「已经发生的事」的告知，不该跟着
+// 任务 ctx 一起被掐掉（任务失败时 rc.ctx 往往已经取消，而失败通知恰恰
+// 是最该发出去的一封）。同 eventsink.go 的 sinkWriteTimeout 一个道理。
+//
+// 30s 比 mail.sessionTimeout（20s）宽：这里管的是「发信 goroutine 整个
+// 生命周期」的上限，底下那 20s 才是 SMTP 会话本身。外层留出余量，
+// 让正常路径由内层的协议超时收口（错误信息也更贴切），而不是被外层
+// 先一步掐断。
+const notifyTimeout = 30 * time.Second
+
 // mailTerminal 是所有终态通知的唯一出口。
 //
 // 刻意不返回 error：调用方都在「任务已经进了终态」之后调它，
 // 此时发信成败与任务无关，返回错误只会诱导调用方去处理一个
 // 不该影响主流程的东西。失败在这里就地记日志。
+//
+// 同样刻意【不阻塞调用方】：投递丢进独立 goroutine，本函数立刻返回。
+// 这条不是洁癖 —— mailTerminal 出现在 MergePoller 的串行路径上
+// （mergepoll.go 的 pollOnce 用 for 循环逐个 pollTask，handleMerged
+// 里 mailTerminal 又排在 onMerged 的现场回收【之前】）。同步发信意味着
+// 一个假死（能连上、永不应答）的 SMTP 会把这一轮之后所有用户的 PR
+// 合并检测连同现场回收一起停摆，而日志上完全看不出来。同步调用把
+// 「锦上添花的功能」变成了主流程的新失败点，这正是本文件开头
+// 第 2 条约束要禁止的事。
 func (p *Pipeline) mailTerminal(ctx context.Context, tk *task.Task, detail string) {
-	if p.Mail == nil || tk == nil {
+	mailer := p.Mail
+	if mailer == nil || tk == nil {
 		return
 	}
 	subject, body := terminalMail(p.BaseURL, tk, detail)
-	if err := p.Mail.SendTaskMail(ctx, tk.ID, subject, body); err != nil {
-		slog.Warn("终态通知发信失败（不影响任务状态）",
-			"task", tk.ID, "state", tk.State, "err", err)
-	}
+
+	// 快照：tk 由调用方持有，goroutine 跑起来时调用方可能已经在改这个
+	// 结构体（任务状态机是并发跑的），不能把指针带进去读。mailer 同理
+	// 先取出来，这样 goroutine 里不碰 p 的任何字段。
+	taskID, state := tk.ID, tk.State
+
+	// ctx 只用于「取用户配置的发信通道是否就绪」这类前置查询——
+	// 用一个已取消的 ctx 去查库会立刻失败，所以同样要脱钩。
+	bg := context.WithoutCancel(ctx)
+
+	go func() {
+		defer func() {
+			// 兜 panic：这里是流水线主流程的旁路，一个渲染或
+			// 实现的空指针不该把整个进程带走。
+			if r := recover(); r != nil {
+				slog.Error("终态通知 goroutine panic（已在边界兜住）",
+					"task", taskID, "state", state, "panic", r)
+			}
+		}()
+
+		sendCtx, cancel := context.WithTimeout(bg, notifyTimeout)
+		defer cancel()
+		if err := mailer.SendTaskMail(sendCtx, taskID, subject, body); err != nil {
+			slog.Warn("终态通知发信失败（不影响任务状态）",
+				"task", taskID, "state", state, "err", err)
+		}
+	}()
 }

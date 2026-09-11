@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Clouditera/lathe/internal/integration/agent"
 	"github.com/Clouditera/lathe/internal/integration/github"
@@ -12,7 +14,12 @@ import (
 )
 
 // fakeMail 记录投递出去的信；err 非空时模拟发信失败。
+//
+// 加锁是必需的，不是防御性编程：mailTerminal 现在是【异步】投递
+// （见 notify.go 的注释），SendTaskMail 在独立 goroutine 里跑，
+// 测试里的读取与它并发。没有互斥的话 -race 会直接报数据竞争。
 type fakeMail struct {
+	mu   sync.Mutex
 	sent []struct {
 		TaskID        int64
 		Subject, Body string
@@ -21,12 +28,50 @@ type fakeMail struct {
 }
 
 func (f *fakeMail) SendTaskMail(ctx context.Context, taskID int64, subject, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sent = append(f.sent, struct {
 		TaskID        int64
 		Subject, Body string
 	}{taskID, subject, body})
 	return f.err
 }
+
+// sentMail 返回已投递信件的快照（拷贝），供断言安全读取。
+func (f *fakeMail) sentMail() []struct {
+	TaskID        int64
+	Subject, Body string
+} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]struct {
+		TaskID        int64
+		Subject, Body string
+	}(nil), f.sent...)
+}
+
+// waitSent 等到至少 n 封信投递出去，或超时。
+//
+// 发信改异步之后必须这么等：直接断言会撞上「goroutine 还没来得及跑」，
+// 而且这种失败是间歇性的——最坏的一种测试。testMailWait 刻意给得比
+// 任何真实断言需要的都宽，它只在真出问题时才耗尽。
+func (f *fakeMail) waitSent(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(testMailWait)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		got := len(f.sent)
+		f.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("等待 %d 封通知超时（%s），实际只投递了 %d 封", n, testMailWait, len(f.sentMail()))
+}
+
+// testMailWait 是异步投递在测试里的等待上限。
+const testMailWait = 5 * time.Second
 
 // 正文渲染是纯函数，能脱离 SMTP 断言「该带的东西都带上了」
 // （docs/08-debt-cleanup.md T3 AC4/AC5）。
@@ -82,8 +127,9 @@ func TestMailTerminalSwallowsSendFailure(t *testing.T) {
 	// 不 panic、不返回值即通过
 	p.mailTerminal(context.Background(), tk, "")
 
-	if len(fm.sent) != 1 {
-		t.Fatalf("应尝试投递一次，实际 %d 次", len(fm.sent))
+	fm.waitSent(t, 1)
+	if got := len(fm.sentMail()); got != 1 {
+		t.Fatalf("应尝试投递一次，实际 %d 次", got)
 	}
 }
 
@@ -145,10 +191,12 @@ func TestPipelineFailureNotifiesOwnerAndSurvivesSMTPOutage(t *testing.T) {
 	}
 
 	// AC1：确实尝试投递了，且带的是这个任务
-	if len(fm.sent) == 0 {
+	fm.waitSent(t, 1)
+	sent := fm.sentMail()
+	if len(sent) == 0 {
 		t.Fatal("AC1：任务进 failed 应发终态通知，实际一封都没发")
 	}
-	last := fm.sent[len(fm.sent)-1]
+	last := sent[len(sent)-1]
 	if last.TaskID != taskID {
 		t.Errorf("发信带的 taskID = %d，期望 %d", last.TaskID, taskID)
 	}
@@ -185,10 +233,12 @@ func TestPipelineManualGateNotifiesOwner(t *testing.T) {
 		t.Fatalf("闸门停机是正常终止: %v", err)
 	}
 
-	if len(fm.sent) == 0 {
+	fm.waitSent(t, 1)
+	sent := fm.sentMail()
+	if len(sent) == 0 {
 		t.Fatal("停在 awaiting_approval 应发通知，实际一封都没发")
 	}
-	last := fm.sent[len(fm.sent)-1]
+	last := sent[len(sent)-1]
 	if !strings.Contains(last.Subject, "等你放行") {
 		t.Errorf("主题应说明是在等放行，得到 %q", last.Subject)
 	}
@@ -215,10 +265,12 @@ func TestPipelinePROpenNotifiesOwner(t *testing.T) {
 		t.Fatalf("Execute 失败: %v", err)
 	}
 
-	if len(fm.sent) == 0 {
+	fm.waitSent(t, 1)
+	sent := fm.sentMail()
+	if len(sent) == 0 {
 		t.Fatal("走到 pr_open 应发通知")
 	}
-	last := fm.sent[len(fm.sent)-1]
+	last := sent[len(sent)-1]
 	if !strings.Contains(last.Body, "https://github.com/acme/demo/pull/42") {
 		t.Errorf("正文应含 PR 地址，实际：\n%s", last.Body)
 	}
