@@ -234,6 +234,13 @@ func (a *API) triggerTask(w http.ResponseWriter, r *http.Request) {
 //     静默重建是违背意图；
 //   - fresh  强制丢弃现场从头重建。
 //
+// 这三个是【全部】用户可传的模式：校验走 UserSelectable 而不是
+// Valid。Valid 还认 RetryApproved，而那是人工闸门放行的内部信号 ——
+// 用 Valid 校验等于让持 token 的用户对任意自己名下的任务 POST
+// {"mode":"approved"} 就能走 EntryPush（跳过实现与验证直接补 push +
+// 开 PR），把 approveTask 的三道防线连同人工闸门一起绕过去。
+// 放行只能从 approveTask 那条路径进来，它自己构造 RetryApproved。
+//
 // 最终决策在派发侧（queue）执行前还会重做一次（TOCTOU：预检到执行
 // 之间现场可能失效），决策理由落任务事件流。
 func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +257,7 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := runner.RetryMode(strings.TrimSpace(body.Mode))
-	if !mode.Valid() {
+	if !mode.UserSelectable() {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "mode 必须是 auto / resume / fresh"})
 		return
 	}
@@ -322,9 +329,20 @@ func (a *API) approveTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := a.Tasks.Transition(r.Context(), id, task.StateQueued, actorOf(r), &task.TransitionOpts{
-		Payload: map[string]any{"reason": "manual_approve", "mode": string(runner.RetryApproved)},
-	}); err != nil {
+	// 上面那次读没有加锁，它只用于快速失败与提示文案。真正的判据是
+	// 这一次带前置状态的转移：awaiting_approval 的条件在行锁下复核，
+	// 与写入原子完成。
+	//
+	// 为什么必须这样：两个并发的确认请求会双双读到 awaiting_approval
+	// 并双双走过上面那道检查，此时「确认」所依据的事实（任务确实还停在
+	// 闸门上等人）对其中一个已经不成立了。两个都放行会让同一个任务被
+	// 重派两次；闸门放行是个副作用不幂等的动作（重派意味着再推一次
+	// 分支、再开一次 PR），不能让「先读后写」的窗口来决定谁有权执行。
+	// 第二个请求在锁下读到的是 queued，直接以冲突拒绝。
+	if _, err := a.Tasks.TransitionFrom(r.Context(), id,
+		task.StateAwaitingApproval, task.StateQueued, actorOf(r), &task.TransitionOpts{
+			Payload: map[string]any{"reason": "manual_approve", "mode": string(runner.RetryApproved)},
+		}); err != nil {
 		transitionError(w, err)
 		return
 	}
@@ -636,6 +654,14 @@ func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 func transitionError(w http.ResponseWriter, err error) {
 	var illegal task.ErrIllegalTransition
 	if errors.As(err, &illegal) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	// 前置状态不成立（并发下被别人先转走了）：也是冲突，不是内部故障。
+	// 单独判一档，免得落到最后的 500 —— 那是把一次正常的并发拒绝报成
+	// 服务端出错，让人误以为可以重试出不同结果。
+	var mismatch task.ErrStateMismatch
+	if errors.As(err, &mismatch) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}

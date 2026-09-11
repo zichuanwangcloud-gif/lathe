@@ -34,13 +34,45 @@ const (
 	// 任务停在 awaiting_approval，人点了确认。只补 push + 开 PR，
 	// 绝不重跑实现与验证 —— 重跑等于把已经付过的 token 再烧一遍，
 	// 而且会让「人看过的那个 diff」和「最终开出 PR 的那个 diff」不是一份东西。
+	//
+	// 【不是用户入参】：只由 approveTask 内部构造。外部入参校验用
+	// UserSelectable，它把这个模式挡在外面（见该方法的注释）。
 	RetryApproved RetryMode = "approved"
 )
 
-// Valid 报告模式是否合法。空串按 auto 处理（缺省值）。
+// Valid 报告模式是否是本包已知的模式（含只许内部构造的 RetryApproved）。
+//
+// 注意：这不是「用户可传」的判据 —— 外部入参必须用 UserSelectable。
+// 本方法面向的是内部调用方（派发侧回读事件流 payload、测试），它们拿到的
+// 是平台自己写下的值，不是用户可以塞进来的字符串。
 func (m RetryMode) Valid() bool {
 	switch m {
 	case "", RetryAuto, RetryResume, RetryFresh, RetryApproved:
+		return true
+	}
+	return false
+}
+
+// UserSelectable 报告模式是否允许作为【外部入参】传入（retryTask 的
+// 请求体 mode 字段）。
+//
+// 与 Valid 的区别只有一条：RetryApproved 不在其中，这是本方法的全部
+// 意义所在。RetryApproved 是人工闸门放行的内部信号，由 approveTask 在
+// 放行时构造、写进转 queued 那次转移的事件 payload，派发侧回读它才
+// 给出 EntryPush（跳过实现与验证，直接补 push + 开 PR）。
+//
+// 它不能是用户入参：持 token 的用户对任意自己名下的任务 POST
+// {"mode":"approved"} 就能让任务按 EntryPush 往下走，闸门形同虚设 ——
+// 这正是「本 PR 建的安全控制被自己开的旁路削弱」。两道闸门都得是白的
+// 名单：只有走过 approveTask 那条路径（先验属主、再验当前状态真的是
+// awaiting_approval）的任务才会带上这个 mode。
+//
+// 判据写成显式白名单而不是 m != RetryApproved：以后新增任何模式时，
+// 默认落在「用户不可选」这一侧，要暴露才必须显式加进来。少一个
+// 忘改的地方，就是少一条旁路。
+func (m RetryMode) UserSelectable() bool {
+	switch m {
+	case "", RetryAuto, RetryResume, RetryFresh:
 		return true
 	}
 	return false
