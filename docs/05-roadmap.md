@@ -14,11 +14,11 @@
 | 字段/组件 | 状态 | 发现方式 |
 |---|---|---|
 | `repos.exclude_dirs` | 字段存在、配置层不 SELECT → 已修复（dd1cb09） | 任务 #316 验证挂在不维护目录 |
-| `repos.gate_mode` | 可配、pipeline 从不读 | 代码走查 |
+| `repos.gate_mode` | ~~可配、pipeline 从不读~~ → 已接线（2026-09-09，08 T2）| 代码走查 |
 | `notify_email` | 字段有了、`internal/mail` 只接了密码重置 | 代码走查 |
 | `agent_session_id` | 注释明说为 `--resume` 留的、无 resume 逻辑 | pipeline.go:201 |
 | `internal/scheduler/` | 空目录 | §6 调度设计的占位 |
-| `verifications.log_ref` | 从不写入 | 任务 #466 排障时无日志可查 |
+| `verifications.log_ref` | ~~从不写入~~ → 已接线（2026-09-09，08 T4）| 任务 #466 排障时无日志可查 |
 
 **结论：每个可配置字段必须有消费方。** 把这条加进 PR 自查清单，比任何单点修复都值钱。
 
@@ -97,7 +97,15 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 8. **worktree 收割机**：失败现场 TTL 回收（解决磁盘占用；同名撞车已由 Create 尸体回收覆盖，本条只剩 TTL 清理价值）。
 9. **通知闭环**：任务终态（失败/待 review）接 `internal/mail` 发 `notify_email` —— 不用盯面板。
-10. **GateMode 接线**：`gate=manual` 时验证通过后停下、人工确认再推 PR（"开 PR 前让我看一眼"）。
+10. ~~**GateMode 接线**~~（已交付，08 T2）：`gate=manual` 时验证通过后停在
+    `awaiting_approval`，人在详情页点「确认开 PR」才推分支开 PR。
+    放行走的是与手动重试同一条成熟通道（转回 `queued` + payload 里
+    `mode=approved` → `PlanRetry` 给出 `EntryPush`，只补 push + 开 PR，均幂等），
+    不在 HTTP 处理器里同步跑 git／调 GitHub。
+    真正的断点原来不在 pipeline 而在 `Enqueue`：它从不把 `repos.gate_mode`
+    复制进任务行，所以 `tasks.gate_mode` 永远是 `direct`。
+    另三个取值（`guarded`/`plan-first`）**仍按 `direct` 处理并在代码里写明** ——
+    不给它们编造语义，那又是一次「配了没接线」。
 
 ~~**任务预览环境**~~（已交付）：看板一键在 worktree 里构建 Dockerfile 镜像、起容器、
 随机端口映射，人手动点完一键停止并清理；内存/磁盘占用超阈值（系统设置可配，
@@ -135,7 +143,7 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 |---|---|---|
 | **B1** | 修复回路（1）+ 重试语义（2）+ 启动 reconcile（3）+ env 白名单（13）+ EventSink UTF8 修复 | 闭环自愈 + 堵安全洞 |
 | **B2** | ~~模型路由（6）~~ + ~~分诊目录（7）~~ 已交付；剩成本面板（5）+ 通知（9）+ worktree reaper（8） | 日常用得爽 |
-| **B3** | GateMode（10）+ webhook 联动（11）+ PR 回流（12） | 自动化加深 |
+| **B3** | ~~GateMode（10）~~ 已交付；剩 webhook 联动（11）+ PR 回流（12） | 自动化加深 |
 | **持续** | 度量（15）先行一点，每批落地后看数据决定下一批 | 数据驱动 |
 
 ## 5. 未决（继承 02-design §9 并增补）

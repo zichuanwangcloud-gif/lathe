@@ -62,11 +62,17 @@ type Step struct {
 
 // StepResult 是一条验证步骤的执行结果。
 type StepResult struct {
-	Step     Step
-	Status   StepStatus
+	Step   Step
+	Status StepStatus
+	// Output 是截断到 maxStepOutput 的输出摘要，进事件流与报告用。
+	// 完整输出见 LogRef 指向的文件（T4）。
 	Output   string
 	Duration time.Duration
 	Err      error
+	// LogRef 是完整输出的落盘引用（相对 DataDir 的路径），
+	// 落进 verifications.log_ref。落盘失败或未配置日志目录时为空串 ——
+	// 空串是合法状态，不是错误。
+	LogRef string
 }
 
 // Report 是一次分级验证的汇总。
@@ -205,7 +211,7 @@ func DetectLightProfile(root string, exclude ...string) ([]Step, error) {
 // RunLight 顺序执行 light 档步骤，遇到第一个失败即停止后续。
 //
 // 早停的理由：构建都没过就没必要再跑 lint，且能更快把失败回帖给人。
-func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step) Report {
+func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step, logs StepLogger) Report {
 	rep := Report{Tier: TierLight}
 
 	stopped := false
@@ -214,7 +220,7 @@ func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step) Repo
 			rep.Results = append(rep.Results, StepResult{Step: st, Status: StatusSkipped})
 			continue
 		}
-		res := v.runStep(ctx, root, st)
+		res := v.runStep(ctx, root, st, logs)
 		rep.Results = append(rep.Results, res)
 		if res.Status != StatusPassed {
 			stopped = true
@@ -223,7 +229,7 @@ func (v *Verifier) RunLight(ctx context.Context, root string, steps []Step) Repo
 	return rep
 }
 
-func (v *Verifier) runStep(ctx context.Context, root string, st Step) StepResult {
+func (v *Verifier) runStep(ctx context.Context, root string, st Step, logs StepLogger) StepResult {
 	res := StepResult{Step: st}
 	if len(st.Cmd) == 0 {
 		res.Status = StatusError
@@ -269,6 +275,10 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step) StepResult
 	select {
 	case err := <-done:
 		res.Duration = time.Since(start)
+		// 先落完整日志，再截断成摘要 —— 顺序反了完整输出就永远不存在了。
+		// 通过的步骤也要落（T4-AC4）：排障时最想看的往往正是
+		// 「上一次通过时是什么样」。
+		res.LogRef = writeStepLog(logs, string(st.Name), buf.Bytes())
 		res.Output = truncate(buf.String(), maxStepOutput)
 		if err != nil {
 			// 非零退出 = 代码有问题（failed），而非验证没跑起来（error）
@@ -283,6 +293,7 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step) StepResult
 		killGroup(pgid)
 		<-done // 等 Wait 收敛，避免僵尸
 		res.Duration = time.Since(start)
+		res.LogRef = writeStepLog(logs, string(st.Name), buf.Bytes())
 		res.Output = truncate(buf.String(), maxStepOutput)
 		res.Status = StatusError
 		res.Err = fmt.Errorf("runner: 步骤 %s 超时（上限 %v），进程树已回收", st.Name, v.stepTimeout)

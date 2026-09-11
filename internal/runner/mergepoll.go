@@ -251,6 +251,12 @@ func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task) error {
 	}
 	slog.Info("任务已合并", "task", merged.ID, "pr_number", *tk.PRNumber)
 
+	// 终态通知（T3）。走 Pipeline.mailTerminal 而不是自己再拼一套：
+	// 同一份渲染逻辑只该有一处，否则两边的正文迟早不一致。
+	if p.Pipeline != nil {
+		p.Pipeline.mailTerminal(ctx, merged, "")
+	}
+
 	if err := p.onMerged(ctx, merged); err != nil {
 		// 合并这个事实本身已经落库成功；跟进动作（现场回收等）失败
 		// 不该反过来污染合并检测的主结果，只告警。
@@ -580,13 +586,20 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 		}
 	}
 
-	if _, err := p.Tasks.Transition(ctx, succ.ID, task.StateFailed, "system:rebase-followup", &task.TransitionOpts{
+	failed, err := p.Tasks.Transition(ctx, succ.ID, task.StateFailed, "system:rebase-followup", &task.TransitionOpts{
 		FailureReason: &reason,
 		FailureStage:  strPtr(string(StageRebaseConflict)),
 		Payload:       map[string]any{"stage": string(StageRebaseConflict)},
-	}); err != nil {
+	})
+	if err != nil {
 		slog.Error("rebase 跟进失败后转 failed 也失败", "task", succ.ID, "err", err)
 		return
+	}
+
+	// 终态通知（T3）：这一条尤其该发 —— 自动 rebase 撞冲突是必须人工
+	// 介入才能往下走的状态，不通知就只能靠人自己发现栈卡住了。
+	if p.Pipeline != nil {
+		p.Pipeline.mailTerminal(ctx, failed, "前驱已合并，自动 rebase 撞上冲突，需要人工处理。")
 	}
 
 	// 5) 失败传播（F2.3-AC1~AC4，与 pipeline.go 的 fail() 一致）：
@@ -639,11 +652,19 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 func (p *MergePoller) handleClosedUnmerged(ctx context.Context, tk *task.Task, clients Clients) error {
 	reason := fmt.Sprintf("PR #%d 已被关闭但未合并", *tk.PRNumber)
 
-	if _, err := p.Tasks.Transition(ctx, tk.ID, task.StateCancelled, "system:merge-poll", &task.TransitionOpts{
+	cancelled, err := p.Tasks.Transition(ctx, tk.ID, task.StateCancelled, "system:merge-poll", &task.TransitionOpts{
 		FailureReason: &reason,
 		Payload:       map[string]any{"pr_number": *tk.PRNumber, "reason": reason},
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("转移到 cancelled 失败: %w", err)
+	}
+
+	// 终态通知（T3）。注意与「人在界面上点取消」的区别：那是人自己的
+	// 动作、不需要通知自己（AC7）；这一条是系统侧发现 PR 被关掉后
+	// 替人做的决定，人未必知道，所以要发。
+	if p.Pipeline != nil {
+		p.Pipeline.mailTerminal(ctx, cancelled, "PR 被关闭且未合并，任务已取消。")
 	}
 	slog.Info("PR 被关闭未合并，任务已转 cancelled", "task", tk.ID, "pr_number", *tk.PRNumber)
 

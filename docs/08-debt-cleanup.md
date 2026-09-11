@@ -65,9 +65,9 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | T0 | v0.1.0 发布准备（staged 文件入库） | A | **DONE** |
 | T1 | 删除 `cmd/lathe-runner` + roadmap §5 记决策 | A | **DONE** |
 | **T9** | **测试基线可信化（前置，见 §7）** | **A** | **DONE** |
-| T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | TODO |
-| T3 | 任务终态邮件通知（接 `notify_email`） | C | TODO |
-| T4 | `verifications.log_ref` 落盘写入 | C | TODO |
+| T2 | `gate_mode` 接线：`awaiting_approval` 可达 + 确认端点 + 前端按钮 | B | **DONE** |
+| T3 | 任务终态邮件通知（接 `notify_email`） | C | **DONE** |
+| T4 | `verifications.log_ref` 落盘写入 | C | **DONE** |
 | T5 | 成本聚合面板（store 聚合 + API + 前端） | D | TODO |
 | T6 | worktree TTL 收割机 | E | TODO |
 | T7 | webhook 联动：标签接单 + issue 取消联动 | F | **DONE** |
@@ -80,7 +80,7 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 
 | PR | 内容 | 聚合理由 |
 |---|---|---|
-| **A** `chore/release-and-prune` | T0 发布准备 + T1 删骨架 | 都是清理类，不碰运行逻辑，可最先合 |
+| **A** `chore/debt-cleanup-baseline` | T0 发布准备 + T1 删骨架 + T9 测试基线 | 都是清理类，不碰运行逻辑，可最先合；且后面每个 PR 都需要它的可信测试基线 |
 | **B** `feat/gate-mode` | T2 闸门 | 动状态机（新增可达状态），独立评审 |
 | **C** `feat/notify-and-logref` | T3 通知 + T4 日志指针 | 都是「终态时补一个副作用」，共享 pipeline 终态落点 |
 | **D** `feat/cost-panel` | T5 成本面板 | 纯读侧聚合 + 前端，零运行风险 |
@@ -88,7 +88,16 @@ roadmap §5 挂着「推进 P3 还是删除」未决，07-prd §1.4 又把「多
 | **F** `feat/webhook-triggers` | T7 webhook 联动 | 只动 ingress 层 |
 | **G** `feat/verify-isolation` | T8 compose 隔离 | 动验证主路径，风险最高，**最后合** |
 
-顺序：A → B/C/D/E/F（互不依赖，可并行推）→ G。
+顺序：A → B → C → D/E/F（互不依赖）→ G。
+
+**2026-09-09 修正**：原先写的「B/C/D/E/F 互不依赖，可并行推」是错的。
+**C 依赖 B**：T3-AC1 把 `awaiting_approval` 列为通知触发状态之一，
+而那个状态只有 T2 才让它可达 —— 我在 baseline 上开 C 的分支之后才发现
+`gateBeforePush` 根本不在场。C 已改栈到 B 之上。
+
+D/E/F 与 B/C 确实互不依赖（成本面板是读侧、收割机是独立轮询器、
+webhook 联动只动 ingress 层），但都 base 在 A 上，因为都需要那个测试基线。
+教训：拆 PR 时「模块不重叠」不等于「无依赖」，还得看**验收标准之间**有没有引用。
 
 ## 4. 验收标准
 
@@ -510,6 +519,139 @@ repos / tasks / task_events / verifications / agent_events。
   Makefile 里那段「-p 1 就够了」的注释也改掉了 —— 它给的是虚假的安全感。
   顺带结清 roadmap §1.3 的 `repos` id=241 占位行（属 fixture 残留，被清理带走）。
 
+- 2026-09-09：**T2 实现完成**（PR B，分支 `feat/gate-mode`）。
+  真正的断点确认在 `Enqueue` 而非 pipeline —— 它从不把 `repos.gate_mode`
+  复制进任务行，所以 `tasks.gate_mode` 永远是 `direct`，人在仓库配置页
+  选了 manual 也毫无效果。改动：
+  - `resolveRepoID` → `resolveRepo`，顺带取出 `gate_mode` 并复制进
+    `CreateParams`（任务创建那刻**钉死**，与 `repo_id` 语义一致）
+  - `internal/task` 新增 `GateDirect/GateManual/GateGuarded/GatePlanFirst`
+    四个常量，并在注释里写明**只有 manual 有实现语义**，另三个按 direct 处理
+  - 状态机加两条边：`verifying → awaiting_approval`（闸门落点）与
+    `awaiting_approval → queued`（放行路径）
+  - `Pipeline.gateBeforePush`：验证通过后按 `tk.GateMode` 决定是否停机；
+    停机时转 `awaiting_approval` + 回帖告诉人「活干完了等你点」
+  - `RetryApproved` 重试模式 + `PlanRetry` 分支 → `EntryPush`
+  - `POST /api/tasks/{id}/approve`：只放行真的停在闸门上的任务
+    （其余状态 409 —— 否则「确认」就是个能把任意任务推去开 PR 的后门），
+    跨用户返回 404，转回 `queued` 并写 `mode=approved`，重派**原任务行**
+  - 前端：详情页「确认开 PR」按钮 + 一张说明卡（`awaiting_approval`
+    的状态文案「待放行」本来就在全站状态表里，无需新增）
+  - 鉴权回归表补登 `/approve` —— 本仓纪律是「所有 API 端点都必须要求认证」，
+    漏登记等于没有护栏
+
+  **一个必须防的死循环**：批准后以 `EntryPush` 重入时闸门不能再次触发，
+  否则 `awaiting_approval → queued → awaiting_approval` 无限转圈，
+  人点一次批准永远开不出 PR。实现上用 `entry != EntryPush` 守卫，
+  并在核心测试里显式断言「批准后恰好开一次 PR」。
+
+  测试：`TestPipelineManualGateHaltsBeforePRThenResumesOnApproval` 覆盖完整
+  闸门周期（停住→批准→补开 PR，两半合在一个测试里，只验前者会漏掉
+  「停住之后再也走不动了」这种更糟的实现）；
+  `TestPipelineNonManualGateModesUnchanged` 对三个非 manual 取值逐个断言
+  行为与现状一致（AC2）；`TestEnqueueCopiesRepoGateMode` 含「事后改仓库配置
+  不影响在途任务」的钉死语义断言；三条 approve 端点测试（正常/错状态/跨用户）。
+
+  门禁：注入 12 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净、`make ui` 通过。另外顺手核了一次「绿是不是真的」：
+  `cmd/lathe` 只用了 0.438s（之前 2.5s）显得可疑 —— 该包连不上库时走
+  `t.Skipf`，而 skip 也显示 `ok`。用 `-v` 数了一遍：14 个用例 RUN、
+  14 个 PASS、0 个 SKIP，绿是真的。**这一类核对以后每轮都做**，
+  本轮已经被假绿骗过两次（`| tail` 取错退出码、无条件打印的「gofmt 干净」）。
+
+- 2026-09-09：记一笔**遗留隐患**（不在本轮范围，但已确认存在）：
+  `internal/httpapi` 的 `apiFixture` 与 `mustUser` 也是「确定性 email +
+  `ON CONFLICT DO UPDATE` + 固定 repo `acme/api-test` + 固定 issue key
+  （`CR-R1`/`CR-EV`/`CR-PV`）」的组合 —— 与 T9 修掉的那两个包同款。
+  它目前不红是因为这个包不用全局 `ClaimReady`，但一旦有非终态孤儿残留，
+  `Create` 同样会撞 `tasks_one_active_per_issue`。没有混进 PR B 是为了
+  不让一个动状态机的 PR 里夹带无关的测试重构。**建议单独一个小 PR 修掉。**
+
+- 2026-09-09：**T3 实现完成**（PR C，分支 `feat/notify-and-logref`，栈在 B 之上）。
+  两个设计约束贯穿全程：
+  1. **runner 不 import `internal/mail`**。runner 只声明窄接口 `TaskMail`
+     （`internal/runner/notify.go`），实现 `taskMailer` 放在 `cmd/lathe`
+     —— 那里同时拿得到 store（解析收件人）与 mail（发信）。
+     这与既有的 `VerificationRecorder`/`AgentEventRecorder` 是同一套做法。
+  2. **发信绝不影响状态流转**。`mailTerminal` 刻意**不返回 error**：
+     调用方都在「任务已进终态」之后调它，返回错误只会诱导调用方去处理一个
+     不该影响主流程的东西。SMTP 没配、投递失败、收件人查不到 ——
+     一律只记日志。把通知做成能让任务卡住的东西，等于用一个「锦上添花」
+     的功能给主流程加了一个新的失败点。
+
+  收件人口径（`store.NotifyEmailForTask`）：优先 `notify_email`，
+  **NULL 与空串都回退登录邮箱**（界面上清空通知邮箱存下来的是空串，
+  不能因此发出一封收件人为 `""` 的信）。与密码重置刻意不同 ——
+  重置邮件永远发登录邮箱，因为那封信的意义就是「证明你拥有这个登录邮箱」。
+  单次 JOIN 而非「先查任务再查用户」：通知在终态转移后的热路径上。
+  查不到收件人返回 `ErrNoRecipient`，调用方据此静默跳过，
+  不把「没人可发」当成发信故障刷日志。
+
+  六个落点全接：`p.fail`（pipeline 所有失败路径的汇流处）、
+  `stagePushAndPR` 的 `pr_open`、`gateBeforePush` 的 `awaiting_approval`、
+  以及 mergepoll 的 `merged` / rebase 冲突 `failed` / PR 关闭 `cancelled`。
+  mergepoll 走 `p.Pipeline.mailTerminal` 而不是自己再拼一套 ——
+  同一份渲染逻辑只该有一处，否则两边正文迟早不一致。
+
+  **AC7（人工取消不发信）由构造保证**：`httpapi` 侧根本没有 `Mail` 依赖，
+  `cancelTask` 无从发信。人自己点的取消不需要通知自己。
+
+  测试：`terminalMail` 是纯函数，脱离 SMTP 断言「issue key／终态／失败原因／
+  失败阶段／补充信息／详情链接」都在正文里，以及 BaseURL 为空时**省略**
+  链接那一行（而不是拼一个指向 localhost 的无用链接）；
+  `TestPipelineFailureNotifiesOwnerAndSurvivesSMTPOutage` 是本项最重要的一条 ——
+  SMTP 全程报错，断言任务依然干净落在 `failed`；
+  另有闸门通知、pr_open 通知、`stateSubject` 全终态覆盖、
+  以及 4 条 store 收件人测试（优先/回退/空串/任务不存在）。
+
+  门禁：注入 14 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净。store 那 4 条用 `-v` 数过：4 RUN / 4 PASS / 0 SKIP。
+
+- 2026-09-09：**修正一处 PR 拆分判断错误**。原先写的「B/C/D/E/F 互不依赖，
+  可并行推」是错的：C 依赖 B，因为 T3-AC1 把 `awaiting_approval` 列为通知
+  触发状态之一，而那个状态只有 T2 才让它可达。我在 baseline 上开了 C 的分支、
+  写到一半才发现 `gateBeforePush` 根本不在场，已改栈到 B 之上。
+  教训：拆 PR 时「模块不重叠」不等于「无依赖」，还得看**验收标准之间**
+  有没有互相引用。
+
+- 2026-09-09：**T4 实现完成**（PR C 的第二半）。光在 INSERT 里补一列远远不够，
+  真正的坑在上游两处：
+  1. 输出在 `runStep` 里就已被 `truncate` 到 16KB。那个截断理由是对的
+     （别把整个构建日志灌进数据库），但结果是**完整日志从来没在任何地方
+     存在过** —— 所以落盘必须发生在截断之前。
+  2. **通过的步骤的输出直接丢弃**（只有失败步骤的前 4KB 进 `agent_events`），
+     而排障时最想看的往往正是「上一次通过时是什么样」。
+
+  设计选择：
+  - **做成注入的 `StepLogger` 而不是给 `Verifier` 加 `logDir` 字段**。
+    `Verifier` 是并发任务共用的单实例（`cmd/lathe` 里只 `NewVerifier` 一次），
+    加可变字段再在每轮验证前改一下，就是一个货真价实的数据竞争。
+    每轮由 `Pipeline.stepLogger(taskID, round)` 现造一个已把 taskID 与轮次
+    烘进去的 logger 传进去，`Verifier` 自己保持无状态。
+  - **日志落 `DataDir` 而非 worktree**（AC5）。worktree 会被回收
+    （合并后回收、同名尸体回收、T6 收割机），而日志的全部价值就在于
+    「现场没了之后还能查」。放 worktree 里等于排障时正好没有。
+  - **`log_ref` 存相对 `DataDir` 的路径**，不是绝对路径：`DataDir` 可配
+    （`LATHE_DATA_DIR`），绝对路径写进库会让部署目录一变、历史记录全失效。
+  - **分轮次目录**（AC3）：同任务多轮互相覆盖的话，「第一轮为什么挂」
+    这个问题在第二轮跑完之后就永远回答不了了 —— 而那恰恰是修复回路
+    最需要回答的问题。
+  - **复现阶段的 `log_ref` 是空格分隔的多个路径**：一个复现阶段可能有多条
+    测试，每条各自落一份完整日志。合并成一份会丢信息 —— 内层 `runStep`
+    返回的 `Output` 已被截断到 16KB，拿它拼出来的合并日志同样残缺。
+  - 顺手加了 `sanitizeLogName`：复现测试的步骤名来自测试文件路径，
+    直接拼进路径就是一个目录穿越，测试里用 `../../etc/passwd` 这类输入断言。
+
+  **一条值得记的教训**：串参时漏了 `HeavyParams{... Logs: logs}` 这一个字段，
+  而**单元测试全绿** —— 是端到端测试（`TestPipelineWritesLogRefForEveryVerifyStep`）
+  把它抓出来的。如果只写单元测试，T4 就会变成又一个「有列没消费方」，
+  正是这一轮要治的病本身。根因是那次批量替换只对函数签名加了 `assert`、
+  对 struct literal 没加，于是静默失败。**以后每处替换都要有断言**，
+  否则「改了」和「以为改了」分不开。
+
+  门禁：注入 16 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿、
+  `go vet` 与 `gofmt` 干净。
+
 - 2026-09-09：**T7 实现完成**（PR F，分支 `feat/webhook-triggers`，base 在 A 上）。
   三个关键判断：
   1. **取消分流必须在接单闸门之前。** 取消事件不是指派事件 —— 放在闸门之后
@@ -547,3 +689,21 @@ repos / tasks / task_events / verifications / agent_events。
   另有 linear 层 20+ 表驱动判定用例与 task 层跨用户隔离断言。
 
   门禁：注入 23 条非终态孤儿行后跑整套，`GOTEST_EXIT=0`、15 包全绿。
+
+  **合并前审计后的加固（三处，均为「目前够不到但防线该在使用点」）**：
+  ① `CancelForIssue` 拒绝空 `issueID` —— 构造 `data:{}` 能让空串进到
+  `WHERE linear_issue_id = ''`，眼下打不中是因为存量为 NULL 而 `= ''`
+  不匹配 NULL，那是数据凑巧不是防线；② 取消传播补跨属主告警 ——
+  `PropagateBlocked` 的递归 CTE 不带 `user_id` 过滤，`pipeline.fail`
+  对同一调用有告警而这条没有，且这条挂在**外部可触发**的 webhook 上，
+  更需要；③ `hasLabel` 在 trim 后为空时一律不匹配 —— `IsLabelTriggered`
+  只判 `label == ""`，纯空白的 `" "` 穿得过去并让**任何空名标签**命中，
+  等于在没配置的部署上悄悄打开接单，正是 AC3 要保证的语义。生产上靠
+  两道上游 `TrimSpace` 够不到，但这条语义不该寄托在两个上游都记得 trim。
+
+  两条已知项未在本 PR 收口，如实记账：`linear_issue_id` 无索引（取消路径
+  在 webhook 热路径上全表扫 `tasks`，属性能项，加索引要新迁移会与同期 PR
+  抢编号）；AC6 披露不全 —— 取消发生在 verifying 阶段时在途 agent 仍会
+  真的开出 PR（`CreatePR` 在 `Transition(pr_open)` 之前），随后转移被拒，
+  于是一个已开的 PR 挂在 `cancelled` 任务上，而 MergePoller 只扫 `pr_open`
+  所以它永不被回收。这属于「取消信号传播」后续项，不是本 PR 能收口的。

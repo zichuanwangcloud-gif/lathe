@@ -85,7 +85,7 @@ func newQueue(st *store.Store, tm *task.Machine, p *runner.Pipeline, cf runner.C
 // 如果行要等 worker 处理才创建，数据库里永远看不到"还没人处理"的
 // 任务，领单查询会一直查到空，调度直接失效。
 func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKey string) error {
-	repoID, err := q.resolveRepoID(ctx, ownerUserID)
+	repoID, gateMode, err := q.resolveRepo(ctx, ownerUserID)
 	if err != nil {
 		slog.Error("无法确定任务归属仓库", "issue", issueKey, "owner", ownerUserID, "err", err)
 		// 接单却建不出任务不能沉默——人在 Linear 那边指派完就干等。
@@ -96,6 +96,7 @@ func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKe
 
 	if _, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: ownerUserID, RepoID: repoID, LinearIssueKey: issueKey, LinearIssueID: issueID,
+		GateMode: gateMode,
 	}); err != nil {
 		// 同一 issue 已有活任务时会撞上部分唯一索引——这是预期行为，非错误
 		slog.Warn("建任务失败（可能已有进行中的同名任务）", "issue", issueKey, "err", err)
@@ -468,6 +469,13 @@ func lastEventString(events []task.Event, key string) string {
 // 由 runOneClaimed 从事件流回读得到（见其注释）。
 func (q *queue) planRetry(ctx context.Context, tk *task.Task, repoCfg runner.RepoConfig, mode string, interruptedState task.State) runner.RetryPlan {
 	m := runner.RetryMode(mode)
+	// 这里用 Valid 而不是 UserSelectable，是有意的【不对称】，别顺手
+	// 改成后者：此处 mode 不是外部入参，是从任务事件流里回读的、平台
+	// 自己写下的值。approved 只有 approveTask 会写（它先验属主、再验
+	// 任务当前确实停在 awaiting_approval），retryTask 那条路已被
+	// UserSelectable 挡住。要是在这里也把 approved 判掉、降级成 auto，
+	// 人点了确认反而会重跑实现与验证 —— 既把 token 重烧一遍，又让最终
+	// 开出 PR 的 diff 不再是人点头时看的那一份。
 	if !m.Valid() {
 		m = runner.RetryAuto
 	}
@@ -518,19 +526,22 @@ func (q *queue) planRetry(ctx context.Context, tk *task.Task, repoCfg runner.Rep
 	return plan
 }
 
-// resolveRepoID 查出属主名下要用的仓库 id：第一条配置。
+// resolveRepo 查出属主名下要用的仓库：第一条配置。
 //
 // 数据隔离（P1.5 第二步）后，每个用户各自在设置页登记仓库；按 issue 的
 // team/project 路由到不同仓库仍是后续项（docs/02-design.md §8）。
-func (q *queue) resolveRepoID(ctx context.Context, ownerUserID int64) (int64, error) {
-	var repoID int64
-	err := q.store.Pool().QueryRow(ctx,
-		`SELECT id FROM repos WHERE user_id = $1 ORDER BY id LIMIT 1`, ownerUserID,
-	).Scan(&repoID)
+//
+// 顺带取出 gate_mode 是 T2 的接线点：它要被复制进任务行【钉死】，
+// 而不是每次派发时现查 repos —— 与 repo_id 的语义保持一致，
+// 任务在途期间人改了仓库配置不该改变这个任务的行为。
+func (q *queue) resolveRepo(ctx context.Context, ownerUserID int64) (repoID int64, gateMode string, err error) {
+	err = q.store.Pool().QueryRow(ctx,
+		`SELECT id, gate_mode FROM repos WHERE user_id = $1 ORDER BY id LIMIT 1`, ownerUserID,
+	).Scan(&repoID, &gateMode)
 	if err != nil {
-		return 0, fmt.Errorf("你的账号下没有仓库配置（请在设置页添加仓库）: %w", err)
+		return 0, "", fmt.Errorf("你的账号下没有仓库配置（请在设置页添加仓库）: %w", err)
 	}
-	return repoID, nil
+	return repoID, gateMode, nil
 }
 
 // loadRepoConfig 按 repo id 读出分支策略配置，供派发时构造
