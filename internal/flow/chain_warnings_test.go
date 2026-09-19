@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // TestChainLengthWarningsLinearChainExceedsDefault 覆盖 F3.3 在无 UI 场景

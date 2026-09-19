@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/Clouditera/lathe/internal/preview"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // PreviewManager 是预览环境的生命周期能力。

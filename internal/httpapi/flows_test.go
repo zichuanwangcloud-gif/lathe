@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/flow"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // flowFixture 建一个 FlowAPI 实例并起一个测试服务器，供本文件的集成测试复用。

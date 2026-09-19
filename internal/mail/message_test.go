@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 func testCfg() store.SMTPConfig {

@@ -29,10 +29,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/config"
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/secret"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/config"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // ★ B1 第一层：buildPipeline 返回的 Pipeline 必须已经装好 Stacks。

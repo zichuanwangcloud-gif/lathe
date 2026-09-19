@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 )
 
 // maxWebhookBody 限制 webhook 载荷大小，防止被打爆内存。

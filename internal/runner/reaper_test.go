@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // fakeReaperTasks 是 ReaperTasks 的假件：让测试完全掌控「有哪些可回收任务、

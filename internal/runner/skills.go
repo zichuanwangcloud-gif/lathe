@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Clouditera/lathe/skills"
+	"github.com/zichuanwangcloud-gif/lathe/skills"
 )
 
 // StageSkillMissing 是节点画像（tasks.profile 的 skills 字段，F7.1）声明的

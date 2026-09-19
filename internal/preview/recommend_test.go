@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // fakeAgent 喂固定输出并记录调用次数与 prompt。

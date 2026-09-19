@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // agentEventFixture 建「用户 + 仓库 + 任务」的最小夹具，返回任务 ID。

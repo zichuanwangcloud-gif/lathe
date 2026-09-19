@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/config"
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/config"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // claimLeaseDuration 是 ClaimReady 打的租约时长。

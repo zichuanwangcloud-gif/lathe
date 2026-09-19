@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // mode=approved 是人工闸门放行的内部信号，只能由 approveTask 构造。

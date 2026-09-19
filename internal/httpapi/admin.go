@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Clouditera/lathe/internal/auth"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/auth"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // AdminAPI 提供用户管理与统计。全部要求管理员。

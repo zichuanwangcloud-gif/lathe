@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 )
 
 // 落盘的必须是【完整】输出，而不是进数据库那份 16KB 截断版（T4-AC2）。

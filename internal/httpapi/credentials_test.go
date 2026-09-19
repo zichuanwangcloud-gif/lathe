@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/secret"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // fakeVerifier 按 kind 返回预设结果，避免测试依赖真实外部服务。

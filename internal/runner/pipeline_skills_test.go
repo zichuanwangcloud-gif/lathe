@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
-	skillsembed "github.com/Clouditera/lathe/skills"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	skillsembed "github.com/zichuanwangcloud-gif/lathe/skills"
 )
 
 // F7.2-AC1/AC3：节点画像声明存在的技能时，Execute 跑完整条链路后

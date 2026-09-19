@@ -5,6 +5,12 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.1] - 2026-09-19
+
+### Fixed
+- Go 模块路径由仓库迁移前的 `github.com/Clouditera/lathe` 更正为 `github.com/zichuanwangcloud-gif/lathe` —— 此前 `go install github.com/zichuanwangcloud-gif/lathe/cmd/lathe@v0.1.0` 会因「声明路径与请求路径不符」报错
+- `scripts/claude-cc-switch` 不再写死本机 claude 二进制的绝对路径，改从 `PATH` 解析
+
 ## [0.1.0] - 2026-09-19
 
 首个版本。绑定 Linear 账户后，指派给你的 issue 自动变成一个**已验证**的 PR ——
@@ -84,4 +90,5 @@
 - **不做需求澄清** —— 单子不明确就回帖提问并停下，不猜
 - **永不 push 受保护分支** —— 一切走 PR
 
+[0.1.1]: https://github.com/zichuanwangcloud-gif/lathe/releases/tag/v0.1.1
 [0.1.0]: https://github.com/zichuanwangcloud-gif/lathe/releases/tag/v0.1.0

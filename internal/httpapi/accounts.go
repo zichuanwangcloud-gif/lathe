@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/auth"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/auth"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // Mailer 发送邮件。由 internal/mail 实现，main.go 注入。

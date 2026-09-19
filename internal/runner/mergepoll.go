@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

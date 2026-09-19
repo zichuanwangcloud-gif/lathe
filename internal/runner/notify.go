@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // TaskMail 给任务属主投一封通知信。

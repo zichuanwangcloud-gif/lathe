@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // testStoreForAPI 连接测试库；连不上则跳过。

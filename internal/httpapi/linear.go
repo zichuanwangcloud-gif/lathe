@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/Clouditera/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 )
 
 // LinearClientFor 按用户产出 Linear 客户端。

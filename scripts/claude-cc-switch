@@ -49,4 +49,4 @@ for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"):
 EOF
 )"
 
-exec /home/clouditera/.local/bin/claude "$@"
+exec claude "$@"

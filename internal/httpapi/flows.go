@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Clouditera/lathe/internal/flow"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // FlowAPI 提供"一键批量入队"（PRD F1.4）的 HTTP 端点：一次请求建一整

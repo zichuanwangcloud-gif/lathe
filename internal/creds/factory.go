@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // Factory 按用户产出凭据提供者与客户端（P1.5 第二步数据隔离）。

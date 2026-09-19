@@ -1,4 +1,4 @@
-module github.com/Clouditera/lathe
+module github.com/zichuanwangcloud-gif/lathe
 
 go 1.25.0
 

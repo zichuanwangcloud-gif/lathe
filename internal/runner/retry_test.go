@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // 现场体检的便捷构造

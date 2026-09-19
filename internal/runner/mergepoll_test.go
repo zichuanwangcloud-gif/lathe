@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

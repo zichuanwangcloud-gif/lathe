@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // silentSMTP 起一个「能建立 TCP 连接但从不吐一个字节」的假服务器。

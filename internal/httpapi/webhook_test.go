@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 )
 
 type fakeClaimer struct {
