@@ -385,6 +385,12 @@ func serve(cfg config.Config) error {
 	}
 	flowAPI.Routes(mux)
 
+	// 内置工单体系（docs/09-internal-issues.md）：手动建单/评论区/开跑/取消。
+	// 与执行队列共用同一个 task.Machine 与 queue —— 取消联动、开跑入队
+	// 走的是与 Linear webhook 同一条通道，不另起语义。
+	issuesAPI := &httpapi.IssuesAPI{Store: st, Auth: auth, Queue: q}
+	issuesAPI.Routes(mux)
+
 	if webui.Available() {
 		mux.Handle("/", webui.Handler())
 	} else {
@@ -463,6 +469,8 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 		Notifier:      pipeline.Notifier,
 		RepoLookup:    runner.NewRepoLookup(st.Pool()),
 		Pipeline:      pipeline,
+		// 内置工单联动（09 §3 F4-AC3）：任务 merged/cancelled → 工单状态。
+		IssueOutcomes: st,
 		Interval:      45 * time.Second,
 	}
 	go mergePoller.Run(ctx)

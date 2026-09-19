@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
+	"github.com/Clouditera/lathe/internal/tracker"
 )
 
 // maxJSONBody 限制请求体大小。
@@ -466,6 +468,13 @@ func (a *API) cancelTask(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		transitionError(w, err)
 		return
+	}
+	// 内置工单联动（09 §3 F4-AC3）：任务取消 → 工单回 open。
+	// 联动失败不影响取消事实（已落库），只记日志。
+	if tk.TrackerProvider == tracker.ProviderInternal && a.Store != nil {
+		if _, err := a.Store.ApplyTaskOutcome(r.Context(), tk.UserID, tk.ExternalKey, store.OutcomeTaskCancelled); err != nil {
+			slog.Warn("工单状态联动失败（task_cancelled）", "task", tk.ID, "issue", tk.ExternalKey, "err", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "cancelled", "taskId": id})
 }
