@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Clouditera/lathe/migrations"
+	"github.com/zichuanwangcloud-gif/lathe/migrations"
 )
 
 // noTransactionMarker 是「非事务迁移」的显式开关。

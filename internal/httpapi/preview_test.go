@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/preview"
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // fakePreviews 记录调用并返回预设结果。

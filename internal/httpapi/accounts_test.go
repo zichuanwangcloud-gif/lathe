@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // 注册 → 自动登录 → 访问受保护接口，全链路走 Cookie。

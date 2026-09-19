@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // fakeSMTP 起一个只按脚本应答的最小 SMTP 服务端。

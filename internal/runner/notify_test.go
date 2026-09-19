@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // fakeMail 记录投递出去的信；err 非空时模拟发信失败。

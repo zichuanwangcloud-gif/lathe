@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // recommendTimeout 是单次 AI 推荐的硬上限。推荐要读部署文档 +

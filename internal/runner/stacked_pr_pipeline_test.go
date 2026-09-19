@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/integration/linear"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // 本文件补 docs/07-prd-orchestration.md F3.2 的两个缺口：

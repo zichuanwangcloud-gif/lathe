@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // profileFixture 是 pipelineFixture 的变体：接受 profile 原始字节，

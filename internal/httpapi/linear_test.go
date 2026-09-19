@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 )
 
 // stubLinear 按查询内容分发应答的最小 Linear GraphQL 桩。

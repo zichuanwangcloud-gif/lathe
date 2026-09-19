@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // Compose 按 RFC 5322 编排一封纯文本邮件。

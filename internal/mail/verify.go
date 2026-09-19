@@ -11,8 +11,8 @@ import (
 	"net/textproto"
 	"strings"
 
-	"github.com/Clouditera/lathe/internal/httpapi"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // Verifier 用给定配置实际投递一封测试邮件，验证发信通道可用。

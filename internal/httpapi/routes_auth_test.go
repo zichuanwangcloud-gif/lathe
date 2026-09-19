@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/secret"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 )
 
 // 新增的管理端与 SMTP 接口同样必须挡住未认证请求。

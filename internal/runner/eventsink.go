@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // AgentEventRecorder 把提炼后的 agent 事件与终局摘要落库。

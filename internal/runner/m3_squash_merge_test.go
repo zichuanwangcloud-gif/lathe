@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // ================================================================

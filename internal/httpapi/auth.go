@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/auth"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/auth"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // sessionCookie 是登录态 Cookie 名。

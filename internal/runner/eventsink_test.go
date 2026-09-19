@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // eventRow 是 recorder 收到的一条事件及其归属（任务 + 阶段）。

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/secret"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/jackc/pgx/v5"
 )
 

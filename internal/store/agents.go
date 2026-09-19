@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // AgentEvent 是 agent_events 表的一行（docs/04-agent-visibility.md §3）。

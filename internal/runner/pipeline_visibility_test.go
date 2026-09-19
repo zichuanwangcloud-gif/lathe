@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // streamingAgent 包一层 fakeAgent：每次 Run 先通过 OnEvent 吐一条事件，

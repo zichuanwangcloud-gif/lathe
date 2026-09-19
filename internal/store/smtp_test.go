@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/secret"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 )
 
 func smtpTestStore(t *testing.T) *Secrets {

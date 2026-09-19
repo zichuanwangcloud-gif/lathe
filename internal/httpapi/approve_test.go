@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
 // awaitingTask 造一条停在 awaiting_approval 的任务（gate_mode=manual 走到的位置）。

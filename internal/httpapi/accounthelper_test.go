@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/auth"
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/auth"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // accountFixture 搭一套完整的账号相关接口，返回带 cookie jar 的客户端。

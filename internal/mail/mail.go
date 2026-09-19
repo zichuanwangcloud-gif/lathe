@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // ErrNotConfigured 表示尚未配置发信通道。
