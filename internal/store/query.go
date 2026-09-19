@@ -24,6 +24,9 @@ type TaskRow struct {
 	// TrackerProvider 是需求来源平台（'linear' | 'internal'）；
 	// 前端据此把 key 渲染成 Linear 链接或内置工单页链接。
 	TrackerProvider string `json:"trackerProvider"`
+	// IssueID 仅内置工单（provider=internal）填充，供前端直达工单页；
+	// Linear 任务为 NULL（Linear 侧的定位主键是 external_id，前端用不到）。
+	IssueID *int64 `json:"issueId,omitempty"`
 	State          string  `json:"state"`
 	TaskKind       *string `json:"taskKind"`
 	VerifyTier     *string `json:"verifyTier"`
@@ -90,9 +93,12 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
-		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
+		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns,
+		       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END
 		FROM tasks t
 		JOIN repos r ON r.id = t.repo_id
+		LEFT JOIN issues i ON t.tracker_provider = 'internal'
+		       AND i.user_id = t.user_id AND i.key = t.external_key
 		WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
 		ORDER BY t.updated_at DESC
 		LIMIT $3 OFFSET $4`, p.UserID, states, p.Limit, p.Offset)
@@ -110,6 +116,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 			&t.AgentSessionID, &t.LeaseExpiresAt,
 			&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
+			&t.IssueID,
 		); err != nil {
 			return nil, 0, fmt.Errorf("store: 读取任务行失败: %w", err)
 		}
@@ -157,8 +164,11 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
 		       r.provider_repo, COALESCE(r.baseline_dir, ''), t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
-		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns
+		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns,
+		       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END
 		FROM tasks t JOIN repos r ON r.id = t.repo_id
+		LEFT JOIN issues i ON t.tracker_provider = 'internal'
+		       AND i.user_id = t.user_id AND i.key = t.external_key
 		WHERE t.id = $1 AND t.user_id = $2`, id, userID,
 	).Scan(
 		&t.ID, &t.UserID, &t.ExternalKey, &t.TrackerProvider, &t.State, &t.TaskKind, &t.VerifyTier,
@@ -166,6 +176,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		&t.ProviderRepo, &t.BaselineDir, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,
 		&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
+		&t.IssueID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: 读取任务 %d 失败: %w", id, err)

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Clouditera/lathe/internal/store"
 )
@@ -41,10 +42,12 @@ func issuesFixture(t *testing.T) (*IssuesAPI, *store.Store, int64, int64) {
 	st := testStoreForAPI(t)
 	userID := mustUser(t, st, "issues-"+t.Name()+"@example.com")
 
+	// provider_repo 必须带随机量：mustUser 的 email 是定值，上一轮被中断的
+	// 测试会留下同 user_id 的孤儿行，定值 repo 名会直接撞唯一索引（T9 教训）。
 	var repoID int64
 	if err := st.Pool().QueryRow(context.Background(),
 		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
-		userID, "acme/issues-api-"+t.Name()+fmt.Sprint(userID)).Scan(&repoID); err != nil {
+		userID, fmt.Sprintf("acme/issues-api-%s-%d", t.Name(), time.Now().UnixNano())).Scan(&repoID); err != nil {
 		t.Fatalf("建 repo 失败: %v", err)
 	}
 	api := &IssuesAPI{Store: st, Auth: authAs(userID, "issues-fixture@example.com"), Queue: &fakeIssueQueue{}}
