@@ -27,7 +27,10 @@ RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/lathe .
 FROM alpine:3.21
 # git：worktree 执行；docker CLI + compose：任务预览环境（需挂载 /var/run/docker.sock）
 # 注意：镜像不含 claude CLI —— agent 执行依赖它，需另行挂载/安装，见 release notes
-RUN apk add --no-cache ca-certificates git tzdata docker-cli docker-cli-compose
+# APK_MIRROR：官方源 dl-cdn.alpinelinux.org 不可达时传镜像站，如 --build-arg APK_MIRROR=mirrors.aliyun.com
+ARG APK_MIRROR=
+RUN if [ -n "$APK_MIRROR" ]; then sed -i "s|dl-cdn.alpinelinux.org|$APK_MIRROR|g" /etc/apk/repositories; fi \
+ && apk add --no-cache ca-certificates git tzdata docker-cli docker-cli-compose
 LABEL org.opencontainers.image.source=https://github.com/zichuanwangcloud-gif/lathe
 # 数据（secret.key、验证日志）与工作区（worktree/mirror）都收进一个卷
 ENV LATHE_DATA_DIR=/data \
