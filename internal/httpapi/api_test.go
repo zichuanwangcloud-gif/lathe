@@ -169,7 +169,7 @@ func TestAPIListAndDetail(t *testing.T) {
 	tasks, _ = body["tasks"].([]any)
 	found := false
 	for _, x := range tasks {
-		if row, ok := x.(map[string]any); ok && row["linearIssueKey"] == "CR-9001" {
+		if row, ok := x.(map[string]any); ok && row["externalKey"] == "CR-9001" {
 			found = true
 			if row["state"] != "triaging" {
 				t.Errorf("过滤结果含非目标状态: %v", row["state"])

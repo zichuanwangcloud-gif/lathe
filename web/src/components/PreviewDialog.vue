@@ -8,7 +8,7 @@ import { ref, computed, watch, onMounted, onUnmounted, inject, nextTick } from '
 import { api, UnauthorizedError } from '../api'
 
 const props = defineProps({
-  task: { type: Object, required: true }, // { id, linearIssueKey }
+  task: { type: Object, required: true }, // { id, externalKey }
 })
 const emit = defineEmits(['close'])
 const onUnauthorized = inject('onUnauthorized')
@@ -304,7 +304,7 @@ onUnmounted(() => {
   <div class="overlay" @click.self="emit('close')">
     <div class="dialog card">
       <div class="spread">
-        <h2>预览环境 · <span class="mono">{{ task.linearIssueKey }}</span></h2>
+        <h2>预览环境 · <span class="mono">{{ task.externalKey }}</span></h2>
         <button class="close" @click="emit('close')">✕</button>
       </div>
 

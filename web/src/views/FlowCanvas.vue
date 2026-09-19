@@ -623,7 +623,7 @@ watch(
     <button class="icon-btn" style="position: absolute; top: 10px; right: 10px" @click="selectedId = null">✕</button>
     <template v-if="inspectorLoading">加载中…</template>
     <template v-else-if="inspector">
-      <div class="mono" style="color: var(--accent); font-weight: 600">{{ inspector.linearIssueKey }}</div>
+      <div class="mono" style="color: var(--accent); font-weight: 600">{{ inspector.externalKey }}</div>
       <div style="margin: 6px 0">
         <span class="badge" :class="stateTone(inspector.state)">{{ stateLabel(inspector.state) }}</span>
       </div>

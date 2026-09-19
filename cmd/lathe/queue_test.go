@@ -726,10 +726,14 @@ func TestFillBaseRefNoopForIndependentRoot(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 6. 缺少 Linear issue UUID 的旧数据
+// ---------------------------------------------------------------- 6. 需求平台引用俱空的残缺数据
 
-// 旧数据（migration 0010 前）没有 external_id，runOneClaimed 应该把
-// 它取消而不是尝试派发（分诊/续跑都需要 UUID 去调 Linear API）。
+// external_id 与 external_key 俱空的任务无法定位工单，runOneClaimed
+// 应该把它取消而不是尝试派发。
+//
+// 注：旧契约是「缺 Linear UUID 即取消」。0021 之后守卫放宽为「引用俱空
+// 才取消」—— Linear 的 issue 查询同时接受 UUID 与 identifier，只有 key
+// 的旧数据可以继续跑；内置工单的 external_id 恒为 NULL，key 即全部身份。
 func TestRunOneClaimedCancelsTaskWithoutExternalID(t *testing.T) {
 	st := testStore(t)
 	userID, repoID := fixture(t, st)
@@ -738,8 +742,8 @@ func TestRunOneClaimedCancelsTaskWithoutExternalID(t *testing.T) {
 	q := testQueue(st, pipe)
 
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-NOUUID"),
-		// ExternalID 留空，模拟旧数据
+		UserID: userID, RepoID: repoID, ExternalKey: "", // 引用俱空
+		// ExternalID 留空，模拟残缺数据
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
@@ -755,7 +759,7 @@ func TestRunOneClaimedCancelsTaskWithoutExternalID(t *testing.T) {
 		t.Fatalf("Get 失败: %v", err)
 	}
 	if got.State != task.StateCancelled {
-		t.Errorf("缺少 Linear issue UUID 的任务应被取消，state = %s", got.State)
+		t.Errorf("引用俱空的任务应被取消，state = %s", got.State)
 	}
 	if len(pipe.snapshot()) != 0 {
 		t.Errorf("不该走到 pipeline.Execute，却被调用了 %d 次", len(pipe.snapshot()))

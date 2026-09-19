@@ -101,7 +101,7 @@ onUnmounted(() => clearInterval(timer))
       <tbody>
         <tr v-for="t in tasks" :key="t.id">
           <td>
-            <RouterLink :to="`/tasks/${t.id}`" class="mono">{{ t.linearIssueKey }}</RouterLink>
+            <RouterLink :to="`/tasks/${t.id}`" class="mono">{{ t.externalKey }}</RouterLink>
             <div class="faint mono">{{ t.providerRepo }}</div>
           </td>
           <td>

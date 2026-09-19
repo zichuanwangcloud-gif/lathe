@@ -395,6 +395,9 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	// 与 repo_id 的语义一致。
 	tr, err := clients.Tracker(ctx, tk.TrackerProvider)
 	if err != nil {
+		if tk.TrackerProvider == tracker.ProviderLinear || tk.TrackerProvider == "" {
+			return nil, "", fmt.Errorf("获取 Linear 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		}
 		return nil, "", fmt.Errorf("获取需求平台客户端失败（provider=%s）: %w", tk.TrackerProvider, err)
 	}
 	// 内置实现支持评论署名（'task-<id>' → 评论区渲染「lathe · 任务 #id」）；
