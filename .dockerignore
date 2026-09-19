@@ -1,0 +1,9 @@
+# 构建上下文只放源码；产物/运行时数据不进上下文
+.git
+.claude
+bin
+data
+workspaces
+web/node_modules
+web/dist
+internal/webui/dist

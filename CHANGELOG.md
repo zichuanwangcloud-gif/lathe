@@ -5,7 +5,7 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.1.0] - 2026-09-09
+## [0.1.0] - 2026-09-19
 
 首个版本。绑定 Linear 账户后，指派给你的 issue 自动变成一个**已验证**的 PR ——
 核心不是「调用 agent 写代码」，而是**证明改动有效**：bug 类任务必须先在改动前的
