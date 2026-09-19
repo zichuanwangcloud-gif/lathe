@@ -6,9 +6,12 @@
 FROM node:22-alpine AS ui
 WORKDIR /build
 # lockfile 是 pnpm；--ignore-scripts 避开 esbuild 安装脚本的交互确认（同 Makefile ui-deps）
+# NPM_REGISTRY：npmjs 官方源不可达/不稳时传镜像，如 --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+ARG NPM_REGISTRY=
+ENV COREPACK_NPM_REGISTRY=${NPM_REGISTRY}
 RUN corepack enable
 COPY web/package.json web/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --ignore-scripts
+RUN pnpm install --frozen-lockfile --ignore-scripts ${NPM_REGISTRY:+--registry=$NPM_REGISTRY}
 COPY web/ ./
 RUN node_modules/.bin/vite build
 
