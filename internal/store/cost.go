@@ -189,10 +189,10 @@ func (s *Store) CostStatsFor(ctx context.Context, userID int64) (*CostStats, err
 
 	// 4) 花费最高的任务
 	topRows, err := s.pool.Query(ctx, `
-		SELECT t.id, t.linear_issue_key, t.state,
+		SELECT t.id, t.external_key, t.state,
 		       COALESCE(SUM((ae.payload->>'costUsd')::numeric), 0)::float8,
 		       COUNT(*)`+costFilter+`
-		GROUP BY t.id, t.linear_issue_key, t.state
+		GROUP BY t.id, t.external_key, t.state
 		ORDER BY 4 DESC, t.id
 		LIMIT 10`, userID)
 	if err != nil {

@@ -60,13 +60,13 @@ func stackedPipelineFixture(t *testing.T) (*task.Machine, int64, int64, RepoConf
 	})
 
 	pred, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-300",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-300",
 	})
 	if err != nil {
 		t.Fatalf("建前驱任务失败: %v", err)
 	}
 	succ, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-301",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-301",
 		DependsOn: &pred.ID,
 	})
 	if err != nil {
@@ -120,7 +120,7 @@ func TestPipelineStackedPRBaseMatchesPredecessorBranch(t *testing.T) {
 	predP.Verifications = &fakeVerifications{}
 
 	if err := predP.Execute(ctx, ExecuteParams{
-		TaskID: predID, Repo: repo, CloneURL: src, IssueID: "uuid-300", Actor: "node:test",
+		TaskID: predID, Repo: repo, CloneURL: src, IssueRef: "uuid-300", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("前驱 Execute 失败: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestPipelineStackedPRBaseMatchesPredecessorBranch(t *testing.T) {
 	succP.Verifications = &fakeVerifications{}
 
 	if err := succP.Execute(ctx, ExecuteParams{
-		TaskID: succID, Repo: succRepo, CloneURL: src, IssueID: "uuid-301", Actor: "node:test",
+		TaskID: succID, Repo: succRepo, CloneURL: src, IssueRef: "uuid-301", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("后继 Execute 失败: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestPipelineErrNoCommitsFailsWithoutPR(t *testing.T) {
 	p.Verifications = &fakeVerifications{}
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	})
 	if err == nil {
 		t.Fatal("ErrNoCommits 应导致任务失败，不应被当成成功放过去")

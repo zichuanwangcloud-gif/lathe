@@ -36,7 +36,7 @@ func TestAPIRetryModesAndPlan(t *testing.T) {
 		seq++
 		tk, err := m.Create(ctx, task.CreateParams{
 			UserID: userID, RepoID: repoID,
-			LinearIssueKey: "CR-R" + itoa(int64(seq)),
+			ExternalKey: "CR-R" + itoa(int64(seq)),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -136,7 +136,7 @@ func TestAPIRetryModesAndPlan(t *testing.T) {
 	var otherRepo int64
 	_ = api.Store.Pool().QueryRow(ctx, `INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
 		otherID, "acme/other").Scan(&otherRepo)
-	otherTk, _ := m.Create(ctx, task.CreateParams{UserID: otherID, RepoID: otherRepo, LinearIssueKey: "CR-X"})
+	otherTk, _ := m.Create(ctx, task.CreateParams{UserID: otherID, RepoID: otherRepo, ExternalKey: "CR-X"})
 	resp = do(t, srv, "GET", "/api/tasks/"+itoa(otherTk.ID)+"/retry-plan", "", true)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("他人任务的预览应 404，得到 %d", resp.StatusCode)

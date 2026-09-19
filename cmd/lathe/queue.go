@@ -12,6 +12,7 @@ import (
 	"github.com/Clouditera/lathe/internal/runner"
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
+	"github.com/Clouditera/lathe/internal/tracker"
 )
 
 // claimLeaseDuration 是 ClaimReady 打的租约时长。
@@ -93,17 +94,63 @@ func (q *queue) Enqueue(ctx context.Context, ownerUserID int64, issueID, issueKe
 		slog.Error("无法确定任务归属仓库", "issue", issueKey, "owner", ownerUserID, "err", err)
 		// 接单却建不出任务不能沉默——人在 Linear 那边指派完就干等。
 		// 尽力回帖说明原因；凭据也没配的话只能放弃，日志里已有痕迹。
-		q.commentUnresolved(ctx, ownerUserID, issueID, issueKey, err)
+		q.commentUnresolved(ctx, ownerUserID, tracker.ProviderLinear, issueID, issueKey, err)
 		return err
 	}
 
 	if _, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: ownerUserID, RepoID: repoID, LinearIssueKey: issueKey, LinearIssueID: issueID,
-		GateMode: gateMode,
+		UserID: ownerUserID, RepoID: repoID, ExternalKey: issueKey, ExternalID: issueID,
+		TrackerProvider: tracker.ProviderLinear,
+		GateMode:        gateMode,
 	}); err != nil {
 		// 同一 issue 已有活任务时会撞上部分唯一索引——这是预期行为，非错误
 		slog.Warn("建任务失败（可能已有进行中的同名任务）", "issue", issueKey, "err", err)
 		return err
+	}
+	return nil
+}
+
+// EnqueueInternal 实现 httpapi.TaskEnqueuer：内置工单开跑（09 §3 F4-AC1）。
+//
+// 与 Linear 路径的两个刻意差异：
+//   - 仓库取自工单上登记的 repo_id（建单时人选定），不走 resolveRepo
+//     的"每用户第一个仓库"——那个随机性对人工建单不可接受；
+//   - 无需回帖通道兜底：建任务失败直接在 HTTP 响应里报给人，
+//     不存在"在 Linear 那边干等"的场景。
+func (q *queue) EnqueueInternal(ctx context.Context, ownerUserID, issueID int64) error {
+	it, err := q.store.GetIssue(ctx, issueID, ownerUserID)
+	if err != nil {
+		return err
+	}
+	// 状态闸门先于唯一索引：给人的话要可读（「已取消」与「撞唯一索引」
+	// 是两件事）。in_progress 说明有活任务或人刚手动改的状态，撞索引
+	// 时唯一索引会再兜一次底。
+	switch it.State {
+	case store.IssueCancelled:
+		return fmt.Errorf("工单已取消，请先在详情页重新打开（改回 open）")
+	case store.IssueInProgress:
+		return fmt.Errorf("工单已有进行中的任务")
+	}
+
+	var gateMode string
+	if err := q.store.Pool().QueryRow(ctx,
+		`SELECT gate_mode FROM repos WHERE id = $1 AND user_id = $2`,
+		it.RepoID, ownerUserID).Scan(&gateMode); err != nil {
+		return fmt.Errorf("工单登记的仓库不可用（repo_id=%d）: %w", it.RepoID, err)
+	}
+
+	if _, err := q.tasks.Create(ctx, task.CreateParams{
+		UserID: ownerUserID, RepoID: it.RepoID, ExternalKey: it.Key,
+		TrackerProvider: tracker.ProviderInternal,
+		GateMode:        gateMode,
+		Priority:        it.Priority,
+	}); err != nil {
+		return err
+	}
+	// 联动（09 §3 F4-AC3）：任务建出 → 工单 in_progress。失败只告警，
+	// 任务本体已经落库，状态联动是便利不是正确性。
+	if _, err := q.store.ApplyTaskOutcome(ctx, ownerUserID, it.Key, store.OutcomeStarted); err != nil {
+		slog.Warn("工单状态联动失败（started）", "issue", it.Key, "err", err)
 	}
 	return nil
 }
@@ -140,7 +187,7 @@ func (q *queue) Requeue(ctx context.Context, taskID int64, mode string) error {
 func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, issueKey string) ([]int64, error) {
 	// 空 issueID 直接拒绝。这条路径由外部 webhook 触发，构造一个
 	// {"type":"Issue","action":"remove","data":{}} 就能让空串进到
-	// `WHERE linear_issue_id = ''` —— 眼下打不中任何行（存量是 NULL，
+	// `WHERE external_id = ''` —— 眼下打不中任何行（存量是 NULL，
 	// 而 `= ''` 不匹配 NULL），但「打不中」是数据凑巧，不是防线。
 	if strings.TrimSpace(issueID) == "" {
 		slog.Warn("取消联动收到空 issueID，忽略", "owner", ownerUserID, "issue", issueKey)
@@ -151,14 +198,40 @@ func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, 
 	if err != nil {
 		return nil, err
 	}
+	reason := fmt.Sprintf("Linear issue %s 已被取消", issueKey)
+	return q.cancelActiveTasks(ctx, active, reason, "system:webhook", issueKey)
+}
+
+// CancelForInternalIssue 实现 httpapi.TaskEnqueuer：内置工单取消联动
+//（09 §3 F4-AC4），触发点是工单详情页的「取消」按钮（应用内动作，
+// 不是 webhook）。语义边界与 CancelForIssue 完全一致：只改数据库状态，
+// 不会停下正在跑的 agent。
+//
+// actor 口径：人是触发者但动作有系统代办的性质（连带取消任务、传播
+// 阻塞），与 webhook 路径同记 "system:" 前缀，审计流里两种取消
+// 一眼可分。
+func (q *queue) CancelForInternalIssue(ctx context.Context, ownerUserID int64, issueKey string) ([]int64, error) {
+	if strings.TrimSpace(issueKey) == "" {
+		return nil, nil
+	}
+	active, err := q.tasks.ActiveByKey(ctx, ownerUserID, tracker.ProviderInternal, issueKey)
+	if err != nil {
+		return nil, err
+	}
+	reason := fmt.Sprintf("内置工单 %s 已被取消", issueKey)
+	return q.cancelActiveTasks(ctx, active, reason, "system:issue-cancel", issueKey)
+}
+
+// cancelActiveTasks 是两条取消联动路径（Linear webhook / 内置工单）
+// 的共同执行体：逐个转 cancelled + 失败传播。单个任务失败不毁整批。
+func (q *queue) cancelActiveTasks(ctx context.Context, active []*task.Task, reason, actor, issueKey string) ([]int64, error) {
 	if len(active) == 0 {
 		return nil, nil
 	}
 
-	reason := fmt.Sprintf("Linear issue %s 已被取消", issueKey)
 	var cancelled []int64
 	for _, tk := range active {
-		if _, err := q.tasks.Transition(ctx, tk.ID, task.StateCancelled, "system:webhook",
+		if _, err := q.tasks.Transition(ctx, tk.ID, task.StateCancelled, actor,
 			&task.TransitionOpts{
 				FailureReason: &reason,
 				Payload:       map[string]any{"reason": "issue_cancelled", "issue": issueKey},
@@ -169,6 +242,14 @@ func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, 
 			continue
 		}
 		cancelled = append(cancelled, tk.ID)
+
+		// 内置工单联动（09 §3 F4-AC3）：任务取消 → 工单回 open。
+		// 仅 internal 任务生效，失败只告警。
+		if tk.TrackerProvider == tracker.ProviderInternal {
+			if _, err := q.store.ApplyTaskOutcome(ctx, tk.UserID, tk.ExternalKey, store.OutcomeTaskCancelled); err != nil {
+				slog.Warn("工单状态联动失败（task_cancelled）", "task", tk.ID, "issue", tk.ExternalKey, "err", err)
+			}
+		}
 
 		// 失败传播：这个任务作废了，depends_on 链上排队等它的后继
 		// 也没有意义了（与 pipeline.fail 和 mergepoll 的取消路径一致）。
@@ -325,13 +406,17 @@ func (q *queue) pollLoop(ctx context.Context) {
 // 效果与旧实现里全新任务跳过智能重试、直接从头跑完全一致，只是不再
 // 需要用一个 if 分支特殊处理。
 func (q *queue) runOneClaimed(ctx context.Context, tk *task.Task) {
-	slog.Info("开始处理", "task", tk.ID, "issue", tk.LinearIssueKey, "owner", tk.UserID)
+	slog.Info("开始处理", "task", tk.ID, "issue", tk.ExternalKey, "owner", tk.UserID, "provider", tk.TrackerProvider)
 
-	if tk.LinearIssueID == nil {
-		// 旧数据没有 Linear issue UUID（migration 0010 前），分诊/续跑
-		// 都要靠它去调 Linear API，没有就没法处理。取消而非失败：这不是
+	issueRef := runner.IssueRefOf(tk)
+	if issueRef == "" {
+		// external_id 与 external_key 同时为空：数据残缺，分诊/续跑
+		// 都靠这个引用去定位工单，没有就没法处理。取消而非失败：这不是
 		// 任务本身的错，是数据不够。
-		reason := "缺少 Linear issue ID，无法处理（请重新触发该 issue）"
+		// （旧数据的 linear 任务没有 UUID 时会退回 key，Linear 的 issue
+		// 查询同时接受 UUID 与 identifier，能继续跑；只有两者俱空
+		// 才走到这里。）
+		reason := "缺少需求平台引用（external_id 与 external_key 俱空），无法处理"
 		if _, err := q.tasks.Transition(ctx, tk.ID, task.StateCancelled, "system", &task.TransitionOpts{
 			FailureReason: &reason,
 		}); err != nil {
@@ -339,15 +424,14 @@ func (q *queue) runOneClaimed(ctx context.Context, tk *task.Task) {
 		}
 		return
 	}
-	issueID := *tk.LinearIssueID
 
 	repoCfg, cloneURL, err := q.loadRepoConfig(ctx, tk.RepoID)
 	if err != nil {
-		slog.Error("无法确定任务归属仓库", "task", tk.ID, "issue", tk.LinearIssueKey, "err", err)
+		slog.Error("无法确定任务归属仓库", "task", tk.ID, "issue", tk.ExternalKey, "err", err)
 		// 正常情况下这不该发生：repo_id 是任务创建时（Enqueue 里）就
 		// 校验过的外键，能失败大概只有仓库配置事后被删掉这种边缘情形。
 		// 依然尽力回帖，别让任务悄无声息地卡住。
-		q.commentUnresolved(ctx, tk.UserID, issueID, tk.LinearIssueKey, err)
+		q.commentUnresolved(ctx, tk.UserID, tk.TrackerProvider, issueRef, tk.ExternalKey, err)
 		return
 	}
 
@@ -401,15 +485,15 @@ func (q *queue) runOneClaimed(ctx context.Context, tk *task.Task) {
 		TaskID:   tk.ID,
 		Repo:     repoCfg,
 		CloneURL: cloneURL,
-		IssueID:  issueID,
+		IssueRef: issueRef,
 		Actor:    "node:" + q.cfg.NodeName,
 		Retry:    &plan,
 	}); err != nil {
 		// 失败三件套已在 pipeline 内部完成，这里只记日志
-		slog.Error("任务处理失败", "issue", tk.LinearIssueKey, "task", tk.ID, "err", err)
+		slog.Error("任务处理失败", "issue", tk.ExternalKey, "task", tk.ID, "err", err)
 		return
 	}
-	slog.Info("任务处理完成", "issue", tk.LinearIssueKey, "task", tk.ID)
+	slog.Info("任务处理完成", "issue", tk.ExternalKey, "task", tk.ID)
 }
 
 // fillBaseRef 是 F3.1（栈式 PR 的地基）：DependsOn 非空的后继任务在
@@ -589,7 +673,7 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 // 多用户之后这一步更常见：新用户配好了 webhook 却还没登记仓库，
 // 指派事件照样投递。不回帖的话 Linear 那边看起来就是「指派了但
 // 毫无反应」，比明确的拒绝难受得多。
-func (q *queue) commentUnresolved(ctx context.Context, ownerUserID int64, issueID, issueKey string, cause error) {
+func (q *queue) commentUnresolved(ctx context.Context, ownerUserID int64, provider, ref, issueKey string, cause error) {
 	if q.clients == nil {
 		return
 	}
@@ -597,12 +681,12 @@ func (q *queue) commentUnresolved(ctx context.Context, ownerUserID int64, issueI
 	if err != nil {
 		return
 	}
-	lin, err := clients.Linear(ctx)
+	tr, err := clients.Tracker(ctx, provider)
 	if err != nil {
 		return // 凭据也没配 —— 无从回帖，日志已留痕
 	}
 	body := "Lathe 无法接单：" + cause.Error() + "\n\n配置完成后重新指派即可触发。"
-	if _, err := lin.Comment(ctx, issueID, body); err != nil {
+	if _, err := tr.Comment(ctx, ref, body); err != nil {
 		slog.Warn("接单失败回帖也没发出去", "issue", issueKey, "err", err)
 	}
 }

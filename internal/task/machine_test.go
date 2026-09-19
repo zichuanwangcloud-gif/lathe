@@ -46,7 +46,7 @@ func fixture(t *testing.T, pool *pgxpool.Pool) (userID, repoID int64) {
 	// 再配 ON CONFLICT DO UPDATE，于是上一轮被中断（测试进程被杀，t.Cleanup
 	// 没执行）留下的孤儿 user 会被【复用】，连带它名下的 repo 与那些用固定
 	// issue key（CR-1001 / CR-ORCH-ROOT 之类）建的非终态任务，
-	// 下一轮 Create 就撞上部分唯一索引 tasks_one_active_per_issue。
+	// 下一轮 Create 就撞上部分唯一索引 tasks_one_active_per_item。
 	//
 	// 新 user 天然给出新 repo_id（repos 唯一键是 (user_id, provider_repo)），
 	// 固定 issue key 也就被限定在这个 repo 内，不会跨轮次撞车。
@@ -117,7 +117,7 @@ func TestMachineCreateAndGet(t *testing.T) {
 
 	created, err := m.Create(ctx, CreateParams{
 		UserID: userID, RepoID: repoID,
-		LinearIssueKey: "CR-1001", TaskKind: ptr("fix"),
+		ExternalKey: "CR-1001", TaskKind: ptr("fix"),
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
@@ -133,8 +133,8 @@ func TestMachineCreateAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get 失败: %v", err)
 	}
-	if got.LinearIssueKey != "CR-1001" {
-		t.Errorf("issue key = %q，期望 CR-1001", got.LinearIssueKey)
+	if got.ExternalKey != "CR-1001" {
+		t.Errorf("issue key = %q，期望 CR-1001", got.ExternalKey)
 	}
 
 	if _, err := m.Get(ctx, 999999999); !errors.Is(err, ErrTaskNotFound) {
@@ -152,7 +152,7 @@ func TestMachineCreateProfileRoundtrip(t *testing.T) {
 
 	withProfile, err := m.Create(ctx, CreateParams{
 		UserID: userID, RepoID: repoID,
-		LinearIssueKey: "CR-2001",
+		ExternalKey: "CR-2001",
 		Profile:        []byte(`{"model_channel":"channel-x","verify_tier":"light"}`),
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func TestMachineCreateProfileRoundtrip(t *testing.T) {
 
 	withoutProfile, err := m.Create(ctx, CreateParams{
 		UserID: userID, RepoID: repoID,
-		LinearIssueKey: "CR-2002",
+		ExternalKey: "CR-2002",
 	})
 	if err != nil {
 		t.Fatalf("Create（不带 profile）失败: %v", err)
@@ -199,12 +199,12 @@ func TestMachineOneActiveTaskPerIssue(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	first, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-2002"})
+	first, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-2002"})
 	if err != nil {
 		t.Fatalf("首个任务应创建成功: %v", err)
 	}
 
-	if _, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-2002"}); err == nil {
+	if _, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-2002"}); err == nil {
 		t.Fatal("同 issue 的第二个活任务应被拒绝")
 	}
 
@@ -212,7 +212,7 @@ func TestMachineOneActiveTaskPerIssue(t *testing.T) {
 	if _, err := m.Transition(ctx, first.ID, StateCancelled, "user:1", nil); err != nil {
 		t.Fatalf("取消首个任务失败: %v", err)
 	}
-	if _, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-2002"}); err != nil {
+	if _, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-2002"}); err != nil {
 		t.Errorf("issue 重开后应允许再建任务，却失败: %v", err)
 	}
 }
@@ -223,7 +223,7 @@ func TestMachineTransitionHappyPath(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-3003"})
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-3003"})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestMachineIllegalTransitionIsAtomic(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-4004"})
+	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-4004"})
 
 	before, _ := m.Events(ctx, tk.ID)
 
@@ -327,7 +327,7 @@ func TestMachineReviewFeedbackRequiresSession(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-5005"})
+	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-5005"})
 	for _, s := range []State{StateTriaging, StateImplementing, StateVerifying, StatePROpen, StateReviewFeedback} {
 		if _, err := m.Transition(ctx, tk.ID, s, "system", nil); err != nil {
 			t.Fatalf("转移到 %s 失败: %v", s, err)
@@ -359,7 +359,7 @@ func TestMachineConcurrentTransitionExactlyOneWins(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-6006"})
+	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-6006"})
 
 	const racers = 8
 	var (
@@ -412,7 +412,7 @@ func TestMachineLeaseExpiryRedispatch(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-7007"})
+	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-7007"})
 	_, _ = m.Transition(ctx, tk.ID, StateTriaging, "system", nil)
 
 	lease := time.Now().Add(-time.Minute) // 已过期
@@ -464,17 +464,17 @@ func TestMachineListOpenPRTasks(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	withPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-8001"})
+	withPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8001"})
 	toPROpen(t, m, withPR.ID)
 	if err := m.SetPRNumber(ctx, withPR.ID, 101); err != nil {
 		t.Fatalf("SetPRNumber 失败: %v", err)
 	}
 
-	withoutPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-8002"})
+	withoutPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8002"})
 	toPROpen(t, m, withoutPR.ID)
 	// 故意不调 SetPRNumber：模拟 pr_number 尚未落库的窗口期
 
-	stillQueued, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-8003"})
+	stillQueued, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8003"})
 	if err := m.SetPRNumber(ctx, stillQueued.ID, 103); err != nil {
 		// pr_number 与状态无关联，此处仅验证 SetPRNumber 本身不会因状态而拒绝
 		t.Fatalf("SetPRNumber 失败: %v", err)
@@ -515,7 +515,7 @@ func TestMachineHasLiveDependentOnBranch(t *testing.T) {
 
 	branch := "lathe/cr-9001-fix"
 	live, err := m.Create(ctx, CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-9002",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-9002",
 		BaseRef: ptr(branch),
 	})
 	if err != nil {

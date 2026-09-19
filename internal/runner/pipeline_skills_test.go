@@ -29,7 +29,7 @@ func TestPipelineSkillsMaterializedAndExcludedFromGit(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestPipelineSkillMissingFailsTaskWithReadableReason(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "test",
 	})
 	if err == nil {
 		t.Fatal("声明不存在的技能应导致 Execute 返回错误")
@@ -207,7 +207,7 @@ func TestPipelineSkillMissingSurvivesRetryAsResume(t *testing.T) {
 
 	// ---- 第一次执行：技能缺失，按预期失败 ----
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "test",
 	}); err == nil {
 		t.Fatal("首次 Execute 应因技能缺失失败")
 	}
@@ -267,7 +267,7 @@ func TestPipelineSkillMissingSurvivesRetryAsResume(t *testing.T) {
 	// ---- 第二次执行：等价于 queue.go runOneClaimed 把决策喂给
 	// pipeline.Execute ----
 	execErr := p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "test",
 		Retry: &plan,
 	})
 

@@ -390,7 +390,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 	// 「实际删掉了什么」（dir_removed / branch_deleted），让事件流里那条
 	// 记录能独立回答「现场是谁在什么时候按什么规则删的、删成了什么样」。
 	reason := map[string]any{
-		"issue":       tk.LinearIssueKey,
+		"issue":       tk.ExternalKey,
 		"state":       string(tk.State),
 		"path":        path,
 		"branch":      branch,
@@ -408,7 +408,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 	// 提交而被保留。日志里说清楚这件事，别让人以为干跑等于精确预演。
 	if r.DryRun {
 		slog.Info("[干跑] 本轮会回收超期现场（不删任何东西；实跑时脏现场与未推送分支仍会被保留）",
-			"task", tk.ID, "issue", tk.LinearIssueKey, "state", tk.State,
+			"task", tk.ID, "issue", tk.ExternalKey, "state", tk.State,
 			"path", path, "branch", branch,
 			"理由", reason["rule"], "cutoff", reason["cutoff"])
 		return ReapSkipped // 干跑不改任何状态，不算回收
@@ -487,7 +487,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 		// 可保护，走 Discard 清掉残留的分支与注册。
 	} else if state.Dirty {
 		slog.Warn("工作区有未提交改动，保留现场不删（D4：人可能正要接手）",
-			"task", tk.ID, "path", path, "issue", tk.LinearIssueKey,
+			"task", tk.ID, "path", path, "issue", tk.ExternalKey,
 			"branch", branch,
 			"提示", "处理掉未提交改动后下一轮会正常回收；确认不要就手工删目录")
 		return ReapHeld
@@ -509,7 +509,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 	// 现在 Discard 返回实际做成了什么，日志也分成删前（即将删除 X，
 	// 因为 Y）与删后（真删掉了什么）两条。
 	slog.Info("即将删除超期现场",
-		"task", tk.ID, "issue", tk.LinearIssueKey, "state", tk.State,
+		"task", tk.ID, "issue", tk.ExternalKey, "state", tk.State,
 		"path", path, "branch", branch, "keep_branch", keepBranch,
 		"理由", "终态超期、无人认领、已校验认领")
 
@@ -563,7 +563,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 	}
 
 	slog.Info("已回收超期现场",
-		"task", tk.ID, "issue", tk.LinearIssueKey, "state", tk.State,
+		"task", tk.ID, "issue", tk.ExternalKey, "state", tk.State,
 		"path", path, "dir_removed", res.DirRemoved,
 		"branch_deleted", res.BranchDeleted, "keep_branch", keepBranch,
 		"errs", len(res.Errs))

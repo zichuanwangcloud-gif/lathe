@@ -106,7 +106,7 @@ func TestMergePollForcePushCacheTriggersRebaseFollowup(t *testing.T) {
 	ctx := context.Background()
 
 	task1, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "FP-1", LinearIssueID: "uuid-fp-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "FP-1", ExternalID: "uuid-fp-1",
 	})
 	if err != nil {
 		t.Fatalf("建 task1 失败: %v", err)
@@ -124,7 +124,7 @@ func TestMergePollForcePushCacheTriggersRebaseFollowup(t *testing.T) {
 	}
 
 	task2, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "FP-2", LinearIssueID: "uuid-fp-2",
+		UserID: userID, RepoID: repoID, ExternalKey: "FP-2", ExternalID: "uuid-fp-2",
 		DependsOn: &task1.ID,
 	})
 	if err != nil {
@@ -217,13 +217,13 @@ func TestMergePollForcePushCascadeReverifiesSuccessor(t *testing.T) {
 	ctx := context.Background()
 
 	task1, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "FPE-1", LinearIssueID: "uuid-fpe-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "FPE-1", ExternalID: "uuid-fpe-1",
 	})
 	if err != nil {
 		t.Fatalf("建 task1 失败: %v", err)
 	}
 	task2, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "FPE-2", LinearIssueID: "uuid-fpe-2",
+		UserID: userID, RepoID: repoID, ExternalKey: "FPE-2", ExternalID: "uuid-fpe-2",
 		DependsOn: &task1.ID,
 	})
 	if err != nil {
@@ -254,7 +254,7 @@ func TestMergePollForcePushCascadeReverifiesSuccessor(t *testing.T) {
 
 	// ---- task1、task2 走完整调度到 pr_open ----
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueID: "uuid-fpe-1", Actor: "node:test",
+		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueRef: "uuid-fpe-1", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task1 Execute 失败: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestMergePollForcePushCascadeReverifiesSuccessor(t *testing.T) {
 	repo2 := repo
 	repo2.BaseRefOverride = task1Branch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueID: "uuid-fpe-2", Actor: "node:test",
+		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueRef: "uuid-fpe-2", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task2 Execute 失败: %v", err)
 	}

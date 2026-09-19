@@ -19,7 +19,7 @@ func awaitingTask(t *testing.T, api *API, m *task.Machine, repoID int64, key str
 		t.Fatalf("查 repo 属主失败: %v", err)
 	}
 	tk, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: key, GateMode: task.GateManual,
+		UserID: userID, RepoID: repoID, ExternalKey: key, GateMode: task.GateManual,
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
@@ -107,7 +107,7 @@ func TestAPIApproveRejectsWrongState(t *testing.T) {
 
 	tk, err := m.Create(ctx, task.CreateParams{
 		UserID: mustUserOfRepo(t, api, repoID), RepoID: repoID,
-		LinearIssueKey: "CR-APPROVE-2",
+		ExternalKey: "CR-APPROVE-2",
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)

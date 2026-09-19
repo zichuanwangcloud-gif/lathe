@@ -203,14 +203,14 @@ func claimAndExecute(t *testing.T, m *task.Machine, repo RepoConfig, src string,
 	t.Helper()
 	p, ok := pipelines[tk.ID]
 	if !ok {
-		t.Fatalf("任务 %d（issue %s）没有配置流水线假件——测试固定数据与图不匹配", tk.ID, tk.LinearIssueKey)
+		t.Fatalf("任务 %d（issue %s）没有配置流水线假件——测试固定数据与图不匹配", tk.ID, tk.ExternalKey)
 	}
 	issueID := ""
-	if tk.LinearIssueID != nil {
-		issueID = *tk.LinearIssueID
+	if tk.ExternalID != nil {
+		issueID = *tk.ExternalID
 	}
 	return p.Execute(context.Background(), ExecuteParams{
-		TaskID: tk.ID, Repo: repo, CloneURL: src, IssueID: issueID, Actor: "node:test",
+		TaskID: tk.ID, Repo: repo, CloneURL: src, IssueRef: issueID, Actor: "node:test",
 	})
 }
 
@@ -233,7 +233,7 @@ func drainScheduler(t *testing.T, m *task.Machine, repo RepoConfig, src string, 
 			// 与 cmd/lathe/queue.go 的 runOneClaimed 同一立场：Execute
 			// 失败已经在 pipeline 内部走完 D4 三件套（回帖+留现场+
 			// 通知+失败传播），这里只记录，不重试、不人工介入。
-			t.Logf("任务 %d（issue %s）Execute 返回错误（可能是本场景故意安排的失败）: %v", tk.ID, tk.LinearIssueKey, err)
+			t.Logf("任务 %d（issue %s）Execute 返回错误（可能是本场景故意安排的失败）: %v", tk.ID, tk.ExternalKey, err)
 		}
 	}
 	t.Fatalf("调度循环超过 50 轮仍未收敛，疑似死循环")
@@ -304,7 +304,7 @@ func TestM1OrchestrationHappyPathZeroHumanIntervention(t *testing.T) {
 	if extra, err := m.ClaimReady(ctx, time.Minute); err != nil {
 		t.Fatalf("第 4 次 ClaimReady 失败: %v", err)
 	} else if extra != nil {
-		t.Fatalf("此刻只有 3 个独立根应就绪，却又领到了任务 %d（issue %s）", extra.ID, extra.LinearIssueKey)
+		t.Fatalf("此刻只有 3 个独立根应就绪，却又领到了任务 %d（issue %s）", extra.ID, extra.ExternalKey)
 	}
 
 	gotRoots := map[int64]bool{}
@@ -332,7 +332,7 @@ func TestM1OrchestrationHappyPathZeroHumanIntervention(t *testing.T) {
 	ghs := map[int64]*fakeGitHub{}
 	pipelines := map[int64]*Pipeline{}
 	for i, tk := range created {
-		lin := &fakeLinear{issue: fakeIssueFor(tk.LinearIssueKey)}
+		lin := &fakeLinear{issue: fakeIssueFor(tk.ExternalKey)}
 		gh := &fakeGitHub{pr: &github.PullRequest{
 			Number: 100 + i,
 			URL:    fmt.Sprintf("https://github.com/acme/demo/pull/%d", 100+i),
@@ -348,7 +348,7 @@ func TestM1OrchestrationHappyPathZeroHumanIntervention(t *testing.T) {
 	// 次数 = 0"。
 	for _, tk := range rootClaims {
 		if err := claimAndExecute(t, m, repo, src, pipelines, tk); err != nil {
-			t.Fatalf("独立根任务 %d（issue %s）执行应成功，得到 %v", tk.ID, tk.LinearIssueKey, err)
+			t.Fatalf("独立根任务 %d（issue %s）执行应成功，得到 %v", tk.ID, tk.ExternalKey, err)
 		}
 	}
 	drainScheduler(t, m, repo, src, pipelines)
@@ -360,10 +360,10 @@ func TestM1OrchestrationHappyPathZeroHumanIntervention(t *testing.T) {
 			t.Fatalf("读取任务 %d 失败: %v", tk.ID, err)
 		}
 		if final.State != task.StatePROpen {
-			t.Errorf("任务 %d（issue %s）终态 = %s，期望 pr_open", tk.ID, tk.LinearIssueKey, final.State)
+			t.Errorf("任务 %d（issue %s）终态 = %s，期望 pr_open", tk.ID, tk.ExternalKey, final.State)
 		}
 		if final.PRURL == nil || *final.PRURL == "" {
-			t.Errorf("任务 %d（issue %s）应落库 PR URL", tk.ID, tk.LinearIssueKey)
+			t.Errorf("任务 %d（issue %s）应落库 PR URL", tk.ID, tk.ExternalKey)
 		}
 	}
 
@@ -467,7 +467,7 @@ func TestM1OrchestrationPredecessorFailureBlocksSuccessorsWithComment(t *testing
 	}
 
 	pipelines := map[int64]*Pipeline{}
-	lin1 := &fakeLinear{issue: fakeIssueFor(task1.LinearIssueKey)}
+	lin1 := &fakeLinear{issue: fakeIssueFor(task1.ExternalKey)}
 	// task1：必然验证失败的短路 agent —— 这是本场景对"杀掉前驱"的
 	// 模拟：不是测试代码手工把任务判死，而是让真实的验证逻辑判它失败。
 	pipelines[task1.ID] = orchestrationPipeline(m, wm, lin1, &fakeGitHub{}, deterministicFailingAgent())
@@ -478,7 +478,7 @@ func TestM1OrchestrationPredecessorFailureBlocksSuccessorsWithComment(t *testing
 	// 会在这里直接 t.Fatalf，而不是安静地用某个默认假件把它们跑通。
 
 	for i, tk := range []*task.Task{task4, task5, task6} {
-		lin := &fakeLinear{issue: fakeIssueFor(tk.LinearIssueKey)}
+		lin := &fakeLinear{issue: fakeIssueFor(tk.ExternalKey)}
 		gh := &fakeGitHub{pr: &github.PullRequest{
 			Number: 200 + i,
 			URL:    fmt.Sprintf("https://github.com/acme/demo/pull/%d", 200+i),
@@ -528,7 +528,7 @@ func TestM1OrchestrationPredecessorFailureBlocksSuccessorsWithComment(t *testing
 			t.Fatalf("读取任务 %d 失败: %v", tk.ID, err)
 		}
 		if final.State != task.StatePROpen {
-			t.Errorf("任务 %d（issue %s）终态 = %s，期望 pr_open（不应受 task1 失败连累）", tk.ID, tk.LinearIssueKey, final.State)
+			t.Errorf("任务 %d（issue %s）终态 = %s，期望 pr_open（不应受 task1 失败连累）", tk.ID, tk.ExternalKey, final.State)
 		}
 	}
 
@@ -539,21 +539,21 @@ func TestM1OrchestrationPredecessorFailureBlocksSuccessorsWithComment(t *testing
 		seen[issueID] = lin1.comments[i]
 	}
 	for _, tk := range []*task.Task{task2, task3} {
-		if tk.LinearIssueID == nil {
-			t.Fatalf("任务 %d 缺少 LinearIssueID，回帖断言无法进行", tk.ID)
+		if tk.ExternalID == nil {
+			t.Fatalf("任务 %d 缺少 ExternalID，回帖断言无法进行", tk.ID)
 		}
-		body, ok := seen[*tk.LinearIssueID]
+		body, ok := seen[*tk.ExternalID]
 		if !ok {
 			t.Errorf("issue %s（任务 %d）未收到阻塞回帖，实际回帖: %v (issues=%v)",
-				*tk.LinearIssueID, tk.ID, lin1.comments, lin1.commentIssueIDs)
+				*tk.ExternalID, tk.ID, lin1.comments, lin1.commentIssueIDs)
 			continue
 		}
 		if !strings.Contains(body, "阻塞") && !strings.Contains(body, "blocked_dep") {
-			t.Errorf("issue %s 的回帖内容没有阻塞相关字样: %s", *tk.LinearIssueID, body)
+			t.Errorf("issue %s 的回帖内容没有阻塞相关字样: %s", *tk.ExternalID, body)
 		}
-		if !strings.Contains(body, task1.LinearIssueKey) && !strings.Contains(body, fmt.Sprintf("#%d", task1.ID)) {
+		if !strings.Contains(body, task1.ExternalKey) && !strings.Contains(body, fmt.Sprintf("#%d", task1.ID)) {
 			t.Errorf("issue %s 的回帖内容未指明是被前驱任务 %d/issue %s 连累: %s",
-				*tk.LinearIssueID, task1.ID, task1.LinearIssueKey, body)
+				*tk.ExternalID, task1.ID, task1.ExternalKey, body)
 		}
 	}
 }
@@ -641,7 +641,7 @@ func TestM1Orchestration10NodeGraphZeroHumanIntervention(t *testing.T) {
 	lins := map[int64]*fakeLinear{}
 	ghs := map[int64]*fakeGitHub{}
 	for i, tk := range created {
-		lin := &fakeLinear{issue: fakeIssueFor(tk.LinearIssueKey)}
+		lin := &fakeLinear{issue: fakeIssueFor(tk.ExternalKey)}
 		gh := &fakeGitHub{pr: &github.PullRequest{
 			Number: 300 + i,
 			URL:    fmt.Sprintf("https://github.com/acme/demo/pull/%d", 300+i),
@@ -661,10 +661,10 @@ func TestM1Orchestration10NodeGraphZeroHumanIntervention(t *testing.T) {
 			t.Fatalf("读取任务 %d 失败: %v", tk.ID, err)
 		}
 		if final.State != task.StatePROpen {
-			t.Errorf("任务 %d（issue %s）终态 = %s，期望 pr_open", tk.ID, tk.LinearIssueKey, final.State)
+			t.Errorf("任务 %d（issue %s）终态 = %s，期望 pr_open", tk.ID, tk.ExternalKey, final.State)
 		}
 		if final.PRURL == nil || *final.PRURL == "" {
-			t.Errorf("任务 %d（issue %s）应落库 PR URL", tk.ID, tk.LinearIssueKey)
+			t.Errorf("任务 %d（issue %s）应落库 PR URL", tk.ID, tk.ExternalKey)
 		}
 	}
 

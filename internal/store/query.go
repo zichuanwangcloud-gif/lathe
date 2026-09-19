@@ -20,7 +20,10 @@ var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
 type TaskRow struct {
 	ID             int64   `json:"id"`
 	UserID         int64   `json:"userId"`
-	LinearIssueKey string  `json:"linearIssueKey"`
+	ExternalKey string  `json:"externalKey"`
+	// TrackerProvider 是需求来源平台（'linear' | 'internal'）；
+	// 前端据此把 key 渲染成 Linear 链接或内置工单页链接。
+	TrackerProvider string `json:"trackerProvider"`
 	State          string  `json:"state"`
 	TaskKind       *string `json:"taskKind"`
 	VerifyTier     *string `json:"verifyTier"`
@@ -83,7 +86,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
+		SELECT t.id, t.user_id, t.external_key, t.tracker_provider, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
@@ -102,7 +105,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 	for rows.Next() {
 		var t TaskRow
 		if err := rows.Scan(
-			&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
+			&t.ID, &t.UserID, &t.ExternalKey, &t.TrackerProvider, &t.State, &t.TaskKind, &t.VerifyTier,
 			&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
 			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 			&t.AgentSessionID, &t.LeaseExpiresAt,
@@ -150,7 +153,7 @@ type TaskDetail struct {
 func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, error) {
 	var t TaskRow
 	err := s.pool.QueryRow(ctx, `
-		SELECT t.id, t.user_id, t.linear_issue_key, t.state, t.task_kind, t.verify_tier,
+		SELECT t.id, t.user_id, t.external_key, t.tracker_provider, t.state, t.task_kind, t.verify_tier,
 		       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
 		       r.provider_repo, COALESCE(r.baseline_dir, ''), t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
@@ -158,7 +161,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		FROM tasks t JOIN repos r ON r.id = t.repo_id
 		WHERE t.id = $1 AND t.user_id = $2`, id, userID,
 	).Scan(
-		&t.ID, &t.UserID, &t.LinearIssueKey, &t.State, &t.TaskKind, &t.VerifyTier,
+		&t.ID, &t.UserID, &t.ExternalKey, &t.TrackerProvider, &t.State, &t.TaskKind, &t.VerifyTier,
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
 		&t.ProviderRepo, &t.BaselineDir, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,

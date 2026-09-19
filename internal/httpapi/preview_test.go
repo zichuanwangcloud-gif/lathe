@@ -66,7 +66,7 @@ func previewFixture(t *testing.T, fp *fakePreviews) (srv *httptest.Server, st *s
 		t.Fatal(err)
 	}
 	tk, err := m.Create(context.Background(), task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PV-" + t.Name(),
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-PV-" + t.Name(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestPreviewWorktreeMissing409(t *testing.T) {
 	var repoID int64
 	_ = st.Pool().QueryRow(context.Background(), `SELECT id FROM repos WHERE user_id=$1`, userID).Scan(&repoID)
 	tk, err := m.Create(context.Background(), task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PV2-" + t.Name(),
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-PV2-" + t.Name(),
 	})
 	if err != nil {
 		t.Fatal(err)

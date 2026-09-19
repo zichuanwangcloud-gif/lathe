@@ -13,6 +13,7 @@ import (
 
 	"github.com/Clouditera/lathe/internal/store"
 	"github.com/Clouditera/lathe/internal/task"
+	"github.com/Clouditera/lathe/internal/tracker"
 )
 
 // ErrIssueActive 表示批次里某个 issue 已经有一个"活着"的任务
@@ -235,11 +236,14 @@ func (s *Service) CreateFlow(ctx context.Context, ownerUserID, repoID int64, nam
 		}
 
 		t, err := s.Tasks.Create(ctx, task.CreateParams{
-			UserID:         ownerUserID,
-			RepoID:         repoID,
-			LinearIssueKey: issueKey,
-			LinearIssueID:  issueID,
-			FlowID:         &flowID,
+			UserID:      ownerUserID,
+			RepoID:      repoID,
+			ExternalKey: issueKey,
+			ExternalID:  issueID,
+			// 编排图当前只有 Linear 节点（画布也只接 Linear 选单）；
+			// 内置工单进图是 09 的 P3，届时 flows 表才加 provider 列。
+			TrackerProvider: tracker.ProviderLinear,
+			FlowID:          &flowID,
 			DependsOn:      dependsOn,
 			DependsOnAt:    n.DependsOnAt,
 			Priority:       n.Priority,
@@ -397,7 +401,7 @@ func sameBatch(existing []*task.Task, nodes []NodeInput) bool {
 		if key == "" {
 			key = n.IssueID
 		}
-		if existing[i].LinearIssueKey != key {
+		if existing[i].ExternalKey != key {
 			return false
 		}
 		wantDep := n.DependsOnIndex

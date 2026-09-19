@@ -173,7 +173,7 @@ func serve(cfg config.Config) error {
 		LinearWebhookSecret: cfg.LinearWebhookSecret,
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
-	}, admin.ID)
+	}, admin.ID, st)
 
 	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory)
 	if err != nil {
@@ -328,13 +328,19 @@ func serve(cfg config.Config) error {
 			if err != nil {
 				return ""
 			}
-			key := detail.Task.LinearIssueKey
-			lin, err := factory.ProviderFor(userID).Linear(ctx)
+			key := detail.Task.ExternalKey
+			clients, err := factory.ForUser(ctx, userID)
 			if err != nil {
-				return key // Linear 未配置：只用 key，推荐质量降级不挡路
+				return key
 			}
-			// Linear 的 issue 查询同时接受 UUID 与 identifier
-			issue, err := lin.Issue(ctx, key)
+			// 需求平台按任务行分派：内置工单直接读库，Linear 走凭据。
+			// 平台不可用时只用 key，推荐质量降级不挡路。
+			tr, err := clients.Tracker(ctx, detail.Task.TrackerProvider)
+			if err != nil {
+				return key
+			}
+			// Linear 的 issue 查询同时接受 UUID 与 identifier；内置按 key 定位
+			issue, err := tr.Issue(ctx, key)
 			if err != nil {
 				return key
 			}

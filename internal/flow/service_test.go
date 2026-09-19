@@ -279,7 +279,7 @@ func TestServiceCreateFlowRejectsWhenIssueActiveOutsideFlow(t *testing.T) {
 
 	issueKey := "T-taken-" + t.Name()
 	if _, err := m.Create(context.Background(), task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: issueKey,
+		UserID: userID, RepoID: repoID, ExternalKey: issueKey,
 	}); err != nil {
 		t.Fatalf("预置活任务失败: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestServiceCreateFlowCompensatesOnMidBatchFailure(t *testing.T) {
 
 	takenKey := "T-mid-taken-" + t.Name()
 	if _, err := m.Create(context.Background(), task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: takenKey,
+		UserID: userID, RepoID: repoID, ExternalKey: takenKey,
 	}); err != nil {
 		t.Fatalf("预置活任务失败: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestServiceCreateFlowCompensatesOnMidBatchFailure(t *testing.T) {
 
 	var state string
 	if err := pool.QueryRow(context.Background(),
-		`SELECT state FROM tasks WHERE user_id = $1 AND linear_issue_key = $2`,
+		`SELECT state FROM tasks WHERE user_id = $1 AND external_key = $2`,
 		userID, "T-mid-ok-"+t.Name()).Scan(&state); err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestGetFlowNotFoundForOtherUser(t *testing.T) {
 // 修复前，detectDuplicateSubmission 的查重查询与后续建 flow/建 tasks
 // 之间没有互斥：所有 goroutine 几乎同时执行查重，都查到"还没有人建过"，
 // 于是全部各自往下建，产生多个孤儿 flow，只有 1 个能成功、其余全部撞
-// tasks_one_active_per_issue 唯一索引收到裸的 ErrIssueActive。
+// tasks_one_active_per_item 唯一索引收到裸的 ErrIssueActive。
 //
 // 修复后（acquireSubmissionLock 咨询锁），并发提交应该只有 1 个
 // goroutine 真正建库，其余全部阻塞到它建完、释放锁之后，在查重阶段

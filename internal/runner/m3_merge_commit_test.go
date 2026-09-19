@@ -31,13 +31,13 @@ func TestM3MergeCommitCascadeConverges(t *testing.T) {
 	ctx := context.Background()
 
 	task1, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "M3M-1", LinearIssueID: "uuid-m3m-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "M3M-1", ExternalID: "uuid-m3m-1",
 	})
 	if err != nil {
 		t.Fatalf("建 task1 失败: %v", err)
 	}
 	task2, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "M3M-2", LinearIssueID: "uuid-m3m-2",
+		UserID: userID, RepoID: repoID, ExternalKey: "M3M-2", ExternalID: "uuid-m3m-2",
 		DependsOn: &task1.ID,
 	})
 	if err != nil {
@@ -68,7 +68,7 @@ func TestM3MergeCommitCascadeConverges(t *testing.T) {
 
 	// ---- task1、task2 走完整调度到 pr_open（task2 栈在 task1 上）----
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueID: "uuid-m3m-1", Actor: "node:test",
+		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueRef: "uuid-m3m-1", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task1 Execute 失败: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestM3MergeCommitCascadeConverges(t *testing.T) {
 	repo2 := repo
 	repo2.BaseRefOverride = task1Branch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueID: "uuid-m3m-2", Actor: "node:test",
+		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueRef: "uuid-m3m-2", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task2 Execute 失败: %v", err)
 	}

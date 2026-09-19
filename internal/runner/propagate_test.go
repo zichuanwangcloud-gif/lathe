@@ -33,7 +33,7 @@ func TestPipelineFailurePropagatesBlockedDep(t *testing.T) {
 
 	task2, err := m.Create(ctx, task.CreateParams{
 		UserID: tk1.UserID, RepoID: tk1.RepoID,
-		LinearIssueKey: "CR-778", LinearIssueID: "issue-778",
+		ExternalKey: "CR-778", ExternalID: "issue-778",
 		DependsOn: &task1ID,
 	})
 	if err != nil {
@@ -41,7 +41,7 @@ func TestPipelineFailurePropagatesBlockedDep(t *testing.T) {
 	}
 	task3, err := m.Create(ctx, task.CreateParams{
 		UserID: tk1.UserID, RepoID: tk1.RepoID,
-		LinearIssueKey: "CR-779", LinearIssueID: "issue-779",
+		ExternalKey: "CR-779", ExternalID: "issue-779",
 		DependsOn: &task2.ID,
 	})
 	if err != nil {
@@ -55,7 +55,7 @@ func TestPipelineFailurePropagatesBlockedDep(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err = p.Execute(ctx, ExecuteParams{
-		TaskID: task1ID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: task1ID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("task1 拉 issue 失败应返回错误")
@@ -117,7 +117,7 @@ func TestPipelineFailurePropagationNoopForRoot(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("拉 issue 失败应返回错误")
@@ -146,7 +146,7 @@ func TestPipelineSuccessWakesBlockedSuccessor(t *testing.T) {
 
 	task2, err := m.Create(ctx, task.CreateParams{
 		UserID: tk1.UserID, RepoID: tk1.RepoID,
-		LinearIssueKey: "CR-780", LinearIssueID: "issue-780",
+		ExternalKey: "CR-780", ExternalID: "issue-780",
 		DependsOn: &task1ID,
 	})
 	if err != nil {
@@ -184,7 +184,7 @@ func TestPipelineSuccessWakesBlockedSuccessor(t *testing.T) {
 	p.SettingSources = "project"
 
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: task1ID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: task1ID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}

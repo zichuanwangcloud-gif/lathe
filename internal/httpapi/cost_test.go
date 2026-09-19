@@ -19,7 +19,7 @@ func TestAPICostStats(t *testing.T) {
 		t.Fatalf("查属主失败: %v", err)
 	}
 	tk, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-COST-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-COST-1",
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)

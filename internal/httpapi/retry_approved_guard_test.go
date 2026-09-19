@@ -34,7 +34,7 @@ func TestAPIRetryRejectsApprovedMode(t *testing.T) {
 
 	// 一条普通的失败任务：有可用现场，只要 mode 能通过校验就会走 EntryPush。
 	tk, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-APPROVED-GUARD",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-APPROVED-GUARD",
 	})
 	if err != nil {
 		t.Fatal(err)
