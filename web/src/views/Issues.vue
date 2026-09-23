@@ -2,6 +2,7 @@
 import { ref, onMounted, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, formatTime } from '../api'
+import BaseDialog from '../components/BaseDialog.vue'
 
 // 工单页（docs/09-internal-issues.md）：手动维护的需求列表。
 // 不依赖 Linear —— 在这里建单、写需求，开跑后任务流向「任务看板」。
@@ -98,7 +99,7 @@ onMounted(load)
       <button class="primary" @click="openCreate">新建工单</button>
     </div>
 
-    <div v-if="error" class="error-banner">{{ error }}</div>
+    <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
     <div class="card toolbar-row" style="margin-bottom: 12px">
       <label class="row" style="gap: 6px">
@@ -135,54 +136,44 @@ onMounted(load)
       </table>
     </div>
 
-    <!-- 新建对话框 -->
-    <div v-if="showCreate" class="overlay" @click.self="showCreate = false">
-      <div class="card dialog">
-        <h3 style="margin-top: 0">新建工单</h3>
-        <div v-if="createError" class="error-banner">{{ createError }}</div>
-        <div v-if="!repos.length" class="empty">
-          你名下还没有仓库 —— 先到「仓库配置」页登记一个，工单需要知道任务在哪个仓库上执行。
-        </div>
-        <template v-else>
-          <label class="field">
-            <span>仓库</span>
-            <select v-model="createForm.repoId">
-              <option v-for="r in repos" :key="r.id" :value="r.id">{{ r.providerRepo }}</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>标题</span>
-            <input v-model="createForm.title" placeholder="一句话说清要干什么" />
-          </label>
-          <label class="field">
-            <span>需求描述（markdown，可后补）</span>
-            <textarea v-model="createForm.description" rows="8"
-              placeholder="现象 / 期望行为 / 复现步骤。写不清的话 agent 会在评论区提问。"></textarea>
-          </label>
-          <label class="field">
-            <span>优先级（数值大的先被调度，0 为默认）</span>
-            <input v-model.number="createForm.priority" type="number" style="width: 120px" />
-          </label>
-          <div class="row" style="justify-content: flex-end; gap: 8px">
-            <button @click="showCreate = false">取消</button>
-            <button class="primary" :disabled="creating || !createForm.title.trim()" @click="submitCreate">
-              {{ creating ? '创建中…' : '创建' }}
-            </button>
-          </div>
-        </template>
+    <!-- 新建对话框：基座管 Escape/焦点/aria，这里只留业务字段 -->
+    <BaseDialog v-if="showCreate" label-id="create-issue-title" @close="showCreate = false">
+      <h3 id="create-issue-title" style="margin-top: 0">新建工单</h3>
+      <div v-if="createError" role="alert" class="error-banner">{{ createError }}</div>
+      <div v-if="!repos.length" class="empty">
+        你名下还没有仓库 —— 先到「仓库配置」页登记一个，工单需要知道任务在哪个仓库上执行。
       </div>
-    </div>
+      <template v-else>
+        <label class="field">
+          <span>仓库</span>
+          <select v-model="createForm.repoId">
+            <option v-for="r in repos" :key="r.id" :value="r.id">{{ r.providerRepo }}</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>标题</span>
+          <input v-model="createForm.title" placeholder="一句话说清要干什么" data-autofocus />
+        </label>
+        <label class="field">
+          <span>需求描述（markdown，可后补）</span>
+          <textarea v-model="createForm.description" rows="8"
+            placeholder="现象 / 期望行为 / 复现步骤。写不清的话 agent 会在评论区提问。"></textarea>
+        </label>
+        <label class="field">
+          <span>优先级（数值大的先被调度，0 为默认）</span>
+          <input v-model.number="createForm.priority" type="number" style="width: 120px" />
+        </label>
+        <div class="row" style="justify-content: flex-end; gap: 8px">
+          <button @click="showCreate = false">取消</button>
+          <button class="primary" :disabled="creating || !createForm.title.trim()" @click="submitCreate">
+            {{ creating ? '创建中…' : '创建' }}
+          </button>
+        </div>
+      </template>
+    </BaseDialog>
   </div>
 </template>
 
 <style scoped>
-.field { display: block; margin: 10px 0; }
-.field > span { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
 .toolbar-row { display: flex; align-items: center; padding: 8px 12px; }
-.overlay {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.5);
-  display: flex; align-items: flex-start; justify-content: center;
-  padding: 6vh 16px; z-index: 100;
-}
-.dialog { width: 560px; max-width: 100%; max-height: 84vh; overflow-y: auto; }
 </style>

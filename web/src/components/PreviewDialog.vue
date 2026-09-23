@@ -6,6 +6,7 @@
 // 弹窗就是「跑起来给我看看」的入口。
 import { ref, computed, watch, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { api, UnauthorizedError } from '../api'
+import BaseDialog from './BaseDialog.vue'
 
 const props = defineProps({
   task: { type: Object, required: true }, // { id, externalKey }
@@ -301,14 +302,13 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="overlay" @click.self="emit('close')">
-    <div class="dialog card">
-      <div class="spread">
-        <h2>预览环境 · <span class="mono">{{ task.externalKey }}</span></h2>
-        <button class="close" @click="emit('close')">✕</button>
-      </div>
+  <BaseDialog label-id="preview-dialog-title" width="640px" @close="emit('close')">
+    <div class="spread">
+      <h2 id="preview-dialog-title">预览环境 · <span class="mono">{{ task.externalKey }}</span></h2>
+      <button class="close" aria-label="关闭" @click="emit('close')">✕</button>
+    </div>
 
-      <div v-if="error" class="error-banner small">{{ error }}</div>
+      <div v-if="error" role="alert" class="error-banner small">{{ error }}</div>
 
       <!-- 资源水位：超阈值时禁启动（系统设置可配阈值） -->
       <div v-if="resources" class="meters">
@@ -332,13 +332,13 @@ onUnmounted(() => {
           <span class="mono">{{ resources.diskUsedPct }}%</span>
           <span class="faint">阈值 {{ resources.diskThreshold }}%</span>
         </div>
-        <div v-if="!resources.allowed" class="error-banner small" style="grid-column: 1 / -1">
+        <div v-if="!resources.allowed" role="alert" class="error-banner small" style="grid-column: 1 / -1">
           {{ resources.reason }} —— 已禁止启动新预览（阈值见「系统设置」）
         </div>
       </div>
 
       <!-- 构建成功提示：从「构建中」回到列表的变化太微妙，必须明说 -->
-      <div v-if="justStarted" class="success-banner">
+      <div v-if="justStarted" role="status" class="success-banner">
         ✓ 构建完成，服务已启动。点下方链接打开验证；用完记得「停止并清理」。
       </div>
 
@@ -364,7 +364,7 @@ onUnmounted(() => {
         <pre v-if="op?.progress" ref="logEl" class="buildlog mono">{{ op.progress }}</pre>
         <button class="danger" :disabled="busy" @click="stop">取消构建并清理</button>
       </div>
-      <div v-else-if="op?.state === 'failed'" class="error-banner small">
+      <div v-else-if="op?.state === 'failed'" role="alert" class="error-banner small">
         上次启动失败：{{ op.error }}
       </div>
 
@@ -396,7 +396,7 @@ onUnmounted(() => {
           <div v-if="rec.result.notes" class="rec-notes">⚠ {{ rec.result.notes }}</div>
           <button class="primary" :disabled="building" @click="adoptRecommendation">采用推荐（自动勾选并预填）</button>
         </div>
-        <div v-else-if="rec?.state === 'failed'" class="error-banner small">
+        <div v-else-if="rec?.state === 'failed'" role="alert" class="error-banner small">
           AI 推荐失败：{{ rec.error }}（仍可手工选择）
         </div>
 
@@ -467,27 +467,10 @@ onUnmounted(() => {
           {{ building ? '构建中……' : `启动选中的 ${selectedCount} 个服务` }}
         </button>
       </div>
-    </div>
-  </div>
+  </BaseDialog>
 </template>
 
 <style scoped>
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding: 6vh 16px;
-  z-index: 100;
-}
-.dialog {
-  width: 640px;
-  max-width: 100%;
-  max-height: 84vh;
-  overflow-y: auto;
-}
 h2 { font-size: 16px; margin: 0; }
 .close { border: none; background: none; font-size: 15px; padding: 2px 8px; }
 
