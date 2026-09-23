@@ -19,6 +19,7 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/02-design.md](docs/02-design.md) | 系统设计：状态机、数据模型、验证设计、调度 |
 | [docs/03-tech-stack.md](docs/03-tech-stack.md) | 技术选型与理由 |
 | [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
+| [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
 
 ## 技术栈
 

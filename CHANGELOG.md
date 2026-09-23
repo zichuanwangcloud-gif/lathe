@@ -27,6 +27,16 @@
 - `make test-ci`：按 CI 的严格口径跑测试
 - `.golangci.yml`：golangci-lint 配置，`new-from-rev` 只卡新增改动
 - [docs/09-ci.md](docs/09-ci.md)：CI 设计说明
+- **模糊任务 PRD 规划**（[docs/10-prd-template.md](docs/10-prd-template.md)）：需求不清楚的单子
+  先走多轮对话产出结构化 PRD，人逐节签字后再一键生成任务。`prds` / `prd_rounds` /
+  `prd_events` 三张表 + `internal/prd` + HTTP API + 「模糊任务」界面
+- 一键生成（§4.3）：approved 的 PRD 按任务块建内置工单、按依赖连成编排图入队。
+  工单正文带上该任务要交付的 **AC 全文**而不只是编号 —— 实现 agent 看不到 PRD，
+  只写「满足 AC-3」等于没写
+- 定稿闸门：自检清单不过则拒绝进评审（可追溯闭环、AC 必须可执行、未决问题清零、
+  每节都要人确认过），并跑一次对抗复核让另一个 agent 专门找 AC 的洞
+- `repos.prd_task_max_lines` / `prd_task_max_files`：PRD 拆出的单任务量级上限
+  （出厂 400 行 / 8 文件），消费方是定稿自检 —— 超限即拒绝进评审
 
 ### Changed
 
