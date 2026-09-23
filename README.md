@@ -18,6 +18,7 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/01-decisions.md](docs/01-decisions.md) | D1–D4 核心决策（验证标准／触发方式／并发／失败处理） |
 | [docs/02-design.md](docs/02-design.md) | 系统设计：状态机、数据模型、验证设计、调度 |
 | [docs/03-tech-stack.md](docs/03-tech-stack.md) | 技术选型与理由 |
+| [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
 
 ## 技术栈
 
@@ -34,6 +35,12 @@ make build        # 编译
 make test         # 测试
 make run          # 起控制面
 ```
+
+`make test` 在库连不上时会跳过所有数据库测试，方便在没起基础设施的环境里跑纯逻辑
+测试。想按 CI 的口径验一遍（库连不上直接失败）用 `make test-ci`。
+
+推 PR 前本地过一遍 `make lint && make test-ci`，与 CI 的判定一致。详见
+[docs/09-ci.md](docs/09-ci.md)。
 
 ## 跑起来
 

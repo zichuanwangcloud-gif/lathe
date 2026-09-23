@@ -4,40 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/testsupport"
 )
 
-// testPool 连接测试库；连不上就跳过（同 internal/task/machine_test.go 的手法）。
+// testPool 连接测试库；本地连不上就跳过，CI 下（LATHE_TEST_REQUIRE_DB）直接失败。
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-
-	dsn := os.Getenv("LATHE_TEST_DSN")
-	if dsn == "" {
-		dsn = "postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Skipf("跳过数据库测试（连接池创建失败）: %v", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Skipf("跳过数据库测试（Ping 失败，先 make dev-infra && make migrate）: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return testsupport.Pool(t)
 }
 
 // testStore 打开一个 *store.Store（与 testPool 连同一个测试库，但走
@@ -47,17 +28,12 @@ func testPool(t *testing.T) *pgxpool.Pool {
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
 
-	dsn := os.Getenv("LATHE_TEST_DSN")
-	if dsn == "" {
-		dsn = "postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := testsupport.ConnectContext(t)
 	defer cancel()
 
-	st, err := store.Open(ctx, dsn)
+	st, err := store.Open(ctx, testsupport.DSN())
 	if err != nil {
-		t.Skipf("跳过数据库测试（连接池创建失败）: %v", err)
+		testsupport.SkipOrFail(t, "打开 store 失败: %v", err)
 	}
 	t.Cleanup(st.Close)
 	return st
@@ -74,31 +50,7 @@ func testStore(t *testing.T) *store.Store {
 // 让测试断言的是咨询锁本身的正确性，不是连接池容量。
 func testConcurrentPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-
-	dsn := os.Getenv("LATHE_TEST_DSN")
-	if dsn == "" {
-		dsn = "postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable"
-	}
-
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		t.Skipf("跳过数据库测试（解析 DSN 失败）: %v", err)
-	}
-	cfg.MaxConns = 40
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Skipf("跳过数据库测试（连接池创建失败）: %v", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Skipf("跳过数据库测试（Ping 失败，先 make dev-infra && make migrate）: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return testsupport.PoolWithMaxConns(t, 40)
 }
 
 // fixture 建一对独立的 user/repo，测试结束一并清掉其名下数据。

@@ -1,0 +1,39 @@
+# golangci-lint 配置（v2 格式）。
+#
+# 宽松起步：存量代码从未跑过这些检查，一次性全量强制会先堆出一批待修项、
+# 把 CI 卡在红灯上。这里用 issues.new-from-rev 只对相对 main 的新增改动报错 ——
+# 今天就能合入并开始拦截新问题，存量随手修，等降到可控量再去掉那行收紧。
+version: "2"
+
+run:
+  timeout: 5m
+  # 测试代码同样检查：数据库 helper、fixture 清理都在测试里，出错一样难查。
+  tests: true
+
+linters:
+  # standard 已含 errcheck / govet / ineffassign / staticcheck / unused。
+  default: standard
+  enable:
+    - misspell
+  settings:
+    staticcheck:
+      checks:
+        - all
+        # ST1003：命名风格（驼峰、缩写大小写）。存量命名已成体系，改动性价比低。
+        - -ST1003
+  exclusions:
+    generated: lax
+    rules:
+      # dist 是前端构建产物的占位目录，不参与检查。
+      - path: internal/webui/
+        linters: [unused]
+
+issues:
+  # 只报相对 main 的新增改动；存量告警不阻塞 CI。
+  new-from-rev: origin/main
+  # 默认只报前 50 条、每类 3 条，容易掩盖问题；全量报出来便于一次修完。
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+# 不配 formatters：lint job 里已有一步独立的全量 gofmt 检查，
+# 比这里受 new-from-rev 限定的范围更严，两处做同一件事只会重复报错。

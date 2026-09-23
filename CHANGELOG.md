@@ -18,12 +18,28 @@
 - `AttributedTracker.WithActor`：内置工单把 agent 评论署名为 `task-<id>`，
   评论区渲染「lathe · 任务 #id」并可跳任务详情
 - 提问回路复用既有 `blocked_spec` + 评论区 + 重试，零新状态零新语义
+- CI 门禁（`.github/workflows/ci.yml`）：静态检查、带真实 Postgres 的测试、
+  镜像构建三个 job 并行；测试前跑迁移并校验最新迁移可回滚
+- 发布流水线（`.github/workflows/release.yml`）：`v*` tag 触发，校验 tag 与
+  CHANGELOG 一致后复用门禁，推多架构镜像到 GHCR、产出三平台二进制、建 Release 草稿
+- `internal/testsupport`：数据库测试的统一连库入口，`LATHE_TEST_REQUIRE_DB`
+  控制连不上库时是跳过还是失败
+- `make test-ci`：按 CI 的严格口径跑测试
+- `.golangci.yml`：golangci-lint 配置，`new-from-rev` 只卡新增改动
+- [docs/09-ci.md](docs/09-ci.md)：CI 设计说明
 
 ### Changed
 
 - `tasks.linear_issue_key` / `linear_issue_id` 改名为 `external_key` /
   `external_id`，新增 `tracker_provider`（`linear` / `internal`）。活跃任务
   唯一索引随之改为 `(repo_id, tracker_provider, external_key)`
+- Dockerfile 的构建阶段改为 `--platform=$BUILDPLATFORM` + `GOOS/GOARCH` 交叉编译，
+  多架构构建不再靠 QEMU 模拟跑 Go 编译
+
+### Fixed
+
+- 数据库测试在库不可达时会静默跳过，导致 CI 可能全绿却什么都没验证 ——
+  改为由 `LATHE_TEST_REQUIRE_DB` 强制失败（本地默认行为不变）
 
 ## [0.1.1] - 2026-09-19
 

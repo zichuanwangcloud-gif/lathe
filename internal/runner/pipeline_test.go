@@ -16,6 +16,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/testsupport"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
@@ -214,23 +215,7 @@ func pipelineFixture(t *testing.T) (*pgxpool.Pool, *task.Machine, int64, RepoCon
 
 func testPoolForPipeline(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	dsn := os.Getenv("LATHE_TEST_DSN")
-	if dsn == "" {
-		dsn = "postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Skipf("跳过数据库测试: %v", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Skipf("跳过数据库测试（先 make dev-infra && make migrate）: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
+	return testsupport.Pool(t)
 }
 
 func demoIssue() *linear.Issue {

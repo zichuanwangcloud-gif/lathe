@@ -1,4 +1,4 @@
-.PHONY: help all build test test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev clean
+.PHONY: help all build test test-ci test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev clean
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
@@ -47,6 +47,13 @@ test: ## 跑测试
 	# internal/task 在建自己的任务前先排空队列。详见 docs/08-debt-cleanup.md §7。
 	# 库里的残留用 make clean-test-db 清（默认干跑）。
 	go test -p 1 ./... -count=1
+
+test-ci: ## 按 CI 的严格口径跑测试（库连不上直接失败，不静默跳过）
+	# 与 make test 的唯一区别是 LATHE_TEST_REQUIRE_DB —— 数据库 helper 在
+	# 连不上库时不再 t.Skip 而是 t.Fatal。CI 里必须这么跑：否则 Postgres 起
+	# 晚一秒或 DSN 写错一个字符，整套数据库测试会被静默跳过，流水线全绿却
+	# 什么都没验证。本地想复现 CI 的判定口径时用它。
+	LATHE_TEST_REQUIRE_DB=1 go test -p 1 ./... -count=1
 
 test-race: ## 跑并发相关测试的 -race 检测（F2.1-AC5；本地目标，未接入 CI）
 	# -p 1：这几个包的测试都跑在同一个真实 Postgres 上，ClaimReady 之类
