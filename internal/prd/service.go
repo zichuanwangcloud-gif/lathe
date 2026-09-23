@@ -75,6 +75,12 @@ type Service struct {
 	Agent     AgentRunner
 	Worktrees Worktrees
 
+	// Issues / Flows 是一键生成（convert.go）要的两个窄能力。为 nil 时
+	// 只有 Convert 返回 ErrConvertUnavailable，规划对话与复核不受影响 ——
+	// 测试装配可以只接前者。
+	Issues Issues
+	Flows  Flows
+
 	// Channel 是模型通道名（docs/10 §9 已决：走强通道，即 ImplementChannel）。
 	//
 	// 为什么不给规划单开一个环境变量：多一个可配项就多一处漏配的可能，

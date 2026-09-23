@@ -81,6 +81,10 @@ func (f *fakeStore) TransitionPRD(_ context.Context, _, _ int64, p store.Transit
 		return nil, store.ErrPRDStateChanged
 	}
 	f.row.State = p.To
+	// 忠实模拟 COALESCE 语义：只有带上图号时才写，nil 保留原值。
+	if p.GeneratedFlowID != nil {
+		f.row.GeneratedFlowID = p.GeneratedFlowID
+	}
 	cp := f.row
 	return &cp, nil
 }

@@ -2,6 +2,7 @@ package prd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -277,4 +278,25 @@ func ParseReviewResult(text string, d *Document) (*ReviewReport, error) {
 		raw.Findings = []ReviewFinding{}
 	}
 	return &ReviewReport{Findings: raw.Findings, Verdict: raw.Verdict, RawText: text}, nil
+}
+
+// ValidateDisposition 校验人填的一条处置。
+//
+// 放在 prd 包而不是 HTTP 层：「accept 必须写理由」是产品规则（docs/10
+// §5.5 —— 认可风险但不改的，要留下认可的依据），不是请求格式校验。
+// 换个入口（CLI、批量导入）进来同样得守。
+func ValidateDisposition(disposition, note string) error {
+	switch disposition {
+	case DispositionFix, DispositionReject:
+		return nil
+	case DispositionAccept:
+		if strings.TrimSpace(note) == "" {
+			return errors.New("prd: 认可风险（accept）必须写明理由")
+		}
+		return nil
+	case "":
+		return errors.New("prd: 处置不能为空")
+	default:
+		return fmt.Errorf("prd: 未知的处置 %q（只能是 fix / reject / accept）", disposition)
+	}
 }
