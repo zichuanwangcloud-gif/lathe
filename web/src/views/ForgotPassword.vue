@@ -39,9 +39,12 @@ async function submit() {
       <h1>找回密码</h1>
       <p class="dim">输入注册邮箱，我们会发一封重置链接给你</p>
 
-      <input v-model="email" type="email" placeholder="邮箱" autocomplete="username" autofocus />
+      <label class="field">
+        <span>邮箱</span>
+        <input v-model="email" type="email" autocomplete="username" autofocus />
+      </label>
 
-      <div v-if="error" class="error-banner">{{ error }}</div>
+      <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
       <button class="primary" type="submit" :disabled="busy || !email">
         {{ busy ? '发送中…' : '发送重置链接' }}

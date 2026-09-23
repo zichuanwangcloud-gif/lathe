@@ -35,15 +35,16 @@ async function submit() {
       <h1>Lathe</h1>
       <p class="dim">登录以继续</p>
 
-      <input v-model="email" type="email" placeholder="邮箱" autocomplete="username" autofocus />
-      <input
-        v-model="password"
-        type="password"
-        placeholder="密码"
-        autocomplete="current-password"
-      />
+      <label class="field">
+        <span>邮箱</span>
+        <input v-model="email" type="email" autocomplete="username" autofocus />
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input v-model="password" type="password" autocomplete="current-password" />
+      </label>
 
-      <div v-if="error" class="error-banner">{{ error }}</div>
+      <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
       <button class="primary" type="submit" :disabled="busy || !email || !password">
         {{ busy ? '登录中…' : '登录' }}

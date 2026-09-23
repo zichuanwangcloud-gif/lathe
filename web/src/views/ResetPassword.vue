@@ -50,21 +50,22 @@ async function submit() {
     <form v-else class="card login-card" @submit.prevent="submit">
       <h1>设置新密码</h1>
 
-      <input
-        v-model="password"
-        type="password"
-        placeholder="新密码（至少 8 位）"
-        autocomplete="new-password"
-        autofocus
-      />
-      <input
-        v-model="confirm"
-        type="password"
-        placeholder="再输一次新密码"
-        autocomplete="new-password"
-      />
+      <label class="field">
+        <span>新密码</span>
+        <input
+          v-model="password"
+          type="password"
+          placeholder="至少 8 位"
+          autocomplete="new-password"
+          autofocus
+        />
+      </label>
+      <label class="field">
+        <span>确认新密码</span>
+        <input v-model="confirm" type="password" autocomplete="new-password" />
+      </label>
 
-      <div v-if="error" class="error-banner">{{ error }}</div>
+      <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
       <button class="primary" type="submit" :disabled="busy || !password || !confirm">
         {{ busy ? '提交中…' : '设置新密码' }}

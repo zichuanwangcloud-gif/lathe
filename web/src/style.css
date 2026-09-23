@@ -187,6 +187,13 @@ pre {
   font-size: 13px;
 }
 
+/* 表单字段：可见 label 包控件。placeholder 不能当 label —— 输入后标签消失，
+   屏幕阅读器也拿不稳（WCAG 3.3.2；skill「Forms | Input Labels」）。
+   login-card 自身带 gap，里面的 field 去掉上下外边距防止双重间距。 */
+.field { display: block; margin: 10px 0; }
+.field > span { display: block; font-size: 12.5px; color: var(--text-dim); margin-bottom: 4px; }
+.login-card .field { margin: 0; }
+
 /* ---------------------------------------------------------------- 可访问性基线 */
 
 /* 键盘焦点环：:focus-visible 的 UA 启发式保证鼠标点击不触发、Tab 导航必出现。
