@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -104,3 +105,92 @@ func TestGetRepoIsolatesByUser(t *testing.T) {
 		t.Error("非属主读取应失败（对非属主隐瞒存在），却成功了")
 	}
 }
+
+// PRD 单任务量级上限（docs/10 D10-5 / §4.2）：出厂值 400 行 / 8 文件。
+//
+// 存量仓库必须直接落在出厂值上而不是先进入「不设限」状态 —— 拆分失控是
+// 规划管线最主要的风险面，没有「不限制」这个语义。
+func TestCreateRepoPRDTaskLimitDefaults(t *testing.T) {
+	st := testStore(t)
+	userID := testUser(t, st)
+
+	repo, err := st.CreateRepo(context.Background(), userID,
+		CreateRepoParams{ProviderRepo: "acme/prd-limits"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.PRDTaskMaxLines != 400 {
+		t.Errorf("出厂行数上限应为 400，got=%d", repo.PRDTaskMaxLines)
+	}
+	if repo.PRDTaskMaxFiles != 8 {
+		t.Errorf("出厂文件数上限应为 8，got=%d", repo.PRDTaskMaxFiles)
+	}
+}
+
+// 非法值在写入时就拒绝，不留到运行期静默降级（AGENTS.md §3 配置项那一行）。
+func TestUpdateRepoRejectsNonPositivePRDTaskLimit(t *testing.T) {
+	st := testStore(t)
+	userID := testUser(t, st)
+	ctx := context.Background()
+
+	repo, err := st.CreateRepo(ctx, userID, CreateRepoParams{ProviderRepo: "acme/prd-bad"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		lines *int
+		files *int
+	}{
+		{"行数为零", intPtr(0), nil},
+		{"行数为负", intPtr(-1), nil},
+		{"文件数为零", nil, intPtr(0)},
+		{"文件数为负", nil, intPtr(-5)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := st.UpdateRepo(ctx, repo.ID, userID, UpdateRepoParams{
+				PRDTaskMaxLines: tc.lines, PRDTaskMaxFiles: tc.files,
+			})
+			if !errors.Is(err, ErrInvalidPRDTaskLimit) {
+				t.Errorf("非法上限应报 ErrInvalidPRDTaskLimit，got=%v", err)
+			}
+		})
+	}
+
+	// 拒绝之后原值不变。
+	got, err := st.GetRepo(ctx, repo.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PRDTaskMaxLines != 400 || got.PRDTaskMaxFiles != 8 {
+		t.Errorf("保存被拒后不该改动原值，got=%d/%d",
+			got.PRDTaskMaxLines, got.PRDTaskMaxFiles)
+	}
+}
+
+// nil = 不修改：改一个不该动另一个。
+func TestUpdateRepoPRDTaskLimitPartialUpdate(t *testing.T) {
+	st := testStore(t)
+	userID := testUser(t, st)
+	ctx := context.Background()
+
+	repo, err := st.CreateRepo(ctx, userID, CreateRepoParams{ProviderRepo: "acme/prd-partial"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.UpdateRepo(ctx, repo.ID, userID,
+		UpdateRepoParams{PRDTaskMaxLines: intPtr(250)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PRDTaskMaxLines != 250 {
+		t.Errorf("行数上限应改为 250，got=%d", got.PRDTaskMaxLines)
+	}
+	if got.PRDTaskMaxFiles != 8 {
+		t.Errorf("没传的字段不该被动，got=%d", got.PRDTaskMaxFiles)
+	}
+}
+
+func intPtr(n int) *int { return &n }
