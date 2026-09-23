@@ -2,6 +2,7 @@
 import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth } from '../auth'
+import { confirmDialog } from '../confirm'
 
 const users = ref([])
 const error = ref('')
@@ -39,26 +40,28 @@ async function act(key, fn) {
 
 const isSelf = (u) => u.id === auth.user?.id
 
-function toggleDisabled(u) {
-  if (!u.disabled && !confirm(`确认停用 ${u.email}？该用户的登录会话会立即失效。`)) return
+async function toggleDisabled(u) {
+  if (!u.disabled && !(await confirmDialog(`确认停用 ${u.email}？该用户的登录会话会立即失效。`))) return
   act(`toggle-${u.id}`, () => (u.disabled ? api.enableUser(u.id) : api.disableUser(u.id)))
 }
 
-function toggleRole(u) {
+async function toggleRole(u) {
   const next = u.role === 'admin' ? 'member' : 'admin'
   const what = next === 'admin' ? '提升为管理员' : '降级为普通用户'
-  if (!confirm(`确认把 ${u.email} ${what}？`)) return
+  if (!(await confirmDialog(`确认把 ${u.email} ${what}？`))) return
   act(`role-${u.id}`, () => api.setUserRole(u.id, next))
 }
 
 async function resetPassword(u) {
-  if (!confirm(`确认重置 ${u.email} 的密码？该用户的所有登录会话会立即失效。`)) return
+  if (!(await confirmDialog(`确认重置 ${u.email} 的密码？该用户的所有登录会话会立即失效。`))) return
   const res = await act(`pw-${u.id}`, () => api.resetUserPassword(u.id, ''))
   if (res?.password) issued.value = { email: u.email, password: res.password }
 }
 
-function remove(u) {
-  if (!confirm(`确认删除用户 ${u.email}？\n\n其名下的任务、仓库配置与凭据都会一并删除，不可恢复。`)) return
+// 删用户是全站最重的操作（级联删任务/仓库/凭据，不可恢复）：
+// 确认强度从「点一下」升级为逐字输入邮箱（type-to-confirm）
+async function remove(u) {
+  if (!(await confirmDialog(`确认删除用户 ${u.email}？\n\n其名下的任务、仓库配置与凭据都会一并删除，不可恢复。`, { requireText: u.email }))) return
   act(`del-${u.id}`, () => api.deleteUser(u.id))
 }
 

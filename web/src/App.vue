@@ -3,6 +3,7 @@ import { onMounted, provide } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from './api'
 import { auth, refresh, clear, isAdmin, hasLinearToken } from './auth'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -64,6 +65,7 @@ onMounted(() => {
       </div>
     </header>
     <main><RouterView /></main>
+    <ConfirmDialog />
   </div>
 </template>
 

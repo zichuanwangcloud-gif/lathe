@@ -4,6 +4,7 @@ import { RouterLink } from 'vue-router'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { api, UnauthorizedError, formatTime, stateLabel, stateTone } from '../api'
+import { confirmDialog } from '../confirm'
 
 // 工单详情页（docs/09-internal-issues.md）：需求本体 + 评论区问答 +
 // 关联任务。agent 的提问（blocked_spec）与人的补充在同一条评论流里 ——
@@ -87,7 +88,7 @@ async function saveEdit() {
 }
 
 async function setState(state, confirmText) {
-  if (confirmText && !confirm(confirmText)) return
+  if (confirmText && !(await confirmDialog(confirmText))) return
   acting.value = true
   error.value = ''
   notice.value = ''
@@ -123,7 +124,7 @@ async function start() {
 }
 
 async function removeIssue() {
-  if (!confirm('确认删除这个工单？评论会一并删除。（有关联任务的工单只能取消、不能删除）')) return
+  if (!(await confirmDialog('确认删除这个工单？评论会一并删除。（有关联任务的工单只能取消、不能删除）'))) return
   acting.value = true
   error.value = ''
   try {

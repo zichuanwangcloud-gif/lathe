@@ -5,6 +5,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
+import { confirmDialog } from '../confirm'
 
 const props = defineProps({ id: { type: String, required: true } })
 const router = useRouter()
@@ -50,7 +51,7 @@ async function load() {
 }
 
 async function act(fn, confirmText) {
-  if (confirmText && !confirm(confirmText)) return
+  if (confirmText && !(await confirmDialog(confirmText))) return
   acting.value = true
   try {
     await fn(props.id)
