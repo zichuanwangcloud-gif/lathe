@@ -49,6 +49,7 @@ onMounted(() => {
         <nav class="row">
           <RouterLink to="/">任务看板</RouterLink>
           <RouterLink to="/issues">工单</RouterLink>
+          <RouterLink to="/prds">模糊任务</RouterLink>
           <RouterLink to="/flows">编排</RouterLink>
           <RouterLink v-if="hasLinearToken()" to="/linear">Linear 任务</RouterLink>
           <RouterLink to="/repos">仓库配置</RouterLink>

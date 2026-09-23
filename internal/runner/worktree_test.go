@@ -399,7 +399,7 @@ func TestListAndPrune(t *testing.T) {
 
 func TestMirrorPathIsStableAndSafe(t *testing.T) {
 	m := newManager(t)
-	p := m.MirrorPath("Clouditera/CloudRouter")
+	p := m.MirrorPath("acme/demo")
 
 	if strings.Contains(filepath.Base(p), "/") {
 		t.Errorf("mirror 目录名不应含路径分隔符: %q", p)
@@ -407,10 +407,10 @@ func TestMirrorPathIsStableAndSafe(t *testing.T) {
 	if !strings.HasSuffix(p, ".git") {
 		t.Errorf("mirror 路径应以 .git 结尾: %q", p)
 	}
-	if p != m.MirrorPath("Clouditera/CloudRouter") {
+	if p != m.MirrorPath("acme/demo") {
 		t.Error("同一仓库的 mirror 路径应稳定")
 	}
-	if p == m.MirrorPath("Other/CloudRouter") {
+	if p == m.MirrorPath("other/demo") {
 		t.Error("不同 owner 的仓库不应映射到同一 mirror")
 	}
 }

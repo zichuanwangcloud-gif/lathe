@@ -1,0 +1,197 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # 供 release.yml 复用，发布前必须先过同一套门禁。
+  workflow_call:
+
+# 同一分支的新 push 取消尚在跑的旧运行；main 上不取消，避免漏掉某次提交的结论。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # 关掉 Go 的版本自动下载：go.mod 写死 1.25.0，装什么版本由 setup-go 决定，
+  # 不让工具链在 CI 里静默换版本。
+  GOTOOLCHAIN: local
+
+jobs:
+  lint:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # golangci-lint 的 new-from-rev 要和 origin/main 比对，需要完整历史。
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          # 与 make lint 一致：用 git ls-files 圈定范围，避开 .claude/ 下的
+          # worktree 检出副本（那是别的分支的文件，不是本仓工作树内容）。
+          unformatted=$(gofmt -l -e $(git ls-files "*.go"))
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请跑 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        # action v7 起才支持 golangci-lint v2 配置格式（.golangci.yml 里的
+        # version: "2"）；v6 及以前只认 v1，配上去会直接报解析失败。
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # 这个版本号有硬下限，不能随手往下调：golangci-lint 会拒绝分析
+          # 「目标 Go 版本高于它自己的构建版本」的项目，报
+          # 「the Go language version used to build golangci-lint is lower
+          # than the targeted Go version」直接退出 3。go.mod 目前是
+          # go 1.25.0，v2.1.6 由 go1.23 构建、装上就挂；v2.13.2 由 go1.26
+          # 构建才够用。以后抬 go.mod 的 go 版本时，这里要跟着抬。
+          version: v2.13
+          # 配置里已设 new-from-rev，这里只需保证能解析到 origin/main。
+          args: --timeout=5m
+
+  test:
+    name: 测试（真实 Postgres）
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: lathe
+          POSTGRES_PASSWORD: lathe
+          POSTGRES_DB: lathe
+        # 端口刻意映射成 55432，与 docker-compose.dev.yml 对齐 —— 这样
+        # LATHE_DB_PORT 与 LATHE_TEST_DSN 的代码默认值在 CI 里同样成立，
+        # 少一处「本地能跑、CI 配漏了」的漂移面。
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U lathe -d lathe"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # 注意 LATHE_DB_* 不放在 job 级：internal/config 的 TestLoadDefaults 会
+      # 断言「没有环境变量时的默认值」，job 级导出这些变量等于把测试的前提
+      # 改掉了（本地用 55434 的临时库验证时就这么炸过一次）。只有下面跑
+      # migrate 的两步真正需要它们，就放到那两步的 step 级。
+      LATHE_TEST_DSN: postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable
+      # 这一条是整个 test job 的关键：不设它，Postgres 起晚一秒或 DSN 写错
+      # 一个字符，所有数据库测试会静默跳过，流水线全绿却什么都没验证。
+      # 详见 internal/testsupport 的包注释。
+      LATHE_TEST_REQUIRE_DB: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 编译 migrate 用的二进制
+        # 先编一次，后面 migrate 要跑三趟，走 go run 每趟都重编。
+        run: go build -o /tmp/lathe ./cmd/lathe
+
+      - name: 应用迁移
+        env:
+          LATHE_DB_HOST: 127.0.0.1
+          LATHE_DB_PORT: "55432"
+          LATHE_DB_USER: lathe
+          LATHE_DB_PASSWORD: lathe
+          LATHE_DB_NAME: lathe
+          LATHE_DB_SSLMODE: disable
+        run: /tmp/lathe migrate up
+
+      - name: 校验最新迁移可回滚
+        # migrate down 是单步回滚（实测：只退最高版本，不是清空）。
+        # 回滚再前滚一次，挡住「新迁移忘了写 down / down 脚本写错」这类问题 ——
+        # 20 个 .down.sql 至今没被任何流程验证过。
+        env:
+          LATHE_DB_HOST: 127.0.0.1
+          LATHE_DB_PORT: "55432"
+          LATHE_DB_USER: lathe
+          LATHE_DB_PASSWORD: lathe
+          LATHE_DB_NAME: lathe
+          LATHE_DB_SSLMODE: disable
+        run: |
+          /tmp/lathe migrate down
+          /tmp/lathe migrate up
+
+      - name: 跑测试
+        # -p 1 是硬约束：领单调度器 ClaimReady 是全局查询、不按包隔离，
+        # 多个测试包并行跑在同一个库上会互相抢/污染 queued 行。见 Makefile。
+        run: |
+          # 成败以 go test 自己的退出码为准（PIPESTATUS[0]），不从 json 里
+          # 反推：编译失败这类情况未必产出 Action=="fail" 事件，靠解析判定
+          # 会把「压根没跑起来」误判成通过。json 只用来渲染摘要。
+          set +e
+          go test -p 1 ./... -count=1 -json | tee /tmp/test.json | \
+            jq -r 'select(.Action=="output") | .Output' | \
+            grep -E "^(ok|FAIL|---|\?)"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::测试失败（go test 退出码 $rc）"
+            jq -r 'select(.Action=="fail" and .Test != null) | "  \(.Package)  \(.Test)"' \
+              /tmp/test.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: 汇总跳过的测试
+        # 不阻塞，只做可见性：跳过的多半是需要 docker 镜像缓存的 preview 集成
+        # 测试。把它们列出来，免得「绿灯」被误读成「全都验过了」。
+        if: always()
+        run: |
+          [ -f /tmp/test.json ] || exit 0
+          {
+            echo "### 本次跳过的测试"
+            echo
+            count=$(jq -r 'select(.Action=="skip" and .Test != null) | .Test' /tmp/test.json | wc -l)
+            if [ "$count" -eq 0 ]; then
+              echo "无。"
+            else
+              echo "共 $count 个（数据库测试已由 LATHE_TEST_REQUIRE_DB 强制，不会出现在这里）："
+              echo
+              echo '```'
+              jq -r 'select(.Action=="skip" and .Test != null) | "\(.Package)  \(.Test)"' /tmp/test.json | sort
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 构建镜像
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: docker build（不推送）
+        # 刻意走完整 Dockerfile 而不是分别跑 pnpm build + go build：
+        # 「前端产物覆盖 internal/webui/dist 再 go:embed」这个顺序容易写错，
+        # Dockerfile 里已经处理好了，CI 再实现一遍就是第二份会腐烂的真相。
+        # 托管 runner 在境外，APK_MIRROR / NPM_REGISTRY 留空走官方源即可。
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

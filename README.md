@@ -7,7 +7,10 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 ## 边界
 
 - **不做合并决策** —— 产出 PR，人点合并
-- **不做需求澄清** —— 单子不明确就回帖提问并停下，不猜
+- **执行阶段不猜** —— 任务单不明确就回帖提问并停下。需求本身没想清楚的，
+  走模糊任务规划（[docs/10](docs/10-prd-template.md)）：智能体陪人把需求写成
+  PRD，但**必须人逐节签字**才能生成任务 —— 规划阶段帮人想清楚 ≠ 执行阶段
+  替人猜
 - **永不 push 受保护分支** —— 一切走 PR
 
 ## 文档
@@ -18,6 +21,8 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/01-decisions.md](docs/01-decisions.md) | D1–D4 核心决策（验证标准／触发方式／并发／失败处理） |
 | [docs/02-design.md](docs/02-design.md) | 系统设计：状态机、数据模型、验证设计、调度 |
 | [docs/03-tech-stack.md](docs/03-tech-stack.md) | 技术选型与理由 |
+| [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
+| [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
 
 ## 技术栈
 
@@ -34,6 +39,13 @@ make build        # 编译
 make test         # 测试
 make run          # 起控制面
 ```
+
+`make test` 在库连不上时会跳过所有数据库测试，方便在没起基础设施的环境里跑纯逻辑
+测试。想按 CI 的口径验一遍（库连不上直接失败）用 `make test-ci`。
+
+推 PR 前本地过一遍 `make lint && make test-ci`。注意 `make lint` 只有
+`gofmt` + `go vet`，CI 的 lint job 还会跑 golangci-lint（需另装，本地装不装都能提
+PR，但只在本地绿过不代表门禁会绿）。详见 [docs/09-ci.md](docs/09-ci.md)。
 
 ## 跑起来
 

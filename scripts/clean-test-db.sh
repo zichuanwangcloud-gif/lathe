@@ -60,7 +60,7 @@ FROM users WHERE email LIKE '%@example.com';"
 echo
 echo "== 非终态任务里【不属于】测试 fixture 的部分（需人工判断，本脚本不动）=="
 run_sql -c "
-SELECT t.id, t.state, t.linear_issue_key, u.email, t.updated_at
+SELECT t.id, t.state, t.external_key, u.email, t.updated_at
 FROM tasks t JOIN users u ON u.id = t.user_id
 WHERE t.state NOT IN ('merged','failed','cancelled')
   AND u.email NOT LIKE '%@example.com'
@@ -77,7 +77,7 @@ echo "== 删除中 =="
 run_sql -c "DELETE FROM users WHERE email LIKE '%@example.com';"
 echo "完成。剩余非终态任务："
 run_sql -c "
-SELECT t.id, t.state, t.linear_issue_key, u.email
+SELECT t.id, t.state, t.external_key, u.email
 FROM tasks t JOIN users u ON u.id = t.user_id
 WHERE t.state NOT IN ('merged','failed','cancelled')
 ORDER BY t.id;"

@@ -2,25 +2,22 @@ package store
 
 import (
 	"context"
-	"os"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/testsupport"
 )
 
+// testStore 连接测试库；本地连不上就跳过，CI 下（LATHE_TEST_REQUIRE_DB）直接失败。
 func testStore(t *testing.T) *Store {
 	t.Helper()
 
-	dsn := os.Getenv("LATHE_TEST_DSN")
-	if dsn == "" {
-		dsn = "postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disable"
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := testsupport.ConnectContext(t)
 	defer cancel()
 
-	st, err := Open(ctx, dsn)
+	st, err := Open(ctx, testsupport.DSN())
 	if err != nil {
-		t.Skipf("跳过数据库测试（先 make dev-infra && make migrate）: %v", err)
+		testsupport.SkipOrFail(t, "打开 store 失败: %v", err)
 	}
 	t.Cleanup(st.Close)
 	return st
