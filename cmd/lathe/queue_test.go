@@ -49,7 +49,7 @@ func fixture(t *testing.T, st *store.Store) (userID, repoID int64) {
 	}
 	if err := st.Pool().QueryRow(ctx,
 		`INSERT INTO repos (user_id, provider_repo) VALUES ($1, $2) RETURNING id`,
-		userID, "Clouditera/queue-test-"+strconv.FormatInt(time.Now().UnixNano(), 10)).Scan(&repoID); err != nil {
+		userID, "acme/queue-test-"+strconv.FormatInt(time.Now().UnixNano(), 10)).Scan(&repoID); err != nil {
 		t.Fatalf("建 repo 失败: %v", err)
 	}
 	t.Cleanup(func() {

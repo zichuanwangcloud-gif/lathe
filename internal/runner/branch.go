@@ -31,7 +31,7 @@ func (k TaskKind) Valid() bool {
 
 // RepoConfig 是仓库级的分支策略配置，对应 repos 表。
 type RepoConfig struct {
-	ProviderRepo      string   // 如 Clouditera/CloudRouter
+	ProviderRepo      string   // 如 acme/demo
 	DefaultBranch     string   // fix/feature 的分叉基线，通常是 dev
 	HotfixBase        string   // hotfix 的分叉基线，通常是 main
 	ProtectedBranches []string // 禁止直接推送的分支
