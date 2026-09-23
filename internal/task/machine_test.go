@@ -153,7 +153,7 @@ func TestMachineCreateProfileRoundtrip(t *testing.T) {
 	withProfile, err := m.Create(ctx, CreateParams{
 		UserID: userID, RepoID: repoID,
 		ExternalKey: "CR-2001",
-		Profile:        []byte(`{"model_channel":"channel-x","verify_tier":"light"}`),
+		Profile:     []byte(`{"model_channel":"channel-x","verify_tier":"light"}`),
 	})
 	if err != nil {
 		t.Fatalf("Create（带 profile）失败: %v", err)

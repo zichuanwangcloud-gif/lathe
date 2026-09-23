@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/integration/linear"
-	"github.com/Clouditera/lathe/internal/tracker"
-	"github.com/Clouditera/lathe/internal/task"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // ---------------------------------------------------------------- 假件

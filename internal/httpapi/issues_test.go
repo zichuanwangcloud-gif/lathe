@@ -12,16 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // fakeIssueQueue 记录工单动作（开跑/取消联动）的调用。
 type fakeIssueQueue struct {
-	enqueued     []int64 // 收到 EnqueueInternal 的 issue id
-	cancelled    []string
-	cancelIDs    []int64
-	enqueueErr   error
-	cancelErr    error
+	enqueued   []int64 // 收到 EnqueueInternal 的 issue id
+	cancelled  []string
+	cancelIDs  []int64
+	enqueueErr error
+	cancelErr  error
 }
 
 func (f *fakeIssueQueue) EnqueueInternal(ctx context.Context, ownerUserID, issueID int64) error {

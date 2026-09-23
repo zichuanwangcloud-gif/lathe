@@ -18,21 +18,21 @@ var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
-	ID             int64   `json:"id"`
-	UserID         int64   `json:"userId"`
-	ExternalKey string  `json:"externalKey"`
+	ID          int64  `json:"id"`
+	UserID      int64  `json:"userId"`
+	ExternalKey string `json:"externalKey"`
 	// TrackerProvider 是需求来源平台（'linear' | 'internal'）；
 	// 前端据此把 key 渲染成 Linear 链接或内置工单页链接。
 	TrackerProvider string `json:"trackerProvider"`
 	// IssueID 仅内置工单（provider=internal）填充，供前端直达工单页；
 	// Linear 任务为 NULL（Linear 侧的定位主键是 external_id，前端用不到）。
-	IssueID *int64 `json:"issueId,omitempty"`
-	State          string  `json:"state"`
-	TaskKind       *string `json:"taskKind"`
-	VerifyTier     *string `json:"verifyTier"`
-	BranchName     *string `json:"branchName"`
-	PRURL          *string `json:"prUrl"`
-	FailureReason  *string `json:"failureReason"`
+	IssueID       *int64  `json:"issueId,omitempty"`
+	State         string  `json:"state"`
+	TaskKind      *string `json:"taskKind"`
+	VerifyTier    *string `json:"verifyTier"`
+	BranchName    *string `json:"branchName"`
+	PRURL         *string `json:"prUrl"`
+	FailureReason *string `json:"failureReason"`
 	// FailureStage 是机器可读的失败阶段代码（智能重试的决策依据），
 	// 仅 state=failed 时有意义。
 	FailureStage *string `json:"failureStage"`

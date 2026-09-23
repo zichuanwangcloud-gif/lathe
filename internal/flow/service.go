@@ -11,9 +11,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // ErrIssueActive 表示批次里某个 issue 已经有一个"活着"的任务
@@ -244,10 +244,10 @@ func (s *Service) CreateFlow(ctx context.Context, ownerUserID, repoID int64, nam
 			// 内置工单进图是 09 的 P3，届时 flows 表才加 provider 列。
 			TrackerProvider: tracker.ProviderLinear,
 			FlowID:          &flowID,
-			DependsOn:      dependsOn,
-			DependsOnAt:    n.DependsOnAt,
-			Priority:       n.Priority,
-			Profile:        []byte(n.Profile),
+			DependsOn:       dependsOn,
+			DependsOnAt:     n.DependsOnAt,
+			Priority:        n.Priority,
+			Profile:         []byte(n.Profile),
 		})
 		if err != nil {
 			s.compensate(ctx, created)

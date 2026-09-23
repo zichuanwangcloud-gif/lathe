@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // 下面这些窄接口让流水线可被完整单测，无需真实的 Linear/GitHub/claude。

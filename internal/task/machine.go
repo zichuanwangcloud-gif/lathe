@@ -10,14 +10,14 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // Task 是 tasks 表的一行。
 type Task struct {
-	ID       int64
-	UserID   int64
-	RepoID   int64
+	ID     int64
+	UserID int64
+	RepoID int64
 	// ExternalKey 是需求工单的人读编号：Linear 形如 CR-1326，
 	// 内置工单形如 LT-1042（migration 0021，docs/09 §4.2）。
 	ExternalKey string
@@ -30,14 +30,14 @@ type Task struct {
 	// 决定 pipeline 从哪儿拉工单、往哪儿回帖。
 	TrackerProvider string
 	State           State
-	GateMode       string
-	TaskKind       *string
-	VerifyTier     *string
-	AgentSessionID *string
-	WorktreePath   *string
-	BranchName     *string
-	PRURL          *string
-	FailureReason  *string
+	GateMode        string
+	TaskKind        *string
+	VerifyTier      *string
+	AgentSessionID  *string
+	WorktreePath    *string
+	BranchName      *string
+	PRURL           *string
+	FailureReason   *string
 	// FailureStage 是机器可读的失败阶段代码（runner 包定义），
 	// 智能重试的断点续跑决策依据。仅 state=failed 时有意义。
 	FailureStage   *string
@@ -117,17 +117,17 @@ const taskColumnsQualified = `
 
 // CreateParams 是建任务所需的最小输入。
 type CreateParams struct {
-	UserID         int64
-	RepoID         int64
-	ExternalKey    string
+	UserID      int64
+	RepoID      int64
+	ExternalKey string
 	// ExternalID 是平台侧定位主键（Linear 的 issue UUID）；为空时存
 	// NULL（兼容旧调用方，且内置工单本来就没有第二标识）。
-	ExternalID      string
+	ExternalID string
 	// TrackerProvider 是需求来源平台（tracker.ProviderLinear / ProviderInternal）；
 	// 空串按 tracker.ProviderLinear 处理（兼容旧调用方与存量语义）。
 	TrackerProvider string
 	GateMode        string
-	TaskKind      *string
+	TaskKind        *string
 	// FlowID 非 nil 时把任务挂到指定编排图；nil 表示独立任务（NULL）。
 	FlowID *int64
 	// DependsOn 非 nil 时声明前驱任务（自引用）；nil 表示独立根。

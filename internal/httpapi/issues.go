@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // IssuesAPI 是内置工单体系的 HTTP 面（docs/09-internal-issues.md）。

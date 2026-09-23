@@ -5,6 +5,26 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **内置工单体系**（`docs/09-internal-issues.md`）：任务不再只能由 Linear webhook
+  产生。`issues` / `issue_comments` 两张表 + HTTP API + 工单列表与详情界面，
+  key 形如 `LT-1042`（全局序列）。工单必绑仓库，修掉 `resolveRepo`
+  「取该用户第一个仓库」的随机性
+- `internal/tracker`：需求平台的窄接口（`Issue` / `Comment` 两方法，返回平台无关
+  类型）。Linear 以类型别名适配，其包内部零改动；内置工单是第二个实现
+- `AttributedTracker.WithActor`：内置工单把 agent 评论署名为 `task-<id>`，
+  评论区渲染「lathe · 任务 #id」并可跳任务详情
+- 提问回路复用既有 `blocked_spec` + 评论区 + 重试，零新状态零新语义
+
+### Changed
+
+- `tasks.linear_issue_key` / `linear_issue_id` 改名为 `external_key` /
+  `external_id`，新增 `tracker_provider`（`linear` / `internal`）。活跃任务
+  唯一索引随之改为 `(repo_id, tracker_provider, external_key)`
+
 ## [0.1.1] - 2026-09-19
 
 ### Fixed

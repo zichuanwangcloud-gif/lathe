@@ -9,16 +9,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/integration/agent"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // providerDispatchClients 按 provider 分派的假客户端：internal 走真
 // LocalTracker（DB 支撑），linear 一旦被动用就报错 —— 内置任务「零外发」
-//（09 §3 F4-AC6）就靠这个硬断言守着。
+// （09 §3 F4-AC6）就靠这个硬断言守着。
 type providerDispatchClients struct {
 	st      *store.Store
 	ownerID int64

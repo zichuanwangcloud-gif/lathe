@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // 本文件测 F2.3-AC2（PR 被关闭未合并 → blocked_dep）的完整驱动链路：

@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // DefaultAPIURL 是 Linear GraphQL 端点。

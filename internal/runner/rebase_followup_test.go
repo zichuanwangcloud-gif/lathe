@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // 本文件测 F4.3（后继链自动跟进）的核心：MergePoller.rebaseFollowup。

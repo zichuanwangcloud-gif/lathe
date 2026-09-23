@@ -263,7 +263,7 @@ func TestClaimReadyDependencyGating(t *testing.T) {
 	succPR, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-DEP-SUCC-PR"),
 		ExternalID: uniqueKey("uuid-dep-succ-pr"),
-		DependsOn:     &pred.ID, DependsOnAt: "pr_open",
+		DependsOn:  &pred.ID, DependsOnAt: "pr_open",
 	})
 	if err != nil {
 		t.Fatalf("Create pr_open 语义后继失败: %v", err)
@@ -271,7 +271,7 @@ func TestClaimReadyDependencyGating(t *testing.T) {
 	succMerged, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-DEP-SUCC-MERGED"),
 		ExternalID: uniqueKey("uuid-dep-succ-merged"),
-		DependsOn:     &pred.ID, DependsOnAt: "merged",
+		DependsOn:  &pred.ID, DependsOnAt: "merged",
 	})
 	if err != nil {
 		t.Fatalf("Create merged 语义后继失败: %v", err)
@@ -548,7 +548,7 @@ func TestFillBaseRefFirstDispatchUsesPredecessorBranch(t *testing.T) {
 	succ, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-SUCC"),
 		ExternalID: uniqueKey("uuid-base-succ"),
-		DependsOn:     &pred.ID, DependsOnAt: "pr_open",
+		DependsOn:  &pred.ID, DependsOnAt: "pr_open",
 	})
 	if err != nil {
 		t.Fatalf("Create 后继失败: %v", err)
@@ -602,7 +602,7 @@ func TestFillBaseRefNotOverwrittenOnRetry(t *testing.T) {
 	succ, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-RETRY-SUCC"),
 		ExternalID: uniqueKey("uuid-base-retry-succ"),
-		DependsOn:     &pred.ID, DependsOnAt: "pr_open",
+		DependsOn:  &pred.ID, DependsOnAt: "pr_open",
 		BaseRef: ptr(originalBranch), // 已经派发过一次，base_ref 已固定
 	})
 	if err != nil {
@@ -671,7 +671,7 @@ func TestFillBaseRefSkipsWhenPredecessorMerged(t *testing.T) {
 	succ, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-MERGED-SUCC"),
 		ExternalID: uniqueKey("uuid-base-merged-succ"),
-		DependsOn:     &pred.ID, DependsOnAt: "merged",
+		DependsOn:  &pred.ID, DependsOnAt: "merged",
 	})
 	if err != nil {
 		t.Fatalf("Create 后继失败: %v", err)

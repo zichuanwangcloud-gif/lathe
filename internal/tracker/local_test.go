@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // 内置 tracker 的契约（docs/09 §3 F2/F5）：

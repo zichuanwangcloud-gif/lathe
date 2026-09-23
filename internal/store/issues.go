@@ -67,12 +67,12 @@ type IssueRow struct {
 // Author 二选一（migration 0021 的 CHECK）：UserID 非空 = 人，
 // Actor 非空 = agent/系统（'task-<id>'，UI 渲染「lathe · 任务 #id」）。
 type IssueCommentRow struct {
-	ID        int64      `json:"id"`
-	IssueID   int64      `json:"issueId"`
-	UserID    *int64     `json:"userId,omitempty"`
-	Actor     *string    `json:"actor,omitempty"`
-	Body      string     `json:"body"`
-	CreatedAt time.Time  `json:"createdAt"`
+	ID        int64     `json:"id"`
+	IssueID   int64     `json:"issueId"`
+	UserID    *int64    `json:"userId,omitempty"`
+	Actor     *string   `json:"actor,omitempty"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
 	// AuthorName 是展示用名字：人的 email / agent 的 actor 标记。
 	// 非表列，查询时 join 得出。
 	AuthorName string `json:"authorName"`
@@ -350,11 +350,11 @@ func (s *Store) ListComments(ctx context.Context, issueID int64) ([]IssueComment
 
 // IssueTask 是工单详情页「关联任务」区块的一行（轻量视图）。
 type IssueTask struct {
-	ID        int64      `json:"id"`
-	State     string     `json:"state"`
-	Branch    *string    `json:"branchName"`
-	PRURL     *string    `json:"prUrl"`
-	CreatedAt time.Time  `json:"createdAt"`
+	ID        int64     `json:"id"`
+	State     string    `json:"state"`
+	Branch    *string   `json:"branchName"`
+	PRURL     *string   `json:"prUrl"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 // ListIssueTasks 返回某内置工单名下的全部任务（含历史终态），新的在前。

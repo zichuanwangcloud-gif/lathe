@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/config"
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/config"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // claimLeaseDuration 是 ClaimReady 打的租约时长。
@@ -203,7 +203,7 @@ func (q *queue) CancelForIssue(ctx context.Context, ownerUserID int64, issueID, 
 }
 
 // CancelForInternalIssue 实现 httpapi.TaskEnqueuer：内置工单取消联动
-//（09 §3 F4-AC4），触发点是工单详情页的「取消」按钮（应用内动作，
+// （09 §3 F4-AC4），触发点是工单详情页的「取消」按钮（应用内动作，
 // 不是 webhook）。语义边界与 CancelForIssue 完全一致：只改数据库状态，
 // 不会停下正在跑的 agent。
 //

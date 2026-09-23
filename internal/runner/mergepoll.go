@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // RepoLookup 按 repoID 查询该仓库的分支策略配置。

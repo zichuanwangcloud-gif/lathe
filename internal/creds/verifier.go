@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/Clouditera/lathe/internal/httpapi"
-	"github.com/Clouditera/lathe/internal/integration/github"
-	"github.com/Clouditera/lathe/internal/integration/linear"
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // Verifier 用给定凭据实际连一次外部服务，验证其可用性。

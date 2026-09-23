@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // 内置工单的任务编排（docs/09 §3 F4）：EnqueueInternal 建任务 +

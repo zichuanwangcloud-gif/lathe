@@ -12,11 +12,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Clouditera/lathe/internal/preview"
-	"github.com/Clouditera/lathe/internal/runner"
-	"github.com/Clouditera/lathe/internal/store"
-	"github.com/Clouditera/lathe/internal/task"
-	"github.com/Clouditera/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
+	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // maxJSONBody 限制请求体大小。

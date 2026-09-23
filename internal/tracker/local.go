@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Clouditera/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // LocalTracker 是 Tracker 的内置实现：需求载体是 Lathe 自己的
@@ -16,9 +16,9 @@ import (
 //   - Comment() 写库后，重试时 Issue() 必须能读回来 ——
 //     blocked_spec 提问回路（问 → 人答 → 重试重读）由此闭合。
 type LocalTracker struct {
-	store  *store.Store
-	owner  int64  // 工单属主（隔离边界；构造时来自任务属主，不信任入参）
-	actor  string // 评论署名（"task-<id>"）；空 = 未署名（人通过 API 发的评论不走这里）
+	store *store.Store
+	owner int64  // 工单属主（隔离边界；构造时来自任务属主，不信任入参）
+	actor string // 评论署名（"task-<id>"）；空 = 未署名（人通过 API 发的评论不走这里）
 }
 
 // NewLocalTracker 构造某属主视角的内置 tracker。
