@@ -40,8 +40,9 @@ make run          # 起控制面
 `make test` 在库连不上时会跳过所有数据库测试，方便在没起基础设施的环境里跑纯逻辑
 测试。想按 CI 的口径验一遍（库连不上直接失败）用 `make test-ci`。
 
-推 PR 前本地过一遍 `make lint && make test-ci`，与 CI 的判定一致。详见
-[docs/09-ci.md](docs/09-ci.md)。
+推 PR 前本地过一遍 `make lint && make test-ci`。注意 `make lint` 只有
+`gofmt` + `go vet`，CI 的 lint job 还会跑 golangci-lint（需另装，本地装不装都能提
+PR，但只在本地绿过不代表门禁会绿）。详见 [docs/09-ci.md](docs/09-ci.md)。
 
 ## 跑起来
 
