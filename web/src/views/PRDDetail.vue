@@ -521,8 +521,17 @@ onUnmounted(() => {
           :disabled="!canAbandon || acting"
           @click="abandon"
         >放弃</button>
+        <!-- 导出（docs/10 §7）：任何状态都能导，走普通链接让浏览器自己下 ——
+             same-origin cookie 自动带上，不必绕 fetch 再造 Blob -->
+        <a class="btn-link" :href="`/api/prds/${prd.id}/export?format=md`" download>导出 Markdown</a>
+        <a class="btn-link" :href="`/api/prds/${prd.id}/export?format=json`" download>导出 JSON</a>
       </div>
     </div>
+
+    <p class="faint export-hint">
+      导出的 Markdown 可以回写进目标仓库的 <code class="mono">docs/</code> ——
+      但 Lathe 不会自动提交、更不会 push，要不要入库是人的决定。
+    </p>
 
     <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
     <div v-if="notice" role="status" class="notice-banner">{{ notice }}</div>
@@ -979,6 +988,21 @@ onUnmounted(() => {
 h1 { margin: 0; font-size: 22px; }
 
 .label { font-size: 12.5px; color: var(--text-dim); margin-bottom: 10px; font-weight: 500; }
+
+/* 导出是链接（浏览器直接下载）而不是按钮，但站在按钮行里就得长得一样 */
+.btn-link {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  font-size: 14px;
+  line-height: 1.6;
+  transition: border-color .15s;
+}
+.btn-link:hover { border-color: var(--accent); text-decoration: none; }
+
+.export-hint { margin: -6px 0 16px; font-size: 12.5px; }
 
 .notice-banner {
   background: var(--ok-bg);
