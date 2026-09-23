@@ -94,8 +94,6 @@ type Service struct {
 
 	// Now 可注入，便于测试。
 	Now func() time.Time
-
-	mu sync.Mutex
 }
 
 // roundTimeout 是单轮规划对话的上限。

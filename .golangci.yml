@@ -21,6 +21,12 @@ linters:
         - all
         # ST1003：命名风格（驼峰、缩写大小写）。存量命名已成体系，改动性价比低。
         - -ST1003
+        # QF1008：「可以省掉选择器里的嵌入字段名」。这是 quickfix 类的风格
+        # 建议，不是缺陷检测，而它建议的方向与本仓 adapter 的写法相反 ——
+        # prd.StoreAdapter 嵌入 *store.Store 后显式写 a.Store.GetPRD()，是
+        # 为了让读者一眼看出「这是转发给嵌入的 store」而不是适配器自己实现的
+        # 方法。按它改成 a.GetPRD() 反而丢掉这个信息。
+        - -QF1008
   exclusions:
     generated: lax
     rules:
