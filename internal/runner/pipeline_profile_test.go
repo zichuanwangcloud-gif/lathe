@@ -39,7 +39,7 @@ func profileFixture(t *testing.T, issueKey string, profile []byte) (*task.Machin
 	})
 
 	tk, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: issueKey,
+		UserID: userID, RepoID: repoID, ExternalKey: issueKey,
 		Profile: profile,
 	})
 	if err != nil {
@@ -87,7 +87,7 @@ func TestPipelineProfileModelChannelPerNode(t *testing.T) {
 	pA.ImplementChannel = "fallback-channel"
 
 	if err := pA.Execute(context.Background(), ExecuteParams{
-		TaskID: idA, Repo: repoA, CloneURL: srcA, IssueID: "uuid-777", Actor: "test",
+		TaskID: idA, Repo: repoA, CloneURL: srcA, IssueRef: "uuid-777", Actor: "test",
 	}); err != nil {
 		t.Fatalf("节点 A Execute 失败: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestPipelineProfileModelChannelPerNode(t *testing.T) {
 	pB.ImplementChannel = "fallback-channel"
 
 	if err := pB.Execute(context.Background(), ExecuteParams{
-		TaskID: idB, Repo: repoB, CloneURL: srcB, IssueID: "uuid-777", Actor: "test",
+		TaskID: idB, Repo: repoB, CloneURL: srcB, IssueRef: "uuid-777", Actor: "test",
 	}); err != nil {
 		t.Fatalf("节点 B Execute 失败: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestPipelineProfileVerifyTierOverridesAutoClassification(t *testing.T) {
 	p.Verifications = verifs
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestPipelineProfileInvalidFailsTaskWithReadableReason(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "test",
 	})
 	if err == nil {
 		t.Fatal("非法画像应导致 Execute 返回错误")

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/jackc/pgx/v5"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 )
 
 // SMTP 的加密方式。与 smtp_settings 的 tls_mode CHECK 约束一致。

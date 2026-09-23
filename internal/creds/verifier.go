@@ -2,6 +2,7 @@ package creds
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
@@ -9,6 +10,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // Verifier 用给定凭据实际连一次外部服务，验证其可用性。
@@ -80,14 +82,34 @@ func verifyGitHub(ctx context.Context, token string) httpapi.VerifyResult {
 // Clients 让 Provider 满足 runner.Clients，使流水线按需取客户端。
 type Clients struct {
 	p *Provider
+	// store 与 userID 供内置工单 tracker（tracker.ProviderInternal）
+	// 使用：它没有凭据概念，直接由 DB 支撑，但属主边界必须与
+	// 凭据提供者是同一个人 —— 都来自 ForUser 的调用参数。
+	store  *store.Store
+	userID int64
 }
 
-// NewClients 包装 Provider 供流水线使用。
-func NewClients(p *Provider) *Clients { return &Clients{p: p} }
+// NewClients 包装 Provider 供流水线使用。st 为 nil 时内置工单
+// tracker 不可用（返回明确错误，不静默 nil）。
+func NewClients(p *Provider, st *store.Store) *Clients {
+	return &Clients{p: p, store: st, userID: p.userID}
+}
 
-// Linear 实现 runner.Clients。
-func (c *Clients) Linear(ctx context.Context) (runner.LinearAPI, error) {
-	return c.p.Linear(ctx)
+// Tracker 实现 runner.Clients：按任务的需求来源平台分派。
+// 未知 provider 报错而不是默认走 Linear —— 静默路由到错误的平台
+// 会把评论写到错误的地方。
+func (c *Clients) Tracker(ctx context.Context, provider string) (tracker.Tracker, error) {
+	switch provider {
+	case tracker.ProviderInternal:
+		if c.store == nil {
+			return nil, errors.New("creds: 内置工单 tracker 未接线（store 为 nil）")
+		}
+		return tracker.NewLocalTracker(c.store, c.userID), nil
+	case tracker.ProviderLinear, "":
+		// 空串按 linear 处理：存量任务行与旧调用方的默认语义。
+		return c.p.Linear(ctx)
+	}
+	return nil, fmt.Errorf("creds: 未知需求平台 %q", provider)
 }
 
 // GitHub 实现 runner.Clients。

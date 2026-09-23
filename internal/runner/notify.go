@@ -47,10 +47,10 @@ type TaskMail interface {
 // awaiting_approval 给放行提示。空串则该段省略。
 func terminalMail(baseURL string, tk *task.Task, detail string) (subject, body string) {
 	label := stateSubject(tk.State)
-	subject = fmt.Sprintf("[Lathe] %s %s", tk.LinearIssueKey, label)
+	subject = fmt.Sprintf("[Lathe] %s %s", tk.ExternalKey, label)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "任务 #%d（%s）%s。\n", tk.ID, tk.LinearIssueKey, label)
+	fmt.Fprintf(&b, "任务 #%d（%s）%s。\n", tk.ID, tk.ExternalKey, label)
 
 	if tk.FailureReason != nil && *tk.FailureReason != "" {
 		fmt.Fprintf(&b, "\n失败原因：\n%s\n", truncate(*tk.FailureReason, 2000))

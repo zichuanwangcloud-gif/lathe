@@ -61,7 +61,7 @@ func TestPipelineAgentVisibility(t *testing.T) {
 	p.AgentEvents = rec
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestPipelineAgentVisibilityFailPath(t *testing.T) {
 	p.AgentEvents = rec
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	})
 	if err == nil {
 		t.Fatal("无改动应走失败路径")

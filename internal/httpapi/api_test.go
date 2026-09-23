@@ -143,7 +143,7 @@ func TestAPIListAndDetail(t *testing.T) {
 	_ = api.Store.Pool().QueryRow(ctx, `SELECT user_id FROM repos WHERE id=$1`, repoID).Scan(&userID)
 
 	tk, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-9001",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-9001",
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
@@ -169,7 +169,7 @@ func TestAPIListAndDetail(t *testing.T) {
 	tasks, _ = body["tasks"].([]any)
 	found := false
 	for _, x := range tasks {
-		if row, ok := x.(map[string]any); ok && row["linearIssueKey"] == "CR-9001" {
+		if row, ok := x.(map[string]any); ok && row["externalKey"] == "CR-9001" {
 			found = true
 			if row["state"] != "triaging" {
 				t.Errorf("过滤结果含非目标状态: %v", row["state"])
@@ -245,7 +245,7 @@ func TestAPIRetryAndCancel(t *testing.T) {
 	var userID int64
 	_ = api.Store.Pool().QueryRow(ctx, `SELECT user_id FROM repos WHERE id=$1`, repoID).Scan(&userID)
 
-	tk, _ := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-9003"})
+	tk, _ := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-9003"})
 
 	// queued 状态下重试是非法转移（queued→queued 不存在）
 	resp := do(t, srv, "POST", "/api/tasks/"+itoa(tk.ID)+"/retry", "", true)
@@ -437,7 +437,7 @@ func TestAPIIsolationBetweenUsers(t *testing.T) {
 		t.Fatalf("建 A 的仓库失败: %v", err)
 	}
 	m := task.NewMachine(st.Pool())
-	tkA, err := m.Create(ctx, task.CreateParams{UserID: userA, RepoID: repoA, LinearIssueKey: "ISO-1"})
+	tkA, err := m.Create(ctx, task.CreateParams{UserID: userA, RepoID: repoA, ExternalKey: "ISO-1"})
 	if err != nil {
 		t.Fatalf("建 A 的任务失败: %v", err)
 	}

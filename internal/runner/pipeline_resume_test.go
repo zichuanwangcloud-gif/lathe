@@ -82,7 +82,7 @@ func TestPipelineResumeFromPush(t *testing.T) {
 	wt := prepareFailedTask(t, p, m, taskID, src, repo, StagePush, true)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 		Retry: &RetryPlan{Entry: EntryPush, Reasons: []string{"验证已通过，仅推送未完成"}},
 	})
 	if err != nil {
@@ -133,7 +133,7 @@ func TestPipelineResumeFromVerify(t *testing.T) {
 	prepareFailedTask(t, p, m, taskID, src, repo, StageVerifyGate, true)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 		Retry: &RetryPlan{Entry: EntryVerify, Reasons: []string{"直接重新验证"}},
 	})
 	if err != nil {
@@ -174,7 +174,7 @@ func TestPipelineResumeImplementWithSession(t *testing.T) {
 	prepareFailedTask(t, p, m, taskID, src, repo, StageImplementRun, false)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 		Retry: &RetryPlan{Entry: EntryImplement, ResumeSession: true, Reasons: []string{"续跑原会话"}},
 	})
 	if err != nil {
@@ -228,7 +228,7 @@ func TestPipelineResumeImplementDegradesOnResumeFailure(t *testing.T) {
 	prepareFailedTask(t, p, m, taskID, src, repo, StageImplementRun, false)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 		Retry: &RetryPlan{Entry: EntryImplement, ResumeSession: true, Reasons: []string{"续跑原会话"}},
 	})
 	if err != nil {
@@ -278,7 +278,7 @@ func TestPipelineResumeFromCommit(t *testing.T) {
 	writeFile(t, filepath.Join(*tk.WorktreePath, "README.md"), "# src\n\n补充：人工介入修好了\n")
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 		Retry: &RetryPlan{Entry: EntryCommit, Reasons: []string{"先提交再重验"}},
 	})
 	if err != nil {
@@ -318,7 +318,7 @@ func TestPipelineFreshRetryRunsFullPipeline(t *testing.T) {
 
 	// 旧现场在派发侧已被 Discard（queue 的职责），这里直接全新执行
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 		Retry: &RetryPlan{Fresh: true, Entry: EntryTriage, Reasons: []string{"现场已不可用，从头重建"}},
 	})
 	if err != nil {

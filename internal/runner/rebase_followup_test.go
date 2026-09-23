@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // 本文件测 F4.3（后继链自动跟进）的核心：MergePoller.rebaseFollowup。
@@ -155,20 +155,20 @@ func TestRebaseFollowupCascadeThreeLevels(t *testing.T) {
 	ctx := context.Background()
 
 	task1, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-1", LinearIssueID: "uuid-rb-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-1", ExternalID: "uuid-rb-1",
 	})
 	if err != nil {
 		t.Fatalf("建 task1 失败: %v", err)
 	}
 	task2, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-2", LinearIssueID: "uuid-rb-2",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-2", ExternalID: "uuid-rb-2",
 		DependsOn: &task1.ID,
 	})
 	if err != nil {
 		t.Fatalf("建 task2 失败: %v", err)
 	}
 	task3, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-3", LinearIssueID: "uuid-rb-3",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-3", ExternalID: "uuid-rb-3",
 		DependsOn: &task2.ID,
 	})
 	if err != nil {
@@ -203,7 +203,7 @@ func TestRebaseFollowupCascadeThreeLevels(t *testing.T) {
 
 	// ---- task1：独立根，正常从 dev 分叉 ----
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueID: "uuid-rb-1", Actor: "node:test",
+		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueRef: "uuid-rb-1", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task1 Execute 失败: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestRebaseFollowupCascadeThreeLevels(t *testing.T) {
 	repo2 := repo
 	repo2.BaseRefOverride = task1Branch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueID: "uuid-rb-2", Actor: "node:test",
+		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueRef: "uuid-rb-2", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task2 Execute 失败: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestRebaseFollowupCascadeThreeLevels(t *testing.T) {
 	repo3 := repo
 	repo3.BaseRefOverride = task2Branch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task3.ID, Repo: repo3, CloneURL: src, IssueID: "uuid-rb-3", Actor: "node:test",
+		TaskID: task3.ID, Repo: repo3, CloneURL: src, IssueRef: "uuid-rb-3", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task3 Execute 失败: %v", err)
 	}
@@ -415,20 +415,20 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 	gitOut(t, src, "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "加 shared.txt")
 
 	taskA, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-CONFLICT-A", LinearIssueID: "uuid-rb-conflict-a",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-CONFLICT-A", ExternalID: "uuid-rb-conflict-a",
 	})
 	if err != nil {
 		t.Fatalf("建 taskA 失败: %v", err)
 	}
 	taskB, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-CONFLICT-B", LinearIssueID: "uuid-rb-conflict-b",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-CONFLICT-B", ExternalID: "uuid-rb-conflict-b",
 		DependsOn: &taskA.ID,
 	})
 	if err != nil {
 		t.Fatalf("建 taskB 失败: %v", err)
 	}
 	taskC, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-CONFLICT-C", LinearIssueID: "uuid-rb-conflict-c",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-CONFLICT-C", ExternalID: "uuid-rb-conflict-c",
 		DependsOn: &taskB.ID,
 	})
 	if err != nil {
@@ -461,7 +461,7 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 	}
 
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: taskA.ID, Repo: repo, CloneURL: src, IssueID: "uuid-rb-conflict-a", Actor: "node:test",
+		TaskID: taskA.ID, Repo: repo, CloneURL: src, IssueRef: "uuid-rb-conflict-a", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("taskA Execute 失败: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 	repoB := repo
 	repoB.BaseRefOverride = taskABranch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: taskB.ID, Repo: repoB, CloneURL: src, IssueID: "uuid-rb-conflict-b", Actor: "node:test",
+		TaskID: taskB.ID, Repo: repoB, CloneURL: src, IssueRef: "uuid-rb-conflict-b", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("taskB Execute 失败: %v", err)
 	}
@@ -495,7 +495,7 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 	repoC := repo
 	repoC.BaseRefOverride = taskBBranch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: taskC.ID, Repo: repoC, CloneURL: src, IssueID: "uuid-rb-conflict-c", Actor: "node:test",
+		TaskID: taskC.ID, Repo: repoC, CloneURL: src, IssueRef: "uuid-rb-conflict-c", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("taskC Execute 失败: %v", err)
 	}
@@ -621,13 +621,13 @@ func TestFailRebaseFollowupPropagatesBlockedDepToQueuedSuccessors(t *testing.T) 
 	gitOut(t, src, "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "加 shared.txt")
 
 	task1, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-DEEP-1", LinearIssueID: "uuid-rb-deep-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-DEEP-1", ExternalID: "uuid-rb-deep-1",
 	})
 	if err != nil {
 		t.Fatalf("建 task1 失败: %v", err)
 	}
 	task2, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-DEEP-2", LinearIssueID: "uuid-rb-deep-2",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-DEEP-2", ExternalID: "uuid-rb-deep-2",
 		DependsOn: &task1.ID,
 	})
 	if err != nil {
@@ -635,14 +635,14 @@ func TestFailRebaseFollowupPropagatesBlockedDepToQueuedSuccessors(t *testing.T) 
 	}
 	// task3/task4 建了就不再动——全程停在 queued，没有 worktree。
 	task3, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-DEEP-3", LinearIssueID: "uuid-rb-deep-3",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-DEEP-3", ExternalID: "uuid-rb-deep-3",
 		DependsOn: &task2.ID,
 	})
 	if err != nil {
 		t.Fatalf("建 task3 失败: %v", err)
 	}
 	task4, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "RB-DEEP-4", LinearIssueID: "uuid-rb-deep-4",
+		UserID: userID, RepoID: repoID, ExternalKey: "RB-DEEP-4", ExternalID: "uuid-rb-deep-4",
 		DependsOn: &task3.ID,
 	})
 	if err != nil {
@@ -673,7 +673,7 @@ func TestFailRebaseFollowupPropagatesBlockedDepToQueuedSuccessors(t *testing.T) 
 	}
 
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueID: "uuid-rb-deep-1", Actor: "node:test",
+		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueRef: "uuid-rb-deep-1", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task1 Execute 失败: %v", err)
 	}
@@ -691,7 +691,7 @@ func TestFailRebaseFollowupPropagatesBlockedDepToQueuedSuccessors(t *testing.T) 
 	repo2 := repo
 	repo2.BaseRefOverride = task1Branch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueID: "uuid-rb-deep-2", Actor: "node:test",
+		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueRef: "uuid-rb-deep-2", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task2 Execute 失败: %v", err)
 	}

@@ -79,7 +79,7 @@ func TestTerminalMailRendersEssentials(t *testing.T) {
 	reason := "验证未通过: 回归测试挂了"
 	stage := "verify_failed"
 	tk := &task.Task{
-		ID: 4242, LinearIssueKey: "CR-999", State: task.StateFailed,
+		ID: 4242, ExternalKey: "CR-999", State: task.StateFailed,
 		FailureReason: &reason, FailureStage: &stage,
 	}
 
@@ -105,7 +105,7 @@ func TestTerminalMailRendersEssentials(t *testing.T) {
 
 // BaseURL 为空时省略链接那一行，而不是拼出一个指向 localhost 的无用链接。
 func TestTerminalMailOmitsLinkWithoutBaseURL(t *testing.T) {
-	tk := &task.Task{ID: 7, LinearIssueKey: "CR-7", State: task.StatePROpen}
+	tk := &task.Task{ID: 7, ExternalKey: "CR-7", State: task.StatePROpen}
 	_, body := terminalMail("", tk, "")
 	if strings.Contains(body, "详情") {
 		t.Errorf("BaseURL 为空时不该出现详情链接，实际正文：\n%s", body)
@@ -122,7 +122,7 @@ func TestTerminalMailOmitsLinkWithoutBaseURL(t *testing.T) {
 func TestMailTerminalSwallowsSendFailure(t *testing.T) {
 	fm := &fakeMail{err: errors.New("smtp 连不上")}
 	p := &Pipeline{Mail: fm, BaseURL: "https://x.example"}
-	tk := &task.Task{ID: 1, LinearIssueKey: "CR-1", State: task.StateFailed}
+	tk := &task.Task{ID: 1, ExternalKey: "CR-1", State: task.StateFailed}
 
 	// 不 panic、不返回值即通过
 	p.mailTerminal(context.Background(), tk, "")
@@ -178,7 +178,7 @@ func TestPipelineFailureNotifiesOwnerAndSurvivesSMTPOutage(t *testing.T) {
 
 	// 失败是预期结果，Execute 返回错误也是预期的
 	_ = p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	})
 
 	final, err := m.Get(ctx, taskID)
@@ -228,7 +228,7 @@ func TestPipelineManualGateNotifiesOwner(t *testing.T) {
 	p.SettingSources = "project"
 
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("闸门停机是正常终止: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestPipelinePROpenNotifiesOwner(t *testing.T) {
 	p.SettingSources = "project"
 
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}

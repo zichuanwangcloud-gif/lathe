@@ -97,7 +97,7 @@ func (f *FlowAPI) create(w http.ResponseWriter, r *http.Request) {
 	for i, t := range created {
 		tasks[i] = map[string]any{
 			"id":       t.ID,
-			"issueKey": t.LinearIssueKey,
+			"issueKey": t.ExternalKey,
 			"state":    string(t.State),
 		}
 	}

@@ -35,7 +35,7 @@ func notifyFixture(t *testing.T, st *Store, notifyEmail *string) (taskID int64, 
 		t.Fatalf("建 repo 失败: %v", err)
 	}
 	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO tasks (user_id, repo_id, linear_issue_key) VALUES ($1, $2, $3) RETURNING id`,
+		`INSERT INTO tasks (user_id, repo_id, external_key) VALUES ($1, $2, $3) RETURNING id`,
 		userID, repoID, "NT-"+nonce).Scan(&taskID); err != nil {
 		t.Fatalf("建 task 失败: %v", err)
 	}

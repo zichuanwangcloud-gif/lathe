@@ -9,27 +9,35 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // Task 是 tasks 表的一行。
 type Task struct {
-	ID             int64
-	UserID         int64
-	RepoID         int64
-	LinearIssueKey string
-	// LinearIssueID 是 issue 的 UUID（Linear API 的定位主键）。
-	// 重试与启动恢复靠它重新定位 issue —— key 只是给人看的编号。
+	ID     int64
+	UserID int64
+	RepoID int64
+	// ExternalKey 是需求工单的人读编号：Linear 形如 CR-1326，
+	// 内置工单形如 LT-1042（migration 0021，docs/09 §4.2）。
+	ExternalKey string
+	// ExternalID 是平台侧的定位主键：Linear 是 issue UUID；
+	// 内置工单为 NULL（按 (属主, key) 解析，不需要第二标识）。
+	// 重试与启动恢复靠它重新定位工单 —— key 只是给人看的编号。
 	// 旧行可能为 NULL（migration 0010 前的数据）。
-	LinearIssueID  *string
-	State          State
-	GateMode       string
-	TaskKind       *string
-	VerifyTier     *string
-	AgentSessionID *string
-	WorktreePath   *string
-	BranchName     *string
-	PRURL          *string
-	FailureReason  *string
+	ExternalID *string
+	// TrackerProvider 是需求来源平台（'linear' | 'internal'），
+	// 决定 pipeline 从哪儿拉工单、往哪儿回帖。
+	TrackerProvider string
+	State           State
+	GateMode        string
+	TaskKind        *string
+	VerifyTier      *string
+	AgentSessionID  *string
+	WorktreePath    *string
+	BranchName      *string
+	PRURL           *string
+	FailureReason   *string
 	// FailureStage 是机器可读的失败阶段代码（runner 包定义），
 	// 智能重试的断点续跑决策依据。仅 state=failed 时有意义。
 	FailureStage   *string
@@ -92,7 +100,7 @@ func (e ErrStateMismatch) Error() string {
 var ErrSessionRequired = errors.New("task: 该转移要求已持有 agent_session_id（review 二轮必须 resume 原会话）")
 
 const taskColumns = `
-	id, user_id, repo_id, linear_issue_key, linear_issue_id, state, gate_mode,
+	id, user_id, repo_id, external_key, external_id, tracker_provider, state, gate_mode,
 	task_kind, verify_tier, agent_session_id, worktree_path,
 	branch_name, pr_url, failure_reason, failure_stage, node_id, lease_expires_at,
 	flow_id, depends_on, depends_on_at, base_ref, priority, profile, pr_number,
@@ -101,7 +109,7 @@ const taskColumns = `
 // taskColumnsQualified 是 taskColumns 的 tasks. 限定版本，供 ClaimReady 这类
 // 联表（FROM candidate）查询使用 —— 不限定会因列名歧义报错。
 const taskColumnsQualified = `
-	tasks.id, tasks.user_id, tasks.repo_id, tasks.linear_issue_key, tasks.linear_issue_id, tasks.state, tasks.gate_mode,
+	tasks.id, tasks.user_id, tasks.repo_id, tasks.external_key, tasks.external_id, tasks.tracker_provider, tasks.state, tasks.gate_mode,
 	tasks.task_kind, tasks.verify_tier, tasks.agent_session_id, tasks.worktree_path,
 	tasks.branch_name, tasks.pr_url, tasks.failure_reason, tasks.failure_stage, tasks.node_id, tasks.lease_expires_at,
 	tasks.flow_id, tasks.depends_on, tasks.depends_on_at, tasks.base_ref, tasks.priority, tasks.profile, tasks.pr_number,
@@ -109,13 +117,17 @@ const taskColumnsQualified = `
 
 // CreateParams 是建任务所需的最小输入。
 type CreateParams struct {
-	UserID         int64
-	RepoID         int64
-	LinearIssueKey string
-	// LinearIssueID 是 issue 的 UUID；为空时存 NULL（兼容旧调用方）。
-	LinearIssueID string
-	GateMode      string
-	TaskKind      *string
+	UserID      int64
+	RepoID      int64
+	ExternalKey string
+	// ExternalID 是平台侧定位主键（Linear 的 issue UUID）；为空时存
+	// NULL（兼容旧调用方，且内置工单本来就没有第二标识）。
+	ExternalID string
+	// TrackerProvider 是需求来源平台（tracker.ProviderLinear / ProviderInternal）；
+	// 空串按 tracker.ProviderLinear 处理（兼容旧调用方与存量语义）。
+	TrackerProvider string
+	GateMode        string
+	TaskKind        *string
 	// FlowID 非 nil 时把任务挂到指定编排图；nil 表示独立任务（NULL）。
 	FlowID *int64
 	// DependsOn 非 nil 时声明前驱任务（自引用）；nil 表示独立根。
@@ -168,6 +180,9 @@ func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 	if p.GateMode == "" {
 		p.GateMode = GateDirect
 	}
+	if p.TrackerProvider == "" {
+		p.TrackerProvider = tracker.ProviderLinear
+	}
 	dependsOnAt := p.DependsOnAt
 	if dependsOnAt == "" {
 		dependsOnAt = "pr_open"
@@ -181,13 +196,14 @@ func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 
 	row := tx.QueryRow(ctx, `
 		INSERT INTO tasks (
-			user_id, repo_id, linear_issue_key, linear_issue_id, state, gate_mode, task_kind,
+			user_id, repo_id, external_key, external_id, tracker_provider, state, gate_mode, task_kind,
 			flow_id, depends_on, depends_on_at, priority, base_ref, profile
 		)
-		VALUES ($1, $2, $3, NULLIF($7, ''), $4, $5, $6, $8, $9, $10, $11, $12, COALESCE($13, '{}'::jsonb))
+		VALUES ($1, $2, $3, NULLIF($7, ''), $14, $4, $5, $6, $8, $9, $10, $11, $12, COALESCE($13, '{}'::jsonb))
 		RETURNING `+taskColumns,
-		p.UserID, p.RepoID, p.LinearIssueKey, StateQueued, p.GateMode, p.TaskKind, p.LinearIssueID,
-		p.FlowID, p.DependsOn, dependsOnAt, p.Priority, p.BaseRef, nilIfEmptyJSON(p.Profile))
+		p.UserID, p.RepoID, p.ExternalKey, StateQueued, p.GateMode, p.TaskKind, p.ExternalID,
+		p.FlowID, p.DependsOn, dependsOnAt, p.Priority, p.BaseRef, nilIfEmptyJSON(p.Profile),
+		p.TrackerProvider)
 
 	t, err := scanTask(row)
 	if err != nil {
@@ -196,7 +212,7 @@ func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 
 	// from_state 为 NULL 表示"任务创建"，重放时是事件流的起点
 	if err := insertEvent(ctx, tx, t.ID, nil, StateQueued, "system",
-		map[string]any{"issue": p.LinearIssueKey}); err != nil {
+		map[string]any{"issue": p.ExternalKey, "provider": t.TrackerProvider}); err != nil {
 		return nil, err
 	}
 
@@ -459,21 +475,51 @@ func (m *Machine) ListReapableTasks(ctx context.Context, olderThan time.Time) ([
 // ActiveByIssueID 返回某属主名下、指定 Linear issue 的所有非终结任务（T7）。
 //
 // 谓词抄 flow/service.go 那条「同 issue 的活任务」查询，改成按
-// linear_issue_id（UUID）而不是 linear_issue_key —— webhook 手里权威的是
+// external_id（UUID）而不是 external_key —— webhook 手里权威的是
 // UUID，issue key 是人读标识、理论上可被重命名。
 //
-// 正常情况下最多一条（tasks_one_active_per_issue 部分唯一索引按
-// (repo_id, linear_issue_key) 挡住），但一个用户可能在多个仓库下登记了
-// 同一个 issue，所以返回切片、不假设恰好一条。
+// 正常情况下最多一条（tasks_one_active_per_item 部分唯一索引按
+// (repo_id, tracker_provider, external_key) 挡住），但一个用户可能在多个
+// 仓库下登记了同一个 issue，所以返回切片、不假设恰好一条。
+//
+// 内置工单不走这里：external_id 为 NULL，取消联动走 ActiveByKey。
 func (m *Machine) ActiveByIssueID(ctx context.Context, userID int64, issueID string) ([]*Task, error) {
 	rows, err := m.pool.Query(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
-		WHERE user_id = $1 AND linear_issue_id = $2
+		WHERE user_id = $1 AND external_id = $2
 		  AND state NOT IN ('merged', 'failed', 'cancelled')
 		ORDER BY id`, userID, issueID)
 	if err != nil {
 		return nil, fmt.Errorf("task: 查询 issue %s 的在途任务失败: %w", issueID, err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取在途任务失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ActiveByKey 返回某属主名下、指定 (平台, key) 的所有非终结任务。
+//
+// 内置工单的取消联动走这条路（docs/09 §3 F4-AC4）：内置任务的
+// external_id 为 NULL，key 就是全部身份。Linear 路径继续用
+// ActiveByIssueID（webhook 手里权威的是 UUID，不用这条）。
+func (m *Machine) ActiveByKey(ctx context.Context, userID int64, provider, key string) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumns+`
+		FROM tasks
+		WHERE user_id = $1 AND tracker_provider = $2 AND external_key = $3
+		  AND state NOT IN ('merged', 'failed', 'cancelled')
+		ORDER BY id`, userID, provider, key)
+	if err != nil {
+		return nil, fmt.Errorf("task: 查询工单 %s 的在途任务失败: %w", key, err)
 	}
 	defer rows.Close()
 
@@ -750,7 +796,7 @@ func (m *Machine) ClaimReady(ctx context.Context, leaseDuration time.Duration) (
 // 不报错：这是已知的未覆盖场景，pipeline 层的报告会说明。
 //
 // 返回所有成功转移的 *Task，供调用方（不是本方法的职责）用其
-// LinearIssueKey/LinearIssueID 去回帖。
+// ExternalKey/ExternalID 去回帖。
 func (m *Machine) PropagateBlocked(ctx context.Context, failedTaskID int64, reason string) ([]*Task, error) {
 	rows, err := m.pool.Query(ctx, `
 		WITH RECURSIVE descendants AS (
@@ -948,7 +994,7 @@ func scanTask(row pgx.Row) (*Task, error) {
 		state string
 	)
 	err := row.Scan(
-		&t.ID, &t.UserID, &t.RepoID, &t.LinearIssueKey, &t.LinearIssueID, &state, &t.GateMode,
+		&t.ID, &t.UserID, &t.RepoID, &t.ExternalKey, &t.ExternalID, &t.TrackerProvider, &state, &t.GateMode,
 		&t.TaskKind, &t.VerifyTier, &t.AgentSessionID, &t.WorktreePath,
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.NodeID, &t.LeaseExpiresAt,
 		&t.FlowID, &t.DependsOn, &t.DependsOnAt, &t.BaseRef, &t.Priority, &t.Profile, &t.PRNumber,

@@ -12,17 +12,11 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
-	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // 下面这些窄接口让流水线可被完整单测，无需真实的 Linear/GitHub/claude。
-
-// LinearAPI 是流水线用到的 Linear 能力。
-type LinearAPI interface {
-	Issue(ctx context.Context, id string) (*linear.Issue, error)
-	Comment(ctx context.Context, issueID, body string) (string, error)
-}
 
 // GitHubAPI 是流水线用到的 GitHub 能力。
 type GitHubAPI interface {
@@ -41,7 +35,10 @@ type GitHubAPI interface {
 // 凭据可在界面上随时修改，因此客户端不能在启动时固定 —— 每次执行
 // 任务时现取，改完凭据无需重启即可生效。
 type Clients interface {
-	Linear(ctx context.Context) (LinearAPI, error)
+	// Tracker 按任务的需求来源平台（tasks.tracker_provider）返回对应
+	// 实现：'linear' 走凭据解析（需在设置页配置）；'internal' 是内置
+	// 工单体系，无凭据概念，直接由 DB 支撑（docs/09-internal-issues.md）。
+	Tracker(ctx context.Context, provider string) (tracker.Tracker, error)
 	GitHub(ctx context.Context) (GitHubAPI, error)
 }
 
@@ -157,7 +154,10 @@ type ExecuteParams struct {
 	TaskID   int64
 	Repo     RepoConfig
 	CloneURL string
-	IssueID  string // Linear issue 的 UUID
+	// IssueRef 是需求工单的定位引用：Linear 是 issue UUID，内置工单
+	// 是 key（LT-xxxx）。派发侧按 external_id-or-key 规则填（见
+	// IssueRefOf），平台差异不进流水线。
+	IssueRef string
 	Actor    string
 
 	// Retry 非空表示这是一次重试：Fresh 为真时丢弃现场从头重建（等价于
@@ -183,11 +183,12 @@ const StageRebaseConflict Stage = "rebase_conflict"
 
 // runCtx 携带一次流水线执行的上下文，在阶段函数间传递。
 type runCtx struct {
-	ctx    context.Context
-	params ExecuteParams
-	actor  string
-	lin    LinearAPI
-	gh     GitHubAPI
+	ctx     context.Context
+	params  ExecuteParams
+	actor   string
+	clients Clients // 失败传播按每个后继自己的 provider 分派 tracker 用
+	tracker tracker.Tracker
+	gh      GitHubAPI
 
 	tk   *task.Task // 任务行（每次转移后刷新）
 	plan *RetryPlan // 非空表示断点续跑
@@ -201,7 +202,7 @@ type runCtx struct {
 	// 见 profile.go 的 StageProfileInvalid 注释）。
 	profile      *Profile
 	profileErr   error
-	issue        *linear.Issue
+	issue        *tracker.Issue
 	kind         TaskKind
 	wt           *Worktree
 	implSession  string
@@ -211,6 +212,37 @@ type runCtx struct {
 	report       Report
 
 	retryNoted bool // 重试决策是否已落进某次转移的 payload
+}
+
+// IssueRefOf 给出某任务行在需求平台上的定位引用：
+// 平台侧主键（Linear UUID）优先；为空时退回人读 key —— 内置工单的
+// external_id 恒为 NULL，key 就是全部身份；Linear 旧数据（migration
+// 0010 前）同样只有 key 可用，而 Linear 的 issue 查询同时接受
+// UUID 与 identifier，退回行为对两边都成立。
+func IssueRefOf(tk *task.Task) string {
+	if tk.ExternalID != nil && *tk.ExternalID != "" {
+		return *tk.ExternalID
+	}
+	return tk.ExternalKey
+}
+
+// commentOnTask 按任务自己的 provider 解析 tracker 并回帖。
+//
+// 逐条现取而不是复用调用方的 tracker：失败传播的后继任务理论上
+// 与本任务同平台（图内不混平台是当前产品约束），但没有结构保证，
+// 用错 tracker 会把评论发去错误的平台。回帖出错返回 error，由调用方
+// 决定跳过 —— 回帖从不该阻断主流程。
+func commentOnTask(ctx context.Context, clients Clients, tk *task.Task, body string) error {
+	ref := IssueRefOf(tk)
+	if ref == "" {
+		return fmt.Errorf("任务 #%d 缺少需求平台引用", tk.ID)
+	}
+	tr, err := clients.Tracker(ctx, tk.TrackerProvider)
+	if err != nil {
+		return fmt.Errorf("解析 tracker（provider=%s）失败: %w", tk.TrackerProvider, err)
+	}
+	_, err = tr.Comment(ctx, ref, body)
+	return err
 }
 
 // takeRetryPayload 把重试决策附进续跑后的第一次状态转移（且仅第一次），
@@ -313,12 +345,12 @@ func (p *Pipeline) gateBeforePush(rc *runCtx) error {
 		"这个仓库配了人工闸门（gate_mode=manual）：到任务详情页点「确认开 PR」后才会推分支并开 PR。")
 
 	slog.Info("人工闸门拦住了开 PR，等人确认",
-		"task", rc.tk.ID, "issue", rc.tk.LinearIssueKey, "gate_mode", rc.tk.GateMode)
+		"task", rc.tk.ID, "issue", rc.tk.ExternalKey, "gate_mode", rc.tk.GateMode)
 
 	// 回帖告诉人「活干完了，等你点」—— 否则人得盯着面板才知道该去确认。
-	if rc.lin != nil {
+	if rc.tracker != nil {
 		body := "验证已通过，但这个仓库配了人工闸门（gate_mode=manual）：确认后才会推分支并开 PR。\n\n请到 Lathe 任务详情页点「确认开 PR」。"
-		if _, err := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); err != nil {
+		if _, err := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); err != nil {
 			// 回帖失败不该影响闸门本身 —— 状态已经落库了，人在面板上照样能看到。
 			slog.Warn("人工闸门回帖失败", "task", rc.tk.ID, "err", err)
 		}
@@ -358,16 +390,27 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 			return nil, "", fmt.Errorf("解析任务属主的凭据失败: %w", err)
 		}
 	}
-	lin, err := clients.Linear(ctx)
+	// 需求平台按任务行上钉死的 provider 分派：'internal' 无凭据概念
+	// （内置工单体系），'linear' 走凭据解析。任务创建后 provider 不可变，
+	// 与 repo_id 的语义一致。
+	tr, err := clients.Tracker(ctx, tk.TrackerProvider)
 	if err != nil {
-		return nil, "", fmt.Errorf("获取 Linear 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		if tk.TrackerProvider == tracker.ProviderLinear || tk.TrackerProvider == "" {
+			return nil, "", fmt.Errorf("获取 Linear 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		}
+		return nil, "", fmt.Errorf("获取需求平台客户端失败（provider=%s）: %w", tk.TrackerProvider, err)
+	}
+	// 内置实现支持评论署名（'task-<id>' → 评论区渲染「lathe · 任务 #id」）；
+	// Linear 没这个概念（评论身份即 token 持有人），类型断言不中就不署。
+	if at, ok := tr.(tracker.AttributedTracker); ok {
+		tr = at.WithActor(fmt.Sprintf("task-%d", tk.ID))
 	}
 	gh, err := clients.GitHub(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
 	}
 
-	rc := &runCtx{ctx: ctx, params: params, actor: actor, lin: lin, gh: gh, tk: tk}
+	rc := &runCtx{ctx: ctx, params: params, actor: actor, clients: clients, tracker: tr, gh: gh, tk: tk}
 	rc.profile, rc.profileErr = ParseProfile(tk.Profile)
 	entry := EntryTriage
 	if params.Retry != nil {
@@ -387,7 +430,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 
 	// ---- 断点续跑：重建现场句柄 ----
 	// issue 拉最新：重试间隔里提单人可能补充了信息，PR 标题与回帖都用它。
-	issue, err := lin.Issue(ctx, params.IssueID)
+	issue, err := tr.Issue(ctx, params.IssueRef)
 	if err != nil {
 		return nil, "", fmt.Errorf("续跑前拉取 issue 失败: %w", err)
 	}
@@ -441,7 +484,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		return err
 	}
 
-	issue, err := rc.lin.Issue(rc.ctx, rc.params.IssueID)
+	issue, err := rc.tracker.Issue(rc.ctx, rc.params.IssueRef)
 	if err != nil {
 		return p.fail(rc, StageFetchIssue, err)
 	}
@@ -476,7 +519,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	if !verdict.Actionable {
 		// 单子不明确：回帖提问并停下，不猜（产品边界）
 		body := fmt.Sprintf("**Lathe 暂不能自动处理这个 issue**\n\n%s\n\n补充后重新指派给我即可。", verdict.Question)
-		if _, cerr := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); cerr != nil {
+		if _, cerr := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); cerr != nil {
 			slog.Warn("回帖失败", "task", rc.tk.ID, "err", cerr)
 		}
 		if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
@@ -857,7 +900,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	if red := redStepFailure(report); red != nil {
 		body := fmt.Sprintf("**Lathe 无法证明这个修复有效，已暂停**\n\n%s\n\n复现测试在改动前的代码上没有失败 —— 可能是 bug 描述与实际不符，或复现条件缺失。请补充复现步骤后重新指派给我。\n\n```\n%s```",
 			red.Err, report.Summary())
-		if _, cerr := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); cerr != nil {
+		if _, cerr := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); cerr != nil {
 			slog.Warn("回帖失败", "task", rc.tk.ID, "err", cerr)
 		}
 		if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
@@ -966,7 +1009,7 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 
 	body := fmt.Sprintf("**Lathe 已完成并开出 PR**\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
 		pr.URL, verifySummary)
-	if _, err := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); err != nil {
+	if _, err := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); err != nil {
 		slog.Warn("回帖失败", "task", rc.tk.ID, "err", err)
 	}
 
@@ -1256,8 +1299,8 @@ func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
 	if rc.wt != nil {
 		body += fmt.Sprintf("\n工作区已保留在 `%s`（分支 `%s`），可直接进去接手；重试会优先续跑该现场。\n", rc.wt.Path, rc.wt.Branch)
 	}
-	if rc.lin != nil {
-		if _, err := rc.lin.Comment(rc.ctx, rc.params.IssueID, body); err != nil {
+	if rc.tracker != nil {
+		if _, err := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); err != nil {
 			slog.Warn("失败回帖也失败了", "task", rc.tk.ID, "err", err)
 		}
 	}
@@ -1304,15 +1347,12 @@ func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
 			slog.Warn("失败传播发现跨属主后继", "task", rc.tk.ID, "taskOwner", rc.tk.UserID,
 				"blockedTask", bt.ID, "blockedOwner", bt.UserID)
 		}
-		if rc.lin == nil || bt.LinearIssueID == nil || *bt.LinearIssueID == "" {
-			continue
-		}
 		blockedBody := fmt.Sprintf(
 			"**Lathe 已阻塞**\n\n前驱任务 #%d（issue `%s`）失败，本任务因依赖它而被阻塞（blocked_dep），"+
 				"等前驱恢复（重试成功或人工处理）后会自动回到排队。\n\n前驱失败原因：\n```\n%s\n```\n",
-			rc.tk.ID, rc.tk.LinearIssueKey, truncate(reason, 1000))
-		if _, cerr := rc.lin.Comment(rc.ctx, *bt.LinearIssueID, blockedBody); cerr != nil {
-			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", cerr)
+			rc.tk.ID, rc.tk.ExternalKey, truncate(reason, 1000))
+		if err := commentOnTask(rc.ctx, rc.clients, bt, blockedBody); err != nil {
+			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", err)
 		}
 	}
 

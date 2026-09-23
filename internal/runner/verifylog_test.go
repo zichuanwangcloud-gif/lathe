@@ -176,7 +176,7 @@ func TestPipelineWritesLogRefForEveryVerifyStep(t *testing.T) {
 	p.SettingSources = "project"
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}

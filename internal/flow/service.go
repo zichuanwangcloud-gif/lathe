@@ -13,6 +13,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // ErrIssueActive 表示批次里某个 issue 已经有一个"活着"的任务
@@ -235,15 +236,18 @@ func (s *Service) CreateFlow(ctx context.Context, ownerUserID, repoID int64, nam
 		}
 
 		t, err := s.Tasks.Create(ctx, task.CreateParams{
-			UserID:         ownerUserID,
-			RepoID:         repoID,
-			LinearIssueKey: issueKey,
-			LinearIssueID:  issueID,
-			FlowID:         &flowID,
-			DependsOn:      dependsOn,
-			DependsOnAt:    n.DependsOnAt,
-			Priority:       n.Priority,
-			Profile:        []byte(n.Profile),
+			UserID:      ownerUserID,
+			RepoID:      repoID,
+			ExternalKey: issueKey,
+			ExternalID:  issueID,
+			// 编排图当前只有 Linear 节点（画布也只接 Linear 选单）；
+			// 内置工单进图是 09 的 P3，届时 flows 表才加 provider 列。
+			TrackerProvider: tracker.ProviderLinear,
+			FlowID:          &flowID,
+			DependsOn:       dependsOn,
+			DependsOnAt:     n.DependsOnAt,
+			Priority:        n.Priority,
+			Profile:         []byte(n.Profile),
 		})
 		if err != nil {
 			s.compensate(ctx, created)
@@ -356,7 +360,7 @@ func (s *Service) detectDuplicateSubmission(ctx context.Context, ownerUserID, re
 	var existingFlowID *int64
 	err := s.Pool.QueryRow(ctx, `
 		SELECT id, flow_id FROM tasks
-		WHERE repo_id = $1 AND user_id = $2 AND linear_issue_key = $3
+		WHERE repo_id = $1 AND user_id = $2 AND tracker_provider = 'linear' AND external_key = $3
 		  AND state NOT IN ('merged', 'failed', 'cancelled')`,
 		repoID, ownerUserID, firstKey,
 	).Scan(&existingID, &existingFlowID)
@@ -397,7 +401,7 @@ func sameBatch(existing []*task.Task, nodes []NodeInput) bool {
 		if key == "" {
 			key = n.IssueID
 		}
-		if existing[i].LinearIssueKey != key {
+		if existing[i].ExternalKey != key {
 			return false
 		}
 		wantDep := n.DependsOnIndex
@@ -496,7 +500,7 @@ func (s *Service) GetFlow(ctx context.Context, ownerUserID, flowID int64) (*Flow
 	}
 
 	rows, err := s.Pool.Query(ctx,
-		`SELECT id, linear_issue_key, state, depends_on, priority, depends_on_at, profile
+		`SELECT id, external_key, state, depends_on, priority, depends_on_at, profile
 		 FROM tasks WHERE flow_id = $1 ORDER BY id`, flowID)
 	if err != nil {
 		return nil, fmt.Errorf("flow: 查询编排图 %d 的任务失败: %w", flowID, err)

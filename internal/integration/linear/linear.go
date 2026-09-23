@@ -14,6 +14,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // DefaultAPIURL 是 Linear GraphQL 端点。
@@ -49,25 +51,14 @@ func NewClientWithURL(token, apiURL string) (*Client, error) {
 }
 
 // Issue 是 Lathe 需要的 issue 字段。
-type Issue struct {
-	ID          string
-	Identifier  string // 形如 CR-1326
-	Title       string
-	Description string
-	URL         string
-	StateName   string
-	Priority    int
-	Labels      []string
-	AssigneeID  string
-	Comments    []Comment
-}
+//
+// 类型本体住在 internal/tracker（它是 pipeline 与各平台实现之间的契约），
+// 这里只是别名 —— 本包内部与其它老调用方继续写 linear.Issue 即可，零改动。
+// 见 internal/tracker/tracker.go 的包注释。
+type Issue = tracker.Issue
 
 // Comment 是 issue 下的一条评论。
-type Comment struct {
-	ID       string `json:"id"`
-	Body     string `json:"body"`
-	UserName string `json:"userName"`
-}
+type Comment = tracker.Comment
 
 // IssueSummary 是列表用的轻量视图 —— 不含描述与评论，
 // 那是详情（Issue）才需要拉的东西。
@@ -154,37 +145,8 @@ func (c *Client) AssignedIssues(ctx context.Context, first int) ([]IssueSummary,
 	return out, nil
 }
 
-// Context 把 issue 及其评论拼成交给 agent 的任务描述。
-//
-// 评论必须带上：真实工作中补充的复现步骤、澄清、变更要求
-// 往往在评论里而不在正文里。
-func (i Issue) Context() string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "# %s: %s\n\n", i.Identifier, i.Title)
-	if len(i.Labels) > 0 {
-		fmt.Fprintf(&b, "标签: %s\n", strings.Join(i.Labels, ", "))
-	}
-	if i.URL != "" {
-		fmt.Fprintf(&b, "链接: %s\n", i.URL)
-	}
-	b.WriteString("\n## 描述\n\n")
-	if strings.TrimSpace(i.Description) == "" {
-		b.WriteString("（无描述）\n")
-	} else {
-		b.WriteString(strings.TrimSpace(i.Description) + "\n")
-	}
-	if len(i.Comments) > 0 {
-		b.WriteString("\n## 评论\n\n")
-		for _, c := range i.Comments {
-			name := c.UserName
-			if name == "" {
-				name = "（未知）"
-			}
-			fmt.Fprintf(&b, "**%s**: %s\n\n", name, strings.TrimSpace(c.Body))
-		}
-	}
-	return b.String()
-}
+// Issue.Context() 已随类型本体迁往 internal/tracker —— 分诊上下文的
+// 拼装格式（标题/描述/评论）必须全平台只有一份，见 tracker.Issue.Context。
 
 const issueQuery = `query($id: String!) {
   issue(id: $id) {

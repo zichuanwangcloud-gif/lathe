@@ -21,6 +21,10 @@ type Factory struct {
 	secrets *store.Secrets
 	env     EnvFallback
 	adminID int64
+	// store 供内置工单 tracker 使用（tracker.ProviderInternal 无凭据
+	// 概念，直接由 DB 支撑）。可为 nil：那时内置 tracker 在 Clients
+	// 层被明确拒绝，不影响 Linear/GitHub 路径。
+	store *store.Store
 
 	mu        sync.Mutex
 	providers map[int64]*Provider
@@ -28,9 +32,9 @@ type Factory struct {
 
 // NewFactory 构造按用户的凭据工厂。adminID 是内置管理员的用户 ID，
 // 只有他的 Provider 带环境变量兜底。
-func NewFactory(secrets *store.Secrets, env EnvFallback, adminID int64) *Factory {
+func NewFactory(secrets *store.Secrets, env EnvFallback, adminID int64, st *store.Store) *Factory {
 	return &Factory{
-		secrets: secrets, env: env, adminID: adminID,
+		secrets: secrets, env: env, adminID: adminID, store: st,
 		providers: map[int64]*Provider{},
 	}
 }
@@ -53,7 +57,7 @@ func (f *Factory) ProviderFor(userID int64) *Provider {
 
 // ForUser 实现 runner.ClientFactory。
 func (f *Factory) ForUser(_ context.Context, userID int64) (runner.Clients, error) {
-	return NewClients(f.ProviderFor(userID)), nil
+	return NewClients(f.ProviderFor(userID), f.store), nil
 }
 
 // Invalidate 使某用户某类凭据的缓存立即失效；kind 为空清该用户全部。

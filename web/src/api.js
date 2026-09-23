@@ -93,6 +93,23 @@ export const api = {
   flow: (id) => request(`/api/flows/${id}`),
   createFlow: (body) => request('/api/flows', { method: 'POST', body: JSON.stringify(body) }),
 
+  // 内置工单（docs/09）：手动建单、评论区问答、开跑/取消联动
+  issues: (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.state) q.set('state', params.state)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return request(`/api/issues${qs ? '?' + qs : ''}`)
+  },
+  issue: (id) => request(`/api/issues/${id}`),
+  createIssue: (body) => request('/api/issues', { method: 'POST', body: JSON.stringify(body) }),
+  updateIssue: (id, body) => request(`/api/issues/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteIssue: (id) => request(`/api/issues/${id}`, { method: 'DELETE' }),
+  addIssueComment: (id, body) =>
+    request(`/api/issues/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
+  startInternalIssue: (id) => request(`/api/issues/${id}/start`, { method: 'POST' }),
+
   trigger: (issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueKey }) }),
   linearIssues: () => request('/api/linear/issues'),

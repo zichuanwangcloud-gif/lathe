@@ -202,7 +202,7 @@ func TestEnqueueCreatesImmediatelyClaimableTask(t *testing.T) {
 	}
 
 	tk := claimOwn(t, q, ctx, userID)
-	if tk == nil || tk.LinearIssueKey != issueKey {
+	if tk == nil || tk.ExternalKey != issueKey {
 		t.Fatalf("Enqueue 之后应能立刻领到该任务，得到 %v", tk)
 	}
 	if tk.State != task.StateQueued {
@@ -254,24 +254,24 @@ func TestClaimReadyDependencyGating(t *testing.T) {
 	q := testQueue(st, &fakePipeline{})
 
 	pred, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-DEP-PRED"),
-		LinearIssueID: uniqueKey("uuid-dep-pred"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-DEP-PRED"),
+		ExternalID: uniqueKey("uuid-dep-pred"),
 	})
 	if err != nil {
 		t.Fatalf("Create 前驱失败: %v", err)
 	}
 	succPR, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-DEP-SUCC-PR"),
-		LinearIssueID: uniqueKey("uuid-dep-succ-pr"),
-		DependsOn:     &pred.ID, DependsOnAt: "pr_open",
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-DEP-SUCC-PR"),
+		ExternalID: uniqueKey("uuid-dep-succ-pr"),
+		DependsOn:  &pred.ID, DependsOnAt: "pr_open",
 	})
 	if err != nil {
 		t.Fatalf("Create pr_open 语义后继失败: %v", err)
 	}
 	succMerged, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-DEP-SUCC-MERGED"),
-		LinearIssueID: uniqueKey("uuid-dep-succ-merged"),
-		DependsOn:     &pred.ID, DependsOnAt: "merged",
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-DEP-SUCC-MERGED"),
+		ExternalID: uniqueKey("uuid-dep-succ-merged"),
+		DependsOn:  &pred.ID, DependsOnAt: "merged",
 	})
 	if err != nil {
 		t.Fatalf("Create merged 语义后继失败: %v", err)
@@ -334,8 +334,8 @@ func TestConcurrentClaimAndDispatchExactlyOnce(t *testing.T) {
 	for i := 0; i < n; i++ {
 		tk, err := q.tasks.Create(ctx, task.CreateParams{
 			UserID: userID, RepoID: repoID,
-			LinearIssueKey: uniqueKey(fmt.Sprintf("Q-CONC-%d", i)),
-			LinearIssueID:  uniqueKey(fmt.Sprintf("uuid-conc-%d", i)),
+			ExternalKey: uniqueKey(fmt.Sprintf("Q-CONC-%d", i)),
+			ExternalID:  uniqueKey(fmt.Sprintf("uuid-conc-%d", i)),
 		})
 		if err != nil {
 			t.Fatalf("Create 第 %d 个任务失败: %v", i, err)
@@ -385,8 +385,8 @@ func TestRunOneClaimedRecoversInterruptedStateFromEvents(t *testing.T) {
 	q := testQueue(st, pipe)
 
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-CRASH"),
-		LinearIssueID: uniqueKey("uuid-crash"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-CRASH"),
+		ExternalID: uniqueKey("uuid-crash"),
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
@@ -452,8 +452,8 @@ func TestRunOneClaimedRecoversModeFromEvents(t *testing.T) {
 	q := testQueue(st, pipe)
 
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-MODE"),
-		LinearIssueID: uniqueKey("uuid-mode"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-MODE"),
+		ExternalID: uniqueKey("uuid-mode"),
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
@@ -522,8 +522,8 @@ func TestFillBaseRefFirstDispatchUsesPredecessorBranch(t *testing.T) {
 
 	branch := "fix/" + uniqueKey("q-base-pred")
 	pred, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-PRED"),
-		LinearIssueID: uniqueKey("uuid-base-pred"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-PRED"),
+		ExternalID: uniqueKey("uuid-base-pred"),
 	})
 	if err != nil {
 		t.Fatalf("Create 前驱失败: %v", err)
@@ -546,9 +546,9 @@ func TestFillBaseRefFirstDispatchUsesPredecessorBranch(t *testing.T) {
 	}
 
 	succ, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-SUCC"),
-		LinearIssueID: uniqueKey("uuid-base-succ"),
-		DependsOn:     &pred.ID, DependsOnAt: "pr_open",
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-SUCC"),
+		ExternalID: uniqueKey("uuid-base-succ"),
+		DependsOn:  &pred.ID, DependsOnAt: "pr_open",
 	})
 	if err != nil {
 		t.Fatalf("Create 后继失败: %v", err)
@@ -591,8 +591,8 @@ func TestFillBaseRefNotOverwrittenOnRetry(t *testing.T) {
 	q := testQueue(st, &fakePipeline{})
 
 	pred, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-RETRY-PRED"),
-		LinearIssueID: uniqueKey("uuid-base-retry-pred"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-RETRY-PRED"),
+		ExternalID: uniqueKey("uuid-base-retry-pred"),
 	})
 	if err != nil {
 		t.Fatalf("Create 前驱失败: %v", err)
@@ -600,9 +600,9 @@ func TestFillBaseRefNotOverwrittenOnRetry(t *testing.T) {
 
 	originalBranch := "fix/" + uniqueKey("original")
 	succ, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-RETRY-SUCC"),
-		LinearIssueID: uniqueKey("uuid-base-retry-succ"),
-		DependsOn:     &pred.ID, DependsOnAt: "pr_open",
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-RETRY-SUCC"),
+		ExternalID: uniqueKey("uuid-base-retry-succ"),
+		DependsOn:  &pred.ID, DependsOnAt: "pr_open",
 		BaseRef: ptr(originalBranch), // 已经派发过一次，base_ref 已固定
 	})
 	if err != nil {
@@ -645,8 +645,8 @@ func TestFillBaseRefSkipsWhenPredecessorMerged(t *testing.T) {
 
 	branch := "fix/" + uniqueKey("q-base-merged-pred")
 	pred, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-MERGED-PRED"),
-		LinearIssueID: uniqueKey("uuid-base-merged-pred"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-MERGED-PRED"),
+		ExternalID: uniqueKey("uuid-base-merged-pred"),
 	})
 	if err != nil {
 		t.Fatalf("Create 前驱失败: %v", err)
@@ -669,9 +669,9 @@ func TestFillBaseRefSkipsWhenPredecessorMerged(t *testing.T) {
 	}
 
 	succ, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-MERGED-SUCC"),
-		LinearIssueID: uniqueKey("uuid-base-merged-succ"),
-		DependsOn:     &pred.ID, DependsOnAt: "merged",
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-MERGED-SUCC"),
+		ExternalID: uniqueKey("uuid-base-merged-succ"),
+		DependsOn:  &pred.ID, DependsOnAt: "merged",
 	})
 	if err != nil {
 		t.Fatalf("Create 后继失败: %v", err)
@@ -704,8 +704,8 @@ func TestFillBaseRefNoopForIndependentRoot(t *testing.T) {
 	q := testQueue(st, &fakePipeline{})
 
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-BASE-ROOT"),
-		LinearIssueID: uniqueKey("uuid-base-root"),
+		UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-BASE-ROOT"),
+		ExternalID: uniqueKey("uuid-base-root"),
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
@@ -726,11 +726,15 @@ func TestFillBaseRefNoopForIndependentRoot(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 6. 缺少 Linear issue UUID 的旧数据
+// ---------------------------------------------------------------- 6. 需求平台引用俱空的残缺数据
 
-// 旧数据（migration 0010 前）没有 linear_issue_id，runOneClaimed 应该把
-// 它取消而不是尝试派发（分诊/续跑都需要 UUID 去调 Linear API）。
-func TestRunOneClaimedCancelsTaskWithoutLinearIssueID(t *testing.T) {
+// external_id 与 external_key 俱空的任务无法定位工单，runOneClaimed
+// 应该把它取消而不是尝试派发。
+//
+// 注：旧契约是「缺 Linear UUID 即取消」。0021 之后守卫放宽为「引用俱空
+// 才取消」—— Linear 的 issue 查询同时接受 UUID 与 identifier，只有 key
+// 的旧数据可以继续跑；内置工单的 external_id 恒为 NULL，key 即全部身份。
+func TestRunOneClaimedCancelsTaskWithoutExternalID(t *testing.T) {
 	st := testStore(t)
 	userID, repoID := fixture(t, st)
 	ctx := context.Background()
@@ -738,14 +742,14 @@ func TestRunOneClaimedCancelsTaskWithoutLinearIssueID(t *testing.T) {
 	q := testQueue(st, pipe)
 
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: uniqueKey("Q-NOUUID"),
-		// LinearIssueID 留空，模拟旧数据
+		UserID: userID, RepoID: repoID, ExternalKey: "", // 引用俱空
+		// ExternalID 留空，模拟残缺数据
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
 	}
-	if tk.LinearIssueID != nil {
-		t.Fatalf("测试前提：LinearIssueID 应为 NULL，得到 %v", *tk.LinearIssueID)
+	if tk.ExternalID != nil {
+		t.Fatalf("测试前提：ExternalID 应为 NULL，得到 %v", *tk.ExternalID)
 	}
 
 	q.runOneClaimed(ctx, tk)
@@ -755,7 +759,7 @@ func TestRunOneClaimedCancelsTaskWithoutLinearIssueID(t *testing.T) {
 		t.Fatalf("Get 失败: %v", err)
 	}
 	if got.State != task.StateCancelled {
-		t.Errorf("缺少 Linear issue UUID 的任务应被取消，state = %s", got.State)
+		t.Errorf("引用俱空的任务应被取消，state = %s", got.State)
 	}
 	if len(pipe.snapshot()) != 0 {
 		t.Errorf("不该走到 pipeline.Execute，却被调用了 %d 次", len(pipe.snapshot()))
@@ -774,7 +778,7 @@ func orphanInflight(t *testing.T, st *store.Store, q *queue) int64 {
 	userID, repoID := fixture(t, st)
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID,
-		LinearIssueKey: uniqueKey("ORPHAN"), LinearIssueID: uniqueKey("uuid-orphan"),
+		ExternalKey: uniqueKey("ORPHAN"), ExternalID: uniqueKey("uuid-orphan"),
 	})
 	if err != nil {
 		t.Fatalf("造孤儿任务失败: %v", err)
@@ -811,7 +815,7 @@ func TestClaimOwnIgnoresForeignInflightTasks(t *testing.T) {
 	userID, repoID := fixture(t, st)
 	tk, err := q.tasks.Create(ctx, task.CreateParams{
 		UserID: userID, RepoID: repoID,
-		LinearIssueKey: uniqueKey("Q-ISO"), LinearIssueID: uniqueKey("uuid-iso"),
+		ExternalKey: uniqueKey("Q-ISO"), ExternalID: uniqueKey("uuid-iso"),
 	})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)

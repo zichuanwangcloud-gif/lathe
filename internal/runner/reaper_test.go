@@ -136,7 +136,7 @@ func reaperEnv(t *testing.T) (*WorktreeManager, string) {
 // 在这里却会让候选看起来"刚刚更新过"而错过回收。
 func terminalTask(id int64, path, branch string, state task.State) *task.Task {
 	return &task.Task{
-		ID: id, RepoID: 1, LinearIssueKey: "CR-" + string(rune('0'+id)),
+		ID: id, RepoID: 1, ExternalKey: "CR-" + string(rune('0'+id)),
 		State: state, WorktreePath: &path, BranchName: &branch,
 		UpdatedAt: time.Now().Add(-30 * 24 * time.Hour),
 	}
@@ -535,7 +535,7 @@ func TestReaperSweepNeverTouchesHiddenDirs(t *testing.T) {
 //	HasLiveDependentOnBranch 查的是别人的 base_ref（B 不是栈式后继）
 //	返回 false，于是 Discard 把 B 正在跑的工作区连同未提交改动删掉。
 //
-// 跨用户版本同样成立（tasks_one_active_per_issue 带 repo_id 维度）。
+// 跨用户版本同样成立（tasks_one_active_per_item 带 repo_id 维度）。
 // 现在同一轮已经查出来的「非终态任务认领的路径」就是那道闸。
 func TestReaperRefusesPathClaimedByLiveTask(t *testing.T) {
 	wm, root := reaperEnv(t)

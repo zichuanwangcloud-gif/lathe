@@ -11,11 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // ---------------------------------------------------------------- 假件
@@ -97,12 +98,12 @@ func (f *fakeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, 
 
 // fakeClients 让流水线在测试里拿到固定的假客户端。
 type fakeClients struct {
-	lin LinearAPI
+	lin tracker.Tracker
 	gh  GitHubAPI
 	err error
 }
 
-func (f *fakeClients) Linear(ctx context.Context) (LinearAPI, error) {
+func (f *fakeClients) Tracker(ctx context.Context, provider string) (tracker.Tracker, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -176,7 +177,7 @@ func pipelineFixture(t *testing.T) (*pgxpool.Pool, *task.Machine, int64, RepoCon
 	// 再配 ON CONFLICT DO UPDATE，于是上一轮被中断（测试进程被杀，t.Cleanup
 	// 没执行）留下的孤儿 user 会被【复用】，连带它名下的 acme/demo repo；
 	// 而 issue key 固定为 CR-777，Create 就撞上部分唯一索引
-	// tasks_one_active_per_issue（SQLSTATE 23505）。
+	// tasks_one_active_per_item（SQLSTATE 23505）。
 	//
 	// 修法是让 user 每次都是新的：repos 的唯一键是 (user_id, provider_repo)，
 	// 所以新 user 天然给出新 repo_id，CR-777 也就被限定在这个 repo 内，
@@ -203,7 +204,7 @@ func pipelineFixture(t *testing.T) (*pgxpool.Pool, *task.Machine, int64, RepoCon
 	}
 
 	tk, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-777",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-777",
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
@@ -292,7 +293,7 @@ func TestPipelineHappyPath(t *testing.T) {
 	p.SettingSources = "project"
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	})
 	if err != nil {
 		t.Fatalf("Execute 失败: %v", err)
@@ -420,7 +421,7 @@ func TestPipelineTriageDirAndChannelRouting(t *testing.T) {
 	p.ImplementChannel = "strong"
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -473,7 +474,7 @@ func TestPipelineBlockedSpec(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	}); err != nil {
 		t.Fatalf("blocked_spec 是正常出口，不应返回错误: %v", err)
 	}
@@ -519,7 +520,7 @@ func TestPipelineVerificationFailurePreservesScene(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("验证不过应返回错误")
@@ -582,7 +583,7 @@ func TestPipelineHeavyRedNotProven(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err != nil {
 		t.Fatalf("blocked_spec 是正常出口，不应返回错误: %v", err)
@@ -631,7 +632,7 @@ func TestPipelineHeavyNoReproTestIsFailure(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("没交复现测试应判为失败")
@@ -690,7 +691,7 @@ func TestPipelineHeavyReproEnvErrorFailsFast(t *testing.T) {
 	p.MaxFixAttempts = 2 // 即使开了修复回路，环境错误也不该进去空烧
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("环境错误应判为失败")
@@ -743,7 +744,7 @@ func TestPipelineContractViolationFixLoopRecovers(t *testing.T) {
 	p.MaxFixAttempts = 1
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("契约违例修复后应正常开 PR: %v", err)
 	}
@@ -795,7 +796,7 @@ func TestPipelineFixLoopRecovers(t *testing.T) {
 	p.MaxFixAttempts = 2
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -851,7 +852,7 @@ func TestPipelineFixLoopExhausted(t *testing.T) {
 	p.MaxFixAttempts = 1
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	})
 	if err == nil {
 		t.Fatal("修复耗尽应失败")
@@ -881,7 +882,7 @@ func TestPipelineNoChangesIsFailure(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("无改动应判为失败")
@@ -911,7 +912,7 @@ func TestPipelineIssueFetchFailure(t *testing.T) {
 	p := newPipeline(t, m, lin, gh, ag, no)
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("拉 issue 失败应返回错误")
@@ -938,7 +939,7 @@ func TestPipelineTriageUnparsable(t *testing.T) {
 	p := newPipeline(t, m, lin, &fakeGitHub{}, ag, no)
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	}); err == nil {
 		t.Fatal("分诊输出无法解析应失败，而不是猜一个结论继续跑")
 	}
@@ -1040,7 +1041,7 @@ func TestPipelineMissingCredentials(t *testing.T) {
 	p.Clients = &fakeClients{err: errors.New("creds: 凭据未配置（linear）")}
 
 	err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	})
 	if err == nil {
 		t.Fatal("缺凭据应报错")
@@ -1063,7 +1064,7 @@ func TestPipelineFetchesClientsPerExecution(t *testing.T) {
 	p.Clients = clients
 
 	if err := p.Execute(context.Background(), ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
 	}); err != nil {
 		t.Fatalf("Execute 失败: %v", err)
 	}
@@ -1078,9 +1079,9 @@ type countingClients struct {
 	linearCalls int
 }
 
-func (c *countingClients) Linear(ctx context.Context) (LinearAPI, error) {
+func (c *countingClients) Tracker(ctx context.Context, provider string) (tracker.Tracker, error) {
 	c.linearCalls++
-	return c.fakeClients.Linear(ctx)
+	return c.fakeClients.Tracker(ctx, provider)
 }
 
 // ---------------------------------------------------------------- T9 测试隔离回归
@@ -1093,9 +1094,9 @@ func (c *countingClients) Linear(ctx context.Context) (LinearAPI, error) {
 // 为什么这会让测试红：pipelineFixture 原先的 email 是 "pipe-<测试名>@example.com"
 // —— 没有随机量 —— 配上 ON CONFLICT DO UPDATE，孤儿 user 会被【复用】，
 // 连带它名下的 acme/demo repo；而 issue key 又固定为 CR-777，于是 Create
-// 撞上部分唯一索引 tasks_one_active_per_issue，报 SQLSTATE 23505。
+// 撞上部分唯一索引 tasks_one_active_per_item，报 SQLSTATE 23505。
 // 实测失败信息：`建任务失败: task: 创建任务失败: ERROR: duplicate key value
-// violates unique constraint "tasks_one_active_per_issue"`。
+// violates unique constraint "tasks_one_active_per_item"`。
 func TestPipelineFixtureSurvivesInterruptedRun(t *testing.T) {
 	pool := testPoolForPipeline(t)
 	m := task.NewMachine(pool)
@@ -1121,7 +1122,7 @@ func TestPipelineFixtureSurvivesInterruptedRun(t *testing.T) {
 		t.Fatalf("造孤儿 repo 失败: %v", err)
 	}
 	if _, err := m.Create(ctx, task.CreateParams{
-		UserID: orphanUser, RepoID: orphanRepo, LinearIssueKey: "CR-777",
+		UserID: orphanUser, RepoID: orphanRepo, ExternalKey: "CR-777",
 	}); err != nil {
 		t.Fatalf("造孤儿任务失败: %v", err)
 	}
@@ -1180,7 +1181,7 @@ func TestPipelineManualGateHaltsBeforePRThenResumesOnApproval(t *testing.T) {
 
 	// ---- 第一段：验证通过后必须停住 ----
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("闸门停机是正常终止，不该返回错误: %v", err)
 	}
@@ -1221,7 +1222,7 @@ func TestPipelineManualGateHaltsBeforePRThenResumesOnApproval(t *testing.T) {
 	}
 
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 		Retry: &plan,
 	}); err != nil {
 		t.Fatalf("批准后续跑失败: %v", err)
@@ -1262,7 +1263,7 @@ func TestPipelineNonManualGateModesUnchanged(t *testing.T) {
 			p.SettingSources = "project"
 
 			if err := p.Execute(ctx, ExecuteParams{
-				TaskID: taskID, Repo: repo, CloneURL: src, IssueID: "uuid-777", Actor: "node:test",
+				TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 			}); err != nil {
 				t.Fatalf("Execute 失败: %v", err)
 			}

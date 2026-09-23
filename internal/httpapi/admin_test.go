@@ -32,7 +32,7 @@ func TestAdminListsUsersWithTaskCounts(t *testing.T) {
 	}
 	for _, state := range []string{"merged", "failed"} {
 		if _, err := f.st.Pool().Exec(context.Background(), `
-			INSERT INTO tasks (user_id, repo_id, linear_issue_key, state)
+			INSERT INTO tasks (user_id, repo_id, external_key, state)
 			VALUES ($1, $2, $3, $4)`,
 			target.ID, repoID, "T-"+state+"-"+t.Name(), state); err != nil {
 			t.Fatal(err)
@@ -135,7 +135,7 @@ func TestAdminDeleteUserCascades(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := f.st.Pool().Exec(context.Background(), `
-		INSERT INTO tasks (user_id, repo_id, linear_issue_key, state)
+		INSERT INTO tasks (user_id, repo_id, external_key, state)
 		VALUES ($1, $2, $3, 'queued')`, target.ID, repoID, "T-del-"+t.Name()); err != nil {
 		t.Fatal(err)
 	}

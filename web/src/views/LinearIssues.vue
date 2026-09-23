@@ -48,7 +48,7 @@ async function load() {
     issues.value = res.issues || []
     const map = new Map()
     for (const t of mine.tasks || []) {
-      if (!map.has(t.linearIssueKey)) map.set(t.linearIssueKey, t)
+      if (!map.has(t.externalKey)) map.set(t.externalKey, t)
     }
     taskByKey.value = map
   } catch (e) {

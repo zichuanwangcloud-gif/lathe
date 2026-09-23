@@ -20,7 +20,7 @@ func TestTaskEventsEndpoint(t *testing.T) {
 	if err := st.Pool().QueryRow(ctx, `SELECT user_id FROM repos WHERE id=$1`, repoID).Scan(&userID); err != nil {
 		t.Fatalf("取 user 失败: %v", err)
 	}
-	tk, err := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-EV"})
+	tk, err := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-EV"})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestTaskEventsIsolation(t *testing.T) {
 	if err := st.Pool().QueryRow(ctx, `SELECT user_id FROM repos WHERE id=$1`, repoID).Scan(&userID); err != nil {
 		t.Fatalf("取 user 失败: %v", err)
 	}
-	tk, err := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-EV2"})
+	tk, err := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-EV2"})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}

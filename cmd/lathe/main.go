@@ -173,7 +173,7 @@ func serve(cfg config.Config) error {
 		LinearWebhookSecret: cfg.LinearWebhookSecret,
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
-	}, admin.ID)
+	}, admin.ID, st)
 
 	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory)
 	if err != nil {
@@ -328,13 +328,19 @@ func serve(cfg config.Config) error {
 			if err != nil {
 				return ""
 			}
-			key := detail.Task.LinearIssueKey
-			lin, err := factory.ProviderFor(userID).Linear(ctx)
+			key := detail.Task.ExternalKey
+			clients, err := factory.ForUser(ctx, userID)
 			if err != nil {
-				return key // Linear 未配置：只用 key，推荐质量降级不挡路
+				return key
 			}
-			// Linear 的 issue 查询同时接受 UUID 与 identifier
-			issue, err := lin.Issue(ctx, key)
+			// 需求平台按任务行分派：内置工单直接读库，Linear 走凭据。
+			// 平台不可用时只用 key，推荐质量降级不挡路。
+			tr, err := clients.Tracker(ctx, detail.Task.TrackerProvider)
+			if err != nil {
+				return key
+			}
+			// Linear 的 issue 查询同时接受 UUID 与 identifier；内置按 key 定位
+			issue, err := tr.Issue(ctx, key)
 			if err != nil {
 				return key
 			}
@@ -378,6 +384,12 @@ func serve(cfg config.Config) error {
 		Auth: auth,
 	}
 	flowAPI.Routes(mux)
+
+	// 内置工单体系（docs/09-internal-issues.md）：手动建单/评论区/开跑/取消。
+	// 与执行队列共用同一个 task.Machine 与 queue —— 取消联动、开跑入队
+	// 走的是与 Linear webhook 同一条通道，不另起语义。
+	issuesAPI := &httpapi.IssuesAPI{Store: st, Auth: auth, Queue: q}
+	issuesAPI.Routes(mux)
 
 	if webui.Available() {
 		mux.Handle("/", webui.Handler())
@@ -457,6 +469,8 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 		Notifier:      pipeline.Notifier,
 		RepoLookup:    runner.NewRepoLookup(st.Pool()),
 		Pipeline:      pipeline,
+		// 内置工单联动（09 §3 F4-AC3）：任务 merged/cancelled → 工单状态。
+		IssueOutcomes: st,
 		Interval:      45 * time.Second,
 	}
 	go mergePoller.Run(ctx)

@@ -7,6 +7,8 @@ import LinearIssues from './views/LinearIssues.vue'
 import TaskDetail from './views/TaskDetail.vue'
 import FlowList from './views/FlowList.vue'
 import FlowCanvas from './views/FlowCanvas.vue'
+import Issues from './views/Issues.vue'
+import IssueDetail from './views/IssueDetail.vue'
 import Repos from './views/Repos.vue'
 import PersonalSettings from './views/PersonalSettings.vue'
 import SystemSettings from './views/SystemSettings.vue'
@@ -24,6 +26,9 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'board', component: Board },
+    // 内置工单（docs/09）：不依赖 Linear 的手动需求入口，所有人可用
+    { path: '/issues', name: 'issues', component: Issues },
+    { path: '/issues/:id', name: 'issue', component: IssueDetail, props: true },
     { path: '/flows', name: 'flows', component: FlowList },
     { path: '/flows/new', name: 'flow-new', component: FlowCanvas },
     { path: '/flows/:id', name: 'flow', component: FlowCanvas, props: true },

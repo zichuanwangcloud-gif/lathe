@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/jackc/pgx/v5"
+	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 )
 
 // 凭据类型。与 integrations 表的 kind CHECK 约束一致。

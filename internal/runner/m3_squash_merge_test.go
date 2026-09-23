@@ -103,13 +103,13 @@ func TestM3SquashMergeCascadeRebasesRetargetsAndKeepsDiffClean(t *testing.T) {
 
 	// ---- 建图：task1（独立根）、task2（depends_on=task1，栈式 PR） ----
 	task1, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "M3-1", LinearIssueID: "uuid-m3-1",
+		UserID: userID, RepoID: repoID, ExternalKey: "M3-1", ExternalID: "uuid-m3-1",
 	})
 	if err != nil {
 		t.Fatalf("建 task1 失败: %v", err)
 	}
 	task2, err := m.Create(ctx, task.CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "M3-2", LinearIssueID: "uuid-m3-2",
+		UserID: userID, RepoID: repoID, ExternalKey: "M3-2", ExternalID: "uuid-m3-2",
 		DependsOn: &task1.ID,
 	})
 	if err != nil {
@@ -147,7 +147,7 @@ func TestM3SquashMergeCascadeRebasesRetargetsAndKeepsDiffClean(t *testing.T) {
 
 	// task1：独立根，正常从 dev 分叉。
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueID: "uuid-m3-1", Actor: "node:test",
+		TaskID: task1.ID, Repo: repo, CloneURL: src, IssueRef: "uuid-m3-1", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task1 Execute 失败: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestM3SquashMergeCascadeRebasesRetargetsAndKeepsDiffClean(t *testing.T) {
 	repo2 := repo
 	repo2.BaseRefOverride = task1Branch
 	if err := pipe.Execute(ctx, ExecuteParams{
-		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueID: "uuid-m3-2", Actor: "node:test",
+		TaskID: task2.ID, Repo: repo2, CloneURL: src, IssueRef: "uuid-m3-2", Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("task2 Execute 失败: %v", err)
 	}

@@ -266,10 +266,15 @@ onUnmounted(() => {
     <div class="spread head">
       <div>
         <div class="row">
-          <h1 class="mono">{{ task.linearIssueKey }}</h1>
+          <h1 class="mono">{{ task.externalKey }}</h1>
           <span class="badge" :class="stateTone(task.state)">{{ stateLabel(task.state) }}</span>
         </div>
-        <div class="faint mono">{{ task.providerRepo }} · 任务 #{{ task.id }}</div>
+        <div class="faint mono">
+          {{ task.providerRepo }} · 任务 #{{ task.id }}
+          <template v-if="task.trackerProvider === 'internal' && task.issueId">
+            · 工单 <RouterLink :to="`/issues/${task.issueId}`">{{ task.externalKey }}</RouterLink>
+          </template>
+        </div>
       </div>
       <div class="wrap">
         <button @click="router.push('/')">返回</button>

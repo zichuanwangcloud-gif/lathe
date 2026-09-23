@@ -71,13 +71,13 @@ func TestM7OrchestrationModelChannelPerNodeAcrossGraph(t *testing.T) {
 		t.Fatalf("建工作区管理器失败: %v", err)
 	}
 
-	linA := &fakeLinear{issue: fakeIssueFor(taskA.LinearIssueKey)}
+	linA := &fakeLinear{issue: fakeIssueFor(taskA.ExternalKey)}
 	ghA := &fakeGitHub{pr: &github.PullRequest{Number: 501, URL: "https://github.com/acme/demo/pull/501"}}
 	agA := implFixAgent()
 	pA := orchestrationPipeline(m, wm, linA, ghA, agA)
 	pA.ImplementChannel = "pipeline-default-channel"
 
-	linB := &fakeLinear{issue: fakeIssueFor(taskB.LinearIssueKey)}
+	linB := &fakeLinear{issue: fakeIssueFor(taskB.ExternalKey)}
 	ghB := &fakeGitHub{pr: &github.PullRequest{Number: 502, URL: "https://github.com/acme/demo/pull/502"}}
 	agB := implFixAgent()
 	pB := orchestrationPipeline(m, wm, linB, ghB, agB)
@@ -182,17 +182,17 @@ func TestM7OrchestrationSkillDeclaredMaterializesAndExcludedFromPR(t *testing.T)
 	if err != nil {
 		t.Fatalf("建工作区管理器失败: %v", err)
 	}
-	lin := &fakeLinear{issue: fakeIssueFor(tk.LinearIssueKey)}
+	lin := &fakeLinear{issue: fakeIssueFor(tk.ExternalKey)}
 	gh := &fakeGitHub{pr: &github.PullRequest{Number: 601, URL: "https://github.com/acme/demo/pull/601"}}
 	ag := implFixAgent()
 	p := orchestrationPipeline(m, wm, lin, gh, ag)
 
 	issueID := ""
-	if tk.LinearIssueID != nil {
-		issueID = *tk.LinearIssueID
+	if tk.ExternalID != nil {
+		issueID = *tk.ExternalID
 	}
 	if err := p.Execute(ctx, ExecuteParams{
-		TaskID: tk.ID, Repo: repo, CloneURL: src, IssueID: issueID, Actor: "node:test",
+		TaskID: tk.ID, Repo: repo, CloneURL: src, IssueRef: issueID, Actor: "node:test",
 	}); err != nil {
 		t.Fatalf("Execute 应成功，得到 %v", err)
 	}
@@ -293,17 +293,17 @@ func TestM7OrchestrationSkillMissingFailsTaskNamingSkill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("建工作区管理器失败: %v", err)
 	}
-	lin := &fakeLinear{issue: fakeIssueFor(tk.LinearIssueKey)}
+	lin := &fakeLinear{issue: fakeIssueFor(tk.ExternalKey)}
 	gh := &fakeGitHub{}
 	ag := implFixAgent()
 	p := orchestrationPipeline(m, wm, lin, gh, ag)
 
 	issueID := ""
-	if tk.LinearIssueID != nil {
-		issueID = *tk.LinearIssueID
+	if tk.ExternalID != nil {
+		issueID = *tk.ExternalID
 	}
 	err = p.Execute(ctx, ExecuteParams{
-		TaskID: tk.ID, Repo: repo, CloneURL: src, IssueID: issueID, Actor: "node:test",
+		TaskID: tk.ID, Repo: repo, CloneURL: src, IssueRef: issueID, Actor: "node:test",
 	})
 	if err == nil {
 		t.Fatal("声明不存在的技能应导致 Execute 返回错误")

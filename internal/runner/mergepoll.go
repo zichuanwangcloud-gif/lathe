@@ -8,8 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
 
 // RepoLookup 按 repoID 查询该仓库的分支策略配置。
@@ -83,6 +85,11 @@ type MergePoller struct {
 	// 任务用（params.Retry = &RetryPlan{Fresh: false, Entry:
 	// EntryVerify}，复用 stageVerify 全套逻辑，不重跑 agent）。
 	Pipeline *Pipeline
+	// IssueOutcomes 是任务生命周期对内置工单的联动面（09 §3 F4-AC3）：
+	// 任务 merged → 工单 done，任务取消 → 工单回 open。仅
+	// tracker_provider='internal' 的任务消费；nil 表示未接线
+	// （测试/老装配），联动静默跳过。
+	IssueOutcomes IssueOutcome
 	// Interval 是轮询间隔；<=0 时取 defaultMergePollInterval。
 	Interval time.Duration
 
@@ -250,6 +257,10 @@ func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task) error {
 		return fmt.Errorf("转移到 merged 失败: %w", err)
 	}
 	slog.Info("任务已合并", "task", merged.ID, "pr_number", *tk.PRNumber)
+
+	// 内置工单联动（09 §3 F4-AC3）：任务 merged → 工单 done。
+	// 联动失败不掩盖合并事实（已落库），只告警。
+	p.applyIssueOutcome(ctx, merged, store.OutcomeMerged)
 
 	// 终态通知（T3）。走 Pipeline.mailTerminal 而不是自己再拼一套：
 	// 同一份渲染逻辑只该有一处，否则两边的正文迟早不一致。
@@ -464,7 +475,7 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 		TaskID:   succ.ID,
 		Repo:     execRepo,
 		CloneURL: cloneURLFor(repoCfg.ProviderRepo),
-		IssueID:  deref(succ.LinearIssueID),
+		IssueRef: IssueRefOf(succ),
 		Actor:    "system:rebase-followup",
 		Retry:    &RetryPlan{Fresh: false, Entry: EntryVerify},
 	}); err != nil {
@@ -569,12 +580,8 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 		} else {
 			clients = c
 			haveClients = true
-			if succ.LinearIssueID != nil && *succ.LinearIssueID != "" {
-				if lin, err := clients.Linear(ctx); err != nil {
-					slog.Warn("获取 Linear 客户端失败，跳过失败回帖", "task", succ.ID, "err", err)
-				} else if _, err := lin.Comment(ctx, *succ.LinearIssueID, body); err != nil {
-					slog.Warn("失败回帖失败", "task", succ.ID, "err", err)
-				}
+			if err := commentOnTask(ctx, clients, succ, body); err != nil {
+				slog.Warn("失败回帖失败", "task", succ.ID, "err", err)
 			}
 		}
 	}
@@ -617,11 +624,6 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 	if len(blocked) == 0 || !haveClients {
 		return
 	}
-	lin, err := clients.Linear(ctx)
-	if err != nil {
-		slog.Warn("获取 Linear 客户端失败，阻塞回帖跳过", "task", succ.ID, "err", err)
-		return
-	}
 	for _, bt := range blocked {
 		if bt.UserID != succ.UserID {
 			// 当前是单用户/管理员凭据模型，同一 flow 下的任务理应同属主；
@@ -630,17 +632,30 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 			slog.Warn("阻塞传播发现跨属主后继", "task", succ.ID, "taskOwner", succ.UserID,
 				"blockedTask", bt.ID, "blockedOwner", bt.UserID)
 		}
-		if bt.LinearIssueID == nil || *bt.LinearIssueID == "" {
-			continue
-		}
 		blockedBody := fmt.Sprintf(
 			"**Lathe 已阻塞**\n\n前驱任务 #%d（issue `%s`）因自动 rebase 冲突失败，本任务因依赖它而被阻塞（blocked_dep），"+
 				"等前驱恢复（人工处理冲突后重试）后会自动回到排队。\n\n前驱失败原因：\n```\n%s\n```\n",
-			succ.ID, succ.LinearIssueKey, truncate(reason, 1000))
-		if _, cerr := lin.Comment(ctx, *bt.LinearIssueID, blockedBody); cerr != nil {
-			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", cerr)
+			succ.ID, succ.ExternalKey, truncate(reason, 1000))
+		if err := commentOnTask(ctx, clients, bt, blockedBody); err != nil {
+			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", err)
 		}
 	}
+}
+
+// applyIssueOutcome 把任务终态联动到内置工单（仅 internal 任务）。
+func (p *MergePoller) applyIssueOutcome(ctx context.Context, tk *task.Task, oc store.TaskOutcome) {
+	if p.IssueOutcomes == nil || tk.TrackerProvider != tracker.ProviderInternal {
+		return
+	}
+	if _, err := p.IssueOutcomes.ApplyTaskOutcome(ctx, tk.UserID, tk.ExternalKey, oc); err != nil {
+		slog.Warn("工单状态联动失败", "task", tk.ID, "issue", tk.ExternalKey, "outcome", oc, "err", err)
+	}
+}
+
+// IssueOutcome 是任务生命周期对内置工单的联动面（docs/09 F4-AC3）。
+// *store.Store 天然满足；定义成接口是为了 MergePoller 的单测能注入假件。
+type IssueOutcome interface {
+	ApplyTaskOutcome(ctx context.Context, userID int64, issueKey string, oc store.TaskOutcome) (bool, error)
 }
 
 // handleClosedUnmerged 处理"PR 被关闭但未合并"：任务本身转 cancelled，
@@ -668,6 +683,10 @@ func (p *MergePoller) handleClosedUnmerged(ctx context.Context, tk *task.Task, c
 	}
 	slog.Info("PR 被关闭未合并，任务已转 cancelled", "task", tk.ID, "pr_number", *tk.PRNumber)
 
+	// 内置工单联动：任务取消 → 工单回 open（人在详情页改态优先，
+	// 联动只在 in_progress 时生效，见 store.ApplyTaskOutcome）。
+	p.applyIssueOutcome(ctx, cancelled, store.OutcomeTaskCancelled)
+
 	blocked, err := p.Tasks.PropagateBlocked(ctx, tk.ID, reason)
 	if err != nil {
 		slog.Warn("阻塞传播失败", "task", tk.ID, "err", err)
@@ -677,11 +696,6 @@ func (p *MergePoller) handleClosedUnmerged(ctx context.Context, tk *task.Task, c
 		return nil
 	}
 
-	lin, err := clients.Linear(ctx)
-	if err != nil {
-		slog.Warn("获取 Linear 客户端失败，阻塞回帖跳过", "task", tk.ID, "err", err)
-		return nil
-	}
 	for _, bt := range blocked {
 		if bt.UserID != tk.UserID {
 			// 当前是单用户/管理员凭据模型，同一 flow 下的任务理应同属主；
@@ -690,15 +704,12 @@ func (p *MergePoller) handleClosedUnmerged(ctx context.Context, tk *task.Task, c
 			slog.Warn("阻塞传播发现跨属主后继", "task", tk.ID, "taskOwner", tk.UserID,
 				"blockedTask", bt.ID, "blockedOwner", bt.UserID)
 		}
-		if bt.LinearIssueID == nil || *bt.LinearIssueID == "" {
-			continue
-		}
 		body := fmt.Sprintf(
 			"**Lathe 已阻塞**\n\n前驱任务 #%d（issue `%s`）的 PR 被关闭但未合并，本任务因依赖它而被阻塞（blocked_dep），"+
 				"等前驱恢复（重新开出 PR 或人工处理）后会自动回到排队。\n\n原因：\n```\n%s\n```\n",
-			tk.ID, tk.LinearIssueKey, reason)
-		if _, cerr := lin.Comment(ctx, *bt.LinearIssueID, body); cerr != nil {
-			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", cerr)
+			tk.ID, tk.ExternalKey, reason)
+		if err := commentOnTask(ctx, clients, bt, body); err != nil {
+			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", err)
 		}
 	}
 	return nil

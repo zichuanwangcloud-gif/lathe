@@ -16,7 +16,7 @@ func TestMachineCreateWithOrchestrationFields(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	root, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-ORCH-ROOT"})
+	root, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-ORCH-ROOT"})
 	if err != nil {
 		t.Fatalf("Create 独立根失败: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestMachineCreateWithOrchestrationFields(t *testing.T) {
 	}
 
 	child, err := m.Create(ctx, CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-ORCH-CHILD",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-ORCH-CHILD",
 		DependsOn: &root.ID, DependsOnAt: "merged", Priority: 5, BaseRef: ptr("fix/cr-orch-root-base"),
 	})
 	if err != nil {
@@ -70,7 +70,7 @@ func TestMachineSetBaseRef(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-SETBASE-1"})
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-SETBASE-1"})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestClaimReadyConcurrency(t *testing.T) {
 	for i := 0; i < n; i++ {
 		tk, err := m.Create(ctx, CreateParams{
 			UserID: userID, RepoID: repoID,
-			LinearIssueKey: "CR-CLAIM-" + time.Now().Format("150405.000000") + "-" + strconv.Itoa(i),
+			ExternalKey: "CR-CLAIM-" + time.Now().Format("150405.000000") + "-" + strconv.Itoa(i),
 		})
 		if err != nil {
 			t.Fatalf("Create 第 %d 个任务失败: %v", i, err)
@@ -190,7 +190,7 @@ func TestClaimReadyLeaseExpiry(t *testing.T) {
 	// 的 drainForeignQueue 注释。
 	drainForeignQueue(t, m, ctx)
 
-	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-LEASE-1"})
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-LEASE-1"})
 	if err != nil {
 		t.Fatalf("Create 失败: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestClaimReadyRespectsDependsOnAt(t *testing.T) {
 	// 的 drainForeignQueue 注释。
 	drainForeignQueue(t, m, ctx)
 
-	pred, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-DEP-PRED"})
+	pred, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-DEP-PRED"})
 	if err != nil {
 		t.Fatalf("Create 前驱失败: %v", err)
 	}
@@ -249,14 +249,14 @@ func TestClaimReadyRespectsDependsOnAt(t *testing.T) {
 	}
 
 	succMerged, err := m.Create(ctx, CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-DEP-SUCC-MERGED",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-DEP-SUCC-MERGED",
 		DependsOn: &pred.ID, DependsOnAt: "merged",
 	})
 	if err != nil {
 		t.Fatalf("Create merged 语义后继失败: %v", err)
 	}
 	succOpen, err := m.Create(ctx, CreateParams{
-		UserID: userID, RepoID: repoID, LinearIssueKey: "CR-DEP-SUCC-OPEN",
+		UserID: userID, RepoID: repoID, ExternalKey: "CR-DEP-SUCC-OPEN",
 		DependsOn: &pred.ID, DependsOnAt: "pr_open",
 	})
 	if err != nil {
@@ -303,23 +303,23 @@ func TestPropagateBlocked(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	t1, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PROP-1"})
+	t1, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-PROP-1"})
 	if err != nil {
 		t.Fatalf("Create t1 失败: %v", err)
 	}
-	t2, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PROP-2", DependsOn: &t1.ID})
+	t2, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-PROP-2", DependsOn: &t1.ID})
 	if err != nil {
 		t.Fatalf("Create t2 失败: %v", err)
 	}
-	t3, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PROP-3", DependsOn: &t2.ID})
+	t3, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-PROP-3", DependsOn: &t2.ID})
 	if err != nil {
 		t.Fatalf("Create t3 失败: %v", err)
 	}
-	t4, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PROP-4", DependsOn: &t2.ID})
+	t4, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-PROP-4", DependsOn: &t2.ID})
 	if err != nil {
 		t.Fatalf("Create t4 失败: %v", err)
 	}
-	t5, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-PROP-5"})
+	t5, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-PROP-5"})
 	if err != nil {
 		t.Fatalf("Create t5 失败: %v", err)
 	}
@@ -399,19 +399,19 @@ func TestWakeBlockedSuccessors(t *testing.T) {
 	userID, repoID := fixture(t, pool)
 	ctx := context.Background()
 
-	root, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-WAKE-ROOT"})
+	root, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-WAKE-ROOT"})
 	if err != nil {
 		t.Fatalf("Create root 失败: %v", err)
 	}
-	c1, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-WAKE-C1", DependsOn: &root.ID})
+	c1, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-WAKE-C1", DependsOn: &root.ID})
 	if err != nil {
 		t.Fatalf("Create c1 失败: %v", err)
 	}
-	c2, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-WAKE-C2", DependsOn: &root.ID})
+	c2, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-WAKE-C2", DependsOn: &root.ID})
 	if err != nil {
 		t.Fatalf("Create c2 失败: %v", err)
 	}
-	grandchild, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CR-WAKE-G", DependsOn: &c1.ID})
+	grandchild, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-WAKE-G", DependsOn: &c1.ID})
 	if err != nil {
 		t.Fatalf("Create 孙节点失败: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestActiveByIssueIDFiltersTerminalAndOwner(t *testing.T) {
 	issueID := "uuid-cancel-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 
 	// 同一 issue 在两个仓库下各一条活任务（一个用户可以登记多个仓库，
-	// tasks_one_active_per_issue 是按 (repo_id, key) 挡的，挡不住这种）
+	// tasks_one_active_per_item 是按 (repo_id, key) 挡的，挡不住这种）
 	var repoA2 int64
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO repos (user_id, provider_repo) VALUES ($1,$2) RETURNING id`,
@@ -511,18 +511,18 @@ func TestActiveByIssueIDFiltersTerminalAndOwner(t *testing.T) {
 	}
 
 	live1, err := m.Create(ctx, CreateParams{
-		UserID: userA, RepoID: repoA, LinearIssueKey: "AC-1", LinearIssueID: issueID})
+		UserID: userA, RepoID: repoA, ExternalKey: "AC-1", ExternalID: issueID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	live2, err := m.Create(ctx, CreateParams{
-		UserID: userA, RepoID: repoA2, LinearIssueKey: "AC-1", LinearIssueID: issueID})
+		UserID: userA, RepoID: repoA2, ExternalKey: "AC-1", ExternalID: issueID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 一条已终结的同 issue 任务，不该被返回
 	done, err := m.Create(ctx, CreateParams{
-		UserID: userA, RepoID: repoA, LinearIssueKey: "AC-DONE", LinearIssueID: issueID})
+		UserID: userA, RepoID: repoA, ExternalKey: "AC-DONE", ExternalID: issueID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestActiveByIssueIDFiltersTerminalAndOwner(t *testing.T) {
 	// 另一个用户的同 issue 任务，绝不该被返回
 	userB, repoB := fixture(t, pool)
 	other, err := m.Create(ctx, CreateParams{
-		UserID: userB, RepoID: repoB, LinearIssueKey: "AC-OTHER", LinearIssueID: issueID})
+		UserID: userB, RepoID: repoB, ExternalKey: "AC-OTHER", ExternalID: issueID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +575,7 @@ func TestListReapableOnlyTerminalStates(t *testing.T) {
 
 	wt := "/tmp/reap-scene"
 	mk := func(key string, path []State) *Task {
-		tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: key})
+		tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: key})
 		if err != nil {
 			t.Fatalf("建任务 %s 失败: %v", key, err)
 		}
@@ -610,12 +610,12 @@ func TestListReapableOnlyTerminalStates(t *testing.T) {
 
 	for _, tk := range []*Task{failedTk, cancelledTk} {
 		if !in[tk.ID] {
-			t.Errorf("终态任务 %d（%s）应进回收候选", tk.ID, tk.LinearIssueKey)
+			t.Errorf("终态任务 %d（%s）应进回收候选", tk.ID, tk.ExternalKey)
 		}
 	}
 	for _, tk := range []*Task{implTk, verifyTk, prTk} {
 		if in[tk.ID] {
-			t.Errorf("AC2：非终态任务 %d（%s）绝不该进回收候选", tk.ID, tk.LinearIssueKey)
+			t.Errorf("AC2：非终态任务 %d（%s）绝不该进回收候选", tk.ID, tk.ExternalKey)
 		}
 	}
 }
@@ -628,7 +628,7 @@ func TestListReapableRespectsCutoff(t *testing.T) {
 	ctx := context.Background()
 
 	wt := "/tmp/reap-fresh"
-	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "RP-FRESH"})
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "RP-FRESH"})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
@@ -658,7 +658,7 @@ func TestListReapableRespectsCutoff(t *testing.T) {
 func reapFixture(t *testing.T, m *Machine, userID, repoID int64, key, path, branch string, final State) *Task {
 	t.Helper()
 	ctx := context.Background()
-	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: key})
+	tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: key})
 	if err != nil {
 		t.Fatalf("建任务 %s 失败: %v", key, err)
 	}
@@ -876,7 +876,7 @@ func TestClaimedWorktreePathsOnlyLiveTasks(t *testing.T) {
 	branch := "fix/claimed-shared"
 	deadTk := reapFixture(t, m, userID, repoID, "CLM-DEAD", shared, branch, StateFailed)
 
-	liveTk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, LinearIssueKey: "CLM-LIVE"})
+	liveTk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CLM-LIVE"})
 	if err != nil {
 		t.Fatal(err)
 	}
