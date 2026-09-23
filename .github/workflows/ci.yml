@@ -54,7 +54,13 @@ jobs:
         # version: "2"）；v6 及以前只认 v1，配上去会直接报解析失败。
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.1
+          # 这个版本号有硬下限，不能随手往下调：golangci-lint 会拒绝分析
+          # 「目标 Go 版本高于它自己的构建版本」的项目，报
+          # 「the Go language version used to build golangci-lint is lower
+          # than the targeted Go version」直接退出 3。go.mod 目前是
+          # go 1.25.0，v2.1.6 由 go1.23 构建、装上就挂；v2.13.2 由 go1.26
+          # 构建才够用。以后抬 go.mod 的 go 版本时，这里要跟着抬。
+          version: v2.13
           # 配置里已设 new-from-rev，这里只需保证能解析到 origin/main。
           args: --timeout=5m
 
