@@ -25,6 +25,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/mail"
+	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
@@ -379,8 +380,9 @@ func serve(cfg config.Config) error {
 
 	// 编排图：一键批量入队（PRD 07 F1.4），与执行队列共用同一个
 	// task.Machine，不重开数据库连接。
+	flowSvc := &flow.Service{Pool: st.Pool(), Tasks: task.NewMachine(st.Pool()), Store: st}
 	flowAPI := &httpapi.FlowAPI{
-		Flow: &flow.Service{Pool: st.Pool(), Tasks: task.NewMachine(st.Pool()), Store: st},
+		Flow: flowSvc,
 		Auth: auth,
 	}
 	flowAPI.Routes(mux)
@@ -390,6 +392,33 @@ func serve(cfg config.Config) error {
 	// 走的是与 Linear webhook 同一条通道，不另起语义。
 	issuesAPI := &httpapi.IssuesAPI{Store: st, Auth: auth, Queue: q}
 	issuesAPI.Routes(mux)
+
+	// 模糊任务规划（docs/10）：多轮对话产出 PRD，人签字后一键生成任务。
+	//
+	// 三处复用都是刻意的：
+	//   - worktree 管理器复用 pipeline 的那一个。规划的只读检出与执行的
+	//     工作树在同一个 workspace 根下，两套管理器会各自把对方的目录
+	//     当尸体回收（#345/#466 那条陷阱就是这个形状）。
+	//   - flow.Service 复用 flowAPI 的那一个，理由见 prdFlows 的注释。
+	//   - 通道走 ImplementChannel（docs/10 §9 已决）：规划与对抗复核都吃
+	//     强通道。不给规划单开配置项 —— 漏配会静默降级到便宜通道，而
+	//     「复核想不出恶意实现」等于没跑，没人会发现。
+	//
+	// agent 驱动另起一个实例：Driver 无状态，与执行共用没有好处，分开
+	// 反而让规划超时将来能独立调。
+	prdAPI := &httpapi.PRDAPI{
+		Store: st,
+		Auth:  auth,
+		Planner: &prd.Service{
+			Store:     prd.NewStoreAdapter(st),
+			Agent:     agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+			Worktrees: prdWorktrees{wm: pipeline.Worktrees},
+			Issues:    prdIssues{st: st},
+			Flows:     prdFlows{svc: flowSvc},
+			Channel:   cfg.ImplementChannel,
+		},
+	}
+	prdAPI.Routes(mux)
 
 	if webui.Available() {
 		mux.Handle("/", webui.Handler())
