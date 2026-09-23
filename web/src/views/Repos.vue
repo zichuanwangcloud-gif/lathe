@@ -140,7 +140,7 @@ onMounted(load)
 
 <template>
   <h1>仓库配置</h1>
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <div class="card">
     <h2>登记仓库</h2>
@@ -265,7 +265,7 @@ onMounted(load)
     </div>
 
     <div v-if="baseline[repo.id]" class="baseline-status">
-      <p v-if="baseline[repo.id].error" class="error-banner">{{ baseline[repo.id].error }}</p>
+      <p v-if="baseline[repo.id].error" role="alert" class="error-banner">{{ baseline[repo.id].error }}</p>
       <template v-else-if="baseline[repo.id].status">
         <p class="faint">
           分支：<span class="mono">{{ baseline[repo.id].status.branch || '未知' }}</span>

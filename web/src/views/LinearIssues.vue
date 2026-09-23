@@ -138,7 +138,7 @@ onMounted(load)
     执行中的流转与历史记录都在「任务看板」。
   </p>
 
-  <div v-if="error" class="error-banner">
+  <div v-if="error" role="alert" class="error-banner">
     {{ error }}
     <RouterLink v-if="errorIsCreds" to="/settings">前往个人设置配置 →</RouterLink>
   </div>
@@ -169,7 +169,7 @@ onMounted(load)
       </div>
     </template>
 
-    <div v-if="startError" class="error-banner small">{{ startError }}</div>
+    <div v-if="startError" role="alert" class="error-banner small">{{ startError }}</div>
     <div class="row" style="margin-top: 14px; gap: 12px; align-items: center">
       <button
         class="primary"

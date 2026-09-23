@@ -144,7 +144,7 @@ onMounted(load)
 
 <template>
   <h1>个人设置</h1>
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <p class="dim note">
     这里的一切都属于你自己的账号：凭据以 AES-256-GCM 加密后存入数据库，
@@ -190,7 +190,7 @@ onMounted(load)
       <span v-if="item.verifiedAt" class="faint">· 验证于 {{ formatTime(item.verifiedAt) }}</span>
     </div>
 
-    <div v-if="item.verifyError" class="error-banner small">{{ item.verifyError }}</div>
+    <div v-if="item.verifyError" role="alert" class="error-banner small">{{ item.verifyError }}</div>
 
     <div
       v-if="results[item.kind]"

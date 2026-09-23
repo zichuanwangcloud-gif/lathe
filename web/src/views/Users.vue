@@ -76,7 +76,7 @@ onMounted(load)
 <template>
   <h1>用户管理</h1>
 
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <!-- 第一步的语义必须讲清楚，否则管理员会以为删掉某人只影响他自己的任务 -->
   <p class="dim note">当前所有用户共享同一份任务与仓库数据。按用户隔离数据是下一步的工作。</p>

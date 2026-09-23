@@ -142,7 +142,7 @@ onMounted(() => {
 
 <template>
   <h1>系统设置</h1>
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <p class="dim note">
     这里的配置对全站生效，仅管理员可改。SMTP 是全站唯一的发件通道 ——
@@ -167,7 +167,7 @@ onMounted(() => {
       <span class="faint">上次验证于 {{ formatTime(smtp.verifiedAt) }}</span>
     </div>
 
-    <div v-if="smtp.verifyError" class="error-banner small">{{ smtp.verifyError }}</div>
+    <div v-if="smtp.verifyError" role="alert" class="error-banner small">{{ smtp.verifyError }}</div>
 
     <div v-if="smtpResult" class="result" :class="smtpResult.ok ? 'good' : 'bad'">
       {{ smtpResult.ok ? '✓ ' : '✗ ' }}{{ smtpResult.detail || smtpResult.error }}

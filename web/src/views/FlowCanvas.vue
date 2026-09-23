@@ -474,8 +474,8 @@ watch(
     <RouterLink to="/flows" class="dim">← 返回编排图列表</RouterLink>
   </div>
 
-  <div v-if="submitError || loadError" class="error-banner">{{ submitError || loadError }}</div>
-  <div v-if="warnings.length" class="error-banner" style="color: var(--warn); border-color: var(--warn)">
+  <div v-if="submitError || loadError" role="alert" class="error-banner">{{ submitError || loadError }}</div>
+  <div v-if="warnings.length" role="alert" class="error-banner" style="color: var(--warn); border-color: var(--warn)">
     <div v-for="(w, i) in warnings" :key="i">{{ w }}</div>
   </div>
 
@@ -591,7 +591,7 @@ watch(
       >
         <div class="row" style="justify-content: space-between">
           <span class="mono" style="color: var(--accent); font-weight: 600; font-size: 12px">{{ n.issueKey }}</span>
-          <button v-if="isNew" class="icon-btn" title="移除" @pointerdown.stop @click.stop="removeNode(n.id)">✕</button>
+          <button v-if="isNew" class="icon-btn" title="移除" aria-label="移除" @pointerdown.stop @click.stop="removeNode(n.id)">✕</button>
           <span v-else class="badge" :class="stateTone(n.state)">{{ stateLabel(n.state) }}</span>
         </div>
         <div v-if="isNew" style="font-size: 13px; margin: 4px 0">{{ n.title }}</div>
@@ -606,7 +606,7 @@ watch(
               <option value="pr_open">前驱 PR 开启后</option>
               <option value="merged">前驱合并后</option>
             </select>
-            <button class="icon-btn" title="取消依赖" @click.stop="clearDepends(n)">✕</button>
+            <button class="icon-btn" title="取消依赖" aria-label="取消依赖" @click.stop="clearDepends(n)">✕</button>
           </div>
           <span
             v-if="isNew"
@@ -620,7 +620,7 @@ watch(
   </div>
 
   <div v-if="!isNew" class="inspector-panel" :class="{ open: selectedId != null }">
-    <button class="icon-btn" style="position: absolute; top: 10px; right: 10px" @click="selectedId = null">✕</button>
+    <button class="icon-btn" style="position: absolute; top: 10px; right: 10px" aria-label="关闭详情面板" @click="selectedId = null">✕</button>
     <template v-if="inspectorLoading">加载中…</template>
     <template v-else-if="inspector">
       <div class="mono" style="color: var(--accent); font-weight: 600">{{ inspector.externalKey }}</div>
