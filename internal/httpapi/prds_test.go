@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -442,4 +444,107 @@ func TestConvertReturnsFlow(t *testing.T) {
 	if planner.convertCalls != 1 {
 		t.Errorf("Convert 应被调一次，got=%d", planner.convertCalls)
 	}
+}
+
+// doRaw 发请求并取回原始响应体 —— 导出是 Markdown / JSON 文件，
+// doReq 那种「顺手 JSON 解码」的拿法读不到 md。
+func doRaw(t *testing.T, srv *httptest.Server, path string) (*http.Response, string) {
+	t.Helper()
+	r, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Header.Set("Authorization", "Bearer "+apiTestToken)
+	resp, err := srv.Client().Do(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp, string(b)
+}
+
+func TestExportPRD(t *testing.T) {
+	api, _, st, userID, repoID := prdFixture(t)
+	srv := prdServer(t, api)
+
+	doc := &prd.Document{
+		Type:     prd.TypeFeature,
+		OneLiner: prd.Section{Status: prd.StatusConfirmed, Body: "让管理员能配预览阈值"},
+		Criteria: []prd.Criterion{{
+			ID: "AC-1", Category: prd.ACCategory("happy_path"),
+			Given: "管理员已登录", When: "改成 5", Then: "立即生效",
+			Verify: prd.VerifyAuto,
+		}},
+	}
+	raw, err := doc.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := mustPRD(t, st, userID, repoID)
+	if _, err := st.UpdatePRDContent(context.Background(), row.ID, userID,
+		store.UpdatePRDContentParams{Document: raw}); err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.FormatInt(row.ID, 10)
+
+	t.Run("默认导出 Markdown", func(t *testing.T) {
+		resp, body := doRaw(t, srv, "/api/prds/"+id+"/export")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("状态码 got=%d want=200", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/markdown") {
+			t.Errorf("Content-Type got=%q want text/markdown", ct)
+		}
+		if cd := resp.Header.Get("Content-Disposition"); !strings.Contains(cd, "prd-"+id+".md") {
+			t.Errorf("Content-Disposition got=%q，应带 .md 文件名", cd)
+		}
+		for _, want := range []string{"# PRD #" + id, "让管理员能配预览阈值", "### AC-1", "§7 验收标准"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("导出内容缺少 %q", want)
+			}
+		}
+	})
+
+	t.Run("JSON 导出可解析且含结构化全量", func(t *testing.T) {
+		resp, body := doRaw(t, srv, "/api/prds/"+id+"/export?format=json")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("状态码 got=%d want=200", resp.StatusCode)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("Content-Type got=%q want application/json", ct)
+		}
+		var out prd.ExportInput
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatalf("JSON 导出不可解析: %v\n%s", err, body)
+		}
+		if out.PRDID != row.ID {
+			t.Errorf("prdId got=%d want=%d", out.PRDID, row.ID)
+		}
+		if out.Document == nil || len(out.Document.Criteria) != 1 {
+			t.Errorf("JSON 导出应带完整 document（含 AC 表），got=%+v", out.Document)
+		}
+		if out.Repo == "" {
+			t.Error("JSON 导出应带仓库名")
+		}
+	})
+
+	t.Run("未知格式要拒绝", func(t *testing.T) {
+		resp, _ := doRaw(t, srv, "/api/prds/"+id+"/export?format=pdf")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("未知格式应 400，got=%d", resp.StatusCode)
+		}
+	})
+
+	t.Run("非属主拿不到", func(t *testing.T) {
+		otherID := mustUser(t, st, "prds-exp-other-"+t.Name()+"@example.com")
+		otherSrv := prdServer(t, &PRDAPI{Store: st, Auth: authAs(otherID, "o@example.com")})
+		resp, _ := doRaw(t, otherSrv, "/api/prds/"+id+"/export")
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("非属主导出应 404，got=%d", resp.StatusCode)
+		}
+	})
 }

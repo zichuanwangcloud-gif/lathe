@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,6 +46,7 @@ func (a *PRDAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/prds/{id}", a.Auth.RequireFunc(a.get))
 	mux.Handle("GET /api/prds/{id}/rounds", a.Auth.RequireFunc(a.listRounds))
 	mux.Handle("GET /api/prds/{id}/events", a.Auth.RequireFunc(a.events))
+	mux.Handle("GET /api/prds/{id}/export", a.Auth.RequireFunc(a.export))
 
 	mux.Handle("POST /api/prds/{id}/rounds", a.Auth.RequireFunc(a.runRound))
 	mux.Handle("POST /api/prds/{id}/review", a.Auth.RequireFunc(a.review))
@@ -576,4 +579,124 @@ func (a *PRDAPI) setDispositions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// export：GET /api/prds/{id}/export?format=md|json —— §7 导出。
+//
+// 两种格式在任何状态下都可用（approved 之后内容本就冻结，导出自然冻结）。
+// Lathe 只把文件交给人，不自动写进目标仓库、更不 push —— 要不要提交进
+// docs/ 是人的决定。
+func (a *PRDAPI) export(w http.ResponseWriter, r *http.Request) {
+	id, ok := prdPathID(w, r)
+	if !ok {
+		return
+	}
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "md"
+	}
+	if format != "md" && format != "json" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "format 只能是 md 或 json"})
+		return
+	}
+
+	userID := CurrentUser(r).ID
+	row, err := a.Store.GetPRD(r.Context(), id, userID)
+	if err != nil {
+		writePRDError(w, "查询 PRD 失败", err)
+		return
+	}
+	in, err := a.exportInput(r.Context(), row, userID)
+	if err != nil {
+		serverError(w, "组装导出内容失败", err)
+		return
+	}
+
+	// filename 只含 PRD 编号，不拼标题：标题带空格、斜杠与中文标点，
+	// 拼进 Content-Disposition 要额外转义，而这个头是直接下发给浏览器的。
+	w.Header().Set("Content-Disposition", `attachment; filename="`+prd.ExportFilename(id, format)+`"`)
+
+	if format == "json" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if err := json.NewEncoder(w).Encode(in); err != nil {
+			// 头已经发出去了，这里只能记日志 —— 再写状态码会是
+			// "superfluous WriteHeader" 且客户端已经开始收 body。
+			slog.Error("写 PRD JSON 导出失败", "prd", id, "err", err)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	if _, err := io.WriteString(w, prd.RenderMarkdown(in)); err != nil {
+		slog.Error("写 PRD Markdown 导出失败", "prd", id, "err", err)
+	}
+}
+
+// exportInput 把库里的行拼成渲染器要的材料。
+//
+// 解析 jsonb 放在这一层而不是 prd 包：渲染器只该管排版，不该知道轮次的
+// questions 在库里是 jsonb 还是别的什么。
+func (a *PRDAPI) exportInput(ctx context.Context, row *store.PRDRow, userID int64) (prd.ExportInput, error) {
+	doc, err := prd.ParseDocument(row.Document)
+	if err != nil {
+		return prd.ExportInput{}, err
+	}
+	blocks, err := prd.ParseTaskBlocks(row.TaskBlocks)
+	if err != nil {
+		return prd.ExportInput{}, err
+	}
+
+	var review *prd.ReviewReport
+	if len(row.ReviewReport) > 0 {
+		var rep prd.ReviewReport
+		if err := json.Unmarshal(row.ReviewReport, &rep); err != nil {
+			return prd.ExportInput{}, err
+		}
+		review = &rep
+	}
+
+	in := prd.ExportInput{
+		PRDID:         row.ID,
+		Type:          prd.Type(row.PRDType),
+		State:         row.State,
+		OriginalInput: row.OriginalInput,
+		CreatedAt:     row.CreatedAt,
+		UpdatedAt:     row.UpdatedAt,
+		ApprovedAt:    row.ApprovedAt,
+		ConvertedAt:   row.ConvertedAt,
+		RefPRDID:      row.RefPRDID,
+		FlowID:        row.GeneratedFlowID,
+		Document:      doc,
+		Blocks:        blocks,
+		Review:        review,
+	}
+
+	// 仓库名取不到不算致命：导出件少一行元信息，比整个导出 500 要好。
+	if repo, err := a.Store.GetRepo(ctx, row.RepoID, userID); err == nil {
+		in.Repo = repo.ProviderRepo
+	}
+
+	rounds, err := a.Store.ListPRDRounds(ctx, row.ID)
+	if err != nil {
+		return prd.ExportInput{}, err
+	}
+	for _, rd := range rounds {
+		s := prd.RoundSummary{
+			Round:     rd.Round,
+			Stage:     rd.Stage,
+			UserInput: rd.UserInput,
+			Notes:     rd.Notes,
+			CreatedAt: rd.CreatedAt,
+		}
+		if len(rd.Questions) > 0 {
+			// 问题清单坏了不该让整份导出失败：附录 A 少一轮的问题，
+			// 比人拿不到 PRD 要好。
+			if err := json.Unmarshal(rd.Questions, &s.Questions); err != nil {
+				slog.Warn("解析轮次问题清单失败，该轮问题不进导出",
+					"prd", row.ID, "round", rd.Round, "err", err)
+			}
+		}
+		in.Rounds = append(in.Rounds, s)
+	}
+	return in, nil
 }

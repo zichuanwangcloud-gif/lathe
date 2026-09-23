@@ -37,6 +37,9 @@
   每节都要人确认过），并跑一次对抗复核让另一个 agent 专门找 AC 的洞
 - `repos.prd_task_max_lines` / `prd_task_max_files`：PRD 拆出的单任务量级上限
   （出厂 400 行 / 8 文件），消费方是定稿自检 —— 超限即拒绝进评审
+- PRD 导出（§7）：`GET /api/prds/{id}/export?format=md|json`，任何状态下都可用。
+  Markdown 版保留节状态标记的文本形式（`[已确认]` 等），可回写进目标仓库 `docs/`
+  —— 但 Lathe 不自动提交、更不 push，入不入库是人的决定
 
 ### Changed
 
