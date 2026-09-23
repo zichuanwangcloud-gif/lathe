@@ -259,7 +259,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
   <div v-if="!detail" class="empty">加载中…</div>
 
   <template v-else>

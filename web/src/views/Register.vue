@@ -38,21 +38,25 @@ async function submit() {
       <h1>注册</h1>
       <p class="dim">注册后即可登录，无需邮箱验证</p>
 
-      <input v-model="email" type="email" placeholder="邮箱" autocomplete="username" autofocus />
-      <input
-        v-model="password"
-        type="password"
-        placeholder="密码（至少 8 位）"
-        autocomplete="new-password"
-      />
-      <input
-        v-model="confirm"
-        type="password"
-        placeholder="再输一次密码"
-        autocomplete="new-password"
-      />
+      <label class="field">
+        <span>邮箱</span>
+        <input v-model="email" type="email" autocomplete="username" autofocus />
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input
+          v-model="password"
+          type="password"
+          placeholder="至少 8 位"
+          autocomplete="new-password"
+        />
+      </label>
+      <label class="field">
+        <span>确认密码</span>
+        <input v-model="confirm" type="password" autocomplete="new-password" />
+      </label>
 
-      <div v-if="error" class="error-banner">{{ error }}</div>
+      <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
       <button class="primary" type="submit" :disabled="busy || !email || !password || !confirm">
         {{ busy ? '注册中…' : '注册' }}

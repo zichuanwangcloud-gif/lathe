@@ -48,7 +48,7 @@ onUnmounted(() => clearInterval(timer))
 </script>
 
 <template>
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <div v-if="stats" class="stats">
     <div class="card stat">

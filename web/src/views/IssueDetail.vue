@@ -180,8 +180,8 @@ onMounted(load)
       <RouterLink to="/issues" class="dim">← 返回工单列表</RouterLink>
     </div>
 
-    <div v-if="error" class="error-banner">{{ error }}</div>
-    <div v-if="notice" class="error-banner" style="color: var(--ok); border-color: var(--ok)">{{ notice }}</div>
+    <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
+    <div v-if="notice" role="alert" class="error-banner" style="color: var(--ok); border-color: var(--ok)">{{ notice }}</div>
 
     <!-- 本体 -->
     <div class="card" style="margin-bottom: 12px">

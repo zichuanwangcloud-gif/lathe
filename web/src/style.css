@@ -7,6 +7,11 @@
   --text-dim: #9aa3b2;
   --text-faint: #6b7280;
   --accent: #5b9cf6;
+  /* 填充级强调色：白字 4.88:1 达标（原 #5b9cf6 填充只有 2.79:1，过不了 WCAG 1.4.3）。
+     --accent 只做文字/描边级用途（暗底 6.78:1 合格）；凡是白字压上去的填充底，
+     一律用 --accent-strong。 */
+  --accent-strong: #2f6fd0;
+  --accent-strong-hover: #2a63ba;
 
   --ok: #3fb950;
   --ok-bg: rgba(63, 185, 80, 0.12);
@@ -32,8 +37,14 @@
     --text: #1c2024;
     --text-dim: #5b6472;
     --text-faint: #8b929e;
+    /* 亮主题链接/描边加深：#5b9cf6 在亮底上只有 2.60:1，#2f6fd0 有 4.55:1。
+       填充级 strong 与暗主题共用（白字对比与底色无关）。 */
+    --accent: #2f6fd0;
+    color-scheme: light;
   }
 }
+
+:root { color-scheme: dark; }
 
 * { box-sizing: border-box; }
 
@@ -60,10 +71,14 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
+button.primary:hover:not(:disabled) {
+  background: var(--accent-strong-hover);
+  border-color: var(--accent-strong-hover);
+}
 button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
 
-input, select {
+input, select, textarea {
   font: inherit;
   background: var(--bg);
   color: var(--text);
@@ -71,7 +86,8 @@ input, select {
   border-radius: var(--radius);
   padding: 7px 10px;
 }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+/* focus 不再移除 outline：全局 :focus-visible 焦点环统一兜底（见文件尾）。 */
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 
 .card {
   background: var(--surface);
@@ -169,4 +185,32 @@ pre {
   justify-content: space-between;
   gap: 12px;
   font-size: 13px;
+}
+
+/* 表单字段：可见 label 包控件。placeholder 不能当 label —— 输入后标签消失，
+   屏幕阅读器也拿不稳（WCAG 3.3.2；skill「Forms | Input Labels」）。
+   login-card 自身带 gap，里面的 field 去掉上下外边距防止双重间距。 */
+.field { display: block; margin: 10px 0; }
+.field > span { display: block; font-size: 12.5px; color: var(--text-dim); margin-bottom: 4px; }
+.login-card .field { margin: 0; }
+
+/* ---------------------------------------------------------------- 可访问性基线 */
+
+/* 键盘焦点环：:focus-visible 的 UA 启发式保证鼠标点击不触发、Tab 导航必出现。
+   此前全站没有任何焦点样式，唯一的 focus 规则还在移除 outline —— 键盘用户
+   完全无法定位焦点（WCAG 2.4.7 Focus Visible）。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 动效敏感用户：动效全部压到近零（WCAG 2.3.3；prefers-reduced-motion 是全
+   系统级偏好，不是某个组件的事，所以用通配符一刀切兜底）。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

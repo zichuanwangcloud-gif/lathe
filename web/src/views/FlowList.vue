@@ -35,7 +35,7 @@ onMounted(load)
     <button class="primary" @click="$router.push('/flows/new')">新建编排图</button>
   </div>
 
-  <div v-if="error" class="error-banner">{{ error }}</div>
+  <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <div v-if="loading" class="card empty">加载中…</div>
 
