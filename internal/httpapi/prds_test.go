@@ -459,7 +459,7 @@ func doRaw(t *testing.T, srv *httptest.Server, path string) (*http.Response, str
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { resp.Body.Close() })
+	t.Cleanup(func() { _ = resp.Body.Close() })
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
