@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth, refresh } from '../auth'
+import { confirmDialog } from '../confirm'
 
 // 每个用户专属的 Linear webhook 回调地址（P1.5 第二步）：
 // 事件按它路由到本人 —— 用谁的凭据验签、任务归谁的名下。
@@ -100,7 +101,7 @@ async function verify(kind) {
 }
 
 async function remove(kind) {
-  if (!confirm(`确认删除 ${META[kind].name}？`)) return
+  if (!(await confirmDialog(`确认删除 ${META[kind].name}？`))) return
   busy.value = kind
   try {
     await api.deleteIntegration(kind)

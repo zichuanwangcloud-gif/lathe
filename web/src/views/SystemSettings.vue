@@ -2,6 +2,7 @@
 import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth } from '../auth'
+import { confirmDialog } from '../confirm'
 
 // 系统设置（仅管理员）：SMTP 发信通道是全站唯一的发件人，
 // 所有系统邮件（密码重置、通知类）都经它发出；收件人由每个人
@@ -119,7 +120,7 @@ async function verifySmtp() {
 }
 
 async function removeSmtp() {
-  if (!confirm('确认删除发信配置？删除后「忘记密码」功能将不可用。')) return
+  if (!(await confirmDialog('确认删除发信配置？删除后「忘记密码」功能将不可用。'))) return
   busy.value = 'smtp'
   try {
     await api.deleteSmtp()

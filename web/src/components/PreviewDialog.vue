@@ -7,6 +7,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, inject, nextTick } from 'vue'
 import { api, UnauthorizedError } from '../api'
 import BaseDialog from './BaseDialog.vue'
+import { confirmDialog } from '../confirm'
 
 const props = defineProps({
   task: { type: Object, required: true }, // { id, externalKey }
@@ -184,7 +185,7 @@ async function start() {
 }
 
 async function stop() {
-  if (!confirm('停止并清理该任务的全部预览容器与镜像？')) return
+  if (!(await confirmDialog('停止并清理该任务的全部预览容器与镜像？'))) return
   busy.value = true
   error.value = ''
   try {

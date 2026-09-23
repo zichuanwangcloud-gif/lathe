@@ -18,6 +18,7 @@ import Register from './views/Register.vue'
 import ForgotPassword from './views/ForgotPassword.vue'
 import ResetPassword from './views/ResetPassword.vue'
 import ChangePassword from './views/ChangePassword.vue'
+import NotFound from './views/NotFound.vue'
 import { auth, refresh, isAdmin, mustChangePassword, hasLinearToken } from './auth'
 import { setPasswordChangeHandler } from './api'
 import './style.css'
@@ -45,6 +46,9 @@ const router = createRouter({
     { path: '/register', name: 'register', component: Register, meta: { public: true } },
     { path: '/forgot-password', name: 'forgot', component: ForgotPassword, meta: { public: true } },
     { path: '/reset-password', name: 'reset', component: ResetPassword, meta: { public: true } },
+    // 兜底：未知地址给明确的 404 页而不是空壳。放在最后，且只在登录后可见
+    // （未登录先被守卫送去登录页）。
+    { path: '/:pathMatch(.*)*', name: 'not-found', component: NotFound },
   ],
 })
 
