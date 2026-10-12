@@ -14,9 +14,7 @@ import (
 // 技能在 Lathe 自己的技能仓库里找不到（名字或版本任一对不上）时的失败阶段
 // 代码。对应 F7.2-AC5：声明了不存在的技能时任务以可读原因失败，不静默忽略。
 //
-// 与 profile.go 的 StageProfileInvalid、pipeline.go 的 StageRebaseConflict
-// 同理，不进 stage.go 的 label()/stageOrder() 表（两者的 default 分支已经
-// 兜得住未列出的 Stage），单独放在离消费方最近的文件里。
+// 常量定义在这里（离消费方最近），中文标签在 stage.go 的 label() 里。
 const StageSkillMissing Stage = "skill_missing"
 
 // materializeSkills 把 rc.profile.Skills 声明的每个技能物化进 worktree 的

@@ -526,6 +526,9 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 	// 返回时 Stacks 必然已经装好，不存在一个「还没装」的中间态。
 	pm := preview.NewManager(cfg.WorkspaceRoot, st.PreviewThresholds)
 
+	// Memory 接 *store.Store 本身：它直接满足 runner.FailureMemory
+	// （方法签名一对一同形），不需要适配器 —— 与 Verifications /
+	// AgentEvents 的接线方式一致。
 	return &runner.Pipeline{
 		Tasks:            task.NewMachine(st.Pool()),
 		Worktrees:        wm,
@@ -539,6 +542,7 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		Verifications:    st,
 		Stacks:           verifyStacks{pm},
 		AgentEvents:      st,
+		Memory:           st,
 		Gates:            runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode:   "acceptEdits",
 		MaxFixAttempts:   cfg.FixAttempts,

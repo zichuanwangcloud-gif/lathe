@@ -607,6 +607,16 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 	// 介入才能往下走的状态，不通知就只能靠人自己发现栈卡住了。
 	if p.Pipeline != nil {
 		p.Pipeline.mailTerminal(ctx, failed, "前驱已合并，自动 rebase 撞上冲突，需要人工处理。")
+		// 跨任务失败记忆（§3.6 第 16 条）。这条路径没有 runCtx、调不了
+		// fail()，所以在这里单独补一次 —— 否则「自动 rebase 撞冲突」这类
+		// 失败就是记忆里的一个黑洞：它恰恰是最该被记住的一类（同一个栈
+		// 重试时会再撞上同一处冲突）。
+		p.Pipeline.recordFailureMemoryFor(ctx, failed.ID, store.FailureLookup{
+			UserID:          failed.UserID,
+			RepoID:          failed.RepoID,
+			TrackerProvider: failed.TrackerProvider,
+			ExternalKey:     failed.ExternalKey,
+		}, StageRebaseConflict, fmt.Errorf("%s失败: %v", action, cause), "")
 	}
 
 	// 5) 失败传播（F2.3-AC1~AC4，与 pipeline.go 的 fail() 一致）：

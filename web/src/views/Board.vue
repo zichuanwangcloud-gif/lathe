@@ -5,6 +5,7 @@ import { api, UnauthorizedError, stateLabel, stateTone, formatTime } from '../ap
 import { hasLinearToken } from '../auth'
 import PreviewDialog from '../components/PreviewDialog.vue'
 import CostPanel from '../components/CostPanel.vue'
+import MetricsPanel from '../components/MetricsPanel.vue'
 
 const tasks = ref([])
 const stats = ref(null)
@@ -116,6 +117,7 @@ onUnmounted(() => clearInterval(timer))
   </div>
 
   <CostPanel />
+  <MetricsPanel />
 
   <div class="card scroll-x" style="padding: 0">
     <table v-if="tasks.length">

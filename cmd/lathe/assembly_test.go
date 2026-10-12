@@ -319,3 +319,16 @@ func testSecrets(t *testing.T, st *store.Store) *store.Secrets {
 	}
 	return st.NewSecrets(sealer)
 }
+
+// 装配契约：*store.Store 直接满足 runner 的窄接口。
+//
+// 这几行是**编译期**断言（不产生测试用例）：接口改签名、store 少了方法，
+// 编译就在这里断，而不是等二进制跑起来第一次派发任务才炸。
+//
+// FailureMemory 是这条断言的直接受益者：它一度多写了一层适配器，
+// 而适配器存在的理由（「runner 不该依赖 store」）在本仓根本不成立 ——
+// MergePoller 的 IssueOutcome 早就是这么接的。断言摆在这里，下次有人
+// 想加包装时会先看到「其实直接接得上」。
+var (
+	_ runner.FailureMemory = (*store.Store)(nil)
+)

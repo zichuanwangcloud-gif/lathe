@@ -89,6 +89,9 @@ export const api = {
   // 成本聚合独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
   // 不需要 5 秒新鲜度（后端注释里有完整理由）。
   costStats: () => request('/api/stats/cost'),
+  // 平台自度量（环节耗时分位数 + 失败分类直方图）。同样独立于 /api/stats，
+  // 理由与 costStats 一样：那两个聚合都要扫 task_events，而看板 5 秒一轮。
+  metricsStats: () => request('/api/stats/metrics'),
   repos: () => request('/api/repos'),
   config: () => request('/api/config'),
 
