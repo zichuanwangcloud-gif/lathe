@@ -43,10 +43,52 @@ func TestStateInvariants(t *testing.T) {
 		}
 	})
 
-	t.Run("终态没有出边", func(t *testing.T) {
-		for _, s := range []State{StateConverted, StateAbandoned} {
-			if got := NextStates(s); len(got) != 0 {
-				t.Errorf("终态 %s 不该有后继，got=%v", s, got)
+	t.Run("converted 彻底没有出边，abandoned 只有一条人工唤醒的边", func(t *testing.T) {
+		// converted 是唯一真正不可回的终态：任务已经发出去了（D10-4）。
+		if got := NextStates(StateConverted); len(got) != 0 {
+			t.Errorf("converted 不该有任何后继，got=%v —— 任务已生成，要改只能开新 PRD", got)
+		}
+		// abandoned 是终态，但允许人工唤醒回起草（docs/10 §9 第 1 条已决）。
+		got := NextStates(StateAbandoned)
+		want := []State{StateDrafting}
+		if len(got) != len(want) || got[0] != want[0] {
+			t.Errorf("abandoned 的后继 got=%v want=%v —— 搁置/放弃后要能由人唤醒回起草，"+
+				"否则一次超时搁置就作废整段对话与已确认的节", got, want)
+		}
+	})
+
+	t.Run("搁置与复活：awaiting_answers → abandoned 合法，复活回 drafting", func(t *testing.T) {
+		// 第 1 条：超时扫描器走的就是这条边。
+		if err := Validate(StateAwaitingAnswers, StateAbandoned); err != nil {
+			t.Errorf("awaiting_answers → abandoned 应当合法（超时搁置）：%v", err)
+		}
+		// 第 3 条：人回来答一句就走这条边。
+		if err := Validate(StateAbandoned, StateDrafting); err != nil {
+			t.Errorf("abandoned → drafting 应当合法（人唤醒搁置的 PRD）：%v", err)
+		}
+		// 复活不能一步跳到别的状态：唤醒的语义是「回到起草接着对话」，
+		// 不是「直接批准」或「直接进评审」。
+		for _, to := range []State{StateReadyForReview, StateApproved, StateConverted, StateAbandoned} {
+			if CanTransition(StateAbandoned, to) {
+				t.Errorf("abandoned → %s 不该存在：唤醒只能回起草", to)
+			}
+		}
+	})
+
+	t.Run("搁置不是自动回流：没有任何自动路径把人放弃的 PRD 拉回来", func(t *testing.T) {
+		// 这条守的是「放弃」这个动作的意义。若将来有人给 abandoned 加上
+		// 一条指向非 drafting 的边，或让别的状态能自动进 abandoned，
+		// 这条测试会先响。
+		//
+		// 唯一允许进 abandoned 的来源是三个活跃态（人点放弃 / 扫描器搁置）。
+		for _, from := range AllStates() {
+			if !CanTransition(from, StateAbandoned) {
+				continue
+			}
+			switch from {
+			case StateDrafting, StateAwaitingAnswers, StateReadyForReview:
+			default:
+				t.Errorf("%s → abandoned 不该存在：只有活跃态能进搁置", from)
 			}
 		}
 	})
@@ -57,7 +99,9 @@ func TestStateInvariants(t *testing.T) {
 				t.Errorf("%s 应该能放弃：人随时有权停下", s)
 			}
 		}
-		for _, s := range []State{StateApproved, StateConverted, StateAbandoned} {
+		// converted 不能放弃（任务已发出），approved 不能（签过字的东西
+		// 作废走的是「生成出来的任务各自取消」，见 state.go 第 3 条）。
+		for _, s := range []State{StateApproved, StateConverted} {
 			if CanTransition(s, StateAbandoned) {
 				t.Errorf("%s → abandoned 不该存在", s)
 			}
@@ -75,8 +119,8 @@ func TestFrozen(t *testing.T) {
 		{StateReadyForReview, false},
 		{StateApproved, true},
 		{StateConverted, true},
-		// 放弃的 PRD 没有「内容冻结」的语义 —— 它不会再被读，
-		// 也不需要保证导出稳定。
+		// 搁置的 PRD 没有「内容冻结」的语义：它随时可能被人唤醒回 drafting
+		// 继续改（docs/10 §9 第 1 条已决），冻结它就等于把这条路堵死。
 		{StateAbandoned, false},
 	}
 	for _, tc := range tests {

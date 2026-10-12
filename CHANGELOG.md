@@ -40,6 +40,15 @@
 - PRD 导出（§7）：`GET /api/prds/{id}/export?format=md|json`，任何状态下都可用。
   Markdown 版保留节状态标记的文本形式（`[已确认]` 等），可回写进目标仓库 `docs/`
   —— 但 Lathe 不自动提交、更不 push，入不入库是人的决定
+- **PRD 对话超时/搁置策略**（docs/10 §9 未决第 1 条）：`awaiting_answers` 的
+  PRD 超过 `LATHE_PRD_STALL_TIMEOUT`（默认 7 天、下限 1 小时）无人回答即转
+  `abandoned`，并发一封提醒邮件（`LATHE_PRD_STALL_NOTIFY`，默认开）。
+  超时时钟取最后一轮对话的时间而不是 `prds.updated_at` —— 后者会被
+  「逐节确认」这类无关写入推后，用它会让一份三周没人答的 PRD 永远不超期
+- 搁置的 PRD 可以唤醒：`abandoned → drafting`（`POST /api/prds/{id}/resume`，
+  界面上是「继续这份 PRD」按钮）。终态的含义是「不再自动流转」，不是死路；
+  唤醒只改状态，轮次历史与已确认的节都还在。放弃与超时搁置共用一个状态，
+  不新增 `stale`（docs/10 §9 记录了这条取舍与它的代价）
 
 ### Changed
 
@@ -48,6 +57,8 @@
   唯一索引随之改为 `(repo_id, tracker_provider, external_key)`
 - Dockerfile 的构建阶段改为 `--platform=$BUILDPLATFORM` + `GOOS/GOARCH` 交叉编译，
   多架构构建不再靠 QEMU 模拟跑 Go 编译
+- PRD 状态机：`abandoned` 从「没有任何出边」改为「只有一条人工出边」
+  （→ `drafting`）。`converted` 仍是唯一不可回的终态
 
 ### Fixed
 

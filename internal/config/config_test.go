@@ -283,3 +283,117 @@ func TestValidateRejectsDangerousWorkspaceRoot(t *testing.T) {
 		}
 	}
 }
+
+// ★ 验收标准：PRD 搁置阈值的下限与默认值（docs/10 §9 第 1 条）。
+//
+// 下限的存在理由与 WorktreeTTL 不同：那边是安全机制（防误删在途现场），
+// 这边纯粹是防手滑 —— 调小不会损坏任何数据，只会把还在等人回答的 PRD
+// 判成「已搁置」。那是一次**可见的误判**（人在列表上看到自己的对话被
+// 放弃了），比数据损坏更难修：数据能恢复，信任不能。
+func TestValidateRejectsTinyPRDStallTimeout(t *testing.T) {
+	base := func() Config {
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("基准配置构造失败: %v", err)
+		}
+		return c
+	}
+
+	for _, d := range []time.Duration{time.Second, time.Minute, 59 * time.Minute, 0, -time.Hour} {
+		c := base()
+		c.PRDStallTimeout = d
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("PRDStallTimeout=%v 应被拒绝（下限 %v）", d, MinPRDStallTimeout)
+			continue
+		}
+		if !strings.Contains(err.Error(), "PRDStallTimeout") {
+			t.Errorf("错误应提到 PRDStallTimeout，得到: %v", err)
+		}
+		// 错误信息要指路：Go 的时长解析不支持 d，写 7d 会静默拿不到值。
+		if !strings.Contains(err.Error(), "168h") {
+			t.Errorf("下限错误应提示写法（168h 而不是 7d），得到: %v", err)
+		}
+	}
+
+	// 正好等于下限：放行。
+	c := base()
+	c.PRDStallTimeout = MinPRDStallTimeout
+	if err := c.Validate(); err != nil {
+		t.Errorf("恰好等于下限时应放行，得到: %v", err)
+	}
+}
+
+// 默认值：七天，够人想清楚，也不至于让列表页堆满陈旧条目。
+func TestPRDStallDefaults(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load() 报错: %v", err)
+	}
+	if c.PRDStallTimeout != 168*time.Hour {
+		t.Errorf("PRDStallTimeout 默认 got=%v want=168h（7 天）", c.PRDStallTimeout)
+	}
+	if c.PRDStallSweepInterval != time.Hour {
+		t.Errorf("PRDStallSweepInterval 默认 got=%v want=1h", c.PRDStallSweepInterval)
+	}
+	// 提醒默认开：搁置发生在后台，不看列表就完全无感，邮件是唯一的主动告知。
+	if !c.PRDStallNotifyEnabled() {
+		t.Error("搁置提醒应默认开启")
+	}
+}
+
+func TestPRDStallNotifySwitch(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"false", false},
+		{"true", true},
+		{"", true}, // 未设置 = 默认开
+	} {
+		t.Run("LATHE_PRD_STALL_NOTIFY="+tc.env, func(t *testing.T) {
+			t.Setenv("LATHE_PRD_STALL_NOTIFY", tc.env)
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load() 报错: %v", err)
+			}
+			if got := c.PRDStallNotifyEnabled(); got != tc.want {
+				t.Errorf("PRDStallNotifyEnabled() got=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// 拼错的布尔值必须在启动时报错，不能静默失效。
+//
+// 对 LATHE_PRD_STALL_NOTIFY 尤其要紧：写成 "no" 的话，静默按「开」处理
+// 与按「关」处理都说得通，而配置的人以为自己的意思传达到了。
+func TestValidateRejectsMalformedPRDStallNotify(t *testing.T) {
+	for _, v := range []string{"yes", "1", "TRUE", "no"} {
+		t.Run(v, func(t *testing.T) {
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load() 报错: %v", err)
+			}
+			c.PRDStallNotify = v
+			verr := c.Validate()
+			if verr == nil || !strings.Contains(verr.Error(), "LATHE_PRD_STALL_NOTIFY") {
+				t.Errorf("LATHE_PRD_STALL_NOTIFY=%q 应在启动时报错，得到: %v", v, verr)
+			}
+		})
+	}
+}
+
+// 扫描间隔必须为正（同 ReapInterval）。
+func TestValidateRejectsNonPositivePRDStallSweepInterval(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load() 报错: %v", err)
+	}
+	for _, iv := range []time.Duration{0, -time.Second} {
+		c.PRDStallSweepInterval = iv
+		if verr := c.Validate(); verr == nil || !strings.Contains(verr.Error(), "PRDStallSweepInterval") {
+			t.Errorf("PRDStallSweepInterval=%v 应被拒绝，得到: %v", iv, verr)
+		}
+	}
+}

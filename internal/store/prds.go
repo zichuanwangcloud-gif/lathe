@@ -221,6 +221,75 @@ func (s *Store) ListPRDs(ctx context.Context, p ListPRDsParams) ([]PRDRow, int, 
 	return out, total, rows.Err()
 }
 
+// ListStalledPRDs 返回「挂在 awaiting_answers 已超期」的 PRD（docs/10 §9）。
+//
+// 超时时钟取的是**最后一轮对话的 created_at**，不是 prds.updated_at。
+// 这一条是整个查询的关键，选错了会误伤：
+//
+//	updated_at 被任何一次写入推后，而哪一轮之后人没回答，只有轮次记录
+//	知道。例如人在详情页逐节点了几个「确认」（confirmSection 走
+//	UpdatePRDContent），updated_at 就跳到今天 —— 用它的时钟，一份
+//	三周没人答的 PRD 会因为昨天点了两下而永远不被判搁置。反过来，
+//	prd_rounds 是 append-only 的（0024 的建表注释），每轮一行、只增不改，
+//	最后一轮的 created_at 就是「问题提出、球踢给人」的准确时刻。
+//
+// now 由调用方传入而不是就地取 time.Now()：同一个判定里还要比
+// processing_started_at 的僵死阈值，两个时间若各取一次就可能落在
+// 不同的瞬间，让测试没法钉死边界。
+//
+// limit 限制单轮扫描量（最早超期的优先）—— 存量积压时靠多轮扫描排空，
+// 而不是一次拉出全表。理由同收割机：扫描是低频维护动作，
+// 单轮耗时不该随积压量线性增长。
+func (s *Store) ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limit int) ([]PRDRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	// 正在跑的这一轮不算搁置：人点了「提交回答并跑下一轮」，agent 还在
+	// 写文档时把它转成 abandoned，那一轮跑完的快照就会写进一份已被判定
+	// 放弃的 PRD（persistRound 的 drafting→awaiting CAS 会失配）。
+	//
+	// 但僵死（进程被杀、没机会把 processing CAS 回去）的轮次必须照样
+	// 算进来 —— 否则这份 PRD 会因为一个永远不会被清掉的标记而免于扫描，
+	// 永远留在这里。僵死判定的阈值与读路径（GetPRD 的 clearStalePRDProcessing）
+	// 共用 prdStallAfter，两处必须一致。
+	staleBefore := now.Add(-prdStallAfter)
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT p.id, p.user_id, p.repo_id, p.ref_prd_id, p.prd_type, p.state, p.round,
+		       p.original_input, p.processing, p.processing_started_at,
+		       p.generated_flow_id, p.approved_at, p.converted_at, p.created_at, p.updated_at
+		FROM prds p
+		LEFT JOIN LATERAL (
+			SELECT r.created_at FROM prd_rounds r
+			WHERE r.prd_id = p.id
+			ORDER BY r.round DESC
+			LIMIT 1
+		) lr ON TRUE
+		WHERE p.state = 'awaiting_answers'
+		  AND (NOT p.processing OR p.processing_started_at IS NULL
+		       OR p.processing_started_at < $3)
+		  AND COALESCE(lr.created_at, p.updated_at) < $1
+		ORDER BY COALESCE(lr.created_at, p.updated_at)
+		LIMIT $2`, cutoff, limit, staleBefore)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询超期 PRD 失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PRDRow
+	for rows.Next() {
+		var it PRDRow
+		if err := rows.Scan(&it.ID, &it.UserID, &it.RepoID, &it.RefPRDID,
+			&it.PRDType, &it.State, &it.Round, &it.OriginalInput,
+			&it.Processing, &it.ProcessingStartedAt, &it.GeneratedFlowID,
+			&it.ApprovedAt, &it.ConvertedAt, &it.CreatedAt, &it.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: 读取超期 PRD 行失败: %w", err)
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // UpdatePRDContentParams 是一轮对话产出的落库输入；nil 字段不动。
 //
 // 注意没有 OriginalInput：原文是所有推断的根，store 层不提供改它的路径

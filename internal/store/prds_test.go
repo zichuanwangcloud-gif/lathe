@@ -297,3 +297,194 @@ func TestListPRDsOmitsHeavyDocuments(t *testing.T) {
 		t.Errorf("状态过滤失效：按 approved 筛出了 %d 份", n)
 	}
 }
+
+// ---------------------------------------------------------------- 超期扫描
+
+// awaitFor 把一份 PRD 摆成「停在 awaiting_answers、最后一轮在 ago 之前」。
+//
+// 最后一轮的时间（prd_rounds.created_at）刻意用 UPDATE 往回推而不是等 ——
+// 搁置阈值是天级的，等不起。created_at 是 DEFAULT now() 但没有触发器守着它
+// （只有 updated_at 有 set_updated_at），所以这一推是稳的。
+func awaitFor(t *testing.T, st *Store, prdID int64, userID int64, ago time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+
+	// 先落一轮对话记录：超时时钟读的就是它。
+	if _, err := st.AppendPRDRound(ctx, AppendPRDRoundParams{
+		PRDID: prdID, Round: 1, Stage: "understand",
+		Questions: json.RawMessage(`["阈值按内存还是磁盘算？"]`),
+	}); err != nil {
+		t.Fatalf("落轮次失败: %v", err)
+	}
+	// 轮次推进与快照写入在真实流程里是同一步（service.persistRound 同时
+	// 做这两件事），fixture 照做，别留下生产环境不会出现的 prds.round=0。
+	round := 1
+	if _, err := st.UpdatePRDContent(ctx, prdID, userID,
+		UpdatePRDContentParams{Round: &round}); err != nil {
+		t.Fatalf("推进轮次失败: %v", err)
+	}
+	if _, err := st.TransitionPRD(ctx, prdID, userID,
+		TransitionPRDParams{From: "drafting", To: "awaiting_answers"}); err != nil {
+		t.Fatalf("转 awaiting_answers 失败: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE prd_rounds SET created_at = now() - $2::interval WHERE prd_id = $1`,
+		prdID, fmt.Sprintf("%d seconds", int(ago.Seconds()))); err != nil {
+		t.Fatalf("推前轮次时间失败: %v", err)
+	}
+}
+
+// ★ 超时时钟必须取最后一轮的时间，而不是 prds.updated_at。
+//
+// 这条是 ListStalledPRDs 的命门，也是唯一必须在真库上验的判据 ——
+// 扫描器那层的假件测不到 SQL。构造的正是最容易踩错的那个形状：
+// 最后一轮在两周前，但 PRD 行刚刚被写过（人点了几下「确认」，
+// 或扫描器自己上一轮的转移）。
+//
+// 用 updated_at 做时钟的话，这份永远答不完的 PRD 会因为「昨天有写入」
+// 而永远不被判搁置 —— 静默失效，没有任何报错。
+func TestListStalledPRDsUsesLastRoundTimeNotRowUpdate(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+
+	// 两周没人答。
+	stale := newPRD(t, st, userID, repoID)
+	awaitFor(t, st, stale.ID, userID, 14*24*time.Hour)
+	// 行本身「刚刚」被写过：updated_at 是新鲜的，轮次时间是老的。
+	if _, err := st.UpdatePRDContent(ctx, stale.ID, userID, UpdatePRDContentParams{
+		Document: json.RawMessage(`{"sections":{}}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 一天前答完的那份不该被选中。
+	fresh := newPRD(t, st, userID, repoID)
+	awaitFor(t, st, fresh.ID, userID, 24*time.Hour)
+
+	now := time.Now()
+	rows, err := st.ListStalledPRDs(ctx, now, now.Add(-168*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("查询超期 PRD 失败: %v", err)
+	}
+
+	ids := map[int64]bool{}
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	if !ids[stale.ID] {
+		t.Error("两周没人答的 PRD 应被判超期 —— 它是按最后一轮的时间算的，" +
+			"即使这一行刚刚被写过（人点确认也会推 updated_at）")
+	}
+	if ids[fresh.ID] {
+		t.Error("一天前还在对话的 PRD 不该被判超期")
+	}
+}
+
+// 正在跑一轮的 PRD 不算搁置（agent 还在写文档）。
+//
+// 但**僵死**的轮次必须照样算进来：进程被杀时没机会把 processing CAS 回去，
+// 若那种标记能让人免于扫描，这份 PRD 就会因为一个永远清不掉的标记而
+// 永久留在这里 —— 正是这条能力要治的病。
+func TestListStalledPRDsSkipsProcessingButNotStale(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+
+	// (a) 正常跑着的一轮：processing=true，起始时刻就在刚才。
+	running := newPRD(t, st, userID, repoID)
+	awaitFor(t, st, running.ID, userID, 14*24*time.Hour)
+	// awaitFor 之后状态已是 awaiting_answers，BeginPRDRound 能抢到。
+	if _, err := st.BeginPRDRound(ctx, running.ID, userID); err != nil {
+		t.Fatalf("抢占轮次失败: %v", err)
+	}
+
+	// (b) 僵死的轮次：processing=true，但起始时刻远在僵死阈值之外。
+	dead := newPRD(t, st, userID, repoID)
+	awaitFor(t, st, dead.ID, userID, 14*24*time.Hour)
+	if _, err := st.BeginPRDRound(ctx, dead.ID, userID); err != nil {
+		t.Fatalf("抢占轮次失败: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE prds SET processing_started_at = now() - $2::interval WHERE id = $1`,
+		dead.ID, fmt.Sprintf("%d minutes", int(prdStallAfter.Minutes())+5)); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	rows, err := st.ListStalledPRDs(ctx, now, now.Add(-168*time.Hour), 100)
+	if err != nil {
+		t.Fatalf("查询超期 PRD 失败: %v", err)
+	}
+
+	ids := map[int64]bool{}
+	for _, r := range rows {
+		ids[r.ID] = true
+	}
+	if ids[running.ID] {
+		t.Error("正在跑一轮的 PRD 不该被判搁置：那一轮跑完还要写快照")
+	}
+	if !ids[dead.ID] {
+		t.Error("僵死的轮次必须照样算进候选 —— 否则一个清不掉的 processing " +
+			"标记就能让这份 PRD 永远免于扫描")
+	}
+}
+
+// 已经不在 awaiting_answers 的一律不进候选（CAS 之外的第二道闸）。
+func TestListStalledPRDsOnlyAwaitingAnswers(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+
+	p := newPRD(t, st, userID, repoID)
+	// 落一轮但**不**转状态：停在 drafting。
+	if _, err := st.AppendPRDRound(ctx, AppendPRDRoundParams{
+		PRDID: p.ID, Round: 1, Stage: "understand",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE prd_rounds SET created_at = now() - interval '14 days' WHERE prd_id = $1`,
+		p.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	rows, err := st.ListStalledPRDs(ctx, now, now.Add(-168*time.Hour), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if r.ID == p.ID {
+			t.Error("drafting 的 PRD 不该被判搁置：它没有挂着等人的问题")
+		}
+	}
+}
+
+// 搁置之后能唤醒回起草（docs/10 §9 第 1 条：允许复活）。
+func TestAbandonedPRDCanResumeToDrafting(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+	p := newPRD(t, st, userID, repoID)
+
+	if _, err := st.TransitionPRD(ctx, p.ID, userID,
+		TransitionPRDParams{From: "drafting", To: "abandoned"}); err != nil {
+		t.Fatalf("放弃失败: %v", err)
+	}
+
+	// 唤醒。CAS 的 From 是 abandoned。
+	got, err := st.TransitionPRD(ctx, p.ID, userID,
+		TransitionPRDParams{From: "abandoned", To: "drafting"})
+	if err != nil {
+		t.Fatalf("唤醒搁置的 PRD 失败: %v", err)
+	}
+	if got.State != "drafting" {
+		t.Errorf("唤醒后状态 got=%q want=drafting", got.State)
+	}
+
+	// 唤醒后能再起轮次：否则「回来接着说」只是一句空话。
+	if _, err := st.BeginPRDRound(ctx, p.ID, userID); err != nil {
+		t.Errorf("唤醒后应能再起对话轮次: %v", err)
+	}
+}
