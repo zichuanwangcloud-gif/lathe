@@ -846,6 +846,16 @@ func legacyWorktreeDirName(issueKey, branch string) string {
 	return name
 }
 
+// agent 提交的作者与提交者身份。
+//
+// 固定值而不是配置项：它标识的是「这条提交由 Lathe 的 agent 产生」，这件事
+// 不随部署环境变化，也不该让人配错成某个真人。真人的 review 与合并仍在 PR
+// 上署自己的名字。noreply 域是 GitHub 的约定，不会往真实邮箱投递。
+const (
+	commitIdentityName  = "lathe"
+	commitIdentityEmail = "lathe@users.noreply.github.com"
+)
+
 // git 执行一条 git 命令。dir 为空时在进程当前目录执行。
 func (m *WorktreeManager) git(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
@@ -860,6 +870,21 @@ func (m *WorktreeManager) git(ctx context.Context, dir string, args ...string) (
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",
 		"GCM_INTERACTIVE=never",
+		// 提交身份显式注入，不靠运行环境的 git config。两个理由：
+		//
+		//  1. 不注入的话，没配过 git 的环境里 commit / rebase / cherry-pick
+		//     会直接失败（"Author identity unknown"）。官方镜像正是这种环境
+		//     —— Dockerfile 里没有、也不该有某个具体人的姓名邮箱。这个坑
+		//     原先只在运行期才会炸，是 CI 第一次跑测试时把它翻出来的。
+		//  2. 即使环境恰好配了，那也是部署机器主人的身份。agent 写的提交
+		//     署上运维同事的名字，会让 blame 与「这行是谁写的」彻底失真。
+		//
+		// 用环境变量而不是 `-c user.name=`：后者必须插在子命令之前，那得改
+		// 所有调用点的 args 顺序；环境变量一处注入就覆盖全部会写提交的操作。
+		"GIT_AUTHOR_NAME="+commitIdentityName,
+		"GIT_AUTHOR_EMAIL="+commitIdentityEmail,
+		"GIT_COMMITTER_NAME="+commitIdentityName,
+		"GIT_COMMITTER_EMAIL="+commitIdentityEmail,
 	)
 
 	var stdout, stderr bytes.Buffer

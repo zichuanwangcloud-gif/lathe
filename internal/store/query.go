@@ -297,6 +297,11 @@ type RepoRow struct {
 	// internal/preview.InfraCatalog 的键（postgres/redis/mysql）。
 	// 空 = 无隔离栈，验证命令直接用宿主环境跑。
 	VerifyInfra []string `json:"verifyInfra"`
+	// PRDTaskMaxLines / PRDTaskMaxFiles 是 PRD 拆出的单任务量级上限
+	// （docs/10 D10-5 / §4.2）。消费方是规划智能体的定稿自检：任一任务
+	// 的 estimate 超限就拒绝进 ready_for_review，除非 §10 记了「接受超限」。
+	PRDTaskMaxLines int `json:"prdTaskMaxLines"`
+	PRDTaskMaxFiles int `json:"prdTaskMaxFiles"`
 }
 
 // ListRepos 返回指定用户名下的仓库配置。
@@ -305,7 +310,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
 		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		       verify_infra
+		       verify_infra, prd_task_max_lines, prd_task_max_files
 		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -317,7 +322,8 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		var r RepoRow
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra); err != nil {
+			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra,
+			&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
@@ -332,11 +338,13 @@ func (s *Store) GetRepo(ctx context.Context, id, userID int64) (*RepoRow, error)
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
-		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, '')
+		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
+		       prd_task_max_lines, prd_task_max_files
 		FROM repos WHERE id = $1 AND user_id = $2`, id, userID,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir)
+		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir,
+		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
@@ -365,13 +373,30 @@ type UpdateRepoParams struct {
 	// BaselineDir 同 VerifyTierOverride 的三态语义：nil=不动，
 	// 空串=清空（不再复用任何基线），非空=设置新目录。
 	BaselineDir *string
+	// PRDTaskMaxLines / PRDTaskMaxFiles 是 PRD 单任务量级上限，
+	// nil = 不修改。没有「清空回默认」这一态：字段是 NOT NULL DEFAULT，
+	// 想回出厂值就显式填 400 / 8。
+	PRDTaskMaxLines *int
+	PRDTaskMaxFiles *int
 }
+
+// ErrInvalidPRDTaskLimit 表示量级上限填了非正数。
+//
+// 在 Go 层先挡一道而不是任由 CHECK 报 SQLSTATE 23514：界面要给出可读的
+// 中文提示，而不是把数据库约束名透给用户（先例：verify_tier_override 的
+// 取值校验也在这一层）。
+var ErrInvalidPRDTaskLimit = errors.New("store: 单任务量级上限必须是正整数")
 
 // UpdateRepo 更新仓库配置。
 //
 // userID 是隔离边界：WHERE 同时限定 id 与属主，改别人的仓库会得到
 // ErrRepoNotFound —— 与 TaskDetail 一样，对非属主隐瞒存在。
 func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoParams) (*RepoRow, error) {
+	if (p.PRDTaskMaxLines != nil && *p.PRDTaskMaxLines <= 0) ||
+		(p.PRDTaskMaxFiles != nil && *p.PRDTaskMaxFiles <= 0) {
+		return nil, ErrInvalidPRDTaskLimit
+	}
+
 	var r RepoRow
 	err := s.pool.QueryRow(ctx, `
 		UPDATE repos SET
@@ -391,17 +416,21 @@ func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoPa
 				WHEN $10::text = '' THEN NULL
 				ELSE $10::text
 			END,
-			verify_infra = COALESCE($11, verify_infra)
+			verify_infra = COALESCE($11, verify_infra),
+			prd_task_max_lines = COALESCE($12, prd_task_max_lines),
+			prd_task_max_files = COALESCE($13, prd_task_max_files)
 		WHERE id = $1 AND user_id = $2
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
 		          exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		          verify_infra`,
+		          verify_infra, prd_task_max_lines, prd_task_max_files`,
 		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
 		p.ExcludeDirs, p.VerifyTierOverride, p.BaselineDir, p.VerifyInfra,
+		p.PRDTaskMaxLines, p.PRDTaskMaxFiles,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra)
+		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra,
+		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
@@ -432,11 +461,12 @@ func (s *Store) CreateRepo(ctx context.Context, userID int64, p CreateRepoParams
 		        COALESCE(NULLIF($4,''), 'main'))
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
-		          COALESCE(verify_tier_override, '')`,
+		          COALESCE(verify_tier_override, ''),
+		          prd_task_max_lines, prd_task_max_files`,
 		userID, p.ProviderRepo, p.DefaultBranch, p.HotfixBase,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.VerifyTierOverride)
+		&r.VerifyTierOverride, &r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		// 23505 = unique_violation，这里只可能是 (user_id, provider_repo)

@@ -1,0 +1,209 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# 发布不设 cancel-in-progress：跑到一半被取消可能留下半推的镜像。
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 校验版本
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析 tag 并核对 CHANGELOG
+        id: meta
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag $tag 不是合法的语义化版本"
+            exit 1
+          fi
+
+          # 预发布（v0.2.0-rc1）不强制 CHANGELOG，正式版必须有对应段落 ——
+          # v0.1.1 就是发了 tag 却没写日志，这一步专门挡这个。
+          if printf '%s' "$version" | grep -q -- '-'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "预发布 $tag，跳过 CHANGELOG 校验"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            if ! grep -qE "^## \[$version\]" CHANGELOG.md; then
+              echo "::error::CHANGELOG.md 里找不到 '## [$version]' 段落，请先补写发布日志"
+              exit 1
+            fi
+            echo "CHANGELOG 段落已就位"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # 发布前必须过同一套门禁，不给 tag 开后门。
+  gate:
+    name: 门禁
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    name: 多架构镜像
+    needs: [validate, gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # 阶段 1、2 靠 --platform=$BUILDPLATFORM 在原生平台跑，但阶段 3 的运行时
+      # 镜像（alpine + apk add）是真正的目标架构，构建 arm64 时那几条 RUN 必须
+      # 靠 QEMU 模拟执行 —— 只装几个包，开销可接受。
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          # latest=auto：预发布不会覆盖 latest。
+          flavor: latest=auto
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # arm64 靠 Dockerfile 的 TARGETARCH 交叉编译，不走 QEMU 模拟 ——
+          # 模拟下 Go 编译加前端构建要十几分钟，交叉编译两三分钟。
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.validate.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  binaries:
+    name: 二进制产物
+    needs: [validate, gate]
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建前端并同步到内嵌目录
+        # 二进制要内嵌 UI，这里必须自己构建一份（镜像那条路走的是 Dockerfile）。
+        # --ignore-scripts 同 Makefile ui-deps：避开 esbuild 安装脚本的交互确认。
+        run: |
+          set -euo pipefail
+          corepack enable
+          cd web
+          pnpm install --frozen-lockfile --ignore-scripts
+          node_modules/.bin/vite build
+          cd ..
+          rm -rf internal/webui/dist
+          cp -r web/dist internal/webui/dist
+
+      - name: 交叉编译
+        # CGO_ENABLED=0，交叉编译无需工具链。
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            out="dist/lathe_${version}_${os}_${arch}"
+            echo "→ $out"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -ldflags "-X main.version=${version}" -o "$out" ./cmd/lathe
+            ( cd dist && sha256sum "$(basename "$out")" >> checksums.txt )
+          done
+          cat dist/checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/
+          retention-days: 7
+
+  release:
+    name: 发布草稿
+    needs: [validate, image, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+
+      - name: 提取发布说明
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate.outputs.version }}"
+          {
+            # 取 CHANGELOG 里本版本那一段（到下一个 ## 为止）。
+            awk -v v="## [$version]" '
+              index($0, v) == 1 { inside = 1; next }
+              inside && /^## \[/  { exit }
+              inside              { print }
+            ' CHANGELOG.md
+            echo
+            echo "---"
+            echo
+            echo '### 镜像'
+            echo
+            echo '```'
+            echo "docker pull ghcr.io/${{ github.repository }}:${version}"
+            echo '```'
+            echo
+            echo '> 镜像不含 `claude` CLI，agent 执行需另行挂载或安装。'
+          } > notes.md
+          cat notes.md
+
+      - name: 创建 Release 草稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # --draft：产物和说明都备好，但留一次人工过目再点发布。
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --draft \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --notes-file notes.md \
+            ${{ needs.validate.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            dist/*

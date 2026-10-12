@@ -44,6 +44,10 @@ async function request(path, options = {}) {
   if (!resp.ok) {
     const err = new Error(data.error || `请求失败（HTTP ${resp.status}）`)
     err.status = resp.status
+    // 失败响应的正文一并带上：有些接口的 4xx 不只是一句话，还捎着结构化
+    // 结果（PRD 提交评审的 422 里是整份自检报告，前端要逐条列出来并能
+    // 跳到对应节）。只丢一个 message 的话那份报告就没了。
+    err.data = data
     throw err
   }
   return data
@@ -109,6 +113,51 @@ export const api = {
   addIssueComment: (id, body) =>
     request(`/api/issues/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
   startInternalIssue: (id) => request(`/api/issues/${id}/start`, { method: 'POST' }),
+
+  // 模糊任务规划（docs/10-prd-template.md）：多轮对话式智能体读代码产出
+  // PRD，对抗复核 + 自检过闸、人逐节签字后，一键生成正式任务与编排图。
+  prds: (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.state) q.set('state', params.state)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return request(`/api/prds${qs ? '?' + qs : ''}`)
+  },
+  prd: (id) => request(`/api/prds/${id}`),
+  createPrd: (body) => request('/api/prds', { method: 'POST', body: JSON.stringify(body) }),
+  prdRounds: (id) => request(`/api/prds/${id}/rounds`),
+  // 规划事件增量轮询：after 传上次的 lastId，首轮传 0。
+  // 注意游标字段是驼峰 lastId，与既有 taskEvents 的 last_id 不同。
+  prdEvents: (id, after = 0, limit = 200) =>
+    request(`/api/prds/${id}/events?after=${after}&limit=${limit}`),
+  // 跑一轮对话：awaiting_answers 时带上人的回答；stage 可选，不传由后端按
+  // 轮次推进阶段。回 {prd, questions, notes} —— 跑完一轮整份 PRD 都可能变，
+  // 所以直接给新的一份
+  runPrdRound: (id, body = {}) =>
+    request(`/api/prds/${id}/rounds`, { method: 'POST', body: JSON.stringify(body) }),
+  reviewPrd: (id) => request(`/api/prds/${id}/review`, { method: 'POST' }),
+  // 成功回 {state, report}；自检不过抛 422，报告在 err.data.report
+  // （见 request 里的 err.data 注释）
+  submitPrd: (id) => request(`/api/prds/${id}/submit`, { method: 'POST' }),
+  approvePrd: (id) => request(`/api/prds/${id}/approve`, { method: 'POST' }),
+  // 打回不带理由：理由的归宿是下一轮对话的回答，不是 append-only 的轮次记录
+  rejectPrd: (id) => request(`/api/prds/${id}/reject`, { method: 'POST' }),
+  abandonPrd: (id) => request(`/api/prds/${id}/abandon`, { method: 'POST' }),
+  convertPrd: (id) => request(`/api/prds/${id}/convert`, { method: 'POST' }),
+
+  // 逐节确认（🤖 → ✅）：自检要求所有推断节被人过目。❓ 的节回 409 ——
+  // 挂着未决问题不许跳过去确认。回更新后的完整 PRDRow。
+  confirmPrdSection: (id, section) =>
+    request(`/api/prds/${id}/sections/${encodeURIComponent(section)}/confirm`, { method: 'POST' }),
+  // 复核发现的处置：按下标定位（ReviewFinding 没有 id，报告是整体覆盖写的，
+  // 下标在一份报告内稳定）。accept 必须带理由，否则 400 且整批不写。
+  // 回更新后的完整 PRDRow。
+  savePrdDispositions: (id, findings) =>
+    request(`/api/prds/${id}/review/dispositions`, {
+      method: 'PUT',
+      body: JSON.stringify({ findings }),
+    }),
 
   trigger: (issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueKey }) }),
@@ -191,6 +240,29 @@ export const STATE_META = {
 
 export const stateLabel = (s) => STATE_META[s]?.label || s
 export const stateTone = (s) => STATE_META[s]?.tone || 'idle'
+
+// PRD（模糊任务）自己的状态机与 task 没有一条共用的边（internal/prd/state.go
+// 的包注释说明了为什么不复用），所以配色表也各管各的。
+export const PRD_STATE_META = {
+  drafting: { label: '起草中', tone: 'run' },
+  awaiting_answers: { label: '待回答', tone: 'warn' },
+  ready_for_review: { label: '待批准', tone: 'warn' },
+  approved: { label: '已批准', tone: 'ok' },
+  converted: { label: '已生成任务', tone: 'ok' },
+  abandoned: { label: '已放弃', tone: 'idle' },
+}
+
+export const prdStateLabel = (s) => PRD_STATE_META[s]?.label || s
+export const prdStateTone = (s) => PRD_STATE_META[s]?.tone || 'idle'
+
+// PRD 类型决定 §4 §7 §8 的变体（docs/10 §3）
+export const PRD_TYPE_META = {
+  defect: { label: '缺陷', hint: '§4 写复现路径，§2 证据必须含一次复现' },
+  feature: { label: '功能', hint: '七类验收标准完整表' },
+  refactor: { label: '重构', hint: '§4 写行为保持清单，首个任务必须是补特征测试' },
+}
+
+export const prdTypeLabel = (t) => PRD_TYPE_META[t]?.label || t
 
 export function formatTime(iso) {
   if (!iso) return '—'
