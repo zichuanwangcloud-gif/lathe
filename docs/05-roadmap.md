@@ -1,6 +1,8 @@
 # Lathe — 05 · 优化路线图
 
-> 2026-08-17 · 状态：待评审
+> 2026-08-17 · 状态：执行中（2026-10-12 按代码证据逐条回写状态，改动处附代码位置）
+> 引用约定：代码位置优先写「文件 + 符号名」（如 `internal/runner/pipeline.go` 的
+> `stageVerify`），不写行号 —— 行号会随每次合入漂移，符号名不会。
 > 前置：[02-design.md](./02-design.md)（系统设计）、[04-agent-visibility.md](./04-agent-visibility.md)（执行可见性）
 > 依据：本文每条方向都标注了代码证据或实战事故编号（任务 #466/#479/#492 等），
 > 不接受"感觉应该做"。
@@ -28,22 +30,22 @@
 
 | 来源 | 承诺 | 现状 |
 |---|---|---|
-| 02-design §5 | 修复回路（验证失败带输出续跑 agent，限次数） | 未实现 —— 验证失败即任务死亡 |
-| 02-design §6.4 | 租约与故障恢复：崩溃 → 任务回 queued 重派；`implementing` 中断凭 `agent_session_id` 续跑 | 未实现 —— 重启即孤儿（#346 实证） |
-| 02-design §7 | `PR 评论 → review_feedback → implementing(--resume) → 重新验证` | ~~状态机跑到 `pr_open` 即止，review 回路无入口~~ —— **已接线（A2）**：`/webhooks/github/{slug}` → `review_feedback → queued` → resume 二轮 → 重新验证 |
-| 02-design §7 | `合并 → merged → 回收 worktree` | `merged` 状态存在但没有代码设置它 |
-| 02-design §8 P1 | per-task compose 隔离（红绿阶段） | 未做，红绿目前在 worktree 里直接跑 |
+| 02-design §5 | 修复回路（验证失败带输出续跑 agent，限次数） | ✅ **已交付**：`Pipeline.MaxFixAttempts`（`internal/runner/pipeline.go` 的 `stageVerify`）驱动修复回路，`cmd/lathe/main.go` 的 `buildPipeline` 接线 `cfg.FixAttempts`（`LATHE_FIX_ATTEMPTS`，默认 2 轮），续跑走 `--resume` 原会话 |
+| 02-design §6.4 | 租约与故障恢复 | ✅ **单机形态已交付**：启动时 `q.Reconcile`（`cmd/lathe/main.go` 的 serve 启动段）把在途任务回 queued 重派；断点续跑凭 `InterruptedState` 推导入口（`internal/runner/retry.go` 的 `PlanRetry`）。多节点租约仍欠（P3 范畴） |
+| 02-design §7 | `PR 评论 → review_feedback → implementing(--resume) → 重新验证` | ✅ **已交付**：`POST /webhooks/github/{slug}`（用户级签名密钥验 `X-Hub-Signature-256`，`X-GitHub-Delivery` 去重）接 review 评论，任务转 `review_feedback → queued` 后以 `--resume` 续原实现会话处理意见、重新验证并更新同一个 PR；现场不可用的任务由 `POST /api/tasks/{id}/review-retry` 走出 |
+| 02-design §7 | `合并 → merged → 回收 worktree` | ✅ **已交付**：mergepoll 的 `handleMerged`（F4.1）转 merged；`onMerged` 回收现场（F4.2），分支被未合并后继依赖时暂不回收 |
+| 02-design §8 P1 | per-task compose 隔离（红绿阶段） | ◐ **部分交付**：`repos.verify_infra` 依赖隔离栈（08 T8，`internal/runner/pipeline.go` 的 `stageVerify` 经 `runHeavy` 消费，与预览容器按标签隔离互不误删）；红绿测试进程仍在 worktree 里跑，完整进程隔离仍欠 |
 | 02-design §8 P3 | 多节点：`cmd/lathe-runner` 节点代理 | ~~54 行骨架，TODO 未装配~~ —— **已决：删除**，见 [08-debt-cleanup.md](./08-debt-cleanup.md) D8-1 |
 
 ### 1.2 本次会话诊断出但未修的
 
 | 缺陷 | 事故证据 |
 |---|---|
-| 重试端点语义断裂：failed→queued 后 `runOne` 走 `tasks.Create` 撞唯一索引，重试=永久卡死 | 任务 #313 |
-| 前置失败不落痕：pre-flight 裸 `return` 绕过 `p.fail`，任务永远"排队中"无痕迹 | 最初"卡排队"病根 |
+| ~~重试端点语义断裂：failed→queued 后走 `tasks.Create` 撞唯一索引~~ —— **已修复**：`/retry` 转 queued 后 `Queue.Requeue` 重派**原任务行**（`internal/httpapi/api.go` retryTask，代码注释留 #313 教训），resume 预检失败返回 409 与理由 | 任务 #313 |
+| ~~前置失败不落痕：pre-flight 裸 `return` 绕过 `p.fail`~~ —— **已修复**：拉单/分诊/建区/实现各阶段失败一律走 `p.fail` 落痕（`pipeline.go` StageFetchIssue…StageCommit 十余处） | 最初"卡排队"病根 |
 | ~~worktree 尸体阻塞同 issue 重试（失败保留现场但无回收策略）~~ —— 已修复：`Create` 回收同名尸体再建（目录/分支/普通残留三形态），重试端点 Fresh 计划先 `Discard` | #345、#466 各撞一次 |
-| EventSink 落库 UTF-8 截断 bug：Digest 切断多字节字符 → 整批事件丢弃（SQLSTATE 22021） | 54075f4 commit body 已记录 |
-| agent 进程 env 泄漏：`sanitizedEnv()` 只剔 4 个变量，`LATHE_ADMIN_TOKEN`、GitHub token 原样漏给 agent 子进程 | 代码走查 |
+| ~~EventSink 落库 UTF-8 截断 bug~~ —— **已修复**：`truncate` 回退到 rune 边界再截（`integration/agent/agent.go`，注释引 SQLSTATE 22021） | 54075f4 commit body 已记录 |
+| ~~agent 进程 env 泄漏~~ —— **已修复**：`sanitizedEnv` 改白名单制（`integration/agent/agent.go:338`），只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程；确需追加走 `LATHE_AGENT_ENV_EXTRA` | 代码走查 |
 | 分诊工作目录污染：triage 未设 `Dir` → 继承 serve 的 cwd=`/opt/lathe` → `--setting-sources project` 把 Lathe 自己的 CLAUDE.md 灌进目标仓库的分诊上下文 | 代码走查 |
 
 ~~已修复~~（B2-3）：分诊改在中立目录执行（默认 `$TMPDIR/lathe-triage`，位于任何项目树之外，`Pipeline.TriageDir` 可覆盖）。
@@ -82,14 +84,14 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 平台当前只能"发现问题"，不能"自我纠正"。
 
-1. **§5 修复回路**（最高价值）：验证失败 → `--resume` 续跑（session id 已落库，比新会话省上下文且 agent 记得自己的思路）→ 再验证，限 N 次。#492 这类"只写测试没实现"的单子有了回路大概率自愈。
-2. **重试语义修复**：retry 改为派发已存在的任务行，而非新建。
-3. **启动 reconcile**（§6.4 的单机退化版）：启动时 `queued` 重新入队、`in-flight` 标记 `interrupted` 可一键续跑。不需要真持久化队列。
-4. **前置失败落痕**：pre-flight 错误一律走 `p.fail`。
+1. ~~**§5 修复回路**~~（已交付，见 §1.1）：验证失败 → `--resume` 原会话就地修复 → 再验证，限 `LATHE_FIX_ATTEMPTS` 轮（默认 2）；每轮验证日志分目录留存，不互相覆盖。
+2. ~~**重试语义修复**~~（已交付）：retry 重派原任务行而非新建。
+3. ~~**启动 reconcile**~~（已交付）：启动时 `q.Reconcile` 在途任务回 queued 重派（`cmd/lathe/main.go:189`）。
+4. ~~**前置失败落痕**~~（已交付）：pre-flight 错误一律走 `p.fail`。
 
 ### 3.2 成本与效率 —— token 就是钱
 
-5. **成本核算面板**：`CostUSD/DurationMS/NumTurns` 已解析落库（pipeline.go:478 + migration 0009），缺聚合视图：每任务/每 issue/每日成本、分诊 vs 实现占比。这是"什么单子值得交给 agent"的决策数据。
+5. ~~**成本核算面板**~~（已交付，08 T5）：`GET /api/stats/cost` 聚合视图（`internal/httpapi/api.go` costStats）+ 看板 `CostPanel.vue`，每任务/每日成本可查。
 6. ~~**模型路由**~~（已交付，B2-2）：`LATHE_TRIAGE_CHANNEL` / `LATHE_IMPLEMENT_CHANNEL` 配 cc-switch 通道名，pipeline 按阶段以 `LATHE_AGENT_CHANNEL` 注入子进程，wrapper（`scripts/claude-cc-switch`）从 `~/.cc-switch/config.json` 现取该通道的 BASE_URL/TOKEN/MODEL；通道不存在时告警回落激活通道。未配置则全局跟随 cc-switch 激活通道。
 7. ~~**分诊目录中立化**~~（已交付，B2-3）。
 
@@ -101,7 +103,7 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
     所以补了一条按 mtime 判超期的孤儿清扫。那个 TTL 不只是策略是**安全机制**：
     worktree 目录先被 Create 建出来、之后才把路径写进任务行，两步之间无人认领，
     不看 mtime 就删会让在途任务突然找不到自己的工作区。
-9. **通知闭环**：任务终态（失败/待 review）接 `internal/mail` 发 `notify_email` —— 不用盯面板。
+9. ~~**通知闭环**~~（已交付，08 T3）：任务终态（失败/待审批）接 `internal/mail` 发 `notify_email`（`internal/runner/notify.go`）。
 10. ~~**GateMode 接线**~~（已交付，08 T2）：`gate=manual` 时验证通过后停在
     `awaiting_approval`，人在详情页点「确认开 PR」才推分支开 PR。
     放行走的是与手动重试同一条成熟通道（转回 `queued` + payload 里
@@ -130,11 +132,11 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
     全包没有任何地方在执行中途回读 task state）。在途 agent 会白跑完一轮，
     然后在下一次状态转移时因 `cancelled` 是无出边终态而被 `Validate` 拒绝。
     真正的取消信号传播列为后续项。
-12. **PR 生命周期回流**（§7 已设计）：(a) ✅ PR review comment → `review_feedback` → resume 续跑修复（A2，GitHub 仓库 webhook + 每用户密钥；已知边界：二轮进行中到达的意见不单独回流，等任务回到 `pr_open` 后的下一条意见触发时一并处理）；(b) PR merged → 任务 `merged` + worktree 回收；(c) base 分支前进自动 rebase。
+12. **PR 生命周期回流**（§7 已设计）：(a) ✅ PR review comment → `review_feedback` → resume 续跑修复（`POST /webhooks/github/{slug}` + 每用户密钥验签、投递去重；已知边界：二轮进行中到达的意见不单独回流，等任务回到 `pr_open` 后的下一条意见触发时一并处理）；(b) ✅ PR merged → 任务 `merged` + worktree 回收（`internal/runner/mergepoll.go` 的 `handleMerged`/`onMerged`，F4.1/F4.2）；(c) ◐ **仅编排后继链** —— `rebaseFollowup` 由两条路径触发，两条都只服务「编排链里的后继任务」：①前驱任务被合并（`onMerged` → 顶层调用 `rebaseFollowup`）；②前驱 PR 被 force-push 改内容（`checkForcePush` → 复用同一入口）。判定后继用的 `TasksWithBaseRef` 条件是 `base_ref = <前驱分支名>`，而 `base_ref` 只由 `cmd/lathe/queue.go` 的 `fillBaseRef` 给 `depends_on` 非空的后继任务写。因此**独立 PR 的 base 分支前进（其余人往 main 推了新提交）不会自动 rebase**，需要「观察 base 落后量 → 主动 rebase 并重验」的独立机制。
 
 ### 3.5 安全与隔离 —— 自用也要防手滑
 
-13. **agent 进程 env 白名单**（最吓人的一条，优先修）：现在 agent 子进程能 `env` 到 `LATHE_ADMIN_TOKEN`。
+13. ~~**agent 进程 env 白名单**~~（已交付）：`sanitizedEnv` 白名单制（`integration/agent/agent.go:338`），agent 子进程拿不到 `LATHE_ADMIN_TOKEN`。
 14. **执行隔离**：中期方向 bubblewrap/容器；P1 分期里的 per-task compose 隔离仍欠着。
 
 ### 3.6 度量与迭代
@@ -146,10 +148,10 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 | 批次 | 内容 | 理由 |
 |---|---|---|
-| **B1** | 修复回路（1）+ 重试语义（2）+ 启动 reconcile（3）+ env 白名单（13）+ EventSink UTF8 修复 | 闭环自愈 + 堵安全洞 |
-| **B2** | ~~模型路由（6）~~ + ~~分诊目录（7）~~ 已交付；剩成本面板（5）+ 通知（9）+ worktree reaper（8） | 日常用得爽 |
-| **B3** | ~~GateMode（10）~~ 已交付；剩 webhook 联动（11）+ PR 回流（12） | 自动化加深 |
-| **持续** | ~~度量（15）与跨任务记忆（16）~~ 已交付；每批落地后看数据决定下一批 | 数据驱动 |
+| ~~**B1**~~ | ~~修复回路（1）+ 重试语义（2）+ 启动 reconcile（3）+ env 白名单（13）+ EventSink UTF8 修复~~ | **已清账**（2026-10-12 按代码核对：5 项全部交付，证据见 §1.1/§3） |
+| ~~**B2**~~ | ~~模型路由（6）~~ + ~~分诊目录（7）~~ + ~~成本面板（5，08 T5）~~ + ~~通知（9，08 T3）~~ + ~~worktree reaper（8，08 T6）~~ | **已清账** |
+| **B3** | ~~GateMode（10，08 T2）~~ + ~~webhook 联动（11，08 T7）~~；PR 回流（12）的 (a)(b) 已交付 | 剩唯一欠项：(c) 独立 PR 的 base 前进自动 rebase |
+| ~~**持续**~~ | ~~度量（15）+ 跨任务记忆（16）~~ | **已清账**（2026-10-12 按代码核对：两项均交付，证据见 §3.6） |
 
 ## 5. 未决（继承 02-design §9 并增补）
 
@@ -162,5 +164,6 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
       当前无多机场景，且它违反 §0 纪律的加强版：不是「字段无消费方」，是整个二进制无消费方。
       真有多机需求时从 git 历史捞回。注意 `config.NodeName` **保留**——它的两个消费方
       （task_events 的 actor 前缀、管理界面运行时面板）与多节点无关。
-- [ ] 修复回路的次数上限与升级策略：N 次失败后是放弃还是换模型/换思路重试（新增）
+- [~] 修复回路的次数上限与升级策略：上限已交付（`LATHE_FIX_ATTEMPTS` 默认 2，超限按当前验证结果收尾）；
+      **升级策略仍欠** —— N 次失败后是放弃还是换模型/换思路重试（新增）
 - [ ] 跨包破坏的回归覆盖：包级收敛后跨包破坏靠仓库自己的 CI，平台是否要可选的"全模块回归"开关（新增）
