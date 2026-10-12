@@ -62,7 +62,7 @@ func fixture(t *testing.T, pool *pgxpool.Pool) (userID, repoID int64) {
 	}
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO repos (user_id, provider_repo) VALUES ($1, $2) RETURNING id`,
-		userID, "Clouditera/CloudRouter").Scan(&repoID); err != nil {
+		userID, "acme/demo").Scan(&repoID); err != nil {
 		t.Fatalf("建 repo 失败: %v", err)
 	}
 

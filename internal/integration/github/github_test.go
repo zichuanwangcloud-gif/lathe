@@ -43,8 +43,8 @@ func TestNewClientRequiresToken(t *testing.T) {
 }
 
 func TestSplitRepo(t *testing.T) {
-	owner, name, err := SplitRepo("Clouditera/CloudRouter")
-	if err != nil || owner != "Clouditera" || name != "CloudRouter" {
+	owner, name, err := SplitRepo("acme/demo")
+	if err != nil || owner != "acme" || name != "demo" {
 		t.Errorf("SplitRepo = (%q, %q, %v)", owner, name, err)
 	}
 	for _, bad := range []string{"", "noslash", "a/b/c", "/b", "a/"} {

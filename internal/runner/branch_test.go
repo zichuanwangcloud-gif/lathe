@@ -7,7 +7,7 @@ import (
 )
 
 func TestBaseBranchByKind(t *testing.T) {
-	c := DefaultRepoConfig("Clouditera/CloudRouter")
+	c := DefaultRepoConfig("acme/demo")
 
 	cases := []struct {
 		kind TaskKind
@@ -44,7 +44,7 @@ func TestBaseBranchByKind(t *testing.T) {
 // BaseRefOverride 生效时忽略 kind 直接返回它 —— 栈式 PR 后继任务从
 // 前驱分支分叉，而不是从仓库配置的默认分支（docs/06-orchestration.md §4）。
 func TestBaseBranchOverride(t *testing.T) {
-	c := DefaultRepoConfig("Clouditera/CloudRouter")
+	c := DefaultRepoConfig("acme/demo")
 	c.BaseRefOverride = "fix/cr-1000-base"
 
 	for _, kind := range []TaskKind{KindFix, KindFeature, KindHotfix} {
@@ -66,7 +66,7 @@ func TestBaseBranchOverride(t *testing.T) {
 
 // 受保护分支拦截 —— 产品边界「永不 push 受保护分支」的最后一道闸门。
 func TestValidatePushTarget(t *testing.T) {
-	c := DefaultRepoConfig("Clouditera/CloudRouter")
+	c := DefaultRepoConfig("acme/demo")
 
 	blocked := []string{
 		"dev", "test", "main",
@@ -105,7 +105,7 @@ func TestValidatePushTarget(t *testing.T) {
 }
 
 func TestBranchName(t *testing.T) {
-	c := DefaultRepoConfig("Clouditera/CloudRouter")
+	c := DefaultRepoConfig("acme/demo")
 
 	cases := []struct {
 		name  string

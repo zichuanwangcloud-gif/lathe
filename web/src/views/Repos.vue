@@ -145,7 +145,7 @@ onMounted(load)
   <div class="card">
     <h2>登记仓库</h2>
     <p class="faint" style="margin: 6px 0 12px">
-      把你要让 Lathe 干活的 GitHub 仓库登记到自己名下，例如 <code class="mono">Clouditera/CloudRouter</code>。
+      把你要让 Lathe 干活的 GitHub 仓库登记到自己名下，例如 <code class="mono">acme/demo</code>。
       登记后把 issue 指派给你的 Linear 账号即可触发任务。
     </p>
     <form class="row" style="display: flex; gap: 10px" @submit.prevent="add">

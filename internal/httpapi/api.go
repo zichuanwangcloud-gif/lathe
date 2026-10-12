@@ -496,7 +496,7 @@ func (a *API) createRepo(w http.ResponseWriter, r *http.Request) {
 	body.ProviderRepo = strings.TrimSpace(body.ProviderRepo)
 	if body.ProviderRepo == "" || !strings.Contains(body.ProviderRepo, "/") {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "providerRepo 须为 owner/repo 形式，如 Clouditera/CloudRouter",
+			"error": "providerRepo 须为 owner/repo 形式，如 acme/demo",
 		})
 		return
 	}
