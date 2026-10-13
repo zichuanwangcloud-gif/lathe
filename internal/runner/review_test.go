@@ -777,6 +777,70 @@ func TestWorktreeReattachMirrorsRemoteTip(t *testing.T) {
 	}
 }
 
+// Reattach 必须在物化本地分支【之前】清掉旧的 worktree 注册。
+//
+// 这是 CI 与本地 git 版本差暴露出来的一条硬约束（CI git 2.55 / 本地 2.34）：
+// 「目录已删、注册还在」的现场在 git 里是一个 prunable 的 worktree 注册，而
+// `git branch -f` 在较新版 git（2.36 前后起）会拒绝改一条仍被 worktree 注册
+// 引用的分支：
+//
+//	fatal: cannot force update the branch 'fix/x' used by worktree at '...'
+//
+// 旧版 git 不查这一条，于是「顺序写反」在本机永远复现不出来。这条用例因此
+// **不依赖运行环境的 git 版本**：它直接构造「目录已删、注册还在、本地分支也
+// 还在」这个现场，然后断言 Reattach 成功 —— 旧 git 上绿、新 git 上红，正好
+// 是这个缺陷的判据。
+//
+// 同时覆盖了另一个容易被顺手「优化」掉的细节：branch -f 不能用不带 -f 的
+// `git branch` 代替（本地残留分支还在时它会撞 "already exists"），所以现场
+// 里刻意保留了那条同名本地分支。
+func TestWorktreeReattachClearsStaleRegistrationFirst(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, &fakeAgent{}, &fakeNotifier{})
+
+	wt := prOpenTask(t, p, m, taskID, src, repo, true)
+	if err := p.Worktrees.Push(ctx, wt, repo, nil); err != nil {
+		t.Fatalf("推进远端失败: %v", err)
+	}
+
+	// 造现场：目录删掉（worktree 注册留下 → prunable），本地分支也留下。
+	// 这正是「停车后现场被清理」的样子，也是 CI 上失败的那个形态。
+	if err := os.RemoveAll(wt.Path); err != nil {
+		t.Fatalf("清理现场目录失败: %v", err)
+	}
+	mirror := p.Worktrees.MirrorPath(repo.ProviderRepo)
+	if _, err := p.Worktrees.git(ctx, mirror, "rev-parse", "--verify", "--quiet",
+		"refs/heads/"+wt.Branch+"^{commit}"); err != nil {
+		t.Fatalf("夹具应留下同名本地分支（否则 branch -f 的必要性测不到）: %v", err)
+	}
+	// 目录已删但注册还在：worktree list 仍能看得到它
+	listOut, err := p.Worktrees.git(ctx, mirror, "worktree", "list", "--porcelain")
+	if err != nil {
+		t.Fatalf("读 worktree 列表失败: %v", err)
+	}
+	if !strings.Contains(listOut, wt.Path) {
+		t.Fatalf("夹具应留下失效的 worktree 注册（目录 %s），实际列表:\n%s", wt.Path, listOut)
+	}
+
+	if err := p.Worktrees.Reattach(ctx, repo.ProviderRepo, wt.Path, wt.Branch); err != nil {
+		t.Fatalf("重挂应成功（先清注册再物化分支）: %v", err)
+	}
+
+	// 重挂后注册归位、内容与远端一致
+	after, err := p.Worktrees.git(ctx, mirror, "worktree", "list", "--porcelain")
+	if err != nil {
+		t.Fatalf("读 worktree 列表失败: %v", err)
+	}
+	if strings.Contains(after, "prunable") {
+		t.Errorf("重挂后不应再有失效注册，实际:\n%s", after)
+	}
+	remoteTip := gitOut(t, src, "rev-parse", "refs/heads/"+wt.Branch)
+	if got := gitOut(t, wt.Path, "rev-parse", "HEAD"); got != remoteTip {
+		t.Errorf("重挂后 HEAD = %s，期望等于远端 tip %s", got[:8], remoteTip[:8])
+	}
+}
+
 // baseOf 取仓库默认基线分支名（测试夹具都是 fix 类任务）。
 func baseOf(t *testing.T, repo RepoConfig) *string {
 	t.Helper()

@@ -562,6 +562,33 @@ func (m *WorktreeManager) Reattach(ctx context.Context, providerRepo, path, bran
 		return fmt.Errorf("runner: 远端没有分支 %q（无法就地重挂，第一轮的提交不在远端）", branch)
 	}
 
+	// ★顺序要紧：先清掉旧的 worktree 注册与目录残骸，【再】物化本地分支。
+	//
+	// 反过来的话在新版 git 上直接失败（CI 的 git 2.55，本地 2.34 不复现）：
+	//
+	//	fatal: cannot force update the branch 'fix/x' used by worktree at '...'
+	//
+	// 原因是「目录已删、注册还在」这种现场（正是停车后的样子）在 git 里是一个
+	// prunable 的 worktree 注册，而 `git branch -f` 自 2.36 前后起会拒绝改一条
+	// 仍被某个 worktree 注册引用的分支。旧版不查这一条，所以本地怎么跑都绿 ——
+	// 这类「本地绿、CI 红」的差异只能靠版本差解释，不能靠本地复现。
+	//
+	// 清注册必须先于 branch -f，而不是把 branch -f 改成不用 -f：这条分支可能
+	// 真的存在（上一轮现场被删后留下的本地尸体），不用 -f 会撞 "already exists"。
+	//
+	// worktree remove 对「目录已经不在」的注册会失败（正是这种现场），
+	// 所以真正起作用的是紧随其后的 prune —— 它把失效注册扫掉。两个都跑，
+	// 覆盖「目录还在」与「目录已删」两形态。
+	_, _ = m.git(ctx, mirror, "worktree", "remove", "--force", path)
+	if _, err := os.Stat(path); err == nil {
+		if rerr := os.RemoveAll(path); rerr != nil {
+			return fmt.Errorf("runner: 清理旧工作区目录 %s 失败: %w", path, rerr)
+		}
+	}
+	if _, err := m.git(ctx, mirror, "worktree", "prune"); err != nil {
+		return fmt.Errorf("runner: 清理失效的工作区注册失败: %w", err)
+	}
+
 	// 把远端分支在镜像里物化成本地分支：worktree add 检出的是本地 ref。
 	// -f 覆盖可能存在的同名残留（本地分支是上一轮现场被删后留下的尸体，
 	// 远端才是权威）。refs/heads/* 与 refs/remotes/origin/* 分属两个
@@ -569,16 +596,6 @@ func (m *WorktreeManager) Reattach(ctx context.Context, providerRepo, path, bran
 	if _, err := m.git(ctx, mirror, "branch", "-f", branch, remoteRef); err != nil {
 		return fmt.Errorf("runner: 在本地物化分支 %q 失败: %w", branch, err)
 	}
-
-	// 清掉旧的注册与目录残骸：目录可能还在（但不是可用的工作树，否则
-	// 调用方不会走到这里），worktree add 会拒绝一个已存在的路径。
-	_, _ = m.git(ctx, mirror, "worktree", "remove", "--force", path)
-	if _, err := os.Stat(path); err == nil {
-		if rerr := os.RemoveAll(path); rerr != nil {
-			return fmt.Errorf("runner: 清理旧工作区目录 %s 失败: %w", path, rerr)
-		}
-	}
-	_, _ = m.git(ctx, mirror, "worktree", "prune")
 
 	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", path, branch); err != nil {
 		return fmt.Errorf("runner: 重挂工作区失败（分支 %s）: %w", branch, err)
