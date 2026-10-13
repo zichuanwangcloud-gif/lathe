@@ -449,7 +449,7 @@ func serve(cfg config.Config) error {
 	// 更实的影响：那一段窗口里被领走的任务 p.Stacks == nil → 整个起栈
 	// 分支跳过 → 既不起栈也不留痕。而那个窗口恰恰是最热的时刻 ——
 	// 上面的 Reconcile 刚把所有在途任务重新入队。
-	startWorkers(ctx, q, pipeline, st, factory)
+	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -471,7 +471,7 @@ func serve(cfg config.Config) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
-// startWorkers 启动后台执行者：任务队列 worker 与合并检测轮询。
+// startWorkers 启动后台执行者：任务队列 worker、合并检测轮询与 PRD 搁置扫描。
 //
 // 抽成函数是为了让「装配完成后才启动」成为一条【结构性】约束：本函数
 // 是唯一的启动点，只要它被放在装配之后调用，就不可能出现「worker 先
@@ -480,7 +480,8 @@ func serve(cfg config.Config) error {
 // ctx 是 serve 的根 ctx：SIGINT/SIGTERM 时它被取消，在途任务收到取消
 // 而不是被硬杀。注意被取消的 ctx 会一路传进拆栈路径 —— 那正是
 // VerifyStack.Down 必须自己解绑取消的原因（见 preview/verifystack.go）。
-func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *store.Store, factory runner.ClientFactory) {
+func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *store.Store,
+	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets) {
 	go q.work(ctx)
 
 	// F4.1 合并检测的轮询兜底 + F4.2 现场回收 + F4.3 后继链自动 rebase
@@ -503,6 +504,29 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 		Interval:      45 * time.Second,
 	}
 	go mergePoller.Run(ctx)
+
+	// PRD 搁置扫描（docs/10 §9 未决第 1 条）：把挂着问题没人回答超过
+	// LATHE_PRD_STALL_TIMEOUT 的 PRD 转 abandoned，并发一封提醒邮件。
+	//
+	// 装配方式照 mergePoller / reaper：只读 store 与一个窄通知接口，
+	// 没有任何需要与别处共用的状态，所以直接在这里构造。
+	//
+	// 与收割机不同，这里没有 dry-run 开关：它只改一行状态字段，没有
+	// 不可逆的破坏面（回收会删磁盘目录与 git 分支，才需要干跑与总开关）。
+	// 通知可以单独关（LATHE_PRD_STALL_NOTIFY=false）—— 关的是那封信，
+	// 不是判定本身。
+	sweeper := &prd.StallSweeper{
+		Store:    st,
+		Notifier: prdStallMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
+		Notify:   cfg.PRDStallNotifyEnabled(),
+		Timeout:  cfg.PRDStallTimeout,
+		Interval: cfg.PRDStallSweepInterval,
+		BaseURL:  cfg.PublicURL(),
+	}
+	if !sweeper.Notify {
+		slog.Warn("PRD 搁置提醒已关闭（LATHE_PRD_STALL_NOTIFY=false）：仍会判搁置，但不会通知属主")
+	}
+	go sweeper.Run(ctx)
 }
 
 // buildPipeline 装配流水线。
@@ -662,6 +686,41 @@ func (logNotifier) Notify(ctx context.Context, msg string) error {
 	slog.Warn("【通知】" + msg)
 	return nil
 }
+
+// prdStallMailer 实现 prd.StallNotifier：把「PRD 被搁置」翻译成一封发给属主的信。
+//
+// 与 taskMailer 同一套做法（放在 cmd/lathe，因为这里同时拿得到 store 与
+// internal/mail；prd 包只依赖它声明的窄接口，不 import internal/mail）。
+// 两者刻意不合成一个类型：收件人的解析路径不同（任务经 tasks JOIN users，
+// PRD 经 prds JOIN users），而共同的只有「SMTP 未配就静默跳过」这一条判断
+// —— 为它抽一层只会让两个调用方各自多绕一道。
+type prdStallMailer struct {
+	store  *store.Store
+	sender *mail.Sender
+}
+
+// NotifyPRDStalled 向 PRD 属主投一封搁置提醒。
+//
+// **SMTP 未配置时返回 nil（静默跳过）而非错误**：没配邮件是默认状态、
+// 不是异常（同 taskMailer.SendTaskMail）。把它当错误上报会让每轮扫描的
+// 日志里刷 WARN，真正的发信故障反而被淹没。
+func (m prdStallMailer) NotifyPRDStalled(ctx context.Context, prdID int64, subject, body string) error {
+	if m.sender == nil || !m.sender.Ready(ctx) {
+		return nil
+	}
+	to, err := m.store.NotifyEmailForPRD(ctx, prdID)
+	if err != nil {
+		// 收件人查不到（PRD 或属主已删）不是发信故障，没有可投递的对象而已。
+		if errors.Is(err, store.ErrNoRecipient) {
+			return nil
+		}
+		return err
+	}
+	return m.sender.Send(ctx, to, subject, body)
+}
+
+// 编译期断言：适配器必须满足扫描器要的通知能力。
+var _ prd.StallNotifier = prdStallMailer{}
 
 // ensureSuperadmin 取得（或创建）内置超级管理员。
 //

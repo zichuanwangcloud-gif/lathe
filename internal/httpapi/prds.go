@@ -56,6 +56,7 @@ func (a *PRDAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/prds/{id}/approve", a.Auth.RequireFunc(a.approve))
 	mux.Handle("POST /api/prds/{id}/reject", a.Auth.RequireFunc(a.reject))
 	mux.Handle("POST /api/prds/{id}/abandon", a.Auth.RequireFunc(a.abandon))
+	mux.Handle("POST /api/prds/{id}/resume", a.Auth.RequireFunc(a.resume))
 	mux.Handle("POST /api/prds/{id}/convert", a.Auth.RequireFunc(a.convert))
 }
 
@@ -332,6 +333,23 @@ func (a *PRDAPI) reject(w http.ResponseWriter, r *http.Request) {
 // abandon：POST /api/prds/{id}/abandon —— 人放弃，终态。
 func (a *PRDAPI) abandon(w http.ResponseWriter, r *http.Request) {
 	a.transition(w, r, prd.StateAbandoned, "放弃 PRD 失败")
+}
+
+// resume：POST /api/prds/{id}/resume —— 唤醒搁置/放弃的 PRD，回到起草。
+//
+// 与 abandon 是一对：abandoned 是终态（不再自动流转），但不是死路
+// （docs/10 §9 第 1 条已决）。人点一下就回来接着对话，之前的轮次历史、
+// 已确认的节与复核报告都还在 —— 唤醒只改状态，不碰内容。
+//
+// 唤醒之后停在 drafting 而不是直接起一轮 agent：起轮要花钱、要占只读
+// 检出，那是人该显式点的动作（同 create 的立场）。人在界面上点完「继续」
+// 看见回复框，写点什么再跑下一轮。
+//
+// 没有单独的「谁唤醒的」记录：这条状态转移经 TransitionPRD 落库，
+// updated_at 会跟着动，事件流的 phase/kind 约束（0025）装的是 agent
+// 事件而不是状态事件，不该为这一条破例（见 internal/prd/state.go 第 5 条）。
+func (a *PRDAPI) resume(w http.ResponseWriter, r *http.Request) {
+	a.transition(w, r, prd.StateDrafting, "唤醒 PRD 失败")
 }
 
 // transition 跑一次状态转移：读当前态 → 查转移表 → CAS 落库。

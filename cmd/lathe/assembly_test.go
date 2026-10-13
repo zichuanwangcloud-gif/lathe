@@ -160,19 +160,23 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		}
 	}
 
-	// 只有一个启动点：serve 里不该再有裸的 go q.work / go mergePoller.Run
+	// 只有一个启动点：serve 里不该再有裸的 `go q.work(...)` /
+	// `go mergePoller.Run(...)` / `go sweeper.Run(...)` —— 那会绕过这个结构。
 	for _, g := range goStmts {
-		if strings.HasPrefix(g, "q.work") || strings.HasPrefix(g, "mergePoller.") {
+		if strings.HasPrefix(g, "q.work") || strings.HasPrefix(g, "mergePoller.") ||
+			strings.HasPrefix(g, "sweeper.") {
 			t.Errorf("serve 里不该直接 `go %s`：后台执行者只能由 startWorkers 启动，"+
 				"那是「装配完成后才启动」这条约束的唯一承载点", g)
 		}
 	}
 }
 
-// startWorkers 必须真的把两条后台循环都起起来 —— 只起 worker 不起
+// startWorkers 必须真的把三条后台循环都起起来 —— 只起 worker 不起
 // merge poller 会让 F4.1/F4.3 静默失效（PR 合并检测与后继链 rebase
-// 跟进全停，任务永远停在 pr_open）。
-func TestStartWorkersLaunchesBothLoops(t *testing.T) {
+// 跟进全停，任务永远停在 pr_open）；不起 PRD 搁置扫描则 docs/10 §9 第 1
+// 条（超时搁置）整条能力静默失效 —— 没有任何报错，只是那份 PRD 永远
+// 躺在 awaiting_answers 里，这正是这条能力要治的病。
+func TestStartWorkersLaunchesAllLoops(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "main.go", nil, parser.SkipObjectResolution)
 	if err != nil {
@@ -198,7 +202,7 @@ func TestStartWorkersLaunchesBothLoops(t *testing.T) {
 		return true
 	})
 
-	want := map[string]bool{"q.work": false, "mergePoller.Run": false}
+	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false}
 	for _, g := range goStmts {
 		for k := range want {
 			if strings.HasPrefix(g, k) {

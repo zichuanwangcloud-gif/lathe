@@ -147,6 +147,10 @@ export const api = {
   // 打回不带理由：理由的归宿是下一轮对话的回答，不是 append-only 的轮次记录
   rejectPrd: (id) => request(`/api/prds/${id}/reject`, { method: 'POST' }),
   abandonPrd: (id) => request(`/api/prds/${id}/abandon`, { method: 'POST' }),
+  // 唤醒搁置/放弃的 PRD（docs/10 §9）：回到 drafting，接着对话。
+  // 终态是「不再自动流转」而不是死路 —— 被超时搁置的那份最可能
+  // 「其实还想做」，重建整段对话的代价远大于给它一条回来的路。
+  resumePrd: (id) => request(`/api/prds/${id}/resume`, { method: 'POST' }),
   convertPrd: (id) => request(`/api/prds/${id}/convert`, { method: 'POST' }),
 
   // 逐节确认（🤖 → ✅）：自检要求所有推断节被人过目。❓ 的节回 409 ——
@@ -252,7 +256,10 @@ export const PRD_STATE_META = {
   ready_for_review: { label: '待批准', tone: 'warn' },
   approved: { label: '已批准', tone: 'ok' },
   converted: { label: '已生成任务', tone: 'ok' },
-  abandoned: { label: '已放弃', tone: 'idle' },
+  // 放弃与超时搁置共用一个状态（docs/10 §9 第 1 条），措辞要能同时
+  // 覆盖两种来源：说「已搁置」比「已放弃」更贴事实 —— 这份 PRD 可能
+  // 是没人答而被系统搁下的，标成「已放弃」会把责任错记到人头上。
+  abandoned: { label: '已搁置', tone: 'idle' },
 }
 
 export const prdStateLabel = (s) => PRD_STATE_META[s]?.label || s

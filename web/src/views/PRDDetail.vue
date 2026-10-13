@@ -296,9 +296,21 @@ async function abandon() {
   try {
     await act(
       () => api.abandonPrd(props.id),
-      '放弃是终态：这份 PRD 之后既不能继续对话也不能生成任务，要接着做只能开新的。确认放弃？',
+      '放弃后这份 PRD 停止推进，也不会再自动流转（放久了会被判定为搁置）。' +
+        '它没丢：随时可以点「继续这份 PRD」回来接着对话。确认放弃？',
     )
-    notice.value = '已放弃。'
+    notice.value = '已放弃 —— 想接着做点「继续这份 PRD」即可回来。'
+  } catch {
+    /* 同上 */
+  }
+}
+
+// 唤醒搁置/放弃的 PRD（docs/10 §9 第 1 条）。终态的含义是「不再自动流转」，
+// 不是死路 —— 之前的轮次历史、已确认的节与复核报告都还在，唤醒只改状态。
+async function resume() {
+  try {
+    await act(() => api.resumePrd(props.id))
+    notice.value = '已恢复起草 —— 在下方对话区写点什么就能接着跑下一轮。'
   } catch {
     /* 同上 */
   }
@@ -442,13 +454,19 @@ onMounted(() => {
   loadRepos()
   refresh()
   loadEvents()
-  // 轮次在后台跑，页面要能跟着动；终态之后没有任何东西会再变
+  // 轮次在后台跑，页面要能跟着动。
+  //
+  // 终态里 converted 是彻底结束（任务已生成，内容冻结），而 abandoned
+  // **仍可能是别的东西改的**：超时扫描器可能在页面上停着的时候把它从
+  // awaiting_answers 判成搁置。所以轮询在 abandoned 上也继续 —— 只是
+  // 它不会自己回来（唤醒要人点），所以刷新的意义是「看到它被搁置了」。
   timer = setInterval(() => {
-    if (!isTerminal.value) refresh()
+    if (!isTerminal.value || state.value === 'abandoned') refresh()
   }, 5000)
   evTimer = setInterval(async () => {
     await loadEvents()
-    if (isTerminal.value) clearInterval(evTimer)
+    // 事件流只在彻底结束之后停：搁置的 PRD 被唤醒后还会有新事件。
+    if (state.value === 'converted') clearInterval(evTimer)
   }, 2000)
 })
 onUnmounted(() => {
@@ -521,6 +539,16 @@ onUnmounted(() => {
           :disabled="!canAbandon || acting"
           @click="abandon"
         >放弃</button>
+        <!-- 唤醒（docs/10 §9）：搁置/放弃之后能回来。这是 abandoned 唯一的
+             出边，按钮的存在与否必须与状态机一致 —— 少了它，一份被超时
+             扫描判搁置的 PRD 在界面上就没有回去的路了 -->
+        <button
+          v-if="state === 'abandoned'"
+          class="primary"
+          :disabled="acting"
+          title="回到起草接着对话：之前的轮次历史、已确认的节与复核报告都还在，唤醒只改状态"
+          @click="resume"
+        >继续这份 PRD</button>
         <!-- 导出（docs/10 §7）：任何状态都能导，走普通链接让浏览器自己下 ——
              same-origin cookie 自动带上，不必绕 fetch 再造 Blob -->
         <a class="btn-link" :href="`/api/prds/${prd.id}/export?format=md`" download>导出 Markdown</a>
@@ -669,6 +697,12 @@ onUnmounted(() => {
       </div>
       <p v-else-if="processing" class="dim" style="margin: 10px 0 0">这一轮还在跑，跑完才能继续。</p>
       <p v-else-if="frozen" class="dim" style="margin: 10px 0 0">PRD 已冻结，对话到此为止。</p>
+      <!-- 搁置不是死路（docs/10 §9 第 1 条）：说清楚怎么回去，别让人以为
+           这份 PRD 只能作废重开 -->
+      <p v-else-if="state === 'abandoned'" class="dim" style="margin: 10px 0 0">
+        这份 PRD 已停止推进（人放弃或长时间无人回答被搁置）。
+        点上方「继续这份 PRD」就能回到起草接着对话 —— 对话历史与已确认的节都还在。
+      </p>
     </div>
 
     <!-- 文档区 -->

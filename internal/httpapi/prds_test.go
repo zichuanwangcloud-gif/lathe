@@ -204,7 +204,7 @@ func TestPRDTransitionGuards(t *testing.T) {
 		}
 	})
 
-	t.Run("终态不能再转", func(t *testing.T) {
+	t.Run("搁置的 PRD 不能再放弃（已在终态）", func(t *testing.T) {
 		row := mustPRD(t, st, userID, repoID)
 		id := strconv.FormatInt(row.ID, 10)
 		if resp, _ := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/abandon", ""); resp.StatusCode != http.StatusOK {
@@ -213,6 +213,42 @@ func TestPRDTransitionGuards(t *testing.T) {
 		resp, body := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/approve", "")
 		if resp.StatusCode != http.StatusConflict {
 			t.Errorf("已放弃的 PRD 不能批准，got=%d 响应=%v", resp.StatusCode, body)
+		}
+	})
+
+	// 搁置/放弃之后能由人唤醒（docs/10 §9 第 1 条已决）：终态的含义是
+	// 「不再自动流转」，不是死路。
+	t.Run("搁置的 PRD 可以唤醒回起草", func(t *testing.T) {
+		row := mustPRD(t, st, userID, repoID)
+		id := strconv.FormatInt(row.ID, 10)
+		if resp, _ := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/abandon", ""); resp.StatusCode != http.StatusOK {
+			t.Fatalf("放弃失败：%d", resp.StatusCode)
+		}
+
+		resp, body := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/resume", "")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("唤醒搁置的 PRD 应 200，got=%d 响应=%v", resp.StatusCode, body)
+		}
+		if body["state"] != string(prd.StateDrafting) {
+			t.Errorf("唤醒后 state got=%v want=%s", body["state"], prd.StateDrafting)
+		}
+
+		// 唤醒后能落一轮问答：否则「回来接着说」只是句空话。
+		// RunRound 走假 planner，只验状态机放行。
+		if resp, body := doReq(t, srv, http.MethodPost,
+			"/api/prds/"+id+"/rounds", `{"answer":"按内存算"}`); resp.StatusCode != http.StatusOK {
+			t.Errorf("唤醒后应能跑对话轮次，got=%d 响应=%v", resp.StatusCode, body)
+		}
+	})
+
+	// 唤醒不是万能回退：只有 abandoned 能走这条边。
+	t.Run("drafting 的 PRD 不能「唤醒」（本来就没停）", func(t *testing.T) {
+		row := mustPRD(t, st, userID, repoID)
+		resp, body := doReq(t, srv, http.MethodPost,
+			"/api/prds/"+strconv.FormatInt(row.ID, 10)+"/resume", "")
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("drafting → drafting 不是合法转移，应 409，got=%d 响应=%v",
+				resp.StatusCode, body)
 		}
 	})
 }

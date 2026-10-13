@@ -306,3 +306,163 @@ func TestKnownSecretsReturnsRealValues(t *testing.T) {
 		t.Errorf("没有配任何凭据时应返回空列表，得到 %d 项", n)
 	}
 }
+
+// ★ 验收标准：PRD 搁置阈值的下限与默认值（docs/10 §9 第 1 条）。
+//
+// 下限的存在理由与 WorktreeTTL 不同：那边是安全机制（防误删在途现场），
+// 这边纯粹是防手滑 —— 调小不会损坏任何数据，只会把还在等人回答的 PRD
+// 判成「已搁置」。那是一次**可见的误判**（人在列表上看到自己的对话被
+// 放弃了），比数据损坏更难修：数据能恢复，信任不能。
+func TestValidateRejectsTinyPRDStallTimeout(t *testing.T) {
+	base := func() Config {
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("基准配置构造失败: %v", err)
+		}
+		return c
+	}
+
+	for _, d := range []time.Duration{time.Second, time.Minute, 59 * time.Minute, 0, -time.Hour} {
+		c := base()
+		c.PRDStallTimeout = d
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("PRDStallTimeout=%v 应被拒绝（下限 %v）", d, MinPRDStallTimeout)
+			continue
+		}
+		if !strings.Contains(err.Error(), "PRDStallTimeout") {
+			t.Errorf("错误应提到 PRDStallTimeout，得到: %v", err)
+		}
+		// 错误信息要指路：Go 的时长解析不支持 d，写 7d 会静默拿不到值。
+		if !strings.Contains(err.Error(), "168h") {
+			t.Errorf("下限错误应提示写法（168h 而不是 7d），得到: %v", err)
+		}
+	}
+
+	// 正好等于下限：放行。
+	c := base()
+	c.PRDStallTimeout = MinPRDStallTimeout
+	if err := c.Validate(); err != nil {
+		t.Errorf("恰好等于下限时应放行，得到: %v", err)
+	}
+}
+
+// 默认值：七天，够人想清楚，也不至于让列表页堆满陈旧条目。
+func TestPRDStallDefaults(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load() 报错: %v", err)
+	}
+	if c.PRDStallTimeout != 168*time.Hour {
+		t.Errorf("PRDStallTimeout 默认 got=%v want=168h（7 天）", c.PRDStallTimeout)
+	}
+	if c.PRDStallSweepInterval != time.Hour {
+		t.Errorf("PRDStallSweepInterval 默认 got=%v want=1h", c.PRDStallSweepInterval)
+	}
+	// 提醒默认开：搁置发生在后台，不看列表就完全无感，邮件是唯一的主动告知。
+	if !c.PRDStallNotifyEnabled() {
+		t.Error("搁置提醒应默认开启")
+	}
+}
+
+func TestPRDStallNotifySwitch(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"false", false},
+		{"true", true},
+		{"", true}, // 未设置 = 默认开
+	} {
+		t.Run("LATHE_PRD_STALL_NOTIFY="+tc.env, func(t *testing.T) {
+			t.Setenv("LATHE_PRD_STALL_NOTIFY", tc.env)
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load() 报错: %v", err)
+			}
+			if got := c.PRDStallNotifyEnabled(); got != tc.want {
+				t.Errorf("PRDStallNotifyEnabled() got=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// 拼错的布尔值必须在启动时报错，不能静默失效。
+//
+// 对 LATHE_PRD_STALL_NOTIFY 尤其要紧：写成 "no" 的话，静默按「开」处理
+// 与按「关」处理都说得通，而配置的人以为自己的意思传达到了。
+func TestValidateRejectsMalformedPRDStallNotify(t *testing.T) {
+	for _, v := range []string{"yes", "1", "TRUE", "no"} {
+		t.Run(v, func(t *testing.T) {
+			c, err := Load()
+			if err != nil {
+				t.Fatalf("Load() 报错: %v", err)
+			}
+			c.PRDStallNotify = v
+			verr := c.Validate()
+			if verr == nil || !strings.Contains(verr.Error(), "LATHE_PRD_STALL_NOTIFY") {
+				t.Errorf("LATHE_PRD_STALL_NOTIFY=%q 应在启动时报错，得到: %v", v, verr)
+			}
+		})
+	}
+}
+
+// 扫描间隔必须为正（同 ReapInterval）。
+func TestValidateRejectsNonPositivePRDStallSweepInterval(t *testing.T) {
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load() 报错: %v", err)
+	}
+	for _, iv := range []time.Duration{0, -time.Second} {
+		c.PRDStallSweepInterval = iv
+		if verr := c.Validate(); verr == nil || !strings.Contains(verr.Error(), "PRDStallSweepInterval") {
+			t.Errorf("PRDStallSweepInterval=%v 应被拒绝，得到: %v", iv, verr)
+		}
+	}
+}
+
+// ★ 本 PRD 新增的两个时长变量写错必须在 Load 时报错，不能静默回落默认值。
+//
+// 存量的 envDuration 解析失败会悄悄用默认值：`LATHE_PRD_STALL_TIMEOUT=30d`
+// 能正常启动、实际生效 168h，人以为配成了 30 天。这违反「非法值启动报错」
+// （AGENTS.md §3 配置行）。错误要点名变量并给出 Go duration 写法（168h）。
+func TestLoadRejectsMalformedPRDStallDurations(t *testing.T) {
+	for _, key := range []string{"LATHE_PRD_STALL_TIMEOUT", "LATHE_PRD_STALL_SWEEP_INTERVAL"} {
+		for _, tc := range []struct {
+			val     string
+			wantErr bool
+		}{
+			{"30d", true},   // Go 不支持 d 单位
+			{"abc", true},   // 根本不是时长
+			{"7 d", true},   // 带空格也不行
+			{"168h", false}, // 合法
+		} {
+			t.Run(key+"="+tc.val, func(t *testing.T) {
+				t.Setenv(key, tc.val)
+				c, err := Load()
+				if !tc.wantErr {
+					if err != nil {
+						t.Fatalf("合法值 %q 不该报错，got: %v", tc.val, err)
+					}
+					got := c.PRDStallTimeout
+					if key == "LATHE_PRD_STALL_SWEEP_INTERVAL" {
+						got = c.PRDStallSweepInterval
+					}
+					if got != 168*time.Hour {
+						t.Errorf("%s 生效值 got=%v want=168h", key, got)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("%s=%q 应在启动时报错，却静默生效（PRDStallTimeout=%v, PRDStallSweepInterval=%v）",
+						key, tc.val, c.PRDStallTimeout, c.PRDStallSweepInterval)
+				}
+				for _, want := range []string{key, tc.val, "168h"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("错误信息应包含 %q，got: %v", want, err)
+					}
+				}
+			})
+		}
+	}
+}

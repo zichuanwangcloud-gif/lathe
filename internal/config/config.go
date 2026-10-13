@@ -59,6 +59,36 @@ type Config struct {
 	// 不必像 mergepoll 那样 45 秒一轮。
 	ReapInterval time.Duration
 
+	// PRDStallTimeout 是 PRD 停在 awaiting_answers 多久无人回答算搁置
+	// （docs/10 §9 第 1 条已决）。超期由后台扫描器转 abandoned 并发一封
+	// 提醒邮件；要恢复须在详情页点「继续这份 PRD」（abandoned → drafting，
+	// POST /api/prds/{id}/resume）—— 搁置后直接回答不会唤醒它。
+	//
+	// 默认七天：规划对话的节奏由人决定，一问一答之间隔一个周末、隔一周
+	// 都很正常（模糊任务本就是「想清楚再做」，不是「现在就得做」）。
+	// 比这更短会把人正常思考中的 PRD 判成搁置，而搁置的代价是属主收到
+	// 一封信、列表页上换个颜色。
+	//
+	// 下限 MinPRDStallTimeout（1 小时）防手滑：写成 `1`（秒）或 `30m`
+	// 会让在线等人的 PRD 被扫描器立刻打上搁置 —— 人刷新一下页面就发现
+	// 自己的对话「被放弃了」。这不是数据损坏，但它让人对系统失去信任，
+	// 比损坏更难修。同 LATHE_WORKTREE_TTL 的下限一样，非法值启动即报错。
+	//
+	// **注意 time.ParseDuration 不支持 d 单位**：配置里写 168h，不能写 7d。
+	// 写错（7d、abc）Load 直接报错，不回落默认值（envDurationStrict）。
+	PRDStallTimeout time.Duration
+	// PRDStallSweepInterval 是搁置扫描器的轮询间隔。
+	//
+	// 与 PRDStallTimeout 相差三个数量级（小时级 vs 天级），所以扫描频率
+	// 对判定的准确性没有影响 —— 取一小时的理由与收割机一样：这是个低频
+	// 维护动作，扫得太勤只是白占数据库连接。
+	PRDStallSweepInterval time.Duration
+	// PRDStallNotify 为真时，搁置时给属主发一封提醒邮件（docs/10 §9）。
+	//
+	// 用字符串而不是 bool：`LATHE_PRD_STALL_NOTIFY=false` 与「未设置」
+	// 必须能区分（同 LATHE_REAP_ENABLED 的理由）。
+	PRDStallNotify string
+
 	// ReapEnabled 是收割机总开关（LATHE_REAP_ENABLED，默认开）。
 	//
 	// 这个组件会删磁盘目录与 git 分支，是控制面里破坏力最大的一环，
@@ -157,6 +187,18 @@ func (d Database) DSN() string {
 // 的正常诉求；比它更激进的值换不来什么，只会把在途现场推进被删区间。
 const MinWorktreeTTL = time.Hour
 
+// MinPRDStallTimeout 是 PRD 搁置判定的下限（1 小时）。
+//
+// 为什么要有下限、而不是「填 0 就关掉」：把它调小不会带来任何好处，只会
+// 让还在正常等人回答的 PRD 被扫描器打上「已搁置」。这个动作本身可逆
+// （在详情页点「继续这份 PRD」就能恢复），但它是**可见的误判** —— 人看到自己昨天开的对话
+// 变成「已搁置」，对系统的信任就掉一档。配置项该越界就报错，而不是让人
+// 配出一个会误伤正常状态的值。
+//
+// 关掉整条能力没有对应的开关：永远是「多久算搁置」，不存在「不判搁置」。
+// 能单独关的是那封信（LATHE_PRD_STALL_NOTIFY）—— 关掉它判定照做。
+const MinPRDStallTimeout = time.Hour
+
 // validateBoolEnv 校验形如 `x == "true"` 的布尔环境变量。
 //
 // 拼错（"yes" / "1" / "TRUE"）会让开关静默失效 —— 对
@@ -207,8 +249,26 @@ func (c Config) ReapingEnabled() bool { return c.ReapEnabled != "false" }
 // ReapingDryRun 报告收割机是否只干跑（默认关）。
 func (c Config) ReapingDryRun() bool { return c.ReapDryRun == "true" }
 
+// PRDStallNotifyEnabled 报告搁置时是否发提醒邮件（默认发）。
+//
+// 默认开：搁置这件事发生在后台，不看列表页就完全无感。邮件是这个能力
+// 唯一「主动告知」的一面，关掉它等于把整件事做成静默的。关掉它的合理
+// 场景是部署方已有自己的告警通道。
+func (c Config) PRDStallNotifyEnabled() bool { return c.PRDStallNotify != "false" }
+
 // Load 从环境变量读取配置并校验。
 func Load() (Config, error) {
+	// 本 PRD 新增的两个时长变量走严格解析：写错（30d、abc）启动即报错。
+	// 存量的 envDuration 调用方暂不动（静默回落是已知存量问题，单独修）。
+	prdStallTimeout, err := envDurationStrict("LATHE_PRD_STALL_TIMEOUT", 168*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	prdStallSweepInterval, err := envDurationStrict("LATHE_PRD_STALL_SWEEP_INTERVAL", time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+
 	c := Config{
 		HTTPAddr: env("LATHE_HTTP_ADDR", ":8200"),
 		Database: Database{
@@ -219,30 +279,33 @@ func Load() (Config, error) {
 			Name:     env("LATHE_DB_NAME", "lathe"),
 			SSLMode:  env("LATHE_DB_SSLMODE", "disable"),
 		},
-		NodeName:            env("LATHE_NODE_NAME", hostnameOr("local")),
-		DataDir:             env("LATHE_DATA_DIR", "/opt/lathe/data"),
-		AdminEmail:          env("LATHE_ADMIN_EMAIL", "admin@lathe.local"),
-		AdminPassword:       env("LATHE_ADMIN_PASSWORD", ""),
-		BaseURL:             strings.TrimRight(env("LATHE_BASE_URL", ""), "/"),
-		CookieSecure:        env("LATHE_COOKIE_SECURE", ""),
-		TrustedProxy:        env("LATHE_TRUSTED_PROXY", "") == "true",
-		WorkspaceRoot:       env("LATHE_WORKSPACE_ROOT", "/opt/lathe/workspaces"),
-		PnpmStore:           env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
-		ClaudeBin:           env("LATHE_CLAUDE_BIN", "claude"),
-		AgentTimeout:        envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
-		WorktreeTTL:         envDuration("LATHE_WORKTREE_TTL", 72*time.Hour),
-		ReapInterval:        envDuration("LATHE_REAP_INTERVAL", time.Hour),
-		ReapEnabled:         env("LATHE_REAP_ENABLED", "true"),
-		ReapDryRun:          env("LATHE_REAP_DRY_RUN", "false"),
-		SettingSources:      env("LATHE_SETTING_SOURCES", "project"),
-		FixAttempts:         envInt("LATHE_FIX_ATTEMPTS", 2),
-		TriageChannel:       env("LATHE_TRIAGE_CHANNEL", ""),
-		ImplementChannel:    env("LATHE_IMPLEMENT_CHANNEL", ""),
-		LightSlots:          envInt("LATHE_LIGHT_SLOTS", 2),
-		HeavySlots:          envInt("LATHE_HEAVY_SLOTS", 1),
-		LinearToken:         env("LATHE_LINEAR_TOKEN", ""),
-		LinearWebhookSecret: env("LATHE_LINEAR_WEBHOOK_SECRET", ""),
-		GitHubToken:         env("LATHE_GITHUB_TOKEN", ""),
+		NodeName:              env("LATHE_NODE_NAME", hostnameOr("local")),
+		DataDir:               env("LATHE_DATA_DIR", "/opt/lathe/data"),
+		AdminEmail:            env("LATHE_ADMIN_EMAIL", "admin@lathe.local"),
+		AdminPassword:         env("LATHE_ADMIN_PASSWORD", ""),
+		BaseURL:               strings.TrimRight(env("LATHE_BASE_URL", ""), "/"),
+		CookieSecure:          env("LATHE_COOKIE_SECURE", ""),
+		TrustedProxy:          env("LATHE_TRUSTED_PROXY", "") == "true",
+		WorkspaceRoot:         env("LATHE_WORKSPACE_ROOT", "/opt/lathe/workspaces"),
+		PnpmStore:             env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
+		ClaudeBin:             env("LATHE_CLAUDE_BIN", "claude"),
+		AgentTimeout:          envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
+		WorktreeTTL:           envDuration("LATHE_WORKTREE_TTL", 72*time.Hour),
+		ReapInterval:          envDuration("LATHE_REAP_INTERVAL", time.Hour),
+		ReapEnabled:           env("LATHE_REAP_ENABLED", "true"),
+		ReapDryRun:            env("LATHE_REAP_DRY_RUN", "false"),
+		PRDStallTimeout:       prdStallTimeout,
+		PRDStallSweepInterval: prdStallSweepInterval,
+		PRDStallNotify:        env("LATHE_PRD_STALL_NOTIFY", "true"),
+		SettingSources:        env("LATHE_SETTING_SOURCES", "project"),
+		FixAttempts:           envInt("LATHE_FIX_ATTEMPTS", 2),
+		TriageChannel:         env("LATHE_TRIAGE_CHANNEL", ""),
+		ImplementChannel:      env("LATHE_IMPLEMENT_CHANNEL", ""),
+		LightSlots:            envInt("LATHE_LIGHT_SLOTS", 2),
+		HeavySlots:            envInt("LATHE_HEAVY_SLOTS", 1),
+		LinearToken:           env("LATHE_LINEAR_TOKEN", ""),
+		LinearWebhookSecret:   env("LATHE_LINEAR_WEBHOOK_SECRET", ""),
+		GitHubToken:           env("LATHE_GITHUB_TOKEN", ""),
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err
@@ -296,6 +359,21 @@ func (c Config) Validate() error {
 		return err
 	}
 	if err := validateBoolEnv("LATHE_REAP_DRY_RUN", c.ReapDryRun); err != nil {
+		return err
+	}
+	// 搁置阈值必须过下限，理由见 MinPRDStallTimeout：调小不会带来好处，
+	// 只会把还在等人回答的 PRD 误判成搁置。
+	if c.PRDStallTimeout < MinPRDStallTimeout {
+		return fmt.Errorf(
+			"config: PRDStallTimeout 不得小于 %v，得到 %v。"+
+				"调小只会把还在等人回答的 PRD 误判成「已搁置」（可在详情页点「继续这份 PRD」恢复，但那是可见的误判）。"+
+				"注意 Go 的时长解析不支持 d 单位：写 168h，不能写 7d",
+			MinPRDStallTimeout, c.PRDStallTimeout)
+	}
+	if c.PRDStallSweepInterval <= 0 {
+		return fmt.Errorf("config: PRDStallSweepInterval 必须为正，得到 %v", c.PRDStallSweepInterval)
+	}
+	if err := validateBoolEnv("LATHE_PRD_STALL_NOTIFY", c.PRDStallNotify); err != nil {
 		return err
 	}
 	// BaseURL 可以不配（此时由 HTTPAddr 兜底并告警），但配了就必须是
@@ -416,6 +494,24 @@ func envDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// envDurationStrict 同 envDuration，但解析失败返回错误而不是静默回落默认值。
+//
+// 静默回落会让 `30d` 这种「看起来对」的写法正常启动、实际按默认值跑，
+// 人以为配成了 30 天 —— 违反「非法值启动报错」。错误里点名变量与原值，
+// 并给出 Go duration 写法。
+func envDurationStrict(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q 不是合法的时长：请用 Go duration 写法，"+
+			"例如 168h（7 天）、90m；不支持 d 单位: %w", key, v, err)
+	}
+	return d, nil
 }
 
 func hostnameOr(def string) string {
