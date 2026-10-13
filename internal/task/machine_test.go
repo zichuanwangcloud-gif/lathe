@@ -581,6 +581,109 @@ func TestMachineReviewRequeueRequiresSession(t *testing.T) {
 	}
 }
 
+// ExplicitReviewRestart 的适用面必须收窄到 review_feedback → queued 这一个
+// 组合（A2 审计 B1 的人工出口）。
+//
+// 背景：约束①（review 二轮必须 resume 原会话）在【没有会话】时无从满足，而
+// parked 的任务两条出边都受它管辖，于是没有出口。人工出口为此开了一个放行口，
+// 但那个口子必须是【最小的】：只认 review_feedback → queued（人明确点了
+// 「重来一轮 review」），绝不外溢成一把绕过会话约束的万能钥匙。
+//
+// 这条用例专门守那个「最小」。它是测试空白而不是逻辑缺陷 —— 收窄逻辑写在
+// Machine.transition 里是生效的，但此前没有任何用例会让它变红：既有用例
+// （TestMachineReviewRequeueRequiresSession）走的是裸 Transition，标志位根本
+// 没设，所以拆掉收窄也不会失败。这里逐个组合把标志位设上，钉死它：
+//
+//   - review_feedback → implementing（直接进二轮）：标志位无效，仍要会话；
+//   - 其它状态 → queued：标志位从不该被读取；
+//   - review_feedback → queued：标志位有效（这条正路另有端到端用例覆盖）。
+func TestMachineExplicitReviewRestartIsNarrowlyScoped(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+
+	// parkedReviewTask 造一条停在 review_feedback 的任务（不带会话）。
+	parkedReviewTask := func(t *testing.T) *Task {
+		t.Helper()
+		userID, repoID := fixture(t, pool)
+		tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID,
+			ExternalKey: "CR-EXPLICIT-" + strconv.FormatInt(time.Now().UnixNano(), 10)})
+		if err != nil {
+			t.Fatalf("建任务失败: %v", err)
+		}
+		for _, s := range []State{StateTriaging, StateImplementing, StateVerifying, StatePROpen, StateReviewFeedback} {
+			if _, err := m.Transition(ctx, tk.ID, s, "system", nil); err != nil {
+				t.Fatalf("转移到 %s 失败: %v", s, err)
+			}
+		}
+		return tk
+	}
+
+	t.Run("review_feedback → implementing 带上标志位仍必须要求会话", func(t *testing.T) {
+		tk := parkedReviewTask(t)
+		_, err := m.Transition(ctx, tk.ID, StateImplementing, "system",
+			&TransitionOpts{ExplicitReviewRestart: true})
+		if !errors.Is(err, ErrSessionRequired) {
+			t.Fatalf("该标志位在 → implementing 上必须无效，应返回 ErrSessionRequired，得到 %v", err)
+		}
+		// 被拒的转移不得留下任何写入
+		got, gerr := m.Get(ctx, tk.ID)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if got.State != StateReviewFeedback {
+			t.Errorf("被拒的转移不该改动状态，得到 %s", got.State)
+		}
+	})
+
+	// 标志位是给人工出口用的，不该被别的状态读取：对非 review_feedback 的
+	// 源状态，它既不该放宽要求也不该放宽别的任何东西。这里用「本来就没有
+	// 会话约束的边」做对照 —— 设了标志位的结果必须与不设时完全一致。
+	t.Run("其它状态带上标志位不产生额外能力", func(t *testing.T) {
+		withFlag := func(t *testing.T) State {
+			t.Helper()
+			userID, repoID := fixture(t, pool)
+			tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID,
+				ExternalKey: "CR-EXPLICIT-OTHER-" + strconv.FormatInt(time.Now().UnixNano(), 10)})
+			if err != nil {
+				t.Fatalf("建任务失败: %v", err)
+			}
+			// queued → implementing 本身不查会话：设了标志位也必须照样成功，
+			// 说明标志位没有被拿去做别的事（它唯一的语义就是那个放行口）。
+			got, err := m.Transition(ctx, tk.ID, StateImplementing, "system",
+				&TransitionOpts{ExplicitReviewRestart: true})
+			if err != nil {
+				t.Fatalf("queued → implementing 不该因这个标志位而改变行为: %v", err)
+			}
+			return got.State
+		}
+		if st := withFlag(t); st != StateImplementing {
+			t.Errorf("state = %s，want implementing", st)
+		}
+	})
+
+	// 正路：review_feedback → queued 带上标志位且无会话时放行（人工出口的全部意义）
+	t.Run("review_feedback → queued 带上标志位且无会话时放行", func(t *testing.T) {
+		tk := parkedReviewTask(t)
+		got, err := m.Transition(ctx, tk.ID, StateQueued, "system",
+			&TransitionOpts{ExplicitReviewRestart: true})
+		if err != nil {
+			t.Fatalf("人工出口应放行无会话的 parked 任务: %v", err)
+		}
+		if got.State != StateQueued {
+			t.Errorf("state = %s，want queued", got.State)
+		}
+	})
+
+	// 对照：不设标志位时同一组合必须仍被拒（webhook 回流走的就是不设的那条路）
+	t.Run("review_feedback → queued 不设标志位仍必须要求会话", func(t *testing.T) {
+		tk := parkedReviewTask(t)
+		if _, err := m.Transition(ctx, tk.ID, StateQueued, "system", nil); !errors.Is(err, ErrSessionRequired) {
+			t.Fatalf("不设标志位时该边必须要求会话，得到 %v", err)
+		}
+	})
+}
+
 // TasksByPR 是 PR 评论 webhook 的路由查询：同名仓库、同号 PR 分属两个
 // 用户时，按属主查只能看见自己的那一条（跨用户隔离，A2 验收第 4 条）。
 func TestMachineTasksByPRIsolatesOwners(t *testing.T) {
