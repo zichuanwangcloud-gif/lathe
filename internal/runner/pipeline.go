@@ -712,7 +712,17 @@ func channelEnv(channel string) []string {
 	return []string{"LATHE_AGENT_CHANNEL=" + strings.TrimSpace(channel)}
 }
 
-// injectFailureMemory 是失败记忆在实现链路上的**唯一注入决策点**。
+// injectFailureMemory 是失败记忆在**实现链路**上的唯一注入决策点。
+//
+// 「唯一」限定在实现链路这一侧：分诊那一处是**独立旁路**（它不走
+// runAgent），注入点在 stageTriage 里 Agent.Run 的 Prompt 字段上。所以
+// 全仓的注入点共两处，都在本文件里：
+//
+//  1. stageTriage → p.withFailureMemory(rc.ctx, rc.scope, TriagePrompt(...), false)
+//  2. 本函数（runAgent 入口，覆盖 implement 与 implement-reentry 两个 phase）
+//
+// 别把「实现链路收敛到一处」读成全仓只有一处：分诊那处不经过 runAgent，
+// 加/改分诊的注入要直接改它的调用点。
 //
 // ---------------------------------------------------------------------------
 // 为什么收敛在 runAgent 而不是各个 prompt 构造函数
@@ -735,8 +745,11 @@ func channelEnv(channel string) []string {
 // 排除修复轮（fix-N）：它是紧接着一次失败的 resume 会话，`tasks.failure_reason`
 // 全文已经在提示词里，再注入一遍是纯噪声。
 //
-// 分诊不在本函数管辖范围内（它不走 runAgent），注入点在 stageTriage 的
-// Agent.Run 调用处 —— 全仓共两处注入点，都在这一个文件里。
+// 分诊不在本函数管辖范围内（它不走 runAgent），见上面顶部那段。
+//
+// phase 名是**跨分支的接口约定**：PR review 二轮（A2）复用 `implement` /
+// `implement-reentry` 这两个名字，不新增第三个 —— 否则这里要跟着加白名单，
+// 两条线的 diff 会顶在一起。
 func (p *Pipeline) injectFailureMemory(rc *runCtx, phase, prompt string, resume bool) string {
 	switch phase {
 	case "implement", "implement-reentry":

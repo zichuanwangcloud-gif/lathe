@@ -29,7 +29,25 @@ package runner
 // 文本里混进了什么」—— 只能靠「平台知道的环境值」比对 + 形态识别兜底。
 //
 // 环境值比对是主力：它不依赖凭据长什么样，覆盖的正是最真实的那类泄漏
-// （子进程回显 env）。形态表只兜那些不来自本进程环境的值。
+// （子进程回显 env）。形态表（tokenShapes）只兜那些不来自本进程环境的值，
+// 且**非穷举** —— 见那里的注释。
+//
+// ---------------------------------------------------------------------------
+// 已知的代价与边界（写下来免得被当成「已经保证干净」）
+// ---------------------------------------------------------------------------
+//
+//   - 环境值那一级按**变量名**取值，收窄到「名字下的值就是凭据」才取。
+//     再宽的词根（AUTH、笼统的 URL）会把 `auth mode is disabled`、
+//     `https://host/tasks/1` 这类正常输出打成 [REDACTED]，摘要的排障价值
+//     直接归零 —— 宁可少抹一点非凭据值，也不把摘要变成筛子。代价是：
+//     **某个自定义名字的变量装着凭据、名字里又没有上面那些词根时，它的值
+//     不会被这一级抹掉**（那还有形态表兜底）。
+//   - 形态表认不出 PEM 私钥、自定义前缀的内部 key、以及被当成普通词出现的
+//     口令（`the password is hunter2` 这种没有键值结构的）。
+//   - 摘要最终会随提示词经 agent.go 的 buildArgs 作为 **argv** 传给 CLI，
+//     因此它不只存在于库里：同机进程能通过 `/proc/<pid>/cmdline` 读到。
+//     （agent 子进程的环境本身是白名单化的，见 agent.go 的 sanitizedEnv；
+//     但 argv 不受它保护。）
 
 import (
 	"os"
@@ -47,15 +65,24 @@ const redactedMark = "[REDACTED]"
 
 // secretKeyRe 命中「变量名本身说明它是敏感值」的环境变量。
 //
-// 与 preview 的 passwordClassRe 同一套词根，但刻意各写一份：那一份服务的是
-// 「哪些必填变量由平台自动生成口令」，改它的词表不该牵动脱敏，反之亦然。
-// 注意 AUTH 会连 LATHE_AUTH_* 一起收进来 —— 这正是想要的（会话密钥、
-// 重置令牌的签名材料都在那一族里）。
-var secretKeyRe = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|CREDENTIALS?|ACCESS_?KEY|AUTH)`)
+// 与 preview 的 passwordClassRe 同一套词根，但**刻意比它窄**，而且各写一份：
+// 那一份服务的是「哪些必填变量由平台自动生成口令」，改它的词表不该牵动脱敏。
+//
+// 这里收词根的标准是「这个名字下的值**就是**凭据」，不是「可能跟认证有关」。
+// 收得再宽一点（早先版本收过 AUTH）实测就开始误伤：`LATHE_AUTH_MODE=disabled`
+// 会把 `auth mode is disabled, expected enabled` 抹成
+// `auth mode is [REDACTED], expected enabled` —— 摘要的排障价值直接没了，
+// 而这类输出恰恰是验证失败时最该看的东西。
+var secretKeyRe = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL)`)
 
-// urlishKeyRe 命中值形如 URL/DSN 的变量名：`postgres://user:pass@host/db`
-// 的口令段不由上面那组词根命名，但一样是凭据。
-var urlishKeyRe = regexp.MustCompile(`(?i)(DSN|URL|URI|DATABASE|REDIS|AMQP|BROKER)`)
+// urlishKeyRe 命中值是 URL/DSN 的变量名：`postgres://user:pass@host/db` 的
+// 口令段不由上面那组词根命名，但一样是凭据。
+//
+// **不收 BASE_URL / *_URL 这类通用地址**：`LATHE_BASE_URL` 是实例地址，
+// 里面没有口令，而它的值会出现在大量正常输出与断言消息里（实测会把
+// `got redirect https://lathe.example.com/tasks/1` 抹掉）。收窄的依据是
+// 「值里必然带 user:pass@」—— DSN 这一类名字才具备这个性质。
+var urlishKeyRe = regexp.MustCompile(`(?i)(^|_)(DSN|DATABASE_URL|DATABASE_URI|REDIS_URL|AMQP_URL|BROKER_URL|CONNECTION_STRING)`)
 
 // minSecretLen 是「值得脱敏的环境值」的最短长度。
 //
@@ -64,34 +91,100 @@ var urlishKeyRe = regexp.MustCompile(`(?i)(DSN|URL|URI|DATABASE|REDIS|AMQP|BROKE
 // 都远长于此。
 const minSecretLen = 8
 
-// tokenPatterns 是凭据形态的兜底表。每条都只替换捕获组里的值，前缀
-// （ghp_、lin_api_…）原样保留 —— 「这里有个 ghp_ 开头的凭据」本身就是
-// 有用的排障信息，抹掉它反而看不出来。
-var tokenPatterns = []*regexp.Regexp{
+// tokenShape 是凭据形态表的一格：一条正则 + 「要抹掉的那一段」是哪个捕获组。
+//
+// 显式标出组号，而不是靠「组数猜语义」—— 早先版本就是后者，于是
+// `\b(?:AKIA|ASIA)([A-Z0-9]{16})\b`（唯一没把整段圈进组的条目）落进
+// 「保留前缀」分支，把 AWS key id 的前 4 位与后 16 位一起原样吐了出去。
+// 组号写在表里，每个条目的意图就是它的注释，读一眼就对得上。
+type tokenShape struct {
+	re *regexp.Regexp
+	// group 是「值」所在的捕获组。命中这一段以外的部分（包括同一捕获组
+	// 前后的字面量）原样保留：`ghp_` 这类前缀留着是有用的排障信息，
+	// 而 `postgres://user:` 与 `@host` 留着能让摘要仍然可读。
+	group int
+}
+
+// tokenShapes 是凭据形态的兜底表。
+//
+// **非穷举**：它盖的是「无需上下文就能认出来的凭据形态」。认不出的还有
+// 不少 —— PEM 私钥块（`-----BEGIN ... PRIVATE KEY-----`）、自签名的
+// base64 blob、自定义前缀的内部 key、以及任意被当成普通词出现的口令
+// （`the password is hunter2`）。这一层的价值在于「多盖一层」而不是
+// 「盖全」：真的保证来自上面那一级（环境值与文本比对），那里不依赖
+// 凭据长什么样。
+var tokenShapes = []tokenShape{
 	// GitHub：PAT（ghp_）、OAuth/Server-to-server（gho_/ghs_）、
 	// 用户与刷新令牌（ghu_/ghr_）、fine-grained PAT（github_pat_）。
-	regexp.MustCompile(`\b((?:gh[pousr]|github_pat)_)[A-Za-z0-9_]{16,}\b`),
-	// Linear API key。
-	regexp.MustCompile(`\b(lin_api_)[A-Za-z0-9]{16,}\b`),
-	// Anthropic / OpenAI 风格的 sk- 密钥。
-	regexp.MustCompile(`\b(sk-)[A-Za-z0-9\-_]{16,}\b`),
-	// Slack bot/app/user token。
-	regexp.MustCompile(`\b(xox[abprs]-)[A-Za-z0-9\-]{10,}\b`),
-	// AWS access key id（前缀不是凭据的一部分，抹掉不影响可读性）。
-	regexp.MustCompile(`\b(?:AKIA|ASIA)([A-Z0-9]{16})\b`),
-	// URL 里的 basic-auth 口令段：scheme://user:pass@host。多捕获组形态
-	// 会被替换逻辑当成 key=value 处理（保留 v[1]+v[2]），所以这里补一个
-	// 空捕获组对齐语义：只保住 scheme://user，口令段抹掉。
-	regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@]+)():[^/\s@]+@`),
-	// key=value / key: value 形态（含 `DATABASE_PASSWORD=…` 这类带前缀的
-	// 变量名），值整段抹掉。值可带引号，门槛 8 字节与 minSecretLen 对齐 ——
-	// 更短的值（oauth_token=expired）抹掉只会让输出难读，而真实凭据都
-	// 不在这个量级。
+	// 前缀保留：「这里有个 ghp_ 开头的凭据」本身就是有用的排障信息。
+	{regexp.MustCompile(`\b(?:gh[pousr]|github_pat)_([A-Za-z0-9_]{16,})\b`), 1},
+	// Linear API key（同上，前缀保留）。
+	{regexp.MustCompile(`\blin_api_([A-Za-z0-9]{16,})\b`), 1},
+	// Anthropic / OpenAI 风格的 sk- 密钥（前缀保留）。
+	{regexp.MustCompile(`\b(sk-[A-Za-z0-9\-_]{16,})\b`), 1},
+	// Slack bot/app/user token（前缀保留）。
+	{regexp.MustCompile(`\b(xox[abprs]-)([A-Za-z0-9\-]{10,})\b`), 2},
+	// JWT / JWS：`eyJ` 开头的三段 base64url（`eyJ` 是 `{"a`/`{"t` 的
+	// base64，任何 JSON 头的 JWT 都以它开头）。整段抹掉 —— 三段一起才是
+	// 凭据，留着 header 段等于告诉人「这里有 token」之外还漏了算法与
+	// kid；末段允许为空（未签名的 JWT）。
+	{regexp.MustCompile(`\b(eyJ[A-Za-z0-9\-_]*\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b`), 1},
+	// AWS access key id：整段抹掉（AKIA/ASIA 这 4 位与后面 16 位一起才
+	// 构成 key id）。
+	{regexp.MustCompile(`\b((?:AKIA|ASIA)[A-Z0-9]{16})\b`), 1},
+	// URL 里的 basic-auth 口令段：`user:pass@host`。只抹口令，`user:` 与
+	// `@` 留着（`postgres://lathe:[REDACTED]@127.0.0.1` 比整段抹掉更可读，
+	// 也仍然没有泄漏）。段首的 `user` 用 `[^\s/:@]+` 而不是整条 URL：
+	// 实测验证输出里的连接串常常只留 `dial postgres://lathe:pw@host`，
+	// 没有 scheme 的变体同样要盖住。
+	{regexp.MustCompile(`[^\s/:@]+:([^\s/:@]+)@`), 1},
+	// key=value / key: value 形态：裸键（`token=…`）、带前缀的变量名
+	// （`DATABASE_PASSWORD=…`）与 JSON（`"apiKey":"…"`、`'password': '…'`）。
 	//
-	// 不能用 \b 起头：`_` 在 Go 的 \b 里算词字符，`DATABASE_PASSWORD=` 的
-	// 下划线之后没有边界，词根永远匹配不上。改成「显式吃一个前置字符」，
-	// 由替换模板原样吐回。
-	regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)\s*[:=]\s*("[^"]{8,}"|'[^']{8,}'|[^\s,;]{8,})`),
+	// 四个约束各有一条实测：
+	//
+	//   - 键**允许带引号**：JSON 的键名后面直接跟 `:`，词根右边先是引号
+	//     再是冒号，不带引号时 `\s*[:=]` 接不上，`{"apiKey":"…"}` 会整体
+	//     漏出去（评审实测）。
+	//   - 前置字符类用 `[^A-Za-z0-9]`（引号算合法前置字符），**不用 `\b`**：
+	//     `_` 是词字符，`DATABASE_PASSWORD=` 的下划线之后没有边界，词根
+	//     永远匹配不上。
+	//   - 值分支吃两种引号，也吃裸串。
+	//   - 值**不设最小长度**（`token: "x"` 也抹）：这条守的是「可能泄漏就
+	//     别放行」。长度门槛只在**环境值**那一级才有意义 —— 那里有真代价
+	//     （抹 1–7 字节的短串会把普通输出打成筛子，见 minSecretLen）；
+	//     形态表命中的是明确写着 token/password 的键，误伤面天然很小。
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])["']?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)["']?\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;]{4,})`), 1},
+}
+
+// redact 把这一段文本里该条目命中的「值」换成 redactedMark。
+//
+// 按字节区间做替换（而不是给 ReplaceAllString 写 `${1}` 模板）：模板没法
+// 表达「保留匹配到的其它部分」，而这里每条的形状都不一样。
+func (sh tokenShape) redact(s string) string {
+	matches := sh.re.FindAllStringSubmatchIndex(s, -1)
+	if len(matches) == 0 {
+		return s
+	}
+	var b strings.Builder
+	prev := 0
+	for _, m := range matches {
+		i := 2 * sh.group
+		if i+1 >= len(m) || m[i] < 0 {
+			continue // 该组没参与匹配（可选组），整段不动
+		}
+		b.WriteString(s[prev:m[i]])
+		if isRedactedValue(s[m[i]:m[i+1]]) {
+			// 上一级已经抹过这一段（环境值替换留下的标记本身长得就像
+			// `token="[REDACTED]"`），别叠成两个标记。
+			b.WriteString(s[m[i]:m[i+1]])
+		} else {
+			b.WriteString(redactedMark)
+		}
+		prev = m[i+1]
+	}
+	b.WriteString(s[prev:])
+	return b.String()
 }
 
 // isRedactedValue 报告这段文本是不是「已经脱敏过」的产物。
@@ -99,8 +192,7 @@ var tokenPatterns = []*regexp.Regexp{
 // 两级脱敏会互相看得见：环境值替换留下的 redactedMark 本身就是一个
 // 「token=…」形态的值，形态兜底若不跳过它就会写成 [REDACTED][REDACTED]。
 func isRedactedValue(s string) bool {
-	t := strings.Trim(s, `"'`)
-	return t == redactedMark
+	return strings.Trim(s, `"'`) == redactedMark
 }
 
 // redactSecrets 把一段自由文本里的凭据替换成 redactedMark。
@@ -146,23 +238,10 @@ func redactSecrets(s string, env map[string]string) string {
 		s = strings.NewReplacer(replacers...).Replace(s)
 	}
 
-	// 3) 形态兜底。用 ReplaceAllStringFunc 而不是 ReplaceAllString 的
-	// `${1}` 模板：要能跳过「上一级已经抹过」的那一段，只替换真正的值。
-	for _, re := range tokenPatterns {
-		s = re.ReplaceAllStringFunc(s, func(m string) string {
-			v := re.FindStringSubmatch(m)
-			if len(v) < 2 || isRedactedValue(v[len(v)-1]) {
-				// 没有捕获组可保留（整段都该抹），或上一级已经抹过这一段。
-				return m
-			}
-			// 单捕获组：前缀原样保留（「这里有个 ghp_ 开头的凭据」是有用
-			// 的信息）。多捕获组（key=value 形态）：前置字符 + 词根保留，
-			// 只抹值。
-			if len(v) == 2 {
-				return v[1] + redactedMark
-			}
-			return v[1] + v[2] + redactedMark
-		})
+	// 3) 形态兜底。每个条目只抹它标出的那一段，其余（前缀、`user:`、
+	// `@host`、引号）原样保留 —— 见 tokenShape 的注释。
+	for _, shape := range tokenShapes {
+		s = shape.redact(s)
 	}
 	return s
 }

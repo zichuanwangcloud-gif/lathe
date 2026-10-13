@@ -104,6 +104,127 @@ func TestRedactSecretsCoversEnvValuesAndTokenShapes(t *testing.T) {
 	}
 }
 
+// 形态表逐条钉住。每格都是一次实测留下的：AWS key id 曾被吐出去一半、
+// JSON 形态曾整体漏出去、连接串的口令段曾整条漏。
+//
+// 断言分两步：**凭据不在**（安全），**上下文还在**（摘要仍然可读）。
+// 只断言前者会让「整段抹掉」这种粗暴实现也过，而那种实现把排障信息一起
+// 抹了 —— 摘要的价值就在于「哪一步、为什么」。
+func TestRedactSecretsShapes(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		wantOut  string // 逐字断言：替换位置也要钉住
+		mustGone []string
+	}{
+		{
+			name:    "AWS key id 整段抹掉",
+			in:      "aws key AKIAIOSFODNN7EXAMPLE unused",
+			wantOut: "aws key [REDACTED] unused",
+		},
+		{
+			name:     "JWT 整段抹掉",
+			in:       "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.abc-DEF_012",
+			wantOut:  "Bearer [REDACTED]",
+			mustGone: []string{"eyJhbGciOiJIUzI1NiJ9"},
+		},
+		{
+			name:    "URL 只抹口令段",
+			in:      "postgres://lathe:s3cr3t-pw@127.0.0.1:55432/lathe_a3",
+			wantOut: "postgres://lathe:[REDACTED]@127.0.0.1:55432/lathe_a3",
+		},
+		{
+			name:    "无 scheme 的连接串同样抹",
+			in:      "dial lathe:s3cr3t-pw@127.0.0.1:55432 timeout",
+			wantOut: "dial lathe:[REDACTED]@127.0.0.1:55432 timeout",
+		},
+		{
+			name:    "GitHub PAT 保留前缀",
+			in:      "auth=ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+			wantOut: "auth=ghp_[REDACTED]",
+		},
+		{
+			name:    "Linear key 保留前缀",
+			in:      "lin_api_abcdefghijklmnopqrstuvwxyz123456",
+			wantOut: "lin_api_[REDACTED]",
+		},
+		{
+			name:    "Slack token 保留前缀",
+			in:      "xoxb-123456789012-abcdefghij",
+			wantOut: "xoxb-[REDACTED]",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactSecrets(c.in, nil)
+			if got != c.wantOut {
+				t.Errorf("got  %q\nwant %q", got, c.wantOut)
+			}
+			for _, g := range c.mustGone {
+				if strings.Contains(got, g) {
+					t.Errorf("仍含凭据片段 %q：%q", g, got)
+				}
+			}
+		})
+	}
+}
+
+// kv / JSON 形态：键带不带引号、冒号后有没有空格、值带不带引号，
+// 六种组合都要抹 —— 少一种就是一个漏点。
+func TestRedactSecretsKVAndJSONShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		wantOut string
+	}{
+		{"裸键等号", `token=hunter2hunter2`, `token=[REDACTED]`},
+		{"裸键冒号", `token: hunter2hunter2`, `token: [REDACTED]`},
+		{"裸键冒号无空格", `token:hunter2hunter2`, `token:[REDACTED]`},
+		{"裸键带引号值", `token:"hunter2hunter2"`, `token:[REDACTED]`},
+		{"引号键无空格", `"token":"hunter2hunter2"`, `"token":[REDACTED]`},
+		{"引号键带空格", `"token": "hunter2hunter2"`, `"token": [REDACTED]`},
+		{"JSON 对象里的 apiKey", `{"apiKey":"abcd1234abcd1234"}`, `{"apiKey":[REDACTED]}`},
+		{"单引号键", `'password': 'hunter2hunter2'`, `'password': [REDACTED]`},
+		{"带前缀的变量名", `DATABASE_PASSWORD="hunter2hunter2"`, `DATABASE_PASSWORD=[REDACTED]`},
+		{"下划线前缀的 token", `oauth_token=short`, `oauth_token=[REDACTED]`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := redactSecrets(c.in, nil); got != c.wantOut {
+				t.Errorf("got  %q\nwant %q", got, c.wantOut)
+			}
+		})
+	}
+}
+
+// 反向的**误伤面**：非凭据的地址/模式值不许被抹。
+//
+// 早先版本按「变量名里有 URL / AUTH 就抹」取值，实测把
+// `got redirect https://…/tasks/1` 与 `auth mode is disabled` 打成
+// [REDACTED] —— 那两类输出恰恰是验证失败时最该看的。这条用例把口径钉住：
+// 只有真的凭据名（token/secret/password/key 词根、DSN 这一类）才抹。
+func TestRedactSecretsLeavesNonSecretConfigValuesAlone(t *testing.T) {
+	t.Setenv("LATHE_BASE_URL", "https://lathe.example.com")
+	t.Setenv("LATHE_AUTH_MODE", "disabled")
+	t.Setenv("DATABASE_URL", "postgres://lathe:lathe@127.0.0.1:55432/lathe_a3")
+
+	cases := []string{
+		"got redirect https://lathe.example.com/tasks/1",
+		"auth mode is disabled, expected enabled",
+		"base url is https://lathe.example.com",
+	}
+	for _, in := range cases {
+		if got := redactSecrets(in, nil); got != in {
+			t.Errorf("非凭据值被误伤：\nin  %q\nout %q", in, got)
+		}
+	}
+	// 但 DSN 里的口令段仍然要抹（LATHE_BASE_URL 收窄了，DATABASE_URL 没有）
+	got := redactSecrets("connect postgres://lathe:lathe@127.0.0.1:55432/lathe_a3 failed", nil)
+	if strings.Contains(got, ":lathe@") {
+		t.Errorf("DSN 口令段泄漏：%q", got)
+	}
+}
+
 // 反向：正常输出一个字节都不许动。脱敏误伤（把普通词抹成 [REDACTED]）
 // 会让摘要失去排障价值，与不脱敏一样糟。
 func TestRedactSecretsLeavesOrdinaryOutputAlone(t *testing.T) {
@@ -119,10 +240,15 @@ func TestRedactSecretsLeavesOrdinaryOutputAlone(t *testing.T) {
 	if got := redactSecrets(in, nil); got != in {
 		t.Errorf("普通输出被误改：\n得到:\n%s\n期望:\n%s", got, in)
 	}
-	// 短值不抹（这是上面那条得以成立的前提之一）
+	// 环境值那一级的长度门槛：短值不抹（这是上面那条得以成立的前提之一）。
+	// 注意这**只**管环境值那一级 —— 形态表命中的 `token=…` 一律抹，
+	// 见下面 TestRedactSecretsRedactsExplicitSecretKeys。
 	t.Setenv("LATHE_MIN_SHORT_TOKEN", "true")
-	if got := redactSecrets("token=true", nil); got != "token=true" {
-		t.Errorf("短值不该脱敏：%q", got)
+	if got := redactSecrets("token=true", nil); got != "token=[REDACTED]" {
+		t.Errorf("形态表命中的键应一律脱敏：%q", got)
+	}
+	if got := redactSecrets("值就三个字母 true", nil); got != "值就三个字母 true" {
+		t.Errorf("环境值那一级应受长度门槛保护，不抹短串：%q", got)
 	}
 }
 

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
@@ -228,13 +230,12 @@ func TestFailureMemoryInjectedOnRetry(t *testing.T) {
 			len(ag2.calls), promptDump(ag2.calls))
 	}
 	implPrompt := ag2.calls[1].Prompt
-	if !strings.Contains(implPrompt, "改不动") && !strings.Contains(implPrompt, rc777Title()) {
-		// 实现的提示词应带着需求正文（证明这是实现那一次调用，而不是
-		// 又一次分诊）。分诊的提示词里也有需求，所以这一条只是交叉校验；
-		// 真正判「是不是实现」的是下面注入断言 + 阶段断言。
-		t.Logf("实现提示词：\n%s", implPrompt)
+	// 真断言（不是 log）：第二次调用必须是**实现**那一次，而不是又一次
+	// 分诊 —— 分诊也注入，若夹具退回「第二轮死在建工作区」，这条会在
+	// 注入断言之前先红，失败信息也直接指出是夹具没走到实现。
+	if !strings.Contains(implPrompt, "当前已在分支") {
+		t.Fatalf("第二次调用应是实现阶段（提示词含「当前已在分支 …」），实际：\n%s", implPrompt)
 	}
-
 	// 断言：第二轮的实现提示词带上了历史失败。
 	if !strings.Contains(implPrompt, "这个需求此前失败过") {
 		t.Errorf("重试时实现提示词应含历史失败段，实际：\n%s", implPrompt)
@@ -248,16 +249,16 @@ func TestFailureMemoryInjectedOnRetry(t *testing.T) {
 	}
 }
 
-// rc777Title 返回夹具 issue 的标题（断言提示词内容用）。
-func rc777Title() string { return demoIssue().Title }
-
-// ★ ReentryImplementPrompt 那条路径（EntryImplement + 会话不可续）同样要注入。
+// ★ EntryImplement 重入（现场保留）同样要注入。
 //
 // 与上一条的区别：这里**不重建**现场，任务在 failed → queued 之后以
-// `Retry{Entry: EntryImplement}` 直接重入实现阶段（人工重试的「续跑」形态，
-// 现场还在）。这正是「不存在 worktree 就注入不到」的盲区 —— 上一条
-// 用重建覆盖了 ImplementPrompt，这一条必须单独守住 reentry 那支。
-func TestFailureMemoryInjectedOnReentry(t *testing.T) {
+// `Retry{Entry: EntryImplement}` 直接重入实现阶段，会话不可续 → 走
+// `ReentryImplementPrompt` 那条**提示词**分支。
+//
+// ⚠ 注意它走的 phase 是 `implement` 而不是 `implement-reentry`：后者是
+// resume 失败后的降级分支（见 TestFailureMemoryInjectedOnResumeDegrade）。
+// 这条用例守的是「EntryImplement 重入也有注入」，不是降级分支。
+func TestFailureMemoryInjectedOnImplementEntry(t *testing.T) {
 	_, m, taskID, repo, src := pipelineFixture(t)
 	ctx := context.Background()
 
@@ -326,6 +327,97 @@ func TestFailureMemoryInjectedOnReentry(t *testing.T) {
 	}
 	if !strings.Contains(got, firstStage) {
 		t.Errorf("注入的内容应是第一轮的失败阶段 %q，实际：\n%s", firstStage, got)
+	}
+}
+
+// ★ resume 失败降级那条分支（phase = "implement-reentry"）也要注入。
+//
+// 这是**唯一**会打出 `implement-reentry` 这个 phase 的路径：第一次调用是
+// resume（提示词里已经带着本任务的失败原因，因此排除自记录），会话数据
+// 丢了之后流水线降级为「同工作区新会话」，而新会话对「上次死在哪」一无所知
+// —— 注入必须发生在这第二次调用上。
+//
+// 为什么单列一条：`implement-reentry` 与 `implement` 是白名单里的两个名字，
+// 只留 `implement` 时前面的用例全都照样绿（它们命中的都是 `implement`），
+// 这条是那个漏点的看守。
+func TestFailureMemoryInjectedOnResumeDegrade(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{URL: "https://x/pr/12", Number: 12}}
+	// 第一次调用直接报错（模拟 claude 的会话数据已不在本机），第二次成功
+	ag := &fakeAgent{
+		errs: []error{errors.New("No conversation found with session ID"), nil},
+		results: []*agent.Result{
+			nil,
+			{Success: true, Text: "新会话收尾完成"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				return os.WriteFile(filepath.Join(dir, "README.md"),
+					[]byte("# src\n\n半成品 + 新会话补完\n"), 0o644)
+			},
+		},
+	}
+	mem := newFakeMemory()
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.Memory = mem
+
+	// 造一个「实现阶段失败过、现场保留、有会话 ID」的任务，再把它摆成
+	// 「人工续跑」的形态（prepareFailedTask 会建工作区 + 落会话 ID）。
+	prepareFailedTask(t, p, m, taskID, src, repo, StageImplementRun, false)
+
+	// 预置本任务那条失败记忆：resume 那一次应当排除它（失败原因已经在
+	// 提示词里），而**降级后的新会话**必须读到它。
+	//
+	// 定位键从任务行现取 —— 注入侧就是按这几个字段查的，写别的键等于
+	// 写了也读不到。
+	const wantMarker = "上一次：main.go:12: undefined: greet"
+	tk, err := m.Get(ctx, taskID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	realKey := store.FailureLookup{
+		UserID: tk.UserID, RepoID: tk.RepoID,
+		TrackerProvider: tk.TrackerProvider, ExternalKey: tk.ExternalKey,
+	}
+	mem.InsertFailureDigest(ctx, store.FailureDigest{
+		TaskID: taskID, Stage: string(StageImplementIncomplete),
+		Reason: "实现中断", Excerpt: wantMarker,
+	}, realKey)
+	mem.written = nil // 上面那次插入只是铺记忆，不算「本次执行写下的」
+
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
+		Retry: &RetryPlan{Entry: EntryImplement, ResumeSession: true, Reasons: []string{"续跑原会话"}},
+	}); err != nil {
+		t.Fatalf("降级续跑应成功: %v", err)
+	}
+
+	if len(ag.calls) != 2 {
+		t.Fatalf("应两次调用 agent（resume 失败 + 降级新会话），实际 %d: %s",
+			len(ag.calls), promptDump(ag.calls))
+	}
+	if !ag.calls[0].Resume {
+		t.Fatal("第一次调用应是 resume 尝试（否则这条用例没走到降级分支）")
+	}
+	// resume 那次：本任务的失败原因已在提示词里，不该再注入历史段
+	if strings.Contains(ag.calls[0].Prompt, "这个需求此前失败过") {
+		t.Errorf("resume 那次应排除自记录，实际注入了：\n%s", ag.calls[0].Prompt)
+	}
+	// 降级那次（phase = implement-reentry）：必须注入 —— 新会话没有第一轮
+	// 的记忆，这份历史就是它唯一的线索。
+	got := ag.calls[1].Prompt
+	if ag.calls[1].Resume {
+		t.Fatal("降级后不应再 resume")
+	}
+	if !strings.Contains(got, "这个需求此前失败过") {
+		t.Errorf("降级新会话的提示词应含历史失败段，实际：\n%s", got)
+	}
+	if !strings.Contains(got, wantMarker) {
+		t.Errorf("注入的应是那段历史输出摘要 %q，实际：\n%s", wantMarker, got)
 	}
 }
 
