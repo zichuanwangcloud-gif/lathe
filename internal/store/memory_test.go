@@ -225,6 +225,61 @@ func TestFailureDigestIsolation(t *testing.T) {
 	}
 }
 
+// ★ AC2 的最严一档：**同 repo_id、不同 user_id** 也必须隔离。
+//
+// 上一条用例（TestFailureDigestIsolation）里的「另一个用户」走的是
+// userB + repoB —— 两个维度一起变，于是 `user_id = $1` 这一条单独去掉
+// 也照样绿（repo_id 那一半还挡着）。这条把变量降到只剩 user_id：repo、
+// 平台、单号三者全同，只有属主不同。
+//
+// 造法：B 派发同一个单子、指向 A 的 repo（`tasks` 没有「任务行必须属于
+// repo 属主」的约束，这正是「一个工作区被跨用户同名 issue 共用」那条
+// 老问题的来源，见 machine.go 的 ClaimedWorktreePaths 注释）。两行任务
+// 只能有一个是活着的（tasks_one_active_per_item），所以 A 那行先转终态
+// —— 与真实的「B 接了同一个 issue」形态一致：A 已经失败收场。
+//
+// 0030 迁移的多租户段（显式带 user_id、不靠 repo_id 隐式限定）守的正是
+// 这条边界：一旦查询漏了 user_id，B 派发时会读到 A 的记忆。
+func TestFailureDigestIsolatesSameRepoDifferentUser(t *testing.T) {
+	st := testStore(t)
+	userA, repoA := metricsFixture(t, st)
+	userB, _ := metricsFixture(t, st)
+	ctx := context.Background()
+
+	const key = "MEM-CROSS-USER"
+	tkA := metricsTask(t, st, userA, repoA, key)
+	// A 的那行先终态：否则 B 建同 (repo, key) 的活任务会撞部分唯一索引
+	metricsTaskFailed(t, st, tkA, "verify_failed")
+	tkB := metricsTask(t, st, userB, repoA, key)
+
+	if err := st.InsertFailureDigest(ctx, FailureDigest{
+		TaskID: tkA, Stage: "verify_failed", Reason: "A 的失败",
+	}, memoryLookup(userA, repoA, key)); err != nil {
+		t.Fatalf("落库失败: %v", err)
+	}
+	if err := st.InsertFailureDigest(ctx, FailureDigest{
+		TaskID: tkB, Stage: "implement_run", Reason: "B 的失败",
+	}, memoryLookup(userB, repoA, key)); err != nil {
+		t.Fatalf("落库失败: %v", err)
+	}
+
+	gotA, err := st.LatestFailureDigest(ctx, memoryLookup(userA, repoA, key), 0)
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if gotA == nil || gotA.Stage != "verify_failed" || gotA.TaskID != tkA {
+		t.Fatalf("A 应只看到自己那条（verify_failed / task %d），得到 %+v", tkA, gotA)
+	}
+
+	gotB, err := st.LatestFailureDigest(ctx, memoryLookup(userB, repoA, key), 0)
+	if err != nil {
+		t.Fatalf("查询失败: %v", err)
+	}
+	if gotB == nil || gotB.Stage != "implement_run" || gotB.TaskID != tkB {
+		t.Fatalf("B 应只看到自己那条（implement_run / task %d），得到 %+v", tkB, gotB)
+	}
+}
+
 // 删除用户时记忆随之消失（外键 ON DELETE CASCADE）。
 //
 // 断言的意义在于：这条链上挂了三个外键（user/repo/task），漏掉任何一个

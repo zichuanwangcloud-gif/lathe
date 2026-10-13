@@ -139,8 +139,8 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 
 ### 3.6 度量与迭代
 
-15. ~~**平台自度量**：成功率、各环节时长分布、失败分类直方图 —— 迭代平台本身时回答"改动有没有用"。~~ **已交付**：`GET /api/stats/metrics` + 看板「平台度量」面板。各环节（排队/分诊/实现/验证/端到端）的 p50/p95/最大/累计，失败分类直方图带中文标签。数据源 `task_events`，取首次进入的里程碑并丢弃续跑产生的负差值。**注意成功率已有**（`Stats.SuccessRate`，看板顶部），本次没有重复做。
-16. ~~**跨任务记忆**：失败 digest 入库，同 issue 重试时注入"上次死在哪"。与修复回路互补（回路管单次任务内，记忆管跨任务）。~~ **已交付**：`failure_digests` 表（migration 0030，append-only）+ 注入点在 runner 的 prompt 构造外层（分诊与实现两处），带上限与「这是历史」的措辞。定位键是 `(user_id, repo_id, tracker_provider, external_key)` —— 按单子而非任务行，因为 issue 关掉重开会新建任务行。
+15. ~~**平台自度量**：成功率、各环节时长分布、失败分类直方图 —— 迭代平台本身时回答"改动有没有用"。~~ **已交付**：`GET /api/stats/metrics` + 看板「平台度量」面板。各环节（排队/分诊/实现/验证/端到端）的 p50/p95/最大/累计，失败分类直方图带中文标签。数据源 `task_events`，取首次进入的里程碑并丢弃续跑产生的负差值。**口径是「环境耗时」不是「平台忙时」**：分诊段包含 awaiting_approval 的人工等待、排队长包含 blocked_dep 的依赖等待（`internal/store/metrics.go` 的 segmentMarksCTE 注释里有取舍理由）。**注意成功率已有**（`Stats.SuccessRate`，看板顶部），本次没有重复做。
+16. ~~**跨任务记忆**：失败 digest 入库，同 issue 重试时注入"上次死在哪"。与修复回路互补（回路管单次任务内，记忆管跨任务）。~~ **已交付**：`failure_digests` 表（migration 0030，append-only）+ 注入点在 runner 的 prompt 构造外层（分诊一处，实现链路收敛到 `runAgent` 一个入口，见 `injectFailureMemory`），带上限与「这是历史」的措辞。摘要是失败步骤输出的**尾部**，落库前脱敏（`redactSecrets`：环境凭据值 + 常见 token 形态）。定位键是 `(user_id, repo_id, tracker_provider, external_key)` —— 按单子而非任务行，因为 issue 关掉重开会新建任务行。
 
 ## 4. 建议批次
 

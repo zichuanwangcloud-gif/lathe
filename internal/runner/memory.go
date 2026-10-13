@@ -50,24 +50,34 @@ import (
 )
 
 const (
-	// maxFailureExcerpt 是注入时「验证输出摘要」的长度上限。
+	// maxFailureExcerpt 是注入时「验证输出摘要」的**字节**上限。
 	//
 	// 这个上限服务的是**提示词预算**（brief 第 3 条「注入要克制」），与
 	// 落库侧的上限是两个不同的约束：库里留长一点是为了排障回看，注入的
-	// 必须短。2000 字符的来由：实现 prompt 本身约 1.5KB，加上这份摘要仍在
-	// 4KB 附近，相对 agent 的上下文可以忽略；而 2000 字符足以装下一次
+	// 必须短。2000 字节的来由：实现 prompt 本身约 1.5KB，加上这份摘要仍在
+	// 4KB 附近，相对 agent 的上下文可以忽略；而 2000 字节足以装下一次
 	// `go test` 失败的全部关键几行（编译错误 + 断言输出）。
+	//
+	// 口径是**字节**不是字符：截断函数按字节切（再回退到 rune 边界），
+	// 上限服务的是字节预算 —— 按 rune 计还要先整串解码，而截断发生在
+	// 每次注入的热路径上。
 	maxFailureExcerpt = 2000
 
-	// maxDigestReason 是注入时「一句话原因」的长度上限。failure_reason 在
+	// maxDigestReason 是注入时「一句话原因」的字节上限。failure_reason 在
 	// 落库前已被 fail() 截到 3000，这里再收一道 —— 注入是给人读的提醒，
 	// 不是完整报告（完整报告在任务详情页与回帖里）。
 	maxDigestReason = 600
 
-	// maxDigestStoredReason 是失败原因**落库**的长度上限。与回帖正文的
+	// maxDigestStoredReason 是失败原因**落库**的字节上限。与回帖正文的
 	// 3000 同量级：回帖是给人扫一眼的，记忆是排障时回看的。两者都不该
 	// 无限长 —— failure_reason 是自由文本，验证摘要会把编译错误整个灌进来。
 	maxDigestStoredReason = 3000
+
+	// maxDigestStoredExcerpt 是「验证输出摘要」**落库**的字节上限（含截断
+	// 标记）。取失败步骤输出的**尾部**：go test / 编译器把结论（FAIL 行、
+	// 断言、panic 栈底）写在最后。比注入上限宽，是为了排障回看时多留几行
+	// 上下文；它仍远小于 verify 的 maxStepOutput（16KB），单条不会把库撑爆。
+	maxDigestStoredExcerpt = 8 << 10 // 8KB
 )
 
 // FailureMemory 是流水线用到的失败记忆读写面。
@@ -125,7 +135,10 @@ func renderFailureMemory(d *store.FailureDigest) string {
 	}
 	if excerpt != "" {
 		b.WriteString("\n失败时的输出摘要：\n\n```\n")
-		b.WriteString(truncate(excerpt, maxFailureExcerpt))
+		// 取**尾部**：摘要是失败步骤输出的后半段（结论在后面），从头部
+		// 截会把最有用的几行切掉。tail 按字节切且回退到 rune 边界，
+		// 不会切出非法 UTF-8。
+		b.WriteString(tail(excerpt, maxFailureExcerpt))
 		b.WriteString("\n```\n")
 	}
 	return b.String()
@@ -198,9 +211,12 @@ func (p *Pipeline) recordFailureMemoryFor(ctx context.Context, taskID int64, lk 
 		return
 	}
 	d := store.FailureDigest{
-		TaskID:  taskID,
-		Stage:   string(stage),
-		Reason:  truncate(fmt.Sprintf("%s: %v", stage.label(), cause), maxDigestStoredReason),
+		TaskID: taskID,
+		Stage:  string(stage),
+		// 原因同样过一遍脱敏：失败原因会把验证错误原样带进来（回帖正文
+		// 就是这么拼的），而回帖只给人看一眼，这份要在库里躺着、还会被
+		// 注入下一个 agent 的提示词。nil 环境 —— 这条路径拿不到具体步骤。
+		Reason:  redactSecrets(truncate(fmt.Sprintf("%s: %v", stage.label(), cause), maxDigestStoredReason), nil),
 		Excerpt: excerpt,
 	}
 	if err := p.Memory.InsertFailureDigest(ctx, d, lk); err != nil {

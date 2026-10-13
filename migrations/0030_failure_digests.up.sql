@@ -66,9 +66,13 @@ CREATE TABLE failure_digests (
   -- 给人看的一句话原因（含阶段标签前缀），已按 rune 截断。
   failure_reason   text,
   -- 验证输出摘要。这是「上次死在哪」最有价值的部分：阶段只说明了
-  -- 「哪一步」，摘要说明「为什么」。已在写入侧截断（见 runner 的
-  -- maxFailureExcerpt），上限写死是为了不让单条超长输出把库撑爆 ——
-  -- 注入侧还有一道更紧的上限（防提示词被撑爆），两道各有各的理由。
+  -- 「哪一步」，摘要说明「为什么」。它在**写入侧**已做两件事：
+  --   1) 按字节上限截断（runner 的 maxDigestStoredExcerpt，含截断标记，
+  --      按 rune 边界回退，不会切出非法 UTF-8 —— 落库撞 SQLSTATE 22021
+  --      就是那么来的）。取的是失败步骤输出的**尾部**：结论写在最后。
+  --   2) 脱敏（runner 的 redactSecrets）：验证命令继承宿主环境，输出里
+  --      回显凭据/带口令的连接串是常见形态，而这份文本会进提示词与详情页。
+  -- 注入侧还有一道更紧的字节上限（防提示词被撑爆），两道各有各的理由。
   excerpt          text,
   at               timestamptz NOT NULL DEFAULT now()
 );

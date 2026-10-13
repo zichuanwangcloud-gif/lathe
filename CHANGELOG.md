@@ -14,12 +14,19 @@
   最大 / 累计）与失败分类直方图；看板新增「平台度量」面板。数据源是
   `task_events`（append-only 状态转移流）而非 `tasks.updated_at` —— 后者被
   触发器每次 UPDATE 刷新，算不出分段。环节时长按**首次进入**取里程碑
-  （重试不混入重跑轮），并丢弃续跑跳环节造成的负差值。按登录用户隔离
+  （重试不混入重跑轮），并丢弃续跑跳环节造成的负差值。按登录用户隔离。
+  口径是「环境耗时」不是「平台忙时」：分诊段含 awaiting_approval 的人工
+  等待、排队长含 blocked_dep 的依赖等待（取舍理由见 store/metrics.go）
 - **跨任务失败记忆**（§3.6 第 16 条）：`failure_digests` 表 + `internal/store`
   读写 + 注入消费方。任务失败时把阶段、原因与验证输出摘要落库（append-only，
   同一单子反复失败留痕）；同一需求单再次派发时，把最近一次失败摘要追加到
-  分诊与实现的提示词末尾。注入有硬上限（摘要 2000 / 原因 600 字符）并明确
-  标注为历史记录；续跑场景不重复注入。mergepoll 的 rebase 失败路径同样落记忆
+  分诊与实现的提示词末尾（注入点收敛在 runner 的 runAgent 一个入口，见
+  injectFailureMemory —— 四个 prompt 构造函数签名不变）。注入有硬上限
+  （摘要 2000 / 原因 600 字节）并明确标注为历史记录；续跑场景不重复注入。
+  摘要是失败步骤输出的**尾部**（go test / 编译器的结论在后面），落库前按
+  「环境里的凭据值 + 常见 token 形态」脱敏 ——
+  验证命令继承宿主环境，输出里回显凭据是最真实的泄漏形态。mergepoll 的
+  rebase 失败路径同样落记忆
 - `runner.Stage.Label()`：失败阶段代码的导出标签方法，供度量接口补中文名 ——
   措辞是 runner 包的知识，避免 store 与前端各存一份
 - `store.MetricsStatsFor` / `store.LatestFailureDigest` / `store.InsertFailureDigest`

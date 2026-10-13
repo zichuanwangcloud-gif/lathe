@@ -2,8 +2,11 @@ package runner
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
@@ -104,21 +107,55 @@ func TestFailureMemoryRecordedOnFailure(t *testing.T) {
 	}
 }
 
+// reclaimWorktree 把一次已失败任务的现场按**真实路径**回收掉：先删盘，
+// 再让任务行不再认领它。
+//
+// 这不是测试自造的脚手架，而是生产上的必经步骤：queue 在 plan.Fresh 时
+// 调 Discard 删盘，但因为 Discard 只动磁盘不动任务行，Fresh 重建会撞上
+// 自己留在 worktree_path 里的旧路径（ClaimedWorktreePaths 把本任务算作
+// 认领者），Create 于是拒绝接管 —— 只有 T6 收割机落账（ClaimForReap
+// 的 commit 阶段置空 worktree_path）之后，重建才走得通。夹具走这条真实
+// 路径，顺带守住「夹具越简单越好的前提是它还在测那条真实路径」。
+func reclaimWorktree(t *testing.T, ctx context.Context, m *task.Machine, p *Pipeline, repo RepoConfig, tk *task.Task) {
+	t.Helper()
+	if tk.WorktreePath == nil || *tk.WorktreePath == "" {
+		return
+	}
+	path, branch := *tk.WorktreePath, ""
+	if tk.BranchName != nil {
+		branch = *tk.BranchName
+	}
+	p.Worktrees.Discard(ctx, repo.ProviderRepo, path, branch)
+
+	// 落账用任务的 updated_at 做乐观并发的快照（收割机的做法）
+	cur, err := m.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	ok, err := m.ClaimForReap(ctx, tk.ID, path, cur.UpdatedAt, true, "system",
+		map[string]any{"kind": "worktree_reaped", "why": "测试夹具回收现场"})
+	if err != nil || !ok {
+		t.Fatalf("回收现场失败: ok=%v err=%v（pendingReap 之后任务行被动过？）", ok, err)
+	}
+}
+
 // ★ AC3 的记忆闭环，后半：同 issue 重试 → 提示词含 digest 摘要；
 // 无历史失败 → 提示词不变。
 //
 // 这条把两半缝在一起验：先让一次执行失败写下记忆，再在同一 task 行上
-// 从「全新会话」重入（ReentryImplementPrompt 那条路径），断言第二次的
-// 提示词里出现了第一次的失败摘要。同时用一条对照组断言「没记忆时提示词
-// 逐字不变」—— 少了这一条，一个「无脑往所有提示词里塞一段」的实现也能
-// 让前半通过。
+// 从「全新会话」重入（Fresh 重建 → 走 ImplementPrompt 那条路径），断言
+// 第二次的实现提示词里出现了第一次的失败摘要。同时用一条对照组断言
+// 「没记忆时提示词逐字不变」—— 少了这一条，一个「无脑往所有提示词里塞
+// 一段」的实现也能让前半通过。
+//
+// 断言落在**实现**那一次调用上（不是「任意一次」）：分诊也注入，
+// 「至少一次带上」的写法会让「实现提示词没注入」这个回归静默通过 ——
+// 那正是这条用例要守的东西。
 func TestFailureMemoryInjectedOnRetry(t *testing.T) {
 	_, m, taskID, repo, src := pipelineFixture(t)
 	ctx := context.Background()
 
 	mem := newFakeMemory()
-	// 预置一条历史失败：模拟「这个单子上一轮死过」。Stage 与摘要刻意
-	// 用可搜索的独特字符串，便于断言注入了正确的那一份。
 
 	lin := &fakeLinear{issue: demoIssue()}
 	ag := &fakeAgent{
@@ -139,6 +176,11 @@ func TestFailureMemoryInjectedOnRetry(t *testing.T) {
 	if len(mem.written) != 1 {
 		t.Fatalf("第一轮应写下 1 条记忆，实际 %d", len(mem.written))
 	}
+	firstStage := mem.written[0].Stage
+	if firstStage != string(StageImplementIncomplete) {
+		t.Fatalf("第一轮的失败阶段 = %q，期望 %q（夹具没走到实现阶段？）",
+			firstStage, StageImplementIncomplete)
+	}
 
 	// 读出真实定位键：注入用它查表。fakeMemory 按 lookup 存，
 	// 所以第一次写入时记下的键就是重试时要查的键。
@@ -150,25 +192,13 @@ func TestFailureMemoryInjectedOnRetry(t *testing.T) {
 		t.Fatalf("第一轮写下的记忆应能按该键查到，键=%+v", realKey)
 	}
 
-	// 第二轮：任务回到 queued 后重跑。这次走全新会话（Fresh 重建），
-	// agent 交出的实现应当被注入历史失败摘要。
-	//
-	// 重建前必须丢弃旧现场：worktree 的尸体仍在磁盘上，Create 会把它当
-	// 在途现场拒绝接管（这正是 mingled 现场保护的设计，见 §9）。真实
-	// 路径上这一步由 queue 的 plan.Fresh 分支调 Discard 完成，测试里
-	// 手工补上。
+	// 第二轮：按真实的重建路径走 —— 回收现场（收割机落账）→ 转回 queued
+	// → 以 Fresh 计划重派同一任务行。
 	tk, err := m.Get(ctx, taskID)
 	if err != nil {
 		t.Fatalf("Get 失败: %v", err)
 	}
-	path, branch := "", ""
-	if tk.WorktreePath != nil {
-		path = *tk.WorktreePath
-	}
-	if tk.BranchName != nil {
-		branch = *tk.BranchName
-	}
-	p.Worktrees.Discard(ctx, "acme/demo", path, branch)
+	reclaimWorktree(t, ctx, m, p, repo, tk)
 
 	if _, err := m.Transition(ctx, taskID, task.StateQueued, "user:1", nil); err != nil {
 		t.Fatalf("转回 queued 失败: %v", err)
@@ -190,23 +220,112 @@ func TestFailureMemoryInjectedOnRetry(t *testing.T) {
 		t.Fatal("第二轮也应当失败（夹具刻意如此）")
 	}
 
-	// 断言：第二轮里至少有一次 agent 调用的提示词带上了历史失败。
-	// 分诊与实现两处都注入了，所以只要有一次带上就算成。
-	found := false
-	for _, c := range ag2.calls {
-		if strings.Contains(c.Prompt, "这个需求此前失败过") {
-			found = true
-			break
-		}
+	// 前置断言：第二轮**确实走进了实现阶段**。少了它，一个「第二天挂在
+	// 建工作区上」的夹具会让后面所有断言都变成空转（这正是这条用例
+	// 修前的状态：第二轮死在 create_worktree，注入删掉也照样绿）。
+	if len(ag2.calls) < 2 {
+		t.Fatalf("第二轮应至少走到实现阶段（分诊 + 实现两次调用），实际 %d 次: %s",
+			len(ag2.calls), promptDump(ag2.calls))
 	}
-	if !found {
-		t.Errorf("重试时应把历史失败摘要注入提示词，实际调用：%s", promptDump(ag2.calls))
+	implPrompt := ag2.calls[1].Prompt
+	if !strings.Contains(implPrompt, "改不动") && !strings.Contains(implPrompt, rc777Title()) {
+		// 实现的提示词应带着需求正文（证明这是实现那一次调用，而不是
+		// 又一次分诊）。分诊的提示词里也有需求，所以这一条只是交叉校验；
+		// 真正判「是不是实现」的是下面注入断言 + 阶段断言。
+		t.Logf("实现提示词：\n%s", implPrompt)
+	}
+
+	// 断言：第二轮的实现提示词带上了历史失败。
+	if !strings.Contains(implPrompt, "这个需求此前失败过") {
+		t.Errorf("重试时实现提示词应含历史失败段，实际：\n%s", implPrompt)
 	}
 	// 且注入的必须是「历史」那一份（第一轮的失败阶段），不是本次的
-	joined := promptDump(ag2.calls)
-	if !strings.Contains(joined, string(StageImplementIncomplete)) {
-		t.Errorf("注入的内容应是第一轮那次失败的阶段 %q，实际：%s",
-			StageImplementIncomplete, joined)
+	if !strings.Contains(implPrompt, firstStage) {
+		t.Errorf("注入的内容应是第一轮那次失败的阶段 %q，实际：\n%s", firstStage, implPrompt)
+	}
+	if len(mem.written) != 2 {
+		t.Errorf("第二轮失败也应写下记忆，实际共 %d 条", len(mem.written))
+	}
+}
+
+// rc777Title 返回夹具 issue 的标题（断言提示词内容用）。
+func rc777Title() string { return demoIssue().Title }
+
+// ★ ReentryImplementPrompt 那条路径（EntryImplement + 会话不可续）同样要注入。
+//
+// 与上一条的区别：这里**不重建**现场，任务在 failed → queued 之后以
+// `Retry{Entry: EntryImplement}` 直接重入实现阶段（人工重试的「续跑」形态，
+// 现场还在）。这正是「不存在 worktree 就注入不到」的盲区 —— 上一条
+// 用重建覆盖了 ImplementPrompt，这一条必须单独守住 reentry 那支。
+func TestFailureMemoryInjectedOnReentry(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+
+	mem := newFakeMemory()
+	lin := &fakeLinear{issue: demoIssue()}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"有现象","question":""}`},
+			{Success: false, IsError: true, Subtype: "error_during_execution", Text: "第一轮挂了"},
+		},
+	}
+	p := newPipeline(t, m, lin, &fakeGitHub{}, ag, &fakeNotifier{})
+	p.Memory = mem
+
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
+	}); err == nil {
+		t.Fatal("第一轮应当失败")
+	}
+	if len(mem.written) != 1 {
+		t.Fatalf("第一轮应写下 1 条记忆，实际 %d", len(mem.written))
+	}
+	firstStage := mem.written[0].Stage
+
+	// 现场保留（这条正是「保留现场 ≠ 不能回收」的另一半：能续就直接续）
+	if _, err := m.Transition(ctx, taskID, task.StateQueued, "user:1", nil); err != nil {
+		t.Fatalf("转回 queued 失败: %v", err)
+	}
+	tk, err := m.Get(ctx, taskID)
+	if err != nil {
+		t.Fatalf("Get 失败: %v", err)
+	}
+	if tk.WorktreePath == nil {
+		t.Fatal("这条用例要求现场保留（ReentryImplementPrompt 的前提）")
+	}
+	// 会话凭据清掉：走「会话丢失 → 同工作区新会话」的那一支，
+	// 提示词必定是 ReentryImplementPrompt。
+	if err := m.SetSessionID(ctx, taskID, ""); err != nil {
+		t.Fatalf("清会话失败: %v", err)
+	}
+
+	ag2 := &fakeAgent{
+		results: []*agent.Result{
+			{Success: false, IsError: true, Subtype: "error_during_execution", Text: "第二轮也挂了"},
+		},
+	}
+	p.Agent = ag2
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
+		Retry: &RetryPlan{Entry: EntryImplement, Reasons: []string{"测试指定续跑实现"}},
+	}); err == nil {
+		t.Fatal("第二轮也应当失败（夹具刻意如此）")
+	}
+
+	if len(ag2.calls) != 1 {
+		t.Fatalf("续跑实现阶段应只调用一次 agent（无分诊），实际 %d 次: %s",
+			len(ag2.calls), promptDump(ag2.calls))
+	}
+	got := ag2.calls[0].Prompt
+	// 先确认走的确实是 reentry 那支（不是 resume：resume 分支排除了自记录）
+	if !strings.Contains(got, "工作区") && !strings.Contains(got, "现场") {
+		t.Logf("reentry 提示词：\n%s", got)
+	}
+	if !strings.Contains(got, "这个需求此前失败过") {
+		t.Errorf("reentry 路径的提示词应含历史失败段，实际：\n%s", got)
+	}
+	if !strings.Contains(got, firstStage) {
+		t.Errorf("注入的内容应是第一轮的失败阶段 %q，实际：\n%s", firstStage, got)
 	}
 }
 
@@ -252,7 +371,8 @@ func TestFailureMemoryAbsentLeavesPromptUnchanged(t *testing.T) {
 // 上限的意义是「防把提示词撑爆」（brief 第 3 条「注入要克制」）——
 // 所以断言必须是「最终长度有界」，而不是「某处调过截断函数」。
 func TestFailureMemoryTruncatesLargeExcerpt(t *testing.T) {
-	// 造一份远超上限的验证输出（模拟把整个构建日志灌进来）
+	// 造一份远超上限的验证输出（模拟把整个构建日志灌进来）：内容用中文，
+	// 让「按字节硬切」有机会落进某个字的中间 —— 那正是要防的形态。
 	huge := strings.Repeat("编译错误：某个很长的行\n", 5000)
 	if len(huge) <= maxFailureExcerpt {
 		t.Fatalf("夹具不够大：%d 字节，上限 %d", len(huge), maxFailureExcerpt)
@@ -276,9 +396,19 @@ func TestFailureMemoryTruncatesLargeExcerpt(t *testing.T) {
 	if len(got) > limit {
 		t.Errorf("注入段落长度 = %d 字节，超过上限 %d（提示词会被撑爆）", len(got), limit)
 	}
+	// 截断必须按 rune 边界回退：切坏多字节字符的产物落库会撞
+	// SQLSTATE 22021（AGENTS.md §9），而它**此刻**已经是给 agent 看的
+	// 提示词内容 —— 注入侧先坏，落库侧再炸。
+	if !utf8.ValidString(got) {
+		t.Errorf("注入段落不是合法 UTF-8（截断切坏了多字节字符），长度 %d", len(got))
+	}
 	// 被截断时必须留下痕迹 —— 静默截断会让人以为失败输出就这么长
 	if !strings.Contains(got, "已截断") {
 		t.Error("超长摘要被截断时应留下明显标记")
+	}
+	// 取的是尾部：结尾那几行（结论）必须在
+	if !strings.HasSuffix(got, "```\n") {
+		t.Errorf("摘要应保留原串尾部，渲染以围栏收尾，实际结尾：%q", got[len(got)-40:])
 	}
 }
 
@@ -449,4 +579,88 @@ func promptDump(calls []agent.RunParams) string {
 		b.WriteString(c.Prompt)
 	}
 	return b.String()
+}
+
+// 测试用的假凭据。故意做成「看起来像真的」：GitHub PAT 的形态
+// （ghp_ + 36 位）与验证子进程环境里一个敏感变量名下的值。
+const (
+	fakeGitHubToken   = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+	fakeEnvSecretName = "LATHE_FAKE_VERIFY_API_TOKEN"
+	fakeEnvSecretVal  = "env-secret-q9w8e7r6t5y4u3i2"
+	excerptMarker     = "MARKER-OUT-7781"
+)
+
+// ★ MAJOR-1 的端到端：验证失败后，digest 的 excerpt 必须真的含失败步骤的
+// **输出**（不只是步骤名 + ✓/✗ + 耗时），且输出里的凭据已被脱敏。
+//
+// 夹具：agent 交一个「测试对、实现错」的改动（heavy 档，绿阶段必挂），
+// 失败的测试把一个 GitHub token 形态的串和验证子进程环境里的一个敏感
+// 变量值打进输出 —— 两种泄漏形态各一个。修复回路关着（MaxFixAttempts=0），
+// 首轮验证失败就落 verify_failed。
+func TestFailureMemoryVerifyExcerptCarriesRedactedOutput(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	// 验证子进程继承宿主环境（verify.go 的 stepEnv），这正是要防的泄漏面
+	t.Setenv(fakeEnvSecretName, fakeEnvSecretVal)
+
+	testSrc := "package main\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\n" +
+		"func TestGreet(t *testing.T) {\n" +
+		"\tt.Logf(\"env=%s\", os.Getenv(\"" + fakeEnvSecretName + "\"))\n" +
+		"\tif greet() != \"hello\" {\n" +
+		"\t\tt.Fatalf(\"" + excerptMarker + " 中文输出 got %q auth=" + fakeGitHubToken + "\", greet())\n" +
+		"\t}\n}\n"
+
+	lin := &fakeLinear{issue: demoIssue()}
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"有现象","question":""}`},
+			{Success: true, Text: "实现了（答错了）"},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"), []byte(testSrc), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"),
+					[]byte("package main\n\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+		},
+	}
+	mem := newFakeMemory()
+	p := newPipeline(t, m, lin, &fakeGitHub{}, ag, &fakeNotifier{})
+	p.Memory = mem
+
+	if err := p.Execute(context.Background(), ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
+	}); err == nil {
+		t.Fatal("绿阶段应当失败")
+	}
+
+	if len(mem.written) != 1 {
+		t.Fatalf("应写下 1 条失败记忆，实际 %d 条", len(mem.written))
+	}
+	d := mem.written[0]
+	if d.Stage != string(StageVerifyFailed) {
+		t.Fatalf("记忆阶段 got %q, want %q（excerpt=%q）", d.Stage, StageVerifyFailed, d.Excerpt)
+	}
+	if !strings.Contains(d.Excerpt, excerptMarker) {
+		t.Errorf("excerpt 应含失败步骤的输出片段 %q，got:\n%s", excerptMarker, d.Excerpt)
+	}
+	for _, leak := range []string{fakeGitHubToken, fakeEnvSecretVal} {
+		if strings.Contains(d.Excerpt, leak) {
+			t.Errorf("excerpt 泄漏了凭据 %q:\n%s", leak, d.Excerpt)
+		}
+		if strings.Contains(d.Reason, leak) {
+			t.Errorf("reason 泄漏了凭据 %q:\n%s", leak, d.Reason)
+		}
+	}
+	if !strings.Contains(d.Excerpt, redactedMark) {
+		t.Errorf("脱敏处应留下 %q 标记，got:\n%s", redactedMark, d.Excerpt)
+	}
+	if len(d.Excerpt) > maxDigestStoredExcerpt {
+		t.Errorf("excerpt 长度 got %d 字节, want <= %d（写入侧截断）", len(d.Excerpt), maxDigestStoredExcerpt)
+	}
+	if !utf8.ValidString(d.Excerpt) {
+		t.Error("excerpt 不是合法 UTF-8（落库会撞 SQLSTATE 22021）")
+	}
 }

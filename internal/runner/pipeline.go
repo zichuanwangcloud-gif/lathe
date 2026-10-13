@@ -638,9 +638,7 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 			slog.Warn("降级会话 ID 落库失败", "task", rc.tk.ID, "err", serr)
 		}
 		implRes, err = p.runAgent(rc, "implement-reentry",
-			p.withFailureMemory(rc.ctx, rc.scope,
-				ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false),
-			rc.implSession, false)
+			ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), rc.implSession, false)
 	}
 
 	// 终局摘要落库含 fail 路径：有 result 就存（docs/04 §3.5）
@@ -659,37 +657,23 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	return nil
 }
 
-// implementPrompt 按续跑来源选择实现阶段的 prompt，并在末尾追加跨任务
-// 失败记忆（§3.6 第 16 条）。
+// implementPrompt 按续跑来源选择实现阶段的 prompt。
 //
-// 三条路径都注入，差别在 alreadyInPrompt 这一位 —— 它决定要不要排除**本
-// 任务自己**写下的那条记录：
-//
-//   - ResumeFixPrompt 已经把 tasks.failure_reason 全文带进提示词，再注入
-//     一遍是同义反复 —— 排除自记录。
-//   - ContinueImplementPrompt 走 --resume，agent 知道自己是「被中断」的，
-//     自记录（实现执行失败）提供不了新信息 —— 同样排除。
-//   - ImplementPrompt / ReentryImplementPrompt 是**全新会话**，脑子里一片
-//     空白，本任务上一次失败对它就是货真价实的历史 —— 不排除。
-//
-// 「排除」而非「不注入」是刻意的：同一单子可能有**更早的任务行**（issue
-// 关掉重开后新建的那行），它的失败对当前这次执行是真历史，不该被一起
-// 丢掉。
+// 失败记忆的注入**不在这里**：本函数是纯构造函数（输入需求与现场状态，
+// 输出提示词），注入统一发生在 runAgent 这个唯一的 agent 调用入口上
+// —— 那里同时知道 phase 与 resume，见 injectFailureMemory。
 func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 	if rc.plan == nil || rc.plan.Entry != EntryImplement {
-		return p.withFailureMemory(rc.ctx, rc.scope,
-			ImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false), false
+		return ImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false
 	}
 	if rc.plan.ResumeSession && rc.implSession != "" {
 		// 验证未通过后的重试：agent 记得实现，把失败原因喂回去修复
 		if rc.failStage == StageVerifyFailed && rc.tk.FailureReason != nil {
-			return p.withFailureMemory(rc.ctx, rc.scope,
-				ResumeFixPrompt(*rc.tk.FailureReason), true), true
+			return ResumeFixPrompt(*rc.tk.FailureReason), true
 		}
-		return p.withFailureMemory(rc.ctx, rc.scope, ContinueImplementPrompt(), true), true
+		return ContinueImplementPrompt(), true
 	}
-	return p.withFailureMemory(rc.ctx, rc.scope,
-		ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false), false
+	return ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false
 }
 
 // runAgent 跑一次 agent 并接好事件汇。
@@ -699,6 +683,7 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 // 不同节点可路由到不同通道），画像未设置该字段时回落到仓库/流水线级
 // 的 p.ImplementChannel（既有行为，F7.1-AC4 的回归保证）。
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
+	prompt = p.injectFailureMemory(rc, phase, prompt, resume)
 	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
 	channel := p.ImplementChannel
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
@@ -725,6 +710,43 @@ func channelEnv(channel string) []string {
 		return nil
 	}
 	return []string{"LATHE_AGENT_CHANNEL=" + strings.TrimSpace(channel)}
+}
+
+// injectFailureMemory 是失败记忆在实现链路上的**唯一注入决策点**。
+//
+// ---------------------------------------------------------------------------
+// 为什么收敛在 runAgent 而不是各个 prompt 构造函数
+// ---------------------------------------------------------------------------
+//
+// 「往提示词里追加一段东西」用不着改动 prompt.go 的任何签名：本函数在
+// 提示词**构造完之后**追加，构造函数不知道自己被注入了。这样
+// ImplementPrompt / ReentryImplementPrompt / ResumeFixPrompt /
+// ContinueImplementPrompt 与它们的调用点一个字都不用改 —— 并行线（A2 的
+// PR review 二轮）改的是同一段 `implementPrompt`/`stageImplement`，
+// 两边各改各的，rebase 时不会互相顶。
+//
+// 本函数是多出来的一层，但换来的是「注入上限、渲染格式、判空、排除规则」
+// 只有一处实现（见 withFailureMemory），而不是散在四个调用点各判一次。
+//
+// ---------------------------------------------------------------------------
+// 为什么只注入实现链路
+// ---------------------------------------------------------------------------
+//
+// 排除修复轮（fix-N）：它是紧接着一次失败的 resume 会话，`tasks.failure_reason`
+// 全文已经在提示词里，再注入一遍是纯噪声。
+//
+// 分诊不在本函数管辖范围内（它不走 runAgent），注入点在 stageTriage 的
+// Agent.Run 调用处 —— 全仓共两处注入点，都在这一个文件里。
+func (p *Pipeline) injectFailureMemory(rc *runCtx, phase, prompt string, resume bool) string {
+	switch phase {
+	case "implement", "implement-reentry":
+		// resume 为真（ResumeFixPrompt / ContinueImplementPrompt）时提示词里
+		// 已经带着本任务那次失败的原因，排除本任务自己的记录 —— 但仍然
+		// 注入**更早的任务行**留下的历史（issue 关掉重开会新建任务行）。
+		return p.withFailureMemory(rc.ctx, rc.scope, prompt, resume)
+	default:
+		return prompt
+	}
 }
 
 // triageDir 返回分诊 agent 的中立工作目录（惰性创建）。
@@ -975,9 +997,11 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 			}
 			cause = header + "\n" + cause
 		}
-		// 带上结构化摘要进跨任务记忆：下一个跑这个单子的 agent 看到
-		// 「验证未通过 + 这几行输出」才知道该绕开什么。
-		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), report.Summary())
+		// 带上失败步骤的**输出摘要**进跨任务记忆：摘要来自报告里失败的
+		// 那一步（不是回帖用的 Summary —— 后者只有步骤名与耗时，没有
+		// 输出，下一个 agent 从中学不到任何东西）。写入侧脱敏 + 截断，
+		// 见 failureExcerpt。
+		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), failureExcerpt(report))
 	}
 
 	rc.report = report
