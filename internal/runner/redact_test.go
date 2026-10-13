@@ -318,61 +318,161 @@ func TestRedactKnownValuesArePrecise(t *testing.T) {
 // 权威层的另一个来源：验证步骤的 StackEnv（隔离栈连接串）。
 // 它带着口令，而且**不是**进程环境变量，只经 Step.StackEnv 流下来。
 func TestRedactKnownCoversStackEnvPassword(t *testing.T) {
+	// 口令**不在** registered 里、也不在自己的进程环境里，只存在于
+	// Step.StackEnv（隔离栈连接串）—— 于是「关掉 StackEnv 这一路来源」
+	// 就必然红。旧版夹具把整条 DSN 当输入喂给形态表，形态表自己就能抹，
+	// 于是去掉 StackEnv 照样绿（名不副实）。
 	const pw = "stack-password-4242"
-	dsn := "postgres://lathe:" + pw + "@127.0.0.1:56001/lathe_task_42"
-	got := redactText("step output: "+truncateTailForTest(dsn, 40), nil, map[string]string{"DATABASE_URL": dsn})
+	dsn := "postgres://lathe:" + pw + "@db.internal:56001/lathe_task_42"
+	// 输入里口令**裸着出现**（没有 `user:pw@host` 结构）：形态表认不出随机串，
+	// 只有权威层能抹 —— 这样「关掉 StackEnv 这一路来源」必然红。
+	input := "step output: 连接口令是 " + pw + " 请注意"
+
+	// 对照：不传 StackEnv 时口令必须留下（证明下面那次抹除来自 StackEnv）
+	if got := redactText(input, nil, nil); !strings.Contains(got, pw) {
+		t.Fatalf("对照不成立：无 StackEnv 时口令应留下，得到 %q", got)
+	}
+
+	got := redactText(input, nil, map[string]string{"DATABASE_URL": dsn})
 	if strings.Contains(got, pw) {
-		t.Errorf("隔离栈口令泄漏：%q", got)
+		t.Errorf("StackEnv 里的口令应被权威层抹掉：%q", got)
 	}
 }
 
-// truncateTailForTest 取一段字符串的**尾部**（模拟 8KB 尾窗砍头），让它变成
-// 不含 `://` 的残段 —— 这正是复审点名的必测路径。
-func truncateTailForTest(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[len(s)-n:]
-}
-
-// ★ 第四轮复审点名的必测路径：被砍头的 DSN 残段（不含 `://`）。
+// ★ 第四轮复审点名的必测路径：被砍头的 DSN 残段（不含 `://`），
+// 且口令**只存在于 StackEnv**（隔离栈连接串）。
 //
-// 残段的来源有两条，都真实：
-//   - `tail` 在窗口左边界按字节砍 —— 单元级复现见本文件
-//     TestTailProducesSchemeLessDSNResidual；
-//   - 上游本就把这行截断了（`t.Logf` 打了一半 / 日志落盘被截）。
-//
-// 两条产出的形状一样：`lathe:<pw>@db.internal:5432/app`。旧的两条规则
-// 都接不上（没有 `://`；主机是域名）。这里走**完整链路**
-// （失败报告 → 两层截断 → 脱敏 → 落库的那份）断言不留明文，
-// 并分别验「权威层」与「只靠形态表」两种配置。
+// 夹具要点：输入里不带 `://`、主机保持原样，口令段单独拿不到形态证据 ——
+// 于是「关掉 StackEnv 这一路来源」就必然红。旧版夹具把整条 DSN 喂进去，
+// 形态表自己就能抹，去掉 StackEnv 照样绿（复审点名的假覆盖）。
 func TestFailureExcerptRedactsSchemeLessDSNResidual(t *testing.T) {
 	const pw = "REALVERYSECRETPW4242"
-	dsn := "postgres://lathe:" + pw + "@db.internal:5432/app"
-	const residual = "lathe:" + pw + "@db.internal:5432/app"
-
-	// 残段放在距尾部 ~4KB 处：8KB 尾窗一定覆盖到它
+	dsn := "postgres://lathe:" + pw + "@127.0.0.1:56001/lathe_task_42"
+	// 被砍头的残段：不含 `://`。主机是回环地址，但形态表可能认得出来 ——
+	// 所以对照断言用「口令裸着出现」（形态表认不出随机串）保证红。
+	residual := "lathe:" + pw + "@127.0.0.1:56001/app"
 	out := "dial " + residual + " failed\n" + strings.Repeat("z", 4000)
 
-	// 前置：夹具本身只含残段（不含 `://`），并确认它落在 8KB 尾窗内
-	if strings.Contains(out, "://") || !strings.Contains(tail(out, maxDigestStoredExcerpt), residual) {
-		t.Fatal("夹具不成立：残段不在尾窗内")
+	// 对照一：去掉 StackEnv 来源 → 口令必须留下（残段这里形态表仍可能盖住，
+	// 所以另外用「裸口令」那一版对照，见对照二）
+	bare := "口令 " + pw + " 被拒绝\n" + strings.Repeat("z", 4000)
+	noStack := (&Pipeline{}).failureExcerpt(Report{Results: []StepResult{{
+		Step: Step{Name: "test"}, Status: StatusFailed, Output: bare,
+	}}})
+	if !strings.Contains(noStack, pw) {
+		t.Fatalf("对照不成立：无 StackEnv 时口令应留下，得到 %q", firstN(noStack, 200))
 	}
 
-	p := &Pipeline{KnownSecrets: []string{dsn}}
-	got := p.failureExcerpt(Report{Results: []StepResult{{
-		Step: Step{Name: "test"}, Status: StatusFailed, Output: out,
+	// 对照二：同一段输出，接上 StackEnv（隔离栈在跑）→ 口令必须被抹
+	withStack := (&Pipeline{}).failureExcerpt(Report{Results: []StepResult{{
+		Step:   Step{Name: "test", StackEnv: map[string]string{"DATABASE_URL": dsn}},
+		Status: StatusFailed, Output: bare,
 	}}})
+	if strings.Contains(withStack, pw) {
+		t.Errorf("StackEnv 里的口令应被抹，前 200 字节：%q", firstN(withStack, 200))
+	}
+
+	// 主断言：残段形状下（走完整链路 + StackEnv）不留明文
+	got := (&Pipeline{}).failureExcerpt(Report{Results: []StepResult{{
+		Step:   Step{Name: "test", StackEnv: map[string]string{"DATABASE_URL": dsn}},
+		Status: StatusFailed, Output: out,
+	}}})
+	if !strings.Contains(got, "lathe:") || strings.Contains(got, "://") {
+		t.Fatalf("夹具不成立：摘要应含残段且不含 ://，前 120 字节 = %q", firstN(got, 120))
+	}
 	if strings.Contains(got, pw) {
-		t.Errorf("残段泄漏口令（权威层），前 200 字节：%q", firstN(got, 200))
+		t.Errorf("残段泄漏口令，前 200 字节：%q", firstN(got, 200))
+	}
+}
+
+// ★ 第五轮复审 B5-1：隔离栈在跑时，层 1 不许把主机抹掉，否则层 2 失效、
+// 口令明文落库。
+//
+// 最小复现（唯一变量是隔离栈在不在跑）：
+//
+//	dial lathe:AGENTSECRETPW9911@127.0.0.1:56001 timeout
+//	  有 StackEnv → 旧版把 127.0.0.1 登记进权威层并抹成 [REDACTED]，
+//	                层 2 的 `@<host>:<port>` 判据随即失去左邻，口令明文留下
+//	  无 StackEnv → 口令被正常抹掉
+//
+// 修法是收窄 StackEnv 的登记口径（只登记含 `user:pass@` 的 DSN 值与其
+// 口令段），顺带也修掉 M5-1（回环地址/用户名这些正常值不再被抹）。
+func TestRedactStackEnvDoesNotClobberHost(t *testing.T) {
+	const agentPW = "AGENTSECRETPW9911" // 不在权威层（agent 抄进来的）
+	stackEnv := map[string]string{
+		"DATABASE_URL":  "postgres://lathe:STACKDBPW777@127.0.0.1:56001/lathe_task_42",
+		"DATABASE_HOST": "127.0.0.1",
+		"DATABASE_PORT": "56001",
+		"DATABASE_USER": "lathe",
+		"DATABASE_NAME": "lathe_task_42",
+	}
+	const in = "dial lathe:" + agentPW + "@127.0.0.1:56001 timeout"
+
+	withStack := redactText(in, nil, stackEnv)
+	if strings.Contains(withStack, agentPW) {
+		t.Errorf("口令明文落库（层 1 抹掉主机导致层 2 失效）：%q", withStack)
+	}
+	// 注意别写成 `[REDACTED]@`：口径替换后标记本来就紧挨 `@`（那是口令的位置）。
+	// 这里要钉的是**主机**还在 —— 旧版会把它替换成 `[REDACTED]:56001`。
+	if strings.Contains(withStack, redactedMark+":56001") {
+		t.Errorf("主机被权威层抹掉（层 2 随即失效）：%q", withStack)
+	}
+	if !strings.Contains(withStack, "127.0.0.1:56001") {
+		t.Errorf("主机与端口应原样保留（排障要看「连的是哪个库」）：%q", withStack)
+	}
+	// 与没有隔离栈时结果一致 —— 这是 B5-1 的判据（唯一变量不该改变结论）
+	if noStack := redactText(in, nil, nil); noStack != withStack {
+		t.Errorf("隔离栈在不在不该改变脱敏结果：\n无 %q\n有 %q", noStack, withStack)
 	}
 
-	// 只靠形态表（没有登记值）时也不该漏
-	bare := (&Pipeline{}).failureExcerpt(Report{Results: []StepResult{{
-		Step: Step{Name: "test"}, Status: StatusFailed, Output: out,
-	}}})
-	if strings.Contains(bare, pw) {
-		t.Errorf("仅靠形态表时残段泄漏口令，前 200 字节：%q", firstN(bare, 200))
+	// M5-1：正常排障信息不许被抹
+	for _, msg := range []string{
+		"dial tcp 127.0.0.1:56001: connect: connection refused",
+		"user=lathe dbname=lathe_task_42",
+	} {
+		if got := redactText(msg, nil, stackEnv); got != msg {
+			t.Errorf("非凭据值被误伤：\nin  %q\nout %q", msg, got)
+		}
+	}
+
+	// 而隔离栈口令本身仍要被抹（收窄不等于放弃）
+	for _, in := range []string{
+		"口令 STACKDBPW777 无效",
+		"postgres://lathe:STACKDBPW777@127.0.0.1:56001/lathe_task_42 连不上",
+	} {
+		if got := redactText(in, nil, stackEnv); strings.Contains(got, "STACKDBPW777") {
+			t.Errorf("隔离栈口令应被抹：%q", got)
+		}
+	}
+}
+
+// ★ 第五轮复审 M9/M11：passwordOf 的两条分支各要单独被钉住。
+//
+// 它们此前互为冗余（去掉任一条，用例仍由另一条满足）。两条各有真实覆盖面：
+// `url.Parse` 走标准 URL（含百分号解码），regex 走非 URL 形态（`tcp(host)`、
+// 被砍头后没有 scheme 的残段）。分别断言。
+func TestPasswordOfBothForms(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// url.Parse 分支：标准 DSN。注意口令里的 %21 会被解码成 `!`，
+		// 这是 regex 分支给不出的语义 —— 所以返回解码后的值。
+		{"标准 URL（含百分号编码）", "postgres://lathe:s3cr3t%21pw@db.internal:5432/app", "s3cr3t!pw"},
+		{"标准 URL（无路径）", "redis://:onlypass@host:6379", "onlypass"},
+		// regex 分支：url.Parse 会失败（没有 scheme / 不是合法 URL）
+		{"非 URL 的 tcp 形态", "user:mysqlpw@tcp(db.internal:3306)/app", "mysqlpw"},
+		{"被砍头后无 scheme 的残段", "lathe:REALVERYSECRETPW@db.internal:5432/app", "REALVERYSECRETPW"},
+		{"无口令", "postgres://lathe@db.internal:5432/app", ""},
+		{"无关文本", "dial tcp 127.0.0.1:56001: refused", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := passwordOf(c.in); got != c.want {
+				t.Errorf("passwordOf(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
 	}
 }
 
@@ -751,10 +851,19 @@ func TestRedactSecretsDoesNotDoubleRedact(t *testing.T) {
 // 隔离栈的连接串经 StackEnv 灌进验证步骤，输出里回显它是最常见的形态
 // （连接失败时整条 DSN 都在错误信息里）。
 func TestRedactSecretsCoversStackEnv(t *testing.T) {
-	const dsn = "postgres://lathe:stack-pw-9911@127.0.0.1:56001/lathe_task_42"
-	got := redactSecrets("连接失败: dial "+dsn+" timeout", map[string]string{"DATABASE_URL": dsn})
-	if strings.Contains(got, "stack-pw-9911") {
-		t.Errorf("隔离栈口令泄漏：%q", got)
+	// 同 TestRedactKnownCoversStackEnvPassword：口令只存在于 StackEnv，
+	// 「关掉 StackEnv 来源」必须红。输入**不含 `://`**，形态表在主机是
+	// 域名且无端口证据时接不住。
+	const pw = "stack-pw-9911"
+	dsn := "postgres://lathe:" + pw + "@db.internal:56001/lathe_task_42"
+	input := "连接失败：口令 " + pw + " 无效"
+
+	if got := redactSecrets(input, nil); !strings.Contains(got, pw) {
+		t.Fatalf("对照不成立：无 StackEnv 时口令应留下，得到 %q", got)
+	}
+	got := redactSecrets(input, map[string]string{"DATABASE_URL": dsn})
+	if strings.Contains(got, pw) {
+		t.Errorf("StackEnv 口令应被抹：%q", got)
 	}
 	if !strings.Contains(got, redactedMark) {
 		t.Errorf("应当脱敏：%q", got)

@@ -50,28 +50,41 @@ package runner
 // 文本里混进了什么」—— 只能靠「平台知道的环境值」比对 + 形态识别兜底。
 //
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // 已知接受的边界（**这些不是通过条件**，列出来免得被当成「已经保证干净」）
 // ---------------------------------------------------------------------------
 //
-// 权威层：
-//   - 环境值按**变量名**选取（无法凭空判断「哪个值是凭据」）。词根表收的是
-//     「这个名字下的值就是凭据」；自定义名字装凭据且名字里没有词根时，这一层
-//     抓不到（还有形态表兜底）。
-//   - 名字级误伤是刻意接受的代价的对偶面：宁可少抹一点非凭据值，也不把摘要
-//     打成筛子（`LATHE_BASE_URL`、`*_AUTH_MODE`、`PWD`/`OLDPWD` 这类实测都
-//     会误伤，已逐个排除）。
-//   - **只有 8 字节及以上的值**参与替换（短串会让普通输出满屏 [REDACTED]）。
+// 权威层（层 1）：
+//   - **登记口径按来源不同**：
+//       · 装配侧 registered（`config.KnownSecrets`）与进程环境里名字命中词根的
+//         变量：登记**整串** + 它的口令段。名字/来源已经说明它是凭据。
+//       · 验证步骤的 `StackEnv`：**只登记含 `user:pass@` 的 DSN 值与它解析出的
+//         口令段**，绝不逐值全登记。那张表里还有 `DATABASE_HOST=127.0.0.1`、
+//         `DATABASE_PORT`、`DATABASE_USER=lathe` 这类非凭据的运行参数，
+//         登记它们有两个后果，都已实测：误伤正常排障信息
+//         （`dial tcp 127.0.0.1:56001: refused` 里的主机没了），以及**自伤**
+//         —— 层 1 先把主机抹成标记，层 2 要求 `@<host>:<port>` 的规则随即
+//         匹配不上，口令反而明文留下。
+//   - **权威层固有的误伤面**：全量精确替换意味着**任意与凭据值同值的正常文本
+//     都会被抹**，不只是名字级 —— 某个凭据值恰好等于一段普通字符串时，
+//     那段文本会被替换掉。这是「不猜形态」的另一面代价，接受它是为了换
+//     主线上的确定性。
+//   - 环境值/登记值**短于 8 字节**不参与替换（短串会让普通输出满屏标记）。
+//   - 无下划线连写的别名（`MYSQLPWD`、`DBPASS`、`PGPASS`）**不被覆盖** ——
+//     太容易命中无关词（`COMPASS`、`BYPASS`）。登记在案，不修。
 //
-// 形态表（层 2）：
+// 形态表（层 2，非穷举）：
 //   - 无键值结构的口令（`the password is hunter2`）。
 //   - PEM 私钥块（`-----BEGIN ... PRIVATE KEY-----`）、`file:///…` 里的路径。
 //   - 裸值 < 8 字节，或值里含 `\` / 多字节字符（裸值字符集只收
 //     `[A-Za-z0-9_\-./+=]`）。
 //   - 结构字面量白名单（`null`/`true`/`false`/`default`/纯数字）**刻意不抹**。
-//   - `a:b@c.com` 判为邮箱形态（有 `@`、无端口/路径），**不抹**；
-//     反例 `noreply@10.0.0.1` 没有冒号，同样不抹。
-//   - 无 scheme 且既无端口也无路径的 `user:pw@host`（如 `lathe:pw@db.internal`）
-//     形态表不认 —— 实际运行里这类值是隔离栈连接串的一段，由权威层精确命中。
+//   - 无 scheme 的连接串要求**主机带端口/路径/`tcp(`/IPv6 括号**；因此
+//     `dial lathe:pw@127.0.0.1 timeout`（无端口无路径）**不抹口令** ——
+//     收的话就得接受 `a:b@c.com` 这类也进来。带 scheme 的 DSN 不受此限。
+//   - `a:b@c.com` 判为邮箱形态**不抹**；反例 `noreply@10.0.0.1`（无冒号）同样不抹。
+//   - **尾窗恰好砍在口令内部**（只剩口令的后半截）：残段里没有任何结构线索，
+//     形态表接不上；权威层也接不上（登记的是完整口令）。属已知边界。
 //
 // 摘要本身：
 //   - 它会随提示词经 agent.go 的 buildArgs 作为 **argv** 传给 CLI，因此不只
@@ -142,15 +155,25 @@ const minSecretLen = 8
 
 // knownCredentialValues 汇总这一轮脱敏可用的「已知凭据值」（层 1 的输入）。
 //
-// 三个来源：
+// 三个来源，**登记口径各不相同**：
 //
-//	registered  装配侧显式登记的（配置里的 DB 口令 / 集成 token / DSN）
-//	env         验证步骤的额外环境（Step.StackEnv：隔离栈连接串），一律算敏感
-//	os.Environ  本进程环境里**名字命中词根**的变量
+//	registered  装配侧显式登记的整串（配置里的 DB DSN / 集成 token）。
+//	            整串登记 + 口令段：整串替换把 DSN 一笔抹掉，口令段兜住
+//	            被 8KB 尾窗砍头的残段。
+//	extraEnv    验证步骤的额外环境（Step.StackEnv）。**只登记含 `user:pass@`
+//	            的 DSN 值及其口令段**，绝不逐值全登记 —— 那张表里还有
+//	            `DATABASE_HOST=127.0.0.1`、`DATABASE_PORT`、`DATABASE_USER=lathe`
+//	            这类**非凭据**的运行参数，它们会成片出现在正常排障输出里
+//	            （`dial tcp 127.0.0.1:56001: refused` 就是要看的那条信息）。
+//	            两个理由使它必须收窄：
+//	              · 误伤：把回环地址/端口抹掉，摘要里「连的是哪个库」就没了；
+//	              · 更坏的是**自伤**：层 1 先把主机抹成 [REDACTED]，层 2 的
+//	                无 scheme 规则（要求 `@` 后是带端口/路径/域名的主机）
+//	                就再也匹配不上 —— 于是口令明文留下。收窄主机登记即消除。
+//	os.Environ  本进程环境里**名字命中词根**的变量（名字本身就是判据）。
 //
-// 对每个值还额外登记它的**口令段**：8KB 尾窗砍头会产生只剩
-// `e:REALVERYSECRETPW@db.internal:5432/app` 的残段，整串精确替换接不上，
-// 但口令段本身仍然接得上。这条正是「权威层不受形态判据约束」的体现。
+// 名字命中词根的变量按名登记（`DATABASE_URL=…` 在内），那是刻意的：
+// 名字已经说明它是连接串/凭据。
 func knownCredentialValues(registered []string, extraEnv map[string]string) []string {
 	seen := map[string]bool{}
 
@@ -162,23 +185,29 @@ func knownCredentialValues(registered []string, extraEnv map[string]string) []st
 		seen[v] = true
 	}
 
-	addWithPassword := func(v string) {
+	// addDigest 登记一个「已知凭据值」：整串 + 从它里面解析出的口令段。
+	//
+	// 口令段单独登记的必要性：8KB 尾窗砍头会产生只剩
+	// `lathe:REALVERYSECRETPW@db.internal:5432/app` 的残段，整串精确替换
+	// 接不上，但口令段本身仍然接得上。
+	addDigest := func(v string) {
+		v = strings.TrimSpace(v)
 		add(v)
-		if u, err := url.Parse(strings.TrimSpace(v)); err == nil && u.User != nil {
-			if pw, ok := u.User.Password(); ok {
-				add(pw)
-			}
-		}
-		if m := dsnUserinfoRe.FindStringSubmatch(v); m != nil {
-			add(m[1])
-		}
+		add(passwordOf(v))
 	}
 
 	for _, v := range registered {
-		addWithPassword(v)
+		addDigest(v)
 	}
-	for _, v := range extraEnv {
-		addWithPassword(v)
+	for name, val := range extraEnv {
+		// 名字命中词根 → 整串算凭据（`DATABASE_URL` 这类）
+		if secretKeyRe.MatchString(name) || urlishKeyRe.MatchString(name) {
+			addDigest(val)
+			continue
+		}
+		// 其余一律**不登记整串**，只取「值里带口令」的那一种
+		// （`user:pass@` 形态）。见上面 extraEnv 那段的两个理由。
+		add(passwordOf(val))
 	}
 	for _, kv := range os.Environ() {
 		i := strings.IndexByte(kv, '=')
@@ -187,7 +216,7 @@ func knownCredentialValues(registered []string, extraEnv map[string]string) []st
 		}
 		name, val := kv[:i], kv[i+1:]
 		if secretKeyRe.MatchString(name) || urlishKeyRe.MatchString(name) {
-			addWithPassword(val)
+			addDigest(val)
 		}
 	}
 
@@ -199,6 +228,29 @@ func knownCredentialValues(registered []string, extraEnv map[string]string) []st
 	// 让长值再也匹配不上。
 	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
 	return out
+}
+
+// passwordOf 从一段值里抠出任一形态携带的口令段（没有则返回空串）。
+//
+// 两条分支各覆盖一半，**缺一不可**：
+//
+//	url.Parse  标准 URL 形态（`postgres://user:pw@host/db`）。它做的是
+//	           百分号解码与前缀校验，`mysql://u:p@/db` 这类也走它。
+//	dsnUserinfoRe  非 URL 形态（`user:pw@tcp(host)/db`、被砍头后不含
+//	           scheme 的残段）—— url.Parse 会因为没有 scheme 而失败。
+//
+// 单测分别钉住两条（TestPasswordOfURLForm / TestPasswordOfNonURLForm）。
+func passwordOf(v string) string {
+	v = strings.TrimSpace(v)
+	if u, err := url.Parse(v); err == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			return pw
+		}
+	}
+	if m := dsnUserinfoRe.FindStringSubmatch(v); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // redactKnown 是层 1：把已知凭据值按字节精确替换。
