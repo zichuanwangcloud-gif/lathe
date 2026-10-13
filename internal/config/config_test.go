@@ -397,3 +397,49 @@ func TestValidateRejectsNonPositivePRDStallSweepInterval(t *testing.T) {
 		}
 	}
 }
+
+// ★ 本 PRD 新增的两个时长变量写错必须在 Load 时报错，不能静默回落默认值。
+//
+// 存量的 envDuration 解析失败会悄悄用默认值：`LATHE_PRD_STALL_TIMEOUT=30d`
+// 能正常启动、实际生效 168h，人以为配成了 30 天。这违反「非法值启动报错」
+// （AGENTS.md §3 配置行）。错误要点名变量并给出 Go duration 写法（168h）。
+func TestLoadRejectsMalformedPRDStallDurations(t *testing.T) {
+	for _, key := range []string{"LATHE_PRD_STALL_TIMEOUT", "LATHE_PRD_STALL_SWEEP_INTERVAL"} {
+		for _, tc := range []struct {
+			val     string
+			wantErr bool
+		}{
+			{"30d", true},   // Go 不支持 d 单位
+			{"abc", true},   // 根本不是时长
+			{"7 d", true},   // 带空格也不行
+			{"168h", false}, // 合法
+		} {
+			t.Run(key+"="+tc.val, func(t *testing.T) {
+				t.Setenv(key, tc.val)
+				c, err := Load()
+				if !tc.wantErr {
+					if err != nil {
+						t.Fatalf("合法值 %q 不该报错，got: %v", tc.val, err)
+					}
+					got := c.PRDStallTimeout
+					if key == "LATHE_PRD_STALL_SWEEP_INTERVAL" {
+						got = c.PRDStallSweepInterval
+					}
+					if got != 168*time.Hour {
+						t.Errorf("%s 生效值 got=%v want=168h", key, got)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("%s=%q 应在启动时报错，却静默生效（PRDStallTimeout=%v, PRDStallSweepInterval=%v）",
+						key, tc.val, c.PRDStallTimeout, c.PRDStallSweepInterval)
+				}
+				for _, want := range []string{key, tc.val, "168h"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("错误信息应包含 %q，got: %v", want, err)
+					}
+				}
+			})
+		}
+	}
+}

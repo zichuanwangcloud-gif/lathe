@@ -206,3 +206,96 @@ type stallNotifierFunc func(ctx context.Context, prdID int64, subject, body stri
 func (f stallNotifierFunc) NotifyPRDStalled(ctx context.Context, prdID int64, subject, body string) error {
 	return f(ctx, prdID, subject, body)
 }
+
+// raceStallStore 在真 store 外面套一层：ListStalledPRDs 返回之后、扫描器
+// 动手转移之前，执行一次 afterList —— 正是「人在 list 与转移之间回答」
+// 的那道缝。其余方法全部透传给真 store。
+type raceStallStore struct {
+	*store.Store
+	afterList func()
+}
+
+func (r raceStallStore) ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limit int) ([]store.PRDRow, error) {
+	rows, err := r.Store.ListStalledPRDs(ctx, now, cutoff, limit)
+	if err == nil && r.afterList != nil {
+		r.afterList()
+	}
+	return rows, err
+}
+
+// ★ 竞态：扫描器查出候选之后、转移之前，人回答了一轮或刚起了一轮。
+//
+// 真实的 RunRound 回答一轮时 PRD 一直停在 awaiting_answers（有新问题就
+// 留在原状态，persistRound 的 drafting→awaiting CAS 失配是预期内的），
+// 所以只比 state 的 CAS 拦不住 —— 转移必须在同一条 UPDATE 里复核
+// 「最后一轮仍早于 cutoff」与「没有在跑的轮次」。
+func TestStallSweepRaceWithAnswerAfterList(t *testing.T) {
+	cases := []struct {
+		name string
+		// interfere 在 list 之后、转移之前对这份 PRD 做的事。
+		interfere func(t *testing.T, st *store.Store, prdID, userID int64)
+	}{
+		{
+			name: "list 之后人答完一轮（新轮次落库、状态仍是 awaiting_answers）→ 不搁置、不发信",
+			interfere: func(t *testing.T, st *store.Store, prdID, userID int64) {
+				ctx := context.Background()
+				if _, err := st.AppendPRDRound(ctx, store.AppendPRDRoundParams{
+					PRDID: prdID, Round: 2, Stage: "explore", UserInput: "按内存算",
+					Questions: json.RawMessage(`["上限要不要按仓库区分？"]`),
+				}); err != nil {
+					t.Fatalf("落第 2 轮失败: %v", err)
+				}
+				round := 2
+				if _, err := st.UpdatePRDContent(ctx, prdID, userID,
+					store.UpdatePRDContentParams{Round: &round}); err != nil {
+					t.Fatalf("推进轮次失败: %v", err)
+				}
+			},
+		},
+		{
+			name: "list 之后人刚提交回答（BeginPRDRound，processing=true）→ 不搁置、不发信",
+			interfere: func(t *testing.T, st *store.Store, prdID, userID int64) {
+				if _, err := st.BeginPRDRound(context.Background(), prdID, userID); err != nil {
+					t.Fatalf("抢占轮次失败: %v", err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			prdID, userID := stallFixture(t, st, 14*24*time.Hour)
+
+			var hit []int64
+			svc := &prd.StallSweeper{
+				Store: raceStallStore{Store: st, afterList: func() {
+					tc.interfere(t, st, prdID, userID)
+				}},
+				Notifier: stallNotifierFunc(func(_ context.Context, id int64, _, _ string) error {
+					hit = append(hit, id)
+					return nil
+				}),
+				Notify:  true,
+				Timeout: 168 * time.Hour,
+			}
+
+			if _, err := svc.SweepOnce(ctx); err != nil {
+				t.Fatalf("扫描失败: %v", err)
+			}
+			row, err := st.GetPRD(ctx, prdID, userID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.State != string(prd.StateAwaitingAnswers) {
+				t.Errorf("状态 got=%q want=%q：人已经回来了，不该被搁置",
+					row.State, prd.StateAwaitingAnswers)
+			}
+			for _, id := range hit {
+				if id == prdID {
+					t.Errorf("不该给刚回答的 PRD 发搁置信，got 通知=%v", hit)
+				}
+			}
+		})
+	}
+}

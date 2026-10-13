@@ -25,8 +25,9 @@ package prd
 //
 //   - 收割机删的是磁盘上的目录与 git 分支，它的绝大部分复杂度都在
 //     「怎么不误删」。这里只改一行状态字段，没有不可逆的破坏面。
-//   - 收割机必须原子认领（ClaimForReap）才敢碰磁盘；这里的 CAS 就是
-//     状态转移本身（TransitionPRD 带 From 守卫），不需要第二套机制。
+//   - 收割机必须原子认领（ClaimForReap）才敢碰磁盘；这里的原子性就是
+//     状态转移本身（store.StallPRD 在同一条 UPDATE 里复核全部搁置判据），
+//     不需要第二套机制。
 //   - 两者扫描的判据、周期、失败代价都不一样。抽一个共同父类换来的
 //     只是「都是 ticker + ctx.Done」这点形状上的相似，不值。
 //
@@ -68,9 +69,14 @@ const defaultStallTimeout = 168 * time.Hour
 type StallStore interface {
 	// ListStalledPRDs 返回停在 awaiting_answers 且最后一轮早于 cutoff 的 PRD。
 	ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limit int) ([]store.PRDRow, error)
-	// TransitionPRD 落一次状态转移。From 是 CAS 比较项：不匹配则失败，
-	// 这正是「同一份 PRD 不会被两轮扫描重复搁置」的保证。
-	TransitionPRD(ctx context.Context, id, userID int64, p store.TransitionPRDParams) (*store.PRDRow, error)
+	// StallPRD 原子地把 PRD 转成 abandoned：同一条 UPDATE 里复核
+	// awaiting_answers、没有在跑的轮次、最后一轮早于 cutoff 三项，
+	// 任一不再满足就返回 ErrPRDStateChanged 且什么都不改。
+	//
+	// 不能退回只比 state 的 TransitionPRD：人回答一轮全程 state 不变
+	// （一直是 awaiting_answers），只比 state 拦不住 list 与转移之间的回答。
+	// 这也是「同一份 PRD 不会被两轮扫描重复搁置」的保证。
+	StallPRD(ctx context.Context, id int64, now, cutoff time.Time) (*store.PRDRow, error)
 }
 
 // StallNotifier 给 PRD 属主投一封搁置提醒。
@@ -94,7 +100,7 @@ func StalledPRDMail(baseURL string, prdID int64, timeout time.Duration) (subject
 	var b strings.Builder
 	fmt.Fprintf(&b, "模糊任务 #%d 已连续 %s没有人回答，已转为「已搁置」。\n",
 		prdID, humanDuration(timeout))
-	b.WriteString("\n它没有丢：回到详情页答一句（或直接点「继续这份 PRD」）就能接着推进，" +
+	b.WriteString("\n它没有丢：打开详情页点「继续这份 PRD」即可恢复，再接着回答推进；" +
 		"之前的对话与已确认的节都还在。\n")
 
 	if baseURL != "" {
@@ -228,11 +234,11 @@ func (s *StallSweeper) SweepOnce(ctx context.Context) (int, error) {
 
 // stall 搁置一份 PRD，报告本轮是否真的转了。
 //
-// 顺序是刻意的：**先 CAS 转移，转成功了才发信**。
+// 顺序是刻意的：**先原子条件转移（StallPRD），转成功了才发信**。
 //
-// 反过来（先发信再转移）会带来两个问题：一是 CAS 失败时信已经发出去了
+// 反过来（先发信再转移）会带来两个问题：一是转移失败时信已经发出去了
 // （人收到「你的 PRD 被搁置了」但状态没变，纯误导）；二是幂等没了 ——
-// 两轮扫描都发信。现在这个顺序让 CAS 天然成为幂等闸门：
+// 两轮扫描都发信。现在这个顺序让条件转移天然成为幂等闸门：
 // awaiting_answers → abandoned 这一条边一辈子只成功一次，失败的那次
 // 什么都不做。不需要额外记「已通知过」的列。
 //
@@ -240,14 +246,11 @@ func (s *StallSweeper) SweepOnce(ctx context.Context) (int, error) {
 // 同一个瞬间，否则「cutoff 说它超期、日志说的时间对不上」这种偏移会在
 // 排障时把人绕进去。
 func (s *StallSweeper) stall(ctx context.Context, row store.PRDRow, timeout time.Duration, now time.Time) bool {
-	_, err := s.Store.TransitionPRD(ctx, row.ID, row.UserID, store.TransitionPRDParams{
-		From: string(StateAwaitingAnswers),
-		To:   string(StateAbandoned),
-	})
+	_, err := s.Store.StallPRD(ctx, row.ID, now, now.Add(-timeout))
 	if err != nil {
 		if errors.Is(err, store.ErrPRDStateChanged) {
-			// 人在这两轮之间答了（或自己放弃了）—— 这正是 CAS 该拦住的事，
-			// 不是错误。不打扰日志。
+			// list 之后人答了一轮、刚提交了回答（processing）、或状态已被
+			// 别处改走 —— 这正是原子转移该拦住的事，不是错误。不打扰日志。
 			return false
 		}
 		if errors.Is(err, store.ErrPRDNotFound) {

@@ -113,8 +113,8 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 | `LATHE_REAP_INTERVAL` | 现场回收的扫描间隔，默认 `1h`，必须为正 |
 | `LATHE_REAP_ENABLED` | 现场回收总开关，默认 `true`。设 `false` 时收割机根本不启动 —— 它会删磁盘目录与 git 分支，必须能一键关掉 |
 | `LATHE_REAP_DRY_RUN` | 设 `true` 时收割机只打「本轮会删什么」的日志，不碰任何东西。首次启用或调整 TTL 后先干跑一轮 |
-| `LATHE_PRD_STALL_TIMEOUT` | 模糊任务（PRD）停在「待回答」多久无人应答算搁置，默认 `168h`（7 天），**下限 `1h`**（配得更小启动直接报错）。同样注意写 `168h` 不能写 `7d`。超期的 PRD 转「已搁置」并发提醒邮件，属主答一句即可唤醒 |
-| `LATHE_PRD_STALL_SWEEP_INTERVAL` | 搁置扫描的轮询间隔，默认 `1h`，必须为正 |
+| `LATHE_PRD_STALL_TIMEOUT` | 模糊任务（PRD）停在「待回答」多久无人应答算搁置，默认 `168h`（7 天），**下限 `1h`**（配得更小启动直接报错）。同样注意写 `168h` 不能写 `7d`（写成 `7d`、`abc` 等非法时长启动直接报错，不回落默认值）。超期的 PRD 转「已搁置」并发提醒邮件；属主要在 PRD 详情页点「继续这份 PRD」恢复（搁置后直接回答不会唤醒） |
+| `LATHE_PRD_STALL_SWEEP_INTERVAL` | 搁置扫描的轮询间隔，默认 `1h`，必须为正；非法时长（如 `1d`）启动直接报错 |
 | `LATHE_PRD_STALL_NOTIFY` | 设 `false` 时搁置不发提醒邮件（判定本身照做）。搁置发生在后台，不看列表页就完全无感，邮件是唯一的主动告知，所以默认开 |
 | `LATHE_WORKSPACE_ROOT` | worktree 与 `.mirrors/` 的根目录，默认 `/opt/lathe/workspaces`。必须是**至少两层**的专用目录，且不能是 `/`、`/opt`、`/home` 这类系统目录 —— 孤儿清扫会删掉根下无人认领且超期的顶层目录 |
 | `LATHE_LIGHT_SLOTS` | light 档验证并发上限，默认 2 |

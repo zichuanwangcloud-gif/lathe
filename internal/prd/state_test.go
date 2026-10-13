@@ -62,7 +62,7 @@ func TestStateInvariants(t *testing.T) {
 		if err := Validate(StateAwaitingAnswers, StateAbandoned); err != nil {
 			t.Errorf("awaiting_answers → abandoned 应当合法（超时搁置）：%v", err)
 		}
-		// 第 3 条：人回来答一句就走这条边。
+		// 第 3 条：人在详情页点「继续这份 PRD」（POST /resume）走这条边。
 		if err := Validate(StateAbandoned, StateDrafting); err != nil {
 			t.Errorf("abandoned → drafting 应当合法（人唤醒搁置的 PRD）：%v", err)
 		}

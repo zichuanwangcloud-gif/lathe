@@ -237,6 +237,8 @@ func (s *Store) ListPRDs(ctx context.Context, p ListPRDsParams) ([]PRDRow, int, 
 // processing_started_at 的僵死阈值，两个时间若各取一次就可能落在
 // 不同的瞬间，让测试没法钉死边界。
 //
+// 「正在跑的这一轮不算搁置」与僵死轮次的处理见 stalledPRDPredicate。
+//
 // limit 限制单轮扫描量（最早超期的优先）—— 存量积压时靠多轮扫描排空，
 // 而不是一次拉出全表。理由同收割机：扫描是低频维护动作，
 // 单轮耗时不该随积压量线性增长。
@@ -244,14 +246,10 @@ func (s *Store) ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limi
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	// 正在跑的这一轮不算搁置：人点了「提交回答并跑下一轮」，agent 还在
-	// 写文档时把它转成 abandoned，那一轮跑完的快照就会写进一份已被判定
-	// 放弃的 PRD（persistRound 的 drafting→awaiting CAS 会失配）。
-	//
-	// 但僵死（进程被杀、没机会把 processing CAS 回去）的轮次必须照样
-	// 算进来 —— 否则这份 PRD 会因为一个永远不会被清掉的标记而免于扫描，
-	// 永远留在这里。僵死判定的阈值与读路径（GetPRD 的 clearStalePRDProcessing）
-	// 共用 prdStallAfter，两处必须一致。
+	// 判据（含「正在跑的这一轮不算搁置」与「僵死的轮次照样算」）在
+	// stalledPRDPredicate 里，与 StallPRD 共用同一份文本 —— 这里只算
+	// 两个时间参数。僵死阈值 staleBefore 与读路径（GetPRD 的
+	// clearStalePRDProcessing）共用 prdStallAfter，两处必须一致。
 	staleBefore := now.Add(-prdStallAfter)
 
 	rows, err := s.pool.Query(ctx, `
@@ -259,18 +257,10 @@ func (s *Store) ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limi
 		       p.original_input, p.processing, p.processing_started_at,
 		       p.generated_flow_id, p.approved_at, p.converted_at, p.created_at, p.updated_at
 		FROM prds p
-		LEFT JOIN LATERAL (
-			SELECT r.created_at FROM prd_rounds r
-			WHERE r.prd_id = p.id
-			ORDER BY r.round DESC
-			LIMIT 1
-		) lr ON TRUE
-		WHERE p.state = 'awaiting_answers'
-		  AND (NOT p.processing OR p.processing_started_at IS NULL
-		       OR p.processing_started_at < $3)
-		  AND COALESCE(lr.created_at, p.updated_at) < $1
-		ORDER BY COALESCE(lr.created_at, p.updated_at)
-		LIMIT $2`, cutoff, limit, staleBefore)
+		WHERE `+stalledPRDPredicate+`
+		ORDER BY `+prdLastRoundAt+`
+		LIMIT $3`, // $1=cutoff $2=staleBefore $3=limit
+		cutoff, staleBefore, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询超期 PRD 失败: %w", err)
 	}
@@ -288,6 +278,55 @@ func (s *Store) ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limi
 		out = append(out, it)
 	}
 	return out, rows.Err()
+}
+
+// prdLastRoundAt 是超时时钟：最后一轮（按轮次号取，不按时间）对话的
+// created_at；一轮都没有时退回 prds.updated_at。理由见 ListStalledPRDs。
+const prdLastRoundAt = `COALESCE((
+			SELECT r.created_at FROM prd_rounds r
+			WHERE r.prd_id = p.id
+			ORDER BY r.round DESC
+			LIMIT 1), p.updated_at)`
+
+// stalledPRDPredicate 是「这份 PRD 现在算搁置」的完整判据（表别名 p，
+// $1 = cutoff，$2 = 僵死阈值 staleBefore）。
+//
+// ListStalledPRDs（选候选）与 StallPRD（原子转移）共用这一份文本：
+// 两处判据一旦分叉，就会出现「查出来是超期、转的时候按另一套口径」
+// 的缝 —— 那正是 StallPRD 要堵的竞态。
+const stalledPRDPredicate = `p.state = 'awaiting_answers'
+		  AND (NOT p.processing OR p.processing_started_at IS NULL
+		       OR p.processing_started_at < $2)
+		  AND ` + prdLastRoundAt + ` < $1`
+
+// StallPRD 把一份 PRD 原子地转成 abandoned —— 仅当它【此刻】仍满足
+// ListStalledPRDs 的全部判据（awaiting_answers、没有在跑的轮次、最后一轮
+// 早于 cutoff）。判据与转移在同一条 UPDATE 里，不满足就影响 0 行，
+// 返回包了 ErrPRDStateChanged 的错误，调用方据此【不发信】。
+//
+// 为什么不能用 TransitionPRD（只比 state 的 CAS）：人回答一轮的真实路径
+// （prd.Service.RunRound）全程不改 state —— BeginPRDRound 只置 processing，
+// 有新问题时 PRD 一直停在 awaiting_answers。扫描器 list 完、转移前人答了，
+// state 没变，CAS 照样成功，刚回来的人会收到一封「已搁置」。
+//
+// 并发：BeginPRDRound / EndPRDRound 都写 prds 这一行，与本 UPDATE 互斥于
+// 行锁；回答路径在 processing=true 期间才追加轮次，所以无论哪边先提交，
+// 本语句要么看到 processing=true，要么看到新的一轮，都不会误转。
+//
+// 不带 user_id：这是后台扫描器的系统动作，候选本来就来自全表查询；
+// 属主隔离是 HTTP 读写路径的事。
+func (s *Store) StallPRD(ctx context.Context, id int64, now, cutoff time.Time) (*PRDRow, error) {
+	staleBefore := now.Add(-prdStallAfter)
+	row := s.pool.QueryRow(ctx, `
+		UPDATE prds p SET state = 'abandoned'
+		WHERE p.id = $3 AND `+stalledPRDPredicate+`
+		RETURNING `+prdColumns, cutoff, staleBefore, id)
+	res, err := scanPRD(row)
+	if errors.Is(err, ErrPRDNotFound) {
+		return nil, fmt.Errorf("store: PRD %d 已不满足搁置条件（已回答、正在跑一轮、状态已变或已删除）: %w",
+			id, ErrPRDStateChanged)
+	}
+	return res, err
 }
 
 // UpdatePRDContentParams 是一轮对话产出的落库输入；nil 字段不动。

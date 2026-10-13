@@ -41,7 +41,7 @@
   Markdown 版保留节状态标记的文本形式（`[已确认]` 等），可回写进目标仓库 `docs/`
   —— 但 Lathe 不自动提交、更不 push，入不入库是人的决定
 - **PRD 对话超时/搁置策略**（docs/10 §9 未决第 1 条）：`awaiting_answers` 的
-  PRD 超过 `LATHE_PRD_STALL_TIMEOUT`（默认 7 天、下限 1 小时）无人回答即转
+  PRD 超过 `LATHE_PRD_STALL_TIMEOUT`（默认 7 天、下限 1 小时，非法时长启动即报错）无人回答即转
   `abandoned`，并发一封提醒邮件（`LATHE_PRD_STALL_NOTIFY`，默认开）。
   超时时钟取最后一轮对话的时间而不是 `prds.updated_at` —— 后者会被
   「逐节确认」这类无关写入推后，用它会让一份三周没人答的 PRD 永远不超期

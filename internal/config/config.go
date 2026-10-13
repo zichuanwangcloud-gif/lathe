@@ -61,7 +61,8 @@ type Config struct {
 
 	// PRDStallTimeout 是 PRD 停在 awaiting_answers 多久无人回答算搁置
 	// （docs/10 §9 第 1 条已决）。超期由后台扫描器转 abandoned 并发一封
-	// 提醒邮件；人回来答一句即可唤醒（abandoned → drafting）。
+	// 提醒邮件；要恢复须在详情页点「继续这份 PRD」（abandoned → drafting，
+	// POST /api/prds/{id}/resume）—— 搁置后直接回答不会唤醒它。
 	//
 	// 默认七天：规划对话的节奏由人决定，一问一答之间隔一个周末、隔一周
 	// 都很正常（模糊任务本就是「想清楚再做」，不是「现在就得做」）。
@@ -74,6 +75,7 @@ type Config struct {
 	// 比损坏更难修。同 LATHE_WORKTREE_TTL 的下限一样，非法值启动即报错。
 	//
 	// **注意 time.ParseDuration 不支持 d 单位**：配置里写 168h，不能写 7d。
+	// 写错（7d、abc）Load 直接报错，不回落默认值（envDurationStrict）。
 	PRDStallTimeout time.Duration
 	// PRDStallSweepInterval 是搁置扫描器的轮询间隔。
 	//
@@ -103,7 +105,8 @@ type Config struct {
 
 	// Agent 执行
 	ClaudeBin    string        // claude CLI 路径
-	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树	// SettingSources 传给 claude --setting-sources。默认 "project"：只加载
+	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
+	// SettingSources 传给 claude --setting-sources。默认 "project"：只加载
 	// 目标仓库自己的配置，排除执行者个人环境的插件（§9 上下文基线成本）。
 	SettingSources string
 	// FixAttempts 是验证失败后的修复轮回数上限（docs/02-design.md §5
@@ -188,7 +191,7 @@ const MinWorktreeTTL = time.Hour
 //
 // 为什么要有下限、而不是「填 0 就关掉」：把它调小不会带来任何好处，只会
 // 让还在正常等人回答的 PRD 被扫描器打上「已搁置」。这个动作本身可逆
-// （人答一句就回来了），但它是**可见的误判** —— 人看到自己昨天开的对话
+// （在详情页点「继续这份 PRD」就能恢复），但它是**可见的误判** —— 人看到自己昨天开的对话
 // 变成「已搁置」，对系统的信任就掉一档。配置项该越界就报错，而不是让人
 // 配出一个会误伤正常状态的值。
 //
@@ -255,6 +258,17 @@ func (c Config) PRDStallNotifyEnabled() bool { return c.PRDStallNotify != "false
 
 // Load 从环境变量读取配置并校验。
 func Load() (Config, error) {
+	// 本 PRD 新增的两个时长变量走严格解析：写错（30d、abc）启动即报错。
+	// 存量的 envDuration 调用方暂不动（静默回落是已知存量问题，单独修）。
+	prdStallTimeout, err := envDurationStrict("LATHE_PRD_STALL_TIMEOUT", 168*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+	prdStallSweepInterval, err := envDurationStrict("LATHE_PRD_STALL_SWEEP_INTERVAL", time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
+
 	c := Config{
 		HTTPAddr: env("LATHE_HTTP_ADDR", ":8200"),
 		Database: Database{
@@ -280,8 +294,8 @@ func Load() (Config, error) {
 		ReapInterval:          envDuration("LATHE_REAP_INTERVAL", time.Hour),
 		ReapEnabled:           env("LATHE_REAP_ENABLED", "true"),
 		ReapDryRun:            env("LATHE_REAP_DRY_RUN", "false"),
-		PRDStallTimeout:       envDuration("LATHE_PRD_STALL_TIMEOUT", 168*time.Hour),
-		PRDStallSweepInterval: envDuration("LATHE_PRD_STALL_SWEEP_INTERVAL", time.Hour),
+		PRDStallTimeout:       prdStallTimeout,
+		PRDStallSweepInterval: prdStallSweepInterval,
 		PRDStallNotify:        env("LATHE_PRD_STALL_NOTIFY", "true"),
 		SettingSources:        env("LATHE_SETTING_SOURCES", "project"),
 		FixAttempts:           envInt("LATHE_FIX_ATTEMPTS", 2),
@@ -352,7 +366,7 @@ func (c Config) Validate() error {
 	if c.PRDStallTimeout < MinPRDStallTimeout {
 		return fmt.Errorf(
 			"config: PRDStallTimeout 不得小于 %v，得到 %v。"+
-				"调小只会把还在等人回答的 PRD 误判成「已搁置」（人答一句就能回来，但那是可见的误判）。"+
+				"调小只会把还在等人回答的 PRD 误判成「已搁置」（可在详情页点「继续这份 PRD」恢复，但那是可见的误判）。"+
 				"注意 Go 的时长解析不支持 d 单位：写 168h，不能写 7d",
 			MinPRDStallTimeout, c.PRDStallTimeout)
 	}
@@ -453,6 +467,24 @@ func envDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// envDurationStrict 同 envDuration，但解析失败返回错误而不是静默回落默认值。
+//
+// 静默回落会让 `30d` 这种「看起来对」的写法正常启动、实际按默认值跑，
+// 人以为配成了 30 天 —— 违反「非法值启动报错」。错误里点名变量与原值，
+// 并给出 Go duration 写法。
+func envDurationStrict(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q 不是合法的时长：请用 Go duration 写法，"+
+			"例如 168h（7 天）、90m；不支持 d 单位: %w", key, v, err)
+	}
+	return d, nil
 }
 
 func hostnameOr(def string) string {

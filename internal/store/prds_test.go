@@ -488,3 +488,190 @@ func TestAbandonedPRDCanResumeToDrafting(t *testing.T) {
 		t.Errorf("唤醒后应能再起对话轮次: %v", err)
 	}
 }
+
+// awaitWithRounds 把一份 PRD 摆成「停在 awaiting_answers」，并按 at 逐轮
+// 落对话记录、把每一轮的 created_at 钉成给定时刻（at[i] 是第 i+1 轮）。
+func awaitWithRounds(t *testing.T, st *Store, prdID, userID int64, at ...time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	for i := range at {
+		if _, err := st.AppendPRDRound(ctx, AppendPRDRoundParams{
+			PRDID: prdID, Round: i + 1, Stage: "understand",
+			Questions: json.RawMessage(`["阈值按内存还是磁盘算？"]`),
+		}); err != nil {
+			t.Fatalf("落第 %d 轮失败: %v", i+1, err)
+		}
+	}
+	round := len(at)
+	if _, err := st.UpdatePRDContent(ctx, prdID, userID,
+		UpdatePRDContentParams{Round: &round}); err != nil {
+		t.Fatalf("推进轮次失败: %v", err)
+	}
+	if _, err := st.TransitionPRD(ctx, prdID, userID,
+		TransitionPRDParams{From: "drafting", To: "awaiting_answers"}); err != nil {
+		t.Fatalf("转 awaiting_answers 失败: %v", err)
+	}
+	for i, ts := range at {
+		if _, err := st.pool.Exec(ctx,
+			`UPDATE prd_rounds SET created_at = $3 WHERE prd_id = $1 AND round = $2`,
+			prdID, i+1, ts); err != nil {
+			t.Fatalf("钉第 %d 轮时间失败: %v", i+1, err)
+		}
+	}
+}
+
+// ★ 超期判据的两个边：取的是【最后一轮】（不是第一轮），且是严格小于 cutoff。
+//
+// 同一组用例同时压 ListStalledPRDs（候选查询）与 StallPRD（原子转移），
+// 两处的判据必须一致 —— 把 ORDER BY r.round DESC 改成 ASC、或把 < 改成 <=，
+// 这里都会红。
+func TestStalledJudgementLatestRoundAndStrictCutoff(t *testing.T) {
+	// 截到微秒：timestamptz 只存到微秒，否则「恰好等于」在库里不成立。
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cutoff := now.Add(-168 * time.Hour)
+
+	cases := []struct {
+		name   string
+		rounds []time.Time
+		want   bool // 是否应被判超期 / 被搁置
+	}{
+		{"第 1 轮很旧、第 2 轮很新 → 不搁置（时钟取最后一轮）",
+			[]time.Time{cutoff.Add(-14 * 24 * time.Hour), now.Add(-time.Hour)}, false},
+		{"最后一轮恰好等于 cutoff → 不搁置（严格小于）",
+			[]time.Time{cutoff}, false},
+		{"最后一轮早于 cutoff 一秒 → 搁置（对照组）",
+			[]time.Time{cutoff.Add(-time.Second)}, true},
+		{"第 1 轮很新、第 2 轮很旧（不按时间而按轮次取最后一轮）→ 搁置",
+			[]time.Time{now.Add(-time.Hour), cutoff.Add(-time.Second)}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			userID, repoID := prdFixture(t, st)
+			p := newPRD(t, st, userID, repoID)
+			awaitWithRounds(t, st, p.ID, userID, tc.rounds...)
+
+			rows, err := st.ListStalledPRDs(ctx, now, cutoff, 500)
+			if err != nil {
+				t.Fatalf("查询超期 PRD 失败: %v", err)
+			}
+			listed := false
+			for _, r := range rows {
+				if r.ID == p.ID {
+					listed = true
+				}
+			}
+			if listed != tc.want {
+				t.Errorf("ListStalledPRDs 选中 got=%v want=%v", listed, tc.want)
+			}
+
+			row, err := st.StallPRD(ctx, p.ID, now, cutoff)
+			stalled := err == nil
+			if err != nil && !errors.Is(err, ErrPRDStateChanged) {
+				t.Fatalf("StallPRD 意外错误: %v", err)
+			}
+			if stalled != tc.want {
+				t.Errorf("StallPRD 搁置 got=%v want=%v (err=%v)", stalled, tc.want, err)
+			}
+			if stalled && row.State != "abandoned" {
+				t.Errorf("搁置后状态 got=%q want=abandoned", row.State)
+			}
+		})
+	}
+}
+
+// ★ StallPRD 在转移的同一条 UPDATE 里复核判据：list 之后人回来了就不搁置。
+//
+// 真实的回答一轮（RunRound）全程不改 state —— 有新问题就留在
+// awaiting_answers —— 所以只比 state 的 CAS 拦不住这条竞态。
+func TestStallPRDRechecksAtUpdate(t *testing.T) {
+	cases := []struct {
+		name      string
+		interfere func(t *testing.T, st *Store, prdID, userID int64)
+		want      bool
+	}{
+		{"list 之后什么都没发生 → 搁置（对照组）", nil, true},
+		{"list 之后人答了一轮（新轮次刚落库）→ 不搁置",
+			func(t *testing.T, st *Store, prdID, userID int64) {
+				ctx := context.Background()
+				if _, err := st.AppendPRDRound(ctx, AppendPRDRoundParams{
+					PRDID: prdID, Round: 2, Stage: "explore", UserInput: "按内存算",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				round := 2
+				if _, err := st.UpdatePRDContent(ctx, prdID, userID,
+					UpdatePRDContentParams{Round: &round}); err != nil {
+					t.Fatal(err)
+				}
+			}, false},
+		{"list 之后人刚提交回答（processing=true）→ 不搁置",
+			func(t *testing.T, st *Store, prdID, userID int64) {
+				if _, err := st.BeginPRDRound(context.Background(), prdID, userID); err != nil {
+					t.Fatal(err)
+				}
+			}, false},
+		{"processing 已僵死（超过僵死阈值）→ 照样搁置",
+			func(t *testing.T, st *Store, prdID, userID int64) {
+				ctx := context.Background()
+				if _, err := st.BeginPRDRound(ctx, prdID, userID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.pool.Exec(ctx,
+					`UPDATE prds SET processing_started_at = now() - $2::interval WHERE id = $1`,
+					prdID, fmt.Sprintf("%d minutes", int(prdStallAfter.Minutes())+5)); err != nil {
+					t.Fatal(err)
+				}
+			}, true},
+		{"list 之后已被别处转走（drafting）→ 不搁置",
+			func(t *testing.T, st *Store, prdID, userID int64) {
+				if _, err := st.TransitionPRD(context.Background(), prdID, userID,
+					TransitionPRDParams{From: "awaiting_answers", To: "drafting"}); err != nil {
+					t.Fatal(err)
+				}
+			}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			userID, repoID := prdFixture(t, st)
+			p := newPRD(t, st, userID, repoID)
+			awaitFor(t, st, p.ID, userID, 14*24*time.Hour)
+
+			now := time.Now()
+			cutoff := now.Add(-168 * time.Hour)
+			rows, err := st.ListStalledPRDs(ctx, now, cutoff, 500)
+			if err != nil {
+				t.Fatal(err)
+			}
+			listed := false
+			for _, r := range rows {
+				listed = listed || r.ID == p.ID
+			}
+			if !listed {
+				t.Fatal("前提不成立：两周没人答的 PRD 应先被 list 选中")
+			}
+
+			if tc.interfere != nil {
+				tc.interfere(t, st, p.ID, userID)
+			}
+
+			_, err = st.StallPRD(ctx, p.ID, time.Now(), cutoff)
+			if err != nil && !errors.Is(err, ErrPRDStateChanged) {
+				t.Fatalf("StallPRD 意外错误: %v", err)
+			}
+			if got := err == nil; got != tc.want {
+				t.Errorf("StallPRD 搁置 got=%v want=%v (err=%v)", got, tc.want, err)
+			}
+			cur, gerr := st.getPRD(ctx, p.ID, userID)
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if gotAbandoned := cur.State == "abandoned"; gotAbandoned != tc.want {
+				t.Errorf("库内状态 got=%q，want 搁置=%v", cur.State, tc.want)
+			}
+		})
+	}
+}

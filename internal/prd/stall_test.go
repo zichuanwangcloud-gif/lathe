@@ -19,11 +19,13 @@ import (
 // 它忠实模拟了真 store 的两条关键语义，因为整个扫描器的正确性都压在上面：
 //   - ListStalledPRDs 只返回「awaiting_answers 且最后一轮早于 cutoff」的行
 //     （超期判定）；
-//   - TransitionPRD 带 From 守卫（CAS）：状态不匹配就返回 ErrPRDStateChanged。
+//   - StallPRD 在转移那一刻复核全部判据（awaiting_answers、没有在跑的
+//     轮次、最后一轮早于 cutoff），任一不满足返回 ErrPRDStateChanged。
 //
-// 第二条尤其不能简化成「无条件改状态」：扫描器的幂等性完全靠它
-// （转成功才发信，见 stall() 的注释）。假件若把那道守卫去掉，
-// 幂等测试就会假绿。
+// 第二条尤其不能简化成「只比 state」：人回答一轮时 state 一直是
+// awaiting_answers，只比 state 的假件会让竞态测试假绿（审计 MAJOR-1）。
+// 真库上的同一条竞态由 store.TestStallPRDRechecksAtUpdate 与
+// cmd/lathe 的 TestStallSweepRaceWithAnswerAfterList 钉住。
 type fakeStallStore struct {
 	rows []store.PRDRow
 
@@ -46,6 +48,8 @@ type fakeStallStore struct {
 
 	transitions []string // 记录每次真的落下去的转移 "from->to"
 	state       map[int64]string
+	// processing 标记正在跑一轮的 PRD（假件不模拟僵死，僵死口径在真库测）。
+	processing map[int64]bool
 
 	// lastCutoff 记录最近一次查询用的 cutoff，供断言「阈值确实传下去了」。
 	lastCutoff time.Time
@@ -54,7 +58,7 @@ type fakeStallStore struct {
 // stalledPRD 是一份「停在 awaiting_answers」的候选，带它的最后一轮时刻。
 //
 // 刻意不是 store.PRDRow：最后一轮什么时候发生是 prd_rounds 的信息，
-// 真实现靠 SQL 的 LATERAL 从那张表取（见 ListStalledPRDs），PRDRow 上
+// 真实现靠 SQL 子查询从那张表取（见 ListStalledPRDs），PRDRow 上
 // 没有、也不该有这个字段。夹具用一个平行的 case 表示同一件事。
 type stalledPRD struct {
 	row store.PRDRow
@@ -85,7 +89,8 @@ func stalled(id int64, ago time.Duration, now time.Time) stalledPRD {
 // newSweeperWith 造一个扫描器 + 假件，并登记每份候选的最后一轮时刻。
 func newSweeperWith(now time.Time, cands ...stalledPRD) (*StallSweeper, *fakeStallStore, *fakeStallNotifier) {
 	rows := make([]store.PRDRow, 0, len(cands))
-	st := &fakeStallStore{state: map[int64]string{}, lastRoundAt: map[int64]time.Time{}}
+	st := &fakeStallStore{state: map[int64]string{}, lastRoundAt: map[int64]time.Time{},
+		processing: map[int64]bool{}}
 	for _, c := range cands {
 		rows = append(rows, c.row)
 		st.state[c.row.ID] = c.row.State
@@ -125,20 +130,21 @@ func (f *fakeStallStore) ListStalledPRDs(_ context.Context, _ time.Time, cutoff 
 	return out, nil
 }
 
-func (f *fakeStallStore) TransitionPRD(_ context.Context, id, _ int64, p store.TransitionPRDParams) (*store.PRDRow, error) {
-	if f.state[id] != p.From {
+func (f *fakeStallStore) StallPRD(_ context.Context, id int64, _, cutoff time.Time) (*store.PRDRow, error) {
+	if f.state[id] != string(StateAwaitingAnswers) || f.processing[id] ||
+		!f.lastRoundAt[id].Before(cutoff) {
 		return nil, store.ErrPRDStateChanged
 	}
-	f.state[id] = p.To
-	f.transitions = append(f.transitions, p.From+"->"+p.To)
 	for i := range f.rows {
 		if f.rows[i].ID == id {
+			f.state[id] = string(StateAbandoned)
+			f.transitions = append(f.transitions, string(StateAwaitingAnswers)+"->"+string(StateAbandoned))
 			cp := f.rows[i]
-			cp.State = p.To
+			cp.State = string(StateAbandoned)
 			return &cp, nil
 		}
 	}
-	return nil, store.ErrPRDNotFound
+	return nil, store.ErrPRDStateChanged
 }
 
 // fakeStallNotifier 记录投出去的信，供幂等断言。
@@ -259,36 +265,48 @@ func TestSweepNotifiesOnlyOnce(t *testing.T) {
 	}
 }
 
-// CAS 失配（人在这两轮之间答了）时，既不重复发信也不报错。
+// list 之后、转移之前人回来了：既不搁置、不发信，也不报错。
 //
-// 构造的是真竞态而不是「候选本身就过期」：查询那一刻这份 PRD 确实在
-// awaiting_answers（所以它进了候选），之后、CAS 之前人答了一句，
-// 状态回到 drafting。真实现里这两步隔着一次数据库往返，人插进来完全
-// 正常 —— 扫描器拿的是过期快照，这一点不该被当成错误，更不该据此发信。
-func TestSweepSkipsWhenStateChangedAfterQuery(t *testing.T) {
+// 查询那一刻这份 PRD 确实超期（所以进了候选），之后人插进来。真实的
+// 回答路径不改 state（一直是 awaiting_answers），所以前两例才是真竞态的
+// 形状；第三例是状态被别处改走。三例都必须靠转移时的复核拦住。
+func TestSweepSkipsWhenPRDChangedAfterQuery(t *testing.T) {
 	now := time.Date(2026, 10, 12, 9, 0, 0, 0, time.UTC)
-	svc, st, n := newSweeperWith(now, stalled(42, 8*24*time.Hour, now))
+	for _, tc := range []struct {
+		name      string
+		interfere func(st *fakeStallStore)
+		wantState State
+	}{
+		{"人答完一轮（最后一轮变新、state 仍是 awaiting_answers）",
+			func(st *fakeStallStore) { st.lastRoundAt[42] = now }, StateAwaitingAnswers},
+		{"人刚提交回答（processing=true、state 仍是 awaiting_answers）",
+			func(st *fakeStallStore) { st.processing[42] = true }, StateAwaitingAnswers},
+		{"状态已被别处改成 drafting",
+			func(st *fakeStallStore) { st.state[42] = string(StateDrafting) }, StateDrafting},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, st, n := newSweeperWith(now, stalled(42, 8*24*time.Hour, now))
+			// 本轮候选：查询时它确实超期。
+			st.candidates = []store.PRDRow{st.rows[0]}
+			tc.interfere(st)
 
-	// 本轮候选：查询时它还在等人回答。
-	st.candidates = []store.PRDRow{st.rows[0]}
-	// 人抢答了 —— CAS 会用 From=awaiting_answers 去比，而实际已是 drafting。
-	st.state[42] = string(StateDrafting)
-
-	got, err := svc.SweepOnce(context.Background())
-	if err != nil {
-		t.Fatalf("人抢答不该让扫描报错: %v", err)
-	}
-	if got != 0 {
-		t.Errorf("状态已变不该算搁置，got=%d", got)
-	}
-	if len(n.sent) != 0 {
-		t.Errorf("状态已变不该发信，got=%d 封 —— 信必须排在 CAS 之后", len(n.sent))
-	}
-	if len(st.transitions) != 0 {
-		t.Errorf("CAS 应失配，不该有任何转移，got=%v", st.transitions)
-	}
-	if st.state[42] != string(StateDrafting) {
-		t.Errorf("人抢答后的状态不该被扫描器改写，got=%q", st.state[42])
+			got, err := svc.SweepOnce(context.Background())
+			if err != nil {
+				t.Fatalf("人回来不该让扫描报错: %v", err)
+			}
+			if got != 0 {
+				t.Errorf("不该算搁置，got=%d", got)
+			}
+			if len(n.sent) != 0 {
+				t.Errorf("不该发信，got=%d 封 —— 信必须排在条件转移成功之后", len(n.sent))
+			}
+			if len(st.transitions) != 0 {
+				t.Errorf("不该有任何转移，got=%v", st.transitions)
+			}
+			if st.state[42] != string(tc.wantState) {
+				t.Errorf("状态 got=%q want=%q", st.state[42], tc.wantState)
+			}
+		})
 	}
 }
 
@@ -378,6 +396,16 @@ func TestStalledPRDMailContent(t *testing.T) {
 	for _, want := range []string{"1 周", "42", "https://lathe.example.com/prds/42"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("正文应包含 %q，got:\n%s", want, body)
+		}
+	}
+	// 恢复入口必须说对：搁置的 PRD 不能靠回答唤醒（BeginPRDRound 排除
+	// abandoned），只能在详情页点「继续这份 PRD」（POST /resume）。
+	if !strings.Contains(body, "「继续这份 PRD」") {
+		t.Errorf("正文应指明恢复入口「继续这份 PRD」，got:\n%s", body)
+	}
+	for _, wrong := range []string{"答一句", "回答即可", "回答就能"} {
+		if strings.Contains(body, wrong) {
+			t.Errorf("正文不该暗示回答即可唤醒（含 %q），got:\n%s", wrong, body)
 		}
 	}
 	// baseURL 为空时省略详情行（部署未配 LATHE_BASE_URL 的情形）。
