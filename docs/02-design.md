@@ -58,7 +58,7 @@
 | `implementing` | agent 写代码 | → `verifying` / `failed` |
 | `verifying` | 按档位跑验证（§5） | → `pr_open` / `failed` |
 | `pr_open` | PR 已开，已回帖 Linear | → `review_feedback` / `merged` / `cancelled` |
-| `review_feedback` | 收到 review 意见，待二轮 | → `implementing`（**必须 resume 原 session**） |
+| `review_feedback` | 收到 review 意见，待二轮 | → `implementing` / `queued`（两者都**必须持有原 session**，见约束①） |
 | `merged` | 终态：已合并，回收工作区 | — |
 | `failed` | 终态：保留现场 + 回帖 + 推送（D4） | ← 人工可重新入队 |
 | `cancelled` | 终态：人工中止 | — |
@@ -68,11 +68,14 @@
 **① `review_feedback` → `implementing` 必须复用原 Claude Code 会话。**
 任务表持久化 `agent_session_id`；二轮用 `claude --resume <id>` 续跑，而不是带着 PR 评论重开一个会话。重开会丢掉第一轮的全部推理与代码定位上下文，这是同类系统最常见的失败点。
 
+PR 评论回流（§7）走的是 `review_feedback → queued`：webhook 只负责记下意见，把任务交还给 DB 领单调度器（它只认 `queued`），由 worker 以 `RetryReview` 计划 resume 原会话派发二轮 —— 不在 HTTP 请求里同步驱动 agent。这条边与 `→ implementing` **同受 `RequiresSession` 约束**：`queued → implementing` 本身不查会话，只约束一条边的话约束①就能经 queued 绕过。代码：`internal/task/state.go`、`internal/runner/review.go`。
+
 **② 准入档位（D2 的四档）只影响 `triaging` 的出口。**
 `direct` 档下 `triaging` 只做明确度判定，通过即直接进 `implementing`，不产生 `awaiting_approval`。
 
 **③ 幂等。**
 Linear webhook 会重投递。用 `webhook_deliveries(delivery_id PK)` 去重表，先落库再处理。
+GitHub webhook 共用这张表（去重键加 `github:` 前缀，两平台的投递 ID 各自生成）。投递去重之外，PR 评论回流再按**意见**去重（`inline:<id>` / `issue:<id>` / `review:<id>`，记在任务事件流里）：同一条意见经不同投递到达、或二轮结束后旧投递姗姗来迟，都不会再开一轮。
 
 ---
 

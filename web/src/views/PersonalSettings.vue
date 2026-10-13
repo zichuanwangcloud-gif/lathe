@@ -4,19 +4,23 @@ import { api, UnauthorizedError, formatTime } from '../api'
 import { auth, refresh } from '../auth'
 import { confirmDialog } from '../confirm'
 
-// 每个用户专属的 Linear webhook 回调地址（P1.5 第二步）：
+// 每个用户专属的 webhook 回调地址（P1.5 第二步）：
 // 事件按它路由到本人 —— 用谁的凭据验签、任务归谁的名下。
-const webhookURL = computed(() => {
+// Linear 与 GitHub 共用同一个随机段，各挂一个平台前缀。
+function webhookFor(platform) {
   const slug = auth.user?.webhookSlug
   if (!slug) return ''
-  return `${location.origin}/webhooks/linear/${slug}`
-})
-const copied = ref(false)
-async function copyWebhook() {
+  return `${location.origin}/webhooks/${platform}/${slug}`
+}
+const webhookURL = computed(() => webhookFor('linear'))
+// PR 评论回流（review 意见 → 二轮修复）的回调地址。
+const githubWebhookURL = computed(() => webhookFor('github'))
+const copied = ref('')
+async function copyWebhook(which, url) {
   try {
-    await navigator.clipboard.writeText(webhookURL.value)
-    copied.value = true
-    setTimeout(() => (copied.value = false), 2000)
+    await navigator.clipboard.writeText(url)
+    copied.value = which
+    setTimeout(() => (copied.value = ''), 2000)
   } catch {
     // 剪贴板不可用（非安全上下文）时退化为选中展示，地址本身就在页面上
   }
@@ -47,6 +51,12 @@ const META = {
     desc: '用于推分支、开 PR。验证时会检查是否具备 repo 权限。',
     where: 'GitHub → Settings → Developer settings → Personal access tokens',
     env: 'LATHE_GITHUB_TOKEN',
+  },
+  github_webhook: {
+    name: 'GitHub Webhook 密钥',
+    desc: '校验 PR review 事件的签名（X-Hub-Signature-256）。配好后，PR 上的 review 意见会回流给 Lathe 在原会话里修改并重新验证。无法主动验证：GitHub 建 webhook 时会发一次 ping，返回 200 即配对成功。',
+    where: '目标仓库 → Settings → Webhooks，创建时自行填写的 Secret',
+    env: 'LATHE_GITHUB_WEBHOOK_SECRET',
   },
 }
 
@@ -165,10 +175,31 @@ onMounted(load)
     </div>
     <div class="row form">
       <input readonly :value="webhookURL" class="mono" @focus="$event.target.select()" />
-      <button @click.prevent="copyWebhook">{{ copied ? '已复制 ✓' : '复制' }}</button>
+      <button @click.prevent="copyWebhook('linear', webhookURL)">{{ copied === 'linear' ? '已复制 ✓' : '复制' }}</button>
     </div>
     <p class="faint hint">
       地址里的随机段用于把事件路由给你；真正的防伪靠下面的 Webhook 密钥按人各自验签。
+    </p>
+  </div>
+
+  <div v-if="githubWebhookURL" class="card cred">
+    <div class="spread">
+      <div>
+        <h2>你的 GitHub Webhook 地址（PR 评论回流）</h2>
+        <p class="faint desc">
+          在目标仓库 → Settings → Webhooks 里新建 webhook：Payload URL 填这个地址，Content type 选
+          <code class="mono">application/json</code>，Secret 填一串随机值（同时保存到下面的「GitHub Webhook 密钥」），
+          事件勾选 <em>Pull request reviews</em> 与 <em>Pull request review comments</em>。
+          之后 PR 上他人留的 review 意见会让任务回到原会话修改、重新验证并更新 PR。
+        </p>
+      </div>
+    </div>
+    <div class="row form">
+      <input readonly :value="githubWebhookURL" class="mono" @focus="$event.target.select()" />
+      <button @click.prevent="copyWebhook('github', githubWebhookURL)">{{ copied === 'github' ? '已复制 ✓' : '复制' }}</button>
+    </div>
+    <p class="faint hint">
+      PR 作者本人（即 Lathe 开 PR 所用的 GitHub 账号）的评论不会回流；approve 不触发返工。
     </p>
   </div>
 

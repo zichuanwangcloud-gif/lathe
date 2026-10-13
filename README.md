@@ -67,6 +67,7 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    - Linear API 令牌：Linear → Settings → Security & access → Personal API keys
 #    - GitHub 令牌：GitHub → Settings → Developer settings → Personal access tokens
 #    - Linear Webhook 密钥：建 webhook 时 Linear 生成
+#    - GitHub Webhook 密钥（可选，PR 评论回流用）：建仓库 webhook 时自己填的 Secret
 #    - 邮件发送（SMTP）：用于「忘记密码」，保存时会真投一封测试邮件
 #    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
 #    接单判定直接使用，无需手工填写。
@@ -74,6 +75,13 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 # 6. 「设置」页顶部有你的专属 Linear webhook 地址（/webhooks/linear/<你的随机段>），
 #    在 Linear → Settings → API → Webhooks 里指过去，勾选 Issue 事件
 # 7. 在「仓库配置」页登记目标仓库（owner/repo）并设置分支策略
+#
+# 7.5（可选）PR 评论回流：「设置」页还有一个 GitHub webhook 地址
+#    （/webhooks/github/<同一个随机段>）。在目标仓库 → Settings → Webhooks 新建：
+#    Content type 选 application/json，Secret 与上面的「GitHub Webhook 密钥」一致，
+#    事件勾 Pull request reviews 与 Pull request review comments。
+#    之后他人在 Lathe 开的 PR 上留 review 意见 → 任务 resume 原会话修改 →
+#    完整重新验证 → 更新同一个 PR。PR 作者本人的评论与 approve 不触发。
 #
 # 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
 #    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
@@ -122,6 +130,7 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 | `LATHE_SETTING_SOURCES` | agent 加载的配置源，默认 `project`（排除个人插件，见 §9） |
 | `LATHE_TRIAGE_CHANNEL` | 分诊的 cc-switch 通道名（模型路由：分诊走便宜通道），空 = 跟随激活通道 |
 | `LATHE_IMPLEMENT_CHANNEL` | 实现/修复回路的 cc-switch 通道名（走强通道），空 = 跟随激活通道 |
+| `LATHE_GITHUB_WEBHOOK_SECRET` | GitHub 仓库 webhook 签名密钥的兜底值（PR 评论回流验签）。与其它凭据类环境变量一样**只对内置管理员生效**、优先级低于设置页；普通成员须在设置页各自配置 |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
@@ -177,6 +186,12 @@ PEM 私钥块、`file:///…`、裸值 < 8 字节或含 `\`/多字节、`null`/`
 时刻，跳过续跑造成的负差值，与花费面板一样按登录用户隔离。口径是**环境
 耗时**（一个单子从接单到开 PR 中间隔了多久），不是「平台实际忙了多久」：
 分诊那段里若有人工审批等待、排队那段里若有等前置任务的时间，它们都在里面。
+
+PR 上收到他人的 review 意见时（配了 GitHub webhook 的话）：任务
+`pr_open → review_feedback → queued`，worker 以 `--resume` 续原实现会话，把
+**全部待处理意见**（行内评论、PR 评论、review 总评，排除 PR 作者本人与已处理过的）
+交给 agent 改，再**完整重走一遍验证**后更新同一个 PR。意见按条记账，同一条
+不会被处理两次；任务已合并/取消/失败时意见安全忽略，终态不会被拉回来。
 
 也可以完全不走 Linear：「工单」页手动建单（标题 + 需求描述 + 评论区 +
 优先级），开跑后走**同一条**状态机与验证链路。agent 的提问（需求不清时）

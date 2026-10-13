@@ -38,6 +38,13 @@ const (
 	// 【不是用户入参】：只由 approveTask 内部构造。外部入参校验用
 	// UserSelectable，它把这个模式挡在外面（见该方法的注释）。
 	RetryApproved RetryMode = "approved"
+	// RetryReview 是 PR 评论回流（docs/02-design.md §7）：任务停在 pr_open，
+	// PR 上收到了 review 意见，webhook 把它转回 queued 并写下本模式。
+	// 派发侧据此 resume 原实现会话，把意见喂给 agent 改，再完整走一遍验证。
+	//
+	// 【不是用户入参】：只由 runner.ReviewIntake 构造，理由与 RetryApproved
+	// 相同 —— 可由用户传入的话，任意任务都能被伪装成「收到 review 意见」。
+	RetryReview RetryMode = "review"
 )
 
 // Valid 报告模式是否是本包已知的模式（含只许内部构造的 RetryApproved）。
@@ -47,7 +54,7 @@ const (
 // 是平台自己写下的值，不是用户可以塞进来的字符串。
 func (m RetryMode) Valid() bool {
 	switch m {
-	case "", RetryAuto, RetryResume, RetryFresh, RetryApproved:
+	case "", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview:
 		return true
 	}
 	return false
@@ -121,6 +128,9 @@ type RetryPlan struct {
 	Entry EntryStage
 	// ResumeSession 为真时实现阶段以 --resume 续原 agent 会话。
 	ResumeSession bool
+	// Review 为真表示这是 PR review 二轮：实现阶段改用带 review 意见的
+	// prompt（见 Pipeline.implementPrompt）。只有 RetryReview 会置它。
+	Review bool
 	// Reasons 是决策依据（落任务事件 + UI 展示），按决策顺序排列。
 	Reasons []string
 }
@@ -161,6 +171,32 @@ func PlanRetry(mode RetryMode, in RetryInput) RetryPlan {
 		// 「我要这个 PR」的意图，重建虽然贵，但比卡住不动更接近意图。
 		// 理由文案写清楚，让人在事件流里看得出这一轮为什么变贵了。
 		return fresh("人工闸门已确认，但工作区现场已不可用（目录/分支缺失），只能从头重建")
+	}
+
+	if mode == RetryReview && in.InterruptedState == "" {
+		// review 二轮不看 failure_stage：任务是从 pr_open 回来的，验证早已
+		// 通过，failure_stage 若非空也是本任务更早一次失败的旧账。
+		//
+		// InterruptedState 非空说明二轮途中进程崩了、被启动恢复转回了
+		// queued（Reconcile 不写 mode，事件流里最近的 mode 仍是 review）——
+		// 那是一次普通的崩溃恢复，交给下面的 auto 决策（崩在验证就只重验，
+		// 不重放 review prompt；意见已在崩溃前那次转移里记为已处理）。
+		if !in.WT.Usable() {
+			// 回流入口（ReviewIntake.Workspaces）已经把现场不可用的任务挡在
+			// review_feedback 了，走到这里只可能是入口体检之后、派发之前那
+			// 一小段窗口里现场被删。queued 没有合法边能直接判死，只能退回
+			// 重建；代价如实写进理由，事件流里可见。
+			return fresh("收到 PR review 意见，但工作区现场在派发前已不可用（目录/分支缺失），只能从头重建：" +
+				"这一轮看不到 review 意见，且远端分支已有第一轮提交，推送可能因非快进被拒，需人工介入")
+		}
+		if in.HasSession {
+			return RetryPlan{Entry: EntryImplement, ResumeSession: true, Review: true,
+				Reasons: []string{"收到 PR review 意见，resume 原实现会话逐条处理，处理后完整重新验证"}}
+		}
+		// 回流入口已经按约束①拒绝了无会话的任务（review_feedback → queued
+		// 受 RequiresSession 约束），走到这里只可能是会话在排队期间被清掉。
+		return RetryPlan{Entry: EntryImplement, Review: true,
+			Reasons: []string{"收到 PR review 意见，但会话凭据已丢失，在同工作区开新会话处理（带全量需求与意见）"}}
 	}
 
 	// ---------- 失败阶段归一化 ----------

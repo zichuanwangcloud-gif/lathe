@@ -161,7 +161,7 @@ func TestPlanRetryDecisionTable(t *testing.T) {
 
 // 非法模式与空模式。
 func TestRetryModeValid(t *testing.T) {
-	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved} {
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview} {
 		if !m.Valid() {
 			t.Errorf("模式 %q 应合法", m)
 		}
@@ -185,11 +185,16 @@ func TestRetryModeUserSelectableExcludesApproved(t *testing.T) {
 	if RetryApproved.UserSelectable() {
 		t.Error("approved 只许 approveTask 内部构造，不能是用户入参")
 	}
+	// review 同理：只由 PR 评论 webhook 的回流路径构造。可由用户传入的话，
+	// 任意任务都能被伪装成「收到 review 意见」，按 review 二轮的 prompt 派发。
+	if RetryReview.UserSelectable() {
+		t.Error("review 只许 PR 评论回流内部构造，不能是用户入参")
+	}
 	if RetryMode("bogus").UserSelectable() {
 		t.Error("未知模式应不可选")
 	}
 	// 白名单式判据：UserSelectable 为真的一定也在 Valid 里，反向不成立。
-	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, "bogus"} {
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview, "bogus"} {
 		if m.UserSelectable() && !m.Valid() {
 			t.Errorf("模式 %q 可选却不是已知模式：UserSelectable 的白名单漏了 Valid 的约束", m)
 		}
@@ -210,5 +215,59 @@ func TestStageOrder(t *testing.T) {
 	// 未知阶段按最靠后处理（保守：有现场就尽量用）
 	if (Stage("bogus")).before(StagePush) {
 		t.Error("未知阶段应按最靠后处理")
+	}
+}
+
+// review 二轮（PR 评论回流）的派发决策。与其它模式不同，它要额外标记
+// plan.Review —— stageImplement 据此改用带评论内容的 prompt。
+func TestPlanRetryReviewRound(t *testing.T) {
+	cases := []struct {
+		name          string
+		in            RetryInput
+		fresh         bool
+		entry         EntryStage
+		resumeSession bool
+		review        bool
+		reasonLike    string
+	}{
+		{"现场与会话俱在：resume 原会话处理意见",
+			RetryInput{HasSession: true, WT: wtOK()},
+			false, EntryImplement, true, true, "review 意见"},
+		{"历史上的失败阶段不影响 review 二轮（failure_stage 是旧账）",
+			RetryInput{Stage: StageVerifyFailed, HasSession: true, WT: wtOK()},
+			false, EntryImplement, true, true, "review 意见"},
+		{"会话凭据缺失：同工作区新会话，仍是 review 二轮",
+			RetryInput{WT: wtOK()},
+			false, EntryImplement, false, true, "新会话"},
+		{"现场在派发前不可用（入口体检后的竞态窗口）：只能从头重建，不卡死在 queued",
+			RetryInput{HasSession: true, WT: wtGone()},
+			true, EntryTriage, false, false, "派发前已不可用"},
+		{"二轮途中崩溃恢复：按普通崩溃恢复决策，不重放 review prompt",
+			RetryInput{InterruptedState: task.StateVerifying, HasSession: true, WT: wtOK()},
+			false, EntryVerify, false, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := PlanRetry(RetryReview, tc.in)
+			if plan.Fresh != tc.fresh || plan.Entry != tc.entry ||
+				plan.ResumeSession != tc.resumeSession || plan.Review != tc.review {
+				t.Errorf("got Fresh=%v Entry=%s Resume=%v Review=%v，want Fresh=%v Entry=%s Resume=%v Review=%v（理由：%v）",
+					plan.Fresh, plan.Entry, plan.ResumeSession, plan.Review,
+					tc.fresh, tc.entry, tc.resumeSession, tc.review, plan.Reasons)
+			}
+			if tc.reasonLike != "" && !strings.Contains(strings.Join(plan.Reasons, " | "), tc.reasonLike) {
+				t.Errorf("理由 %v 应包含 %q", plan.Reasons, tc.reasonLike)
+			}
+			if len(plan.Reasons) == 0 {
+				t.Error("任何决策都必须给出人读理由")
+			}
+		})
+	}
+
+	// 其它模式永远不产出 Review 标记 —— review prompt 只能经回流路径进来。
+	for _, m := range []RetryMode{RetryAuto, RetryResume, RetryFresh, RetryApproved} {
+		if PlanRetry(m, RetryInput{HasSession: true, WT: wtOK()}).Review {
+			t.Errorf("模式 %q 不应产出 Review=true", m)
+		}
 	}
 }

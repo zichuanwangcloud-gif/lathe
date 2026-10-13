@@ -550,3 +550,96 @@ func TestMachineHasLiveDependentOnBranch(t *testing.T) {
 		t.Errorf("无匹配 base_ref 时应返回 false")
 	}
 }
+
+// review_feedback → queued（PR 评论回流交给调度器的那条边）与
+// → implementing 同受约束①：没有会话就不许走向二轮。
+func TestMachineReviewRequeueRequiresSession(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-5006"})
+	for _, s := range []State{StateTriaging, StateImplementing, StateVerifying, StatePROpen, StateReviewFeedback} {
+		if _, err := m.Transition(ctx, tk.ID, s, "system", nil); err != nil {
+			t.Fatalf("转移到 %s 失败: %v", s, err)
+		}
+	}
+
+	if _, err := m.Transition(ctx, tk.ID, StateQueued, "system", nil); !errors.Is(err, ErrSessionRequired) {
+		t.Fatalf("无会话时 review_feedback → queued 应返回 ErrSessionRequired，得到 %v", err)
+	}
+	if err := m.SetSessionID(ctx, tk.ID, "sess-review"); err != nil {
+		t.Fatalf("SetSessionID 失败: %v", err)
+	}
+	got, err := m.Transition(ctx, tk.ID, StateQueued, "system", nil)
+	if err != nil {
+		t.Fatalf("持有会话时 review_feedback → queued 应成功: %v", err)
+	}
+	if got.State != StateQueued {
+		t.Errorf("state = %s，want queued", got.State)
+	}
+}
+
+// TasksByPR 是 PR 评论 webhook 的路由查询：同名仓库、同号 PR 分属两个
+// 用户时，按属主查只能看见自己的那一条（跨用户隔离，A2 验收第 4 条）。
+func TestMachineTasksByPRIsolatesOwners(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+
+	userA, repoA := fixture(t, pool) // 两个 fixture 的 provider_repo 都是 acme/demo
+	userB, repoB := fixture(t, pool)
+
+	mk := func(user, repo int64, key string, pr int) *Task {
+		t.Helper()
+		tk, err := m.Create(ctx, CreateParams{UserID: user, RepoID: repo, ExternalKey: key})
+		if err != nil {
+			t.Fatalf("建任务 %s 失败: %v", key, err)
+		}
+		if err := m.SetPRNumber(ctx, tk.ID, pr); err != nil {
+			t.Fatalf("SetPRNumber 失败: %v", err)
+		}
+		return tk
+	}
+	a7 := mk(userA, repoA, "CR-PR-A7", 7)
+	b7 := mk(userB, repoB, "CR-PR-B7", 7)
+	mk(userA, repoA, "CR-PR-A8", 8) // 同仓库不同 PR，不应命中
+
+	cases := []struct {
+		name   string
+		user   int64
+		repo   string
+		pr     int
+		wantID []int64
+	}{
+		{"A 查自己的 PR 只得到 A 的任务", userA, "acme/demo", 7, []int64{a7.ID}},
+		{"B 查同名仓库同号 PR 只得到 B 的任务", userB, "acme/demo", 7, []int64{b7.ID}},
+		{"仓库名大小写不敏感（GitHub 不区分）", userA, "ACME/Demo", 7, []int64{a7.ID}},
+		{"别的仓库同号 PR 不命中", userA, "acme/other", 7, nil},
+		{"不存在的 PR 号不命中", userA, "acme/demo", 999, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := m.TasksByPR(ctx, tc.user, tc.repo, tc.pr)
+			if err != nil {
+				t.Fatalf("TasksByPR 失败: %v", err)
+			}
+			var ids []int64
+			for _, tk := range got {
+				if tk.UserID != tc.user {
+					t.Errorf("返回了别人的任务 #%d（属主 %d，查询者 %d）", tk.ID, tk.UserID, tc.user)
+				}
+				ids = append(ids, tk.ID)
+			}
+			if len(ids) != len(tc.wantID) {
+				t.Fatalf("got %v，want %v", ids, tc.wantID)
+			}
+			for i := range ids {
+				if ids[i] != tc.wantID[i] {
+					t.Errorf("got %v，want %v", ids, tc.wantID)
+				}
+			}
+		})
+	}
+}

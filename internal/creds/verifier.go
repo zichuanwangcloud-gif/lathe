@@ -33,6 +33,18 @@ func (Verifier) Verify(ctx context.Context, kind, token string) httpapi.VerifyRe
 			OK:     true,
 			Detail: "已保存。webhook 密钥无法主动验证，需等 Linear 实际投递一次事件才能确认。",
 		}
+	case store.KindGitHubWebhook:
+		// 与 Linear webhook 密钥同理：没有可调用的验证接口。但 GitHub 建
+		// webhook 时会立刻发一个 ping，回调地址对 ping 验签后回 pong ——
+		// 在 GitHub 仓库 webhook 的 Recent Deliveries 里就能看到配对结果。
+		if len(token) < 8 {
+			return httpapi.VerifyResult{OK: false, Error: "webhook 密钥过短，请使用足够长的随机串（GitHub 建 webhook 时自行填写）"}
+		}
+		return httpapi.VerifyResult{
+			OK: true,
+			Detail: "已保存。webhook 密钥无法主动验证：在 GitHub 仓库 → Settings → Webhooks 的 Recent Deliveries 里，" +
+				"ping 投递返回 200 即说明密钥配对成功。",
+		}
 	default:
 		return httpapi.VerifyResult{OK: false, Error: "未知凭据类型 " + kind}
 	}

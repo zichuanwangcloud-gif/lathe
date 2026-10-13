@@ -68,6 +68,11 @@ func AllStates() []State {
 //  5. queued → blocked_dep —— 前驱失败或前驱 PR 被关闭未合并，后继的地基
 //     没了（docs/06-orchestration.md §5.2）；blocked_dep → queued 是前驱
 //     恢复后的唤醒路径，→ cancelled 是人工中止。
+//  6. review_feedback → queued —— PR 评论回流（docs/02-design.md §7）：
+//     webhook 记下 review 意见后把任务交还给 DB 领单调度器（它只认
+//     queued），由 worker 以 resume 原会话的方式派发二轮。不让 webhook
+//     处理器直接 → implementing：那等于在 HTTP 请求里同步驱动 agent。
+//     这条边与边 3 同受 RequiresSession 约束，否则约束①可经 queued 绕过。
 var transitions = map[State][]State{
 	StateQueued:   {StateTriaging, StateImplementing, StateVerifying, StateBlockedDep, StateCancelled},
 	StateTriaging: {StateQueued, StateImplementing, StateAwaitingApproval, StateBlockedSpec, StateFailed, StateCancelled},
@@ -89,7 +94,7 @@ var transitions = map[State][]State{
 	StateVerifying:    {StatePROpen, StateAwaitingApproval, StateBlockedSpec, StateQueued, StateFailed, StateCancelled},
 
 	StatePROpen:         {StateReviewFeedback, StateMerged, StateFailed, StateCancelled},
-	StateReviewFeedback: {StateImplementing, StateMerged, StateFailed, StateCancelled},
+	StateReviewFeedback: {StateImplementing, StateQueued, StateMerged, StateFailed, StateCancelled},
 
 	// 终态
 	StateMerged:    {},
@@ -175,6 +180,10 @@ func Validate(from, to State) error {
 //
 // 这是 docs/02-design.md §3 约束① 的代码化：review 二轮必须 resume
 // 原会话，重开会话会丢掉第一轮的全部推理与代码定位上下文。
+//
+// review_feedback 的两条「走向二轮」的出边都受约束：→ implementing 是
+// 直接进二轮，→ queued 是交给领单调度器再进二轮（见转移表注释第 6 条）。
+// 只约束前者的话，queued → implementing 不查会话，约束①就形同虚设。
 func RequiresSession(from, to State) bool {
-	return from == StateReviewFeedback && to == StateImplementing
+	return from == StateReviewFeedback && (to == StateImplementing || to == StateQueued)
 }

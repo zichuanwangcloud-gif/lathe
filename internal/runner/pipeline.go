@@ -234,6 +234,9 @@ type runCtx struct {
 	commitMsg    string     // 实现阶段产出，提交阶段消费
 	agentSummary string     // 实现阶段终局摘要，写进 PR body
 	report       Report
+	// review 是 PR review 二轮（plan.Review）本轮要处理的意见，setup 里
+	// 收集一次；非二轮恒为 nil。
+	review *pendingReview
 
 	retryNoted bool // 重试决策是否已落进某次转移的 payload
 }
@@ -482,6 +485,21 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 		rc.tier = VerifyTier(*tk.VerifyTier)
 	}
 
+	// PR review 二轮：先收集待处理意见。一条都没有（触发的那条被删了、
+	// 或都已在之前的轮次处理过）就不该唤起 agent —— 让它对着空意见列表
+	// 「改点什么」只会产出无意义的 diff。降级为只重新验证，任务照常回到
+	// pr_open，验证证据照常落库。
+	if rc.plan.Review && entry == EntryImplement {
+		rc.review = p.collectReview(rc)
+		if len(rc.review.Comments) == 0 {
+			plan := *rc.plan
+			plan.Entry, plan.ResumeSession = EntryVerify, false
+			plan.Reasons = append(append([]string(nil), rc.plan.Reasons...),
+				"没有待处理的 review 意见（可能已被删除或已在之前的轮次处理过），跳过 agent，只重新验证")
+			rc.plan, entry = &plan, EntryVerify
+		}
+	}
+
 	// 提交/验证入口的 diff 与基线工作区都解析自 mirror 命名空间，先刷新。
 	if entry == EntryCommit || entry == EntryVerify {
 		if _, err := p.Worktrees.EnsureMirror(ctx, params.Repo.ProviderRepo, params.CloneURL); err != nil {
@@ -612,12 +630,25 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	}
 
 	kindStr := string(rc.kind)
+	payload := rc.takeRetryPayload()
+	if keys := rc.review.Keys(); len(keys) > 0 {
+		// 本轮处理的意见记为已处理：下一轮（或二轮途中崩溃后的恢复）
+		// 收集意见时据此排除，同一条意见不会被反复改。记在进入实现的
+		// 这次转移上而不是实现成功之后 —— agent 中途崩了，恢复走的是
+		// 普通的崩溃恢复（PlanRetry 对 InterruptedState 的处理），
+		// 不重放 review prompt。
+		if payload == nil {
+			payload = map[string]any{}
+		}
+		payload[payloadReviewKeys] = keys
+		payload["review_source"] = rc.review.Source
+	}
 	tk, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateImplementing, rc.actor, &task.TransitionOpts{
 		AgentSessionID: &rc.implSession,
 		WorktreePath:   &rc.wt.Path,
 		BranchName:     &rc.wt.Branch,
 		TaskKind:       &kindStr,
-		Payload:        rc.takeRetryPayload(),
+		Payload:        payload,
 	})
 	if err != nil {
 		return err
@@ -648,8 +679,12 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, rc.implSession); serr != nil {
 			slog.Warn("降级会话 ID 落库失败", "task", rc.tk.ID, "err", serr)
 		}
-		implRes, err = p.runAgent(rc, PhaseImplementReentry,
-			ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), rc.implSession, false)
+		reentry := ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch)
+		if rc.review != nil && len(rc.review.Comments) > 0 {
+			// 新会话没有第一轮的记忆，review 意见更得带上，否则这一轮白跑。
+			reentry += "\n\n" + reviewPromptOf(rc.review)
+		}
+		implRes, err = p.runAgent(rc, PhaseImplementReentry, reentry, rc.implSession, false)
 	}
 
 	// 终局摘要落库含 fail 路径：有 result 就存（docs/04 §3.5）
@@ -676,6 +711,15 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 	if rc.plan == nil || rc.plan.Entry != EntryImplement {
 		return ImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false
+	}
+	if rc.plan.Review && rc.review != nil && len(rc.review.Comments) > 0 {
+		// PR review 二轮（docs/02-design.md §7）。先于下面的验证失败分支判：
+		// failure_stage 若非空，是本任务更早一次失败的旧账，与这一轮无关。
+		if rc.plan.ResumeSession && rc.implSession != "" {
+			return reviewPromptOf(rc.review), true
+		}
+		return ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch) +
+			"\n\n" + reviewPromptOf(rc.review), false
 	}
 	if rc.plan.ResumeSession && rc.implSession != "" {
 		// 验证未通过后的重试：agent 记得实现，把失败原因喂回去修复
@@ -1093,10 +1137,15 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 	}
 
 	// 终态通知（T3）：活干完了，等人评审合并。
+	headline := "**Lathe 已完成并开出 PR**"
+	if rc.plan != nil && rc.plan.Review {
+		// review 二轮复用的是同一个 PR，「开出 PR」的措辞会误导。
+		headline = "**Lathe 已按 review 意见更新 PR，并重新通过验证**"
+	}
 	p.mailTerminal(rc.ctx, opened, "PR："+pr.URL+"\n\n"+verifySummary)
 
-	body := fmt.Sprintf("**Lathe 已完成并开出 PR**\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
-		pr.URL, verifySummary)
+	body := fmt.Sprintf("%s\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
+		headline, pr.URL, verifySummary)
 	if _, err := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); err != nil {
 		slog.Warn("回帖失败", "task", rc.tk.ID, "err", err)
 	}

@@ -438,6 +438,40 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 	return out, rows.Err()
 }
 
+// TasksByPR 返回属主 userID 名下、仓库 providerRepo（owner/name，大小写
+// 不敏感 —— GitHub 本身不区分）上 PR 号为 prNumber 的全部任务，新的在前。
+// 供 PR 评论 webhook 把事件路由到任务。
+//
+// 属主过滤刻意做两遍（tasks.user_id 与 repos.user_id）：这是一条由外部
+// webhook 触发的查询，两个用户各自登记了同名仓库、各自有同号 PR 是正常
+// 现象，任何一侧漏掉过滤都会让 A 的评论去推动 B 的任务。
+//
+// 不按状态过滤：调用方需要看到终态任务，才能如实回报「任务已合并/已取消，
+// 忽略」，而不是笼统的「找不到」。
+func (m *Machine) TasksByPR(ctx context.Context, userID int64, providerRepo string, prNumber int) ([]*Task, error) {
+	rows, err := m.pool.Query(ctx, `
+		SELECT `+taskColumnsQualified+`
+		FROM tasks JOIN repos r ON r.id = tasks.repo_id
+		WHERE tasks.user_id = $1 AND r.user_id = $1
+		  AND lower(r.provider_repo) = lower($2)
+		  AND tasks.pr_number = $3
+		ORDER BY tasks.id DESC`, userID, providerRepo, prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("task: 按 PR 查询任务失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("task: 读取按 PR 查询的任务失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ListReapableTasks 返回可被 TTL 收割机回收现场的任务（T6）：
 // 已进终态、还留着 worktree_path、且最后一次变更早于 olderThan。
 //
