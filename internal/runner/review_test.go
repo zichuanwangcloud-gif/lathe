@@ -10,6 +10,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
@@ -530,6 +531,101 @@ func TestPipelineReviewRoundWithoutPendingCommentsOnlyReverifies(t *testing.T) {
 	}
 	if final, _ := m.Get(context.Background(), taskID); final.State != task.StatePROpen {
 		t.Errorf("state = %s，want pr_open（重新验证后回到 pr_open）", final.State)
+	}
+}
+
+// ★ review 二轮 + 失败记忆**同时生效**：两套机制各自都有用例，但
+// 「一起走到」这条组合此前没有任何覆盖 —— 而它们恰好共用同一条注入通道
+// （runAgent → injectFailureMemory，按 phase 判定），任一侧改动都可能
+// 悄悄掐掉另一侧。
+//
+// 背景（这次 rebase 的结论，见 PR 描述）：rebase 之前 A2 的 review 分支在
+// implementPrompt 里**直接提前返回**，压根不经过当时散落在各构造点上的
+// 注入调用，于是 review 二轮的提示词里没有历史失败段；#17 把注入收敛到
+// runAgent（phase 为 implement / implement-reentry 即注入）之后，review
+// 二轮走的是同一次 runAgent 调用、phase 也是 implement，**自动继承**。
+// 这条用例就是那个结论的看守：把注入从 runAgent 挪回构造函数、或给 review
+// 轮换个不在白名单里的 phase 名，它都会红。
+//
+// 关键判据：review 意见与历史失败段**同时**出现在同一次调用的提示词里，
+// 且顺序是「意见在前、历史在后」（withFailureMemory 追加在末尾）。
+func TestPipelineReviewRoundAlsoInjectsFailureMemory(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{URL: "https://x/pr/11", Number: reviewPR, Existing: true}}
+	ag := &fakeAgent{
+		results: []*agent.Result{{Success: true, Text: "按意见改了"}},
+		mutate: []func(string) error{func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "README.md"),
+				[]byte("# src\n\n第一轮：补充导入失败说明\n\n第二轮：失败时记一条日志\n"), 0o644)
+		}},
+	}
+	mem := newFakeMemory()
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.Memory = mem
+	p.Clients = &fakeClients{lin: lin, gh: &feedbackGitHub{fakeGitHub: gh, fb: &github.ReviewFeedback{
+		PRAuthor: "lathe-bot",
+		Comments: []github.ReviewComment{
+			{Key: "inline:71", Author: "alice", Body: "错误被吞掉了，至少记一条日志", Path: "README.md", Line: 3},
+		},
+	}}}
+
+	prOpenTask(t, p, m, taskID, src, repo, true)
+
+	// 铺一条**更早的任务行**留下的历史失败：定位键与当前任务一致
+	// （同一需求单再次派发），TaskID 不同 —— 于是它不会被 resume 的
+	// 「排除自记录」规则挡掉，正是这段历史该被注入的样子。
+	const wantMarker = "上一次：main.go:12: undefined: greet"
+	tk, err := m.Get(ctx, taskID)
+	if err != nil {
+		t.Fatalf("读取任务失败: %v", err)
+	}
+	if err := mem.InsertFailureDigest(ctx, store.FailureDigest{
+		TaskID: taskID + 100000, Stage: string(StageVerifyFailed),
+		Reason: "验证未通过：build 挂了", Excerpt: wantMarker,
+	}, store.FailureLookup{
+		UserID: tk.UserID, RepoID: tk.RepoID,
+		TrackerProvider: tk.TrackerProvider, ExternalKey: tk.ExternalKey,
+	}); err != nil {
+		t.Fatalf("铺历史记忆失败: %v", err)
+	}
+
+	if out, err := (&ReviewIntake{Tasks: m}).AcceptReview(ctx, ownerOf(t, m, taskID),
+		inlineEvent("inline:71", "alice", "错误被吞掉了，至少记一条日志"), "d-mem"); err != nil || out.Status != ReviewQueued {
+		t.Fatalf("回流失败：%+v %v", out, err)
+	}
+
+	plan := reviewRoundPlan(t, p, m, taskID, repo)
+	if !plan.Review || !plan.ResumeSession || plan.Entry != EntryImplement {
+		t.Fatalf("派发计划应为 review 二轮 + resume，得到 %+v", plan)
+	}
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Retry: plan,
+	}); err != nil {
+		t.Fatalf("二轮执行失败: %v", err)
+	}
+
+	if len(ag.calls) != 1 {
+		t.Fatalf("应只调用 1 次 agent，实际 %d", len(ag.calls))
+	}
+	got := ag.calls[0].Prompt
+	// 1) review 意见在（二轮的核心语义没被注入挤掉）
+	if !strings.Contains(got, "错误被吞掉了，至少记一条日志") {
+		t.Errorf("二轮提示词应含 review 意见，实际：\n%s", got)
+	}
+	// 2) 历史失败段也在 —— 这条组合的判据
+	if !strings.Contains(got, "这个需求此前失败过") {
+		t.Errorf("review 二轮也要拿到失败记忆（phase=implement 的注入应自动继承），实际：\n%s", got)
+	}
+	if !strings.Contains(got, wantMarker) {
+		t.Errorf("注入的历史摘要应是 %q，实际：\n%s", wantMarker, got)
+	}
+	// 3) 历史段追加在**末尾**：本次任务本身（含 review 意见）要读在最前面，
+	//    历史是「注意」不是「前提」。
+	if strings.Index(got, wantMarker) < strings.Index(got, "错误被吞掉了") {
+		t.Errorf("失败记忆应追加在 review 意见之后，实际：\n%s", got)
 	}
 }
 
