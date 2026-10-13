@@ -109,12 +109,27 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 `Authorization: Bearer <token>` 的请求会被当作内置管理员，供 curl 直接调接口；
 同时它也是「SMTP 挂了且管理员把自己锁在门外」时唯一进得去的路。日常登录不用它。
 
+### Docker 部署
+
+```bash
+docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
+```
+
+镜像不含 Postgres 与 `claude` CLI：用 `LATHE_DB_*` 指向外部数据库
+（容器内先跑 `lathe migrate up` 建表），agent 执行需另行挂载或安装 claude。
+
 | 环境变量 | 作用 |
 |---|---|
 | `LATHE_BASE_URL` | 对外地址，重置邮件里的链接前缀。不配则退回本机地址并告警 |
+| `LATHE_HTTP_ADDR` | 监听地址，默认 `:8200` |
+| `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres |
 | `LATHE_ADMIN_EMAIL` | 内置管理员邮箱，默认 `admin@lathe.local` |
 | `LATHE_ADMIN_PASSWORD` | 内置管理员初始口令，不配则随机生成并打印一次 |
 | `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
+| `LATHE_LINEAR_TOKEN` | Linear API 令牌的兜底值。**只对内置管理员生效**，且优先级低于设置页（界面里配了就以界面为准，改完即刻生效） |
+| `LATHE_LINEAR_WEBHOOK_SECRET` | Linear webhook 签名密钥的兜底值。**只对内置管理员生效**、优先级低于设置页 |
+| `LATHE_LINEAR_USER_ID` | 「指派给我了吗」接单判定用的 Linear 用户 ID。**只对内置管理员生效**；设置页配 Linear 令牌时会自动取到账号 ID，正常情况不用手工填 |
+| `LATHE_GITHUB_TOKEN` | GitHub 个人访问令牌的兜底值（推分支、开 PR）。**只对内置管理员生效**、优先级低于设置页 |
 | `LATHE_COOKIE_SECURE` | 覆盖会话 Cookie 的 Secure 标志，默认按 BaseURL 的协议推断 |
 | `LATHE_TRUSTED_PROXY` | 设为 `true` 才信任 `X-Forwarded-For`（限流按它取客户端 IP） |
 | `LATHE_WORKTREE_TTL` | 终态任务的工作区现场保留时长，默认 `72h`，**下限 `1h`**（配得更小启动直接报错）。注意 Go 的时长解析**不支持 `d`**，写 `72h` 不能写 `3d` |
@@ -131,6 +146,12 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 | `LATHE_TRIAGE_CHANNEL` | 分诊的 cc-switch 通道名（模型路由：分诊走便宜通道），空 = 跟随激活通道 |
 | `LATHE_IMPLEMENT_CHANNEL` | 实现/修复回路的 cc-switch 通道名（走强通道），空 = 跟随激活通道 |
 | `LATHE_GITHUB_WEBHOOK_SECRET` | GitHub 仓库 webhook 签名密钥的兜底值（PR 评论回流验签）。与其它凭据类环境变量一样**只对内置管理员生效**、优先级低于设置页；普通成员须在设置页各自配置 |
+| `LATHE_FIX_ATTEMPTS` | 验证失败后的修复轮回数上限（resume 原实现会话就地修复再验证），默认 `2` |
+| `LATHE_AGENT_TIMEOUT` | agent 单次执行超时，默认 `45m` |
+| `LATHE_AGENT_ENV_EXTRA` | agent 子进程环境白名单的显式开口（逗号分隔变量名）。默认白名单只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程 |
+| `LATHE_CLAUDE_BIN` | claude 二进制名或路径，默认 `claude`（从 PATH 解析） |
+| `LATHE_NODE_NAME` | 节点名（事件 actor 前缀、管理界面运行时面板），默认主机名 |
+| `LATHE_PNPM_STORE` | 验证器跑前端步骤时共享的 pnpm store 目录，默认 `/opt/lathe/.pnpm-store` |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
@@ -140,7 +161,9 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 环境变量，或 `$LATHE_DATA_DIR/secret.key`，首次运行自动生成、权限 0600），
 因此拿到数据库转储也解不出凭据。
 
-也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等），优先级低于界面配置。
+也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等，见上表），优先级低于设置页，
+且**只对内置管理员生效**（`internal/creds` 的 `Factory.ProviderFor`：环境兜底只发给
+部署者自己的账号，不借给普通成员的任务 —— 普通成员在设置页各自配置）。
 
 流程：指派 issue 给自己 → 事件按你的专属 webhook 地址路由到你名下（用你的
 webhook 密钥验签）→ 接单 → 分诊 → 实现（fix/feature 必须交复现/验收
@@ -201,9 +224,10 @@ PR 上收到他人的 review 意见时（配了 GitHub webhook 的话）：任�
 ## 状态
 
 **P0 已完成**（单机闭环 / light 档验证）+ 管理界面 + 账号体系（第一步）
-+ **内置工单体系 P1**（手动建单 / 评论区 / 开跑与取消联动，docs/09）。
++ **内置工单体系 P1**（手动建单 / 评论区 / 开跑与取消联动，docs/09）
++ **模糊任务 PRD 规划**（多轮对话产出 PRD、人逐节签字、一键生成任务与编排图，docs/10）。
 
-**P1 验证基建已交付 3/4**：
+**P1 验证基建已交付 4/4**：
 
 - ✅ **§5.1 档位路由**：diff 产出后按实际改动面定档（只碰前端展示层 → light；
   碰到后端/migration/计费或跨前后端 → heavy），仓库配置可强制覆盖（设置页）
@@ -213,8 +237,10 @@ PR 上收到他人的 review 意见时（配了 GitHub webhook 的话）：任�
   任务详情页可查
 - ✅ **单机双通道并发**：light/heavy 各自独立配额（默认 2/1，
   `LATHE_LIGHT_SLOTS` / `LATHE_HEAVY_SLOTS`），闸门在验证阶段按定档结果准入
-- ⬜ per-task compose 隔离栈：红绿阶段目前在 git worktree 里跑（进程组隔离），
-  待目标仓库声明服务栈后补
+- ✅ **验证依赖隔离栈**（T8）：仓库可声明验证期依赖（`verify_infra`，
+  postgres/redis/mysql 目录键），验证阶段为任务起专属依赖容器，与预览环境按
+  标签隔离互不误删；红绿测试进程本身仍在 worktree 里跑（进程组隔离），
+  完整 compose 进程隔离见 docs/02-design.md §8
 
 账号体系两步都已交付：注册登录、找回密码、角色与用户管理（第一步），以及
 **全链路数据隔离**（P1.5 第二步）——每个用户有专属的 webhook 回调地址
@@ -226,4 +252,4 @@ webhook 密钥验签、任务记在各自名下、队列按属主解析各自的
 
 后续见 [docs/02-design.md](docs/02-design.md) §8：P2 OAuth 绑定与配额 → P3 多节点。
 
-未完成：per-task compose 隔离、按用户隔离数据、多节点。
+未完成：红绿测试进程的完整 compose 隔离（§8）、多节点。

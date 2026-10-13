@@ -1,7 +1,9 @@
 # Lathe — 08 · 欠账清理（v0.1.1 批次）
 
-> 2026-09-09 · 状态：执行中
+> 2026-09-09 · 状态：**已归档**（2026-10-12：T0–T9 全部 DONE，批次关闭；新一批方向见 05-roadmap §3）
 > 前置：[05-roadmap.md](./05-roadmap.md)（欠账盘点）、[02-design.md](./02-design.md)（§8 隔离设计）
+> 引用约定：代码位置写「文件 + 符号名」（与 05-roadmap 同一约定），**不写行号** ——
+> 行号随每次合入漂移，2026-10-13 复核时本文原有的 19 处行号绝大多数已落空。
 >
 > **本文是这一轮的工作队列与验收契约。** 每条都标注验收方式，
 > 不可验证的条目不算标准。loop 的每一轮从本文读状态、回写状态。
@@ -129,7 +131,7 @@ webhook 联动只动 ingress 层），但都 base 在 A 上，因为都需要那
   **不推分支、不开 PR**（单测：断言 GitHub client 的 Push/CreatePR 未被调用）
 - AC2 `direct`/`guarded`/`plan-first` 行为与现状逐字节一致；回归测试不得有一条因本项而变
 - AC3 存在确认端点，调用后任务继续走到 `pr_open`。**复用现成的 `EntryPush`**
-  （`runner/retry.go:59`，"验证已过，只补 push + 开 PR，均幂等"），不新写推送路径。
+  （`internal/runner/retry.go` 里 `EntryPush` 的注释："验证已过，只补 push + 开 PR（均幂等）"），不新写推送路径。
   注意 `q.planRetry` 按 `failure_stage` 决策，approve 场景该列为空会落到 default
   分支，需显式处理才能拿到 `EntryPush`
 - AC4 `verifying → awaiting_approval` 与 `awaiting_approval → {queued|pr_open}`
@@ -140,7 +142,7 @@ webhook 联动只动 ingress 层），但都 base 在 A 上，因为都需要那
 
 ### T3 终态通知
 
-**探查修正**：`Notifier` 接口（`runner/pipeline.go:62`）签名是 `Notify(ctx, message string)`
+**探查修正**：`Notifier` 接口（`internal/runner/pipeline.go`）签名是 `Notify(ctx, message string)`
 —— **只有一个字符串，不带 taskID/userID**，按属主发信拿不到收件人；且 runner 包
 目前**没有 `*store.Users` 的任何通路**。本项必然要动接口。倾向在 store 加
 `NotifyEmailForTask(ctx, taskID)`（`SELECT COALESCE(u.notify_email, u.email) ... JOIN`），
@@ -151,18 +153,20 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 - AC2 SMTP 未配置时静默跳过且不影响状态流转（单测：`Ready()` 返回 false，断言任务仍进终态）
 - AC3 发信失败只记日志，不重试、不阻塞、不改任务状态
 - AC4 信里含 issue key、终态、失败分类（若有）、详情页链接（用 `LATHE_BASE_URL` 拼）
-- AC5 正文渲染抽成可独立测试的纯函数，照 `httpapi/accounts.go:273` 的 `resetMail`
+- AC5 正文渲染抽成可独立测试的纯函数，照 `internal/httpapi/accounts.go` 的 `resetMail`
   惯例（该处注释写明「单独成函数是为了能脱离 SMTP 测正文」）
-- AC6 失败落点**只需插桩 `p.fail`**（`pipeline.go:1073`）—— 探查确认 pipeline
-  所有失败路径都汇流到它；另需覆盖 mergepoll 的 `merged`(`:246`)、`failed`(`:583`)、
-  `cancelled`(`:642`)
-- AC7 人工点的取消（`httpapi/api.go:382`）**不发信** —— 人自己点的不用通知自己
+- AC6 失败落点**只需插桩 `p.fail`**（`internal/runner/pipeline.go`）—— 探查确认 pipeline
+  所有失败路径都汇流到它；另需覆盖 mergepoll 的三处转移：`handleMerged` 转 `merged`、
+  `failRebaseFollowup` 转 `failed`、`handleClosedUnmerged` 转 `cancelled`
+  （均在 `internal/runner/mergepoll.go`）
+- AC7 人工点的取消（`internal/httpapi/api.go` 的 `cancelTask`）**不发信** —— 人自己点的不用通知自己
 
 ### T4 log_ref
 
 **探查修正**：`log_ref` 列已存在且可空，**无需迁移**。断点在
-`store/verifications.go:12` 的 `InsertVerification` —— INSERT 语句里就没有这一列。
-更要紧：验证输出在 `runner/verify.go:272` 就已被 `truncate` 到 **16KB**，
+`internal/store/verifications.go` 的 `InsertVerification` —— INSERT 语句里就没有这一列。
+更要紧：验证输出在 `internal/runner/verify.go` 的 `runStep` 里就已被 `truncate`
+（上限 `maxStepOutput = 16 << 10`）到 **16KB**，
 且**通过的步骤的输出直接丢弃**（只有失败步骤的前 4KB 进 agent_events）。
 所以「落盘完整日志」不是在写库那层加个参数就行，要在 `runStep` 层改成边写文件边留摘要。
 
@@ -178,21 +182,23 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
 
 **探查发现一个会让这个面板从一开始就算错的坑，必须记下：**
 
-`tasks.agent_cost_usd` **不是任务累计成本**。`persistAgentResult`（`pipeline.go:1058`）
+`tasks.agent_cost_usd` **不是任务累计成本**。`persistAgentResult`
+（`internal/runner/pipeline.go`）
 在实现阶段和**修复回路的每一轮**都调用，底层 `store.SetAgentSummary` 是 `UPDATE`
 整行覆盖 —— 这一列最终存的是**最后一轮 fix 的单轮成本**。拿它做「每任务成本」会严重低估。
 另外 migration 0009 头注释明说**分诊阶段的 result 不落 tasks 表**，
 所以「分诊 vs 实现占比」从这一列根本算不出来。
 
 真正的数据源是 `agent_events`：`kind='result'` 的 `payload->>'costUsd'`
-（写入点 `integration/agent/digest.go:252`），按 `phase` 分组（`implement` 与
+（写入点是 `internal/integration/agent/digest.go` 的 `digestResult`），按 `phase` 分组（`implement` 与
 `fix-N` 归实现，`triage` 归分诊）。`agent_events` **没有 user_id 列**，
 多租户隔离必须 `JOIN tasks t ON t.id = ae.task_id WHERE t.user_id = $1`。
 
 - AC1 `/api/stats` 返回成本聚合：累计、按阶段（分诊/实现）、按日
 - AC2 成本**从 `agent_events` 求和**，不用 `tasks.agent_cost_usd`；
   单测：造一个跑了 2 轮 fix 的任务，断言聚合值等于各轮之和而非最后一轮
-- AC3 聚合按 `user_id` 隔离且走 JOIN；沿用 `httpapi/api_test.go:429` 的跨用户隔离断言套路
+- AC3 聚合按 `user_id` 隔离且走 JOIN；沿用 `internal/httpapi/api_test.go` 里
+  `TestAPIIsolationBetweenUsers` 的跨用户隔离断言套路
 - AC4 无成本数据时返回零值而非 `null`（照 `Stats.ByState` 用 `map[string]int{}`
   而非 nil 的既有做法，新字段别用指针）
 - AC5 前端有可读的成本视图；**不引入新前端依赖**（package.json 现只有
@@ -360,27 +366,31 @@ mtime `< cutoff`，两把尺子都超期才删）；删之前用现成的 `Inspe
 
 **探查发现两处硬阻碍，AC 据此收紧：**
 
-1. Linear webhook payload 结构体（`integration/linear/linear.go:401`）
+1. Linear webhook payload 结构体（`internal/integration/linear/linear.go` 的
+   `ParseWebhook` / `WebhookEvent`）
    **没有 labels 也没有 labelIds** —— 标签接单必须先给结构体加字段。
    `Data.State` 字段**有**（含 `Type`，`canceled` 即取消判据）但全仓无消费方。
    `update` 事件要靠 `UpdatedFrom["labelIds"]` 判断「这次改的是标签」，
-   套路与现成的 `UpdatedFrom["assigneeId"]`（`linear.go:452`）一致。
+   套路与 `WebhookEvent.IsLabelTriggered`（同文件）读 `UpdatedFrom[assigneeId]` 的写法一致。
 2. **取消联动做不到「停住在跑的 agent」**：`Transition` 到 `cancelled` 只改库，
    runner 全包没有任何地方在执行中途回读 task state。而 `cancelled` 是无出边终态，
    在途 agent 跑完再转移会被 `Validate` 拒绝并报错。**必须显式决策，不能含糊过去。**
 
 - AC1 issue 打上触发标签（默认 `lathe:go`，可配）时接单
 - AC2 issue 被取消（`Data.State.Type == "canceled"`）时其在途任务转 `cancelled`，
-  actor 口径照 `mergepoll.go:641` 写成 `"system:webhook"`，并跟着调 `PropagateBlocked`
+  actor 口径照 `internal/runner/mergepoll.go` 里 `"system:merge-poll"` 的写法，
+  定为 `"system:webhook"`（实现即 `cmd/lathe/queue.go` 的 `cancelActiveTasks`），
+  并跟着调 `PropagateBlocked`
 - AC3 标签名可配；**未配置时行为与现状一致**（不得让存量部署突然开始接单）。
-  回归护栏：`webhook_test.go:183` 与 `:199` 两个「忽略」用例必须仍绿
+  回归护栏：`internal/httpapi/webhook_test.go` 的 `TestWebhookRejectsBadSignature`
+  与 `TestWebhookIgnoresNonAssignment` 两个「忽略」用例必须仍绿
 - AC4 幂等：同一事件重放不产生第二个任务。除既有 `ClaimDelivery` 去重外，
   `tasks_one_active_per_issue` 部分唯一索引是第二道防线（标签与指派双触发时靠它挡）
 - AC5 验签失败一律拒绝 —— 不得在 ingress 上开任何新的免验签路径
 - AC6 **在途 agent 的取消语义必须写明**：本轮接受「只转状态、agent 白跑完一轮」，
   并在 pipeline 转移失败处补一条明确日志（而非现在的裸错误），真正的取消信号
   传播列为后续项。取消联动需要「按 issue 找在途任务」的查询，谓词抄
-  `flow/service.go:357`，改按 `user_id + linear_issue_id`
+  `internal/flow/service.go` 的 `detectDuplicateSubmission`，改按 `user_id + linear_issue_id`
 ### T8 per-task compose 隔离
 
 **探查结论：AC2 原先写的「复用 preview，不新写」过于乐观，需要修正为分层复用。**
@@ -473,7 +483,7 @@ mtime `< cutoff`，两把尺子都超期才删）；删之前用现成的 `Inspe
 Postgres 上，而生产查询是全局的」，但机制不同：
 
 **缺陷 1 —— `cmd/lathe` 的 `TestRunOneClaimedRecoversInterruptedStateFromEvents`**
-（`queue_test.go:367` 断言「应领到恢复后的任务」）：
+（`cmd/lathe/queue_test.go`，断言「应领到恢复后的任务」）：
 
 失败时日志是
 ```
@@ -488,7 +498,7 @@ INFO 启动恢复完成 requeued_inflight=2
 不是跨轮次的历史残留。
 
 **缺陷 2 —— `internal/runner` 的 `TestPipelineHeavyNoReproTestIsFailure`**
-（`pipeline_test.go:595`）：
+（`internal/runner/pipeline_test.go`）：
 ```
 建任务失败: task: 创建任务失败: ERROR: duplicate key value violates
 unique constraint "tasks_one_active_per_issue" (SQLSTATE 23505)
@@ -1063,8 +1073,8 @@ repos / tasks / task_events / verifications / agent_events。
   标签隔离方案本身经审计核实是**正确**的（`Manager.Stop` 的三处六条过滤器与
   `lathe.verify` 全不相交，反向也不会误删预览容器），命令注入面也干净 ——
   这些没动。
-  ① **worker 先跑、Stacks 后装。** `go q.work(ctx)` 在 main.go:153，而
-  `pipeline.Stacks = ...` 在 257 —— worker goroutine 读它、main goroutine
+  ① **worker 先跑、Stacks 后装。** `go q.work(ctx)`（`cmd/lathe/main.go` 的 `startWorkers`）
+  排在 `pipeline.Stacks = ...` 之前 —— worker goroutine 读它、main goroutine
   无同步地写它，是 Go data race（interface 值两个字，撕裂读可能读到非 nil 的
   itab 配 nil 的 data，然后在验证主路径上 panic；`go test -race` 抓不到，
   因为 `serve()` 没有测试覆盖）。更实的影响：这两行之间被领走的任务

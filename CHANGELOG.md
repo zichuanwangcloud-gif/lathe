@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-13
+
 ### Added
 
 - **平台自度量**（`docs/05-roadmap.md` §3.6 第 15 条）：`GET /api/stats/metrics`
@@ -95,6 +97,10 @@
   界面上是「继续这份 PRD」按钮）。终态的含义是「不再自动流转」，不是死路；
   唤醒只改状态，轮次历史与已确认的节都还在。放弃与超时搁置共用一个状态，
   不新增 `stale`（docs/10 §9 记录了这条取舍与它的代价）
+- 弹窗基座 `BaseDialog`：Escape 关闭 / 焦点管理 / aria 语义，收编两处重复实现
+- 确认对话框取代原生 `confirm`；删除用户升级为逐字输入确认
+- 看板翻页与筛选状态写入 URL：可分享、刷新不丢
+- 未匹配路由落到 404 页，不再渲染空白外壳
 
 ### Changed
 
@@ -110,11 +116,23 @@
   多架构构建不再靠 QEMU 模拟跑 Go 编译
 - PRD 状态机：`abandoned` 从「没有任何出边」改为「只有一条人工出边」
   （→ `drafting`）。`converted` 仍是唯一不可回的终态
+- 校验报错与界面说明里的示例仓库值统一为中立占位 `acme/demo`，
+  不再引用仓库迁移前的私有部署
 
 ### Fixed
 
+- agent 提交时的身份改为显式注入 `GIT_AUTHOR_*` / `GIT_COMMITTER_*`（固定为
+  `lathe <lathe@users.noreply.github.com>`），不再依赖运行环境的 git config。
+  没配过 git 的环境里 `git commit` 会直接失败（Author identity unknown），
+  官方镜像正是这种环境 —— 也就是说按镜像部署的实例，agent 提交那一步会在
+  运行期才炸。**同时改变了既有行为**：在配过 git 的机器上，agent 提交原先
+  署的是部署机器主人的名字，现在统一署 `lathe`（agent 写的提交署上运维同事
+  的名字会让 blame 失真）
 - 数据库测试在库不可达时会静默跳过，导致 CI 可能全绿却什么都没验证 ——
   改为由 `LATHE_TEST_REQUIRE_DB` 强制失败（本地默认行为不变）
+- 可访问性基线达标：按钮对比度 / 焦点环 / `prefers-reduced-motion` 动效消减；
+  错误横幅与状态变化对屏幕阅读器可感知（`role="alert"` 等），图标按钮补可访问名称；
+  认证表单补可见 label，placeholder 回归提示本职
 
 ## [0.1.1] - 2026-09-19
 
@@ -201,5 +219,7 @@
 - **不做需求澄清** —— 单子不明确就回帖提问并停下，不猜
 - **永不 push 受保护分支** —— 一切走 PR
 
+[Unreleased]: https://github.com/zichuanwangcloud-gif/lathe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/zichuanwangcloud-gif/lathe/releases/tag/v0.2.0
 [0.1.1]: https://github.com/zichuanwangcloud-gif/lathe/releases/tag/v0.1.1
 [0.1.0]: https://github.com/zichuanwangcloud-gif/lathe/releases/tag/v0.1.0
