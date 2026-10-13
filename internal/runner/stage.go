@@ -47,6 +47,14 @@ const (
 	StageCreatePR Stage = "create_pr"
 )
 
+// Label 是 label() 的导出形式。
+//
+// 存在的唯一理由：失败分类直方图（平台自度量）要把 failure_stage 渲染成
+// 中文。措辞是本包的知识，不该复制一份到 httpapi 或前端去 —— 那边复制
+// 一份就一定会漏改（stage.go 的集合会随流水线演进而增加，这正是 0012
+// 迁移不给这一列加 CHECK 的原因）。
+func (s Stage) Label() string { return s.label() }
+
 // label 是给人看的阶段名（failure_reason 前缀与回帖沿用中文）。
 func (s Stage) label() string {
 	switch s {
@@ -82,6 +90,19 @@ func (s Stage) label() string {
 		return "推送分支失败"
 	case StageCreatePR:
 		return "创建 PR 失败"
+	case StageRebaseConflict:
+		// 这条常量定义在 pipeline.go（它的触发路径是 MergePoller 而不是
+		// Pipeline.Execute，见那里的注释）。**在这里补上标签**是因为它现在
+		// 有了一个人读的消费方：平台自度量的失败分类直方图 ——
+		// 落到 default 分支会把 "rebase_conflict" 这个英文标识原样混进
+		// 一堆中文标签里。
+		return "自动 rebase 冲突"
+	case StageProfileInvalid:
+		// 常量在 profile.go。同样是为了直方图（见上面那条的理由）。
+		return "节点画像非法"
+	case StageSkillMissing:
+		// 常量在 skills.go。
+		return "技能缺失"
 	}
 	return string(s)
 }

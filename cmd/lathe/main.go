@@ -550,19 +550,26 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 	// 返回时 Stacks 必然已经装好，不存在一个「还没装」的中间态。
 	pm := preview.NewManager(cfg.WorkspaceRoot, st.PreviewThresholds)
 
+	// Memory 接 *store.Store 本身：它直接满足 runner.FailureMemory
+	// （方法签名一对一同形），不需要适配器 —— 与 Verifications /
+	// AgentEvents 的接线方式一致。
 	return &runner.Pipeline{
-		Tasks:            task.NewMachine(st.Pool()),
-		Worktrees:        wm,
-		Verifier:         runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
-		Agent:            agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
-		ClientFactory:    factory,
-		Notifier:         logNotifier{},
-		Mail:             taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
-		BaseURL:          cfg.PublicURL(),
-		LogDir:           cfg.DataDir,
-		Verifications:    st,
-		Stacks:           verifyStacks{pm},
-		AgentEvents:      st,
+		Tasks:         task.NewMachine(st.Pool()),
+		Worktrees:     wm,
+		Verifier:      runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
+		Agent:         agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		ClientFactory: factory,
+		Notifier:      logNotifier{},
+		Mail:          taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
+		BaseURL:       cfg.PublicURL(),
+		LogDir:        cfg.DataDir,
+		Verifications: st,
+		Stacks:        verifyStacks{pm},
+		AgentEvents:   st,
+		Memory:        st,
+		// 脱敏权威层的登记值：配置里的 DB 口令/集成 token（见 config.KnownSecrets）。
+		// 隔离栈连接串与进程环境由 runner 自己在脱敏时补上（它拿得到 StackEnv）。
+		KnownSecrets:     cfg.KnownSecrets(),
 		Gates:            runner.NewVerifyGates(cfg.LightSlots, cfg.HeavySlots),
 		PermissionMode:   "acceptEdits",
 		MaxFixAttempts:   cfg.FixAttempts,

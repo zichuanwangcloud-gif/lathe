@@ -202,14 +202,36 @@ func TestNoteStackSkippedEventCarriesSharedNote(t *testing.T) {
 
 // captureEvents 是 AgentEventRecorder 的最小假件。
 type captureEvents struct {
-	phase   string
+	// phase 是**最后**一批事件的阶段（老字段，保留给只看单个阶段的用例）。
+	phase string
+	// phases 记录见过的每个阶段（按出现顺序，含空批）。阶段名是跨分支的
+	// 接口约定（见 pipeline.injectFailureMemory），改名会静默改变事件流的
+	// 标签，所以要能被断言。
+	phases  []string
 	entries []agent.Entry
 }
 
 func (c *captureEvents) InsertAgentEvents(ctx context.Context, taskID int64, phase string, entries []agent.Entry) error {
 	c.phase = phase
+	c.phases = append(c.phases, phase)
 	c.entries = append(c.entries, entries...)
 	return nil
+}
+
+// shownPhases 返回「界面/接口侧实际会看到的」阶段序列。
+//
+// 事件是按批落库的：一批写不进条目（比如纯粹的 assistant 文本被 Digest 滤掉）
+// 就不会调 InsertAgentEvents —— 空批不落库是刻意的（见 EventSink.flush）。
+// 所以这里按出现顺序去重，反映的是「这个任务的 agent_events 里会有哪些
+// 阶段标签」，而不是「代码里调了几次」。
+func (c *captureEvents) shownPhases() []string {
+	var out []string
+	for _, p := range c.phases {
+		if len(out) == 0 || out[len(out)-1] != p {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *captureEvents) SetAgentSummary(context.Context, int64, string, float64, int64, int) error {

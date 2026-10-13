@@ -72,8 +72,6 @@ func ParseProfile(raw []byte) (*Profile, error) {
 }
 
 // StageProfileInvalid 是节点画像校验失败的失败阶段代码：JSON 损坏，
-// 或字段取值非法（如 verify_tier 不是 light/heavy）。与
-// StageRebaseConflict 同理，不进 stage.go 的 label()/stageOrder() 表
-// （两者的 default 分支已经兜得住未列出的 Stage），单独放在离消费方
-// 最近的文件里。
+// 或字段取值非法（如 verify_tier 不是 light/heavy）。常量定义在这里
+// （离消费方最近），中文标签在 stage.go 的 label() 里。
 const StageProfileInvalid Stage = "profile_invalid"

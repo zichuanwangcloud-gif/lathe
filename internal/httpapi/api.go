@@ -72,6 +72,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
 	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
+	mux.Handle("GET /api/stats/metrics", a.Auth.RequireFunc(a.metricsStats))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
 
@@ -170,6 +171,41 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// metricsStats 返回平台自度量：各环节时长分布 + 失败分类直方图
+// （docs/05-roadmap.md §3.6 第 15 条）。
+//
+// 与 costStats 同一个理由独立于 /api/stats：看板每 5 秒轮询那个端点，
+// 而这两个聚合都要扫 task_events 并按任务分组。决策视图不需要 5 秒新鲜度。
+//
+// 失败分类在这里补上中文名：failure_stage 的措辞是 runner 包的知识
+// （runner.Stage 的标签方法），store 与前端都不该各存一份 —— 复制一份
+// 就一定会随流水线演进漏改。
+func (a *API) metricsStats(w http.ResponseWriter, r *http.Request) {
+	ms, err := a.Store.MetricsStatsFor(r.Context(), CurrentUser(r).ID)
+	if err != nil {
+		serverError(w, "度量统计失败", err)
+		return
+	}
+	stages := make([]map[string]any, 0, len(ms.FailureStages))
+	for _, fc := range ms.FailureStages {
+		item := map[string]any{"stage": fc.Stage, "count": fc.Count}
+		// 空键是 0012 之前的历史失败（没记阶段），给它一句人读说明而不是
+		// 一个空字符串 —— 前端直接渲染 label 即可，不必再判空。
+		if fc.Stage == "" {
+			item["label"] = "未记录阶段（早期数据）"
+		} else {
+			item["label"] = runner.Stage(fc.Stage).Label()
+		}
+		stages = append(stages, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"segments":      ms.Segments,
+		"failureStages": stages,
+		"failed":        ms.Failed,
+		"tasks":         ms.Tasks,
+	})
 }
 
 // costStats 返回 agent 花费的聚合视图（T5）。

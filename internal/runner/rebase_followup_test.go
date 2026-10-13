@@ -13,6 +13,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
@@ -454,10 +455,12 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 		},
 	})
 
+	mem := newFakeMemory()
 	pipe := &Pipeline{
 		Tasks: m, Worktrees: wm, Verifier: NewVerifier(3*time.Minute, ""),
 		Agent: ag, Clients: &fakeClients{lin: lin, gh: gh}, Notifier: &fakeNotifier{},
 		Verifications: &fakeVerifications{}, PermissionMode: "acceptEdits", SettingSources: "project",
+		Memory: mem,
 	}
 
 	if err := pipe.Execute(ctx, ExecuteParams{
@@ -584,6 +587,46 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 	if isAncestor(t, *tCAfter.WorktreePath, devTip, "HEAD") {
 		t.Error("taskC 不应以 dev 的新 tip 为祖先——它根本没被 rebase 过")
 	}
+
+	// ---- 断言五（§3.6 第 16 条）：rebase 冲突失败也写进跨任务记忆 ----
+	//
+	// 这条路径没有 runCtx、调不了 fail()，记忆写入是单独补的一次
+	// （recordFailureMemoryFor）。少了它，「自动 rebase 撞冲突」就是记忆
+	// 里的一个黑洞 —— 而它恰恰最该被记住：同一个栈重试时会再撞同一处。
+	var rebaseDigest *store.FailureDigest
+	for i := range mem.written {
+		if mem.written[i].TaskID == taskB.ID {
+			rebaseDigest = &mem.written[i]
+		}
+	}
+	if rebaseDigest == nil {
+		t.Fatalf("rebase 冲突失败也应落一条失败记忆，实际写入 %+v", mem.written)
+	}
+	if rebaseDigest.Stage != string(StageRebaseConflict) {
+		t.Errorf("记忆阶段 = %q，期望 %q", rebaseDigest.Stage, StageRebaseConflict)
+	}
+	if !strings.Contains(rebaseDigest.Reason, "冲突") {
+		t.Errorf("记忆原因应能看出是冲突相关，实际 %q", rebaseDigest.Reason)
+	}
+	// 且要按 taskB 这个单子的定位键写 —— 注入时按 (repo, 平台, 单号) 查，
+	// 定位字段写错就是「写了也读不到」。fakeMemory 按 lookup 存，所以
+	// 「能按 taskB 的键查回来」等价于「定位字段与任务行一致」。
+	wantKey := store.FailureLookup{
+		UserID: tBAfter.UserID, RepoID: tBAfter.RepoID,
+		TrackerProvider: tBAfter.TrackerProvider, ExternalKey: "RB-CONFLICT-B",
+	}
+	if _, ok := mem.stored[wantKey]; !ok {
+		t.Errorf("记忆应按 taskB 的定位键写入，实际键集合：%v", memoryKeys(mem))
+	}
+}
+
+// memoryKeys 把 fakeMemory 里存过的键摊开，失败信息里看得见实际写的是什么。
+func memoryKeys(f *fakeMemory) []store.FailureLookup {
+	keys := make([]store.FailureLookup, 0, len(f.stored))
+	for k := range f.stored {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // ----------------------------------------------------------------

@@ -109,6 +109,24 @@ type Pipeline struct {
 	// （docs/04-agent-visibility.md）；为 nil 时整个可见性机制关闭。
 	AgentEvents AgentEventRecorder
 
+	// Memory 读写跨任务失败记忆（§3.6 第 16 条）：fail() 往里写，
+	// 分诊/实现提示词从里读。为 nil 时整个机制关闭（测试与老装配）。
+	//
+	// 一读一写两半必须同时接线 —— 只写不读是「有列没消费方」
+	// （AGENTS.md §1.3），只读不写则永远读不到东西。
+	Memory FailureMemory
+
+	// KnownSecrets 是装配侧登记的平台自身凭据（配置里的 DB 口令、集成
+	// token、拼好的 DSN），供失败记忆的脱敏**权威层**做精确替换
+	// （见 redact.go 的分层说明）。
+	//
+	// 为什么需要它而不是只靠进程环境：凭据可能来自库（creds 解出来的
+	// token）而从未进过 env；而形态表认不出随机串。凡平台已知的凭据值，
+	// 按字节精确替换是最可靠的一道 —— 它不依赖任何「像不像凭据」的猜测。
+	//
+	// 为 nil 时该层关闭，形态表照旧工作（测试与老装配）。
+	KnownSecrets []string
+
 	// Stacks 起 per-task 依赖隔离栈（T8）；为 nil 时不起栈，
 	// 验证命令用宿主环境跑 —— 与本字段引入之前完全一致。
 	//
@@ -176,9 +194,11 @@ var errHalt = errors.New("pipeline: 任务正常终止（非失败）")
 //
 // 与 stage.go 里的其它 Stage 常量同属一套机器可读契约（tasks.failure_
 // stage），只是触发路径是 MergePoller.rebaseFollowup 而不是
-// Pipeline.Execute 的常规阶段编排，因此单独放在这里，不去改
-// stage.go 的既有函数逻辑（label()/stageOrder() 的 default 分支已经
-// 兜得住未列出的 Stage，不需要为它们改动这些函数）。
+// Pipeline.Execute 的常规阶段编排，因此常量本身定义在这里。
+//
+// 它的中文标签在 stage.go 的 label() 里（StageLabel 有真实消费方之后补的：
+// 失败分类直方图会把阶段代码渲染成人读文字，落 default 分支会把英文标识
+// 混进一堆中文里）。
 const StageRebaseConflict Stage = "rebase_conflict"
 
 // runCtx 携带一次流水线执行的上下文，在阶段函数间传递。
@@ -192,6 +212,10 @@ type runCtx struct {
 
 	tk   *task.Task // 任务行（每次转移后刷新）
 	plan *RetryPlan // 非空表示断点续跑
+	// scope 是失败记忆的定位字段（§3.6 第 16 条），setup 时从任务行摊一次。
+	// 存下来而不是每次注入时重算：它是任务行的不变量（repo/external_key
+	// 创建后不可变，与 repo_id 同理）。
+	scope failureScope
 	// failStage 是本次重试针对的失败阶段（tasks.failure_stage），
 	// 影响续跑 prompt 的选择（实现中断 vs 验证未通过）。
 	failStage Stage
@@ -411,6 +435,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	}
 
 	rc := &runCtx{ctx: ctx, params: params, actor: actor, clients: clients, tracker: tr, gh: gh, tk: tk}
+	rc.scope = failureScopeOf(tk)
 	rc.profile, rc.profileErr = ParseProfile(tk.Profile)
 	entry := EntryTriage
 	if params.Retry != nil {
@@ -496,8 +521,12 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	}
 	triageSession := p.newID()
 	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", triageDir, triageSession)
+	// 失败记忆：分诊是全流程的第一个 agent 调用，也是「上次这个单子死过」
+	// 最该被知道的地方 —— 上次若因单子不明确 blocked_spec 过，这次分诊
+	// 直接看到那段历史，判定就有了上下文。分诊是新会话，提示词里没有
+	// 任何失败信息，所以不排除本任务的记录（alreadyInPrompt=false）。
 	triageRes, err := p.Agent.Run(rc.ctx, agent.RunParams{
-		Prompt:         TriagePrompt(issue.Context()),
+		Prompt:         p.withFailureMemory(rc.ctx, rc.scope, TriagePrompt(issue.Context()), false),
 		Dir:            triageDir,
 		SessionID:      triageSession,
 		PermissionMode: "plan", // 分诊只读不写
@@ -619,7 +648,7 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, rc.implSession); serr != nil {
 			slog.Warn("降级会话 ID 落库失败", "task", rc.tk.ID, "err", serr)
 		}
-		implRes, err = p.runAgent(rc, "implement-reentry",
+		implRes, err = p.runAgent(rc, PhaseImplementReentry,
 			ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), rc.implSession, false)
 	}
 
@@ -640,6 +669,10 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 }
 
 // implementPrompt 按续跑来源选择实现阶段的 prompt。
+//
+// 失败记忆的注入**不在这里**：本函数是纯构造函数（输入需求与现场状态，
+// 输出提示词），注入统一发生在 runAgent 这个唯一的 agent 调用入口上
+// —— 那里同时知道 phase 与 resume，见 injectFailureMemory。
 func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 	if rc.plan == nil || rc.plan.Entry != EntryImplement {
 		return ImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), false
@@ -661,6 +694,7 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 // 不同节点可路由到不同通道），画像未设置该字段时回落到仓库/流水线级
 // 的 p.ImplementChannel（既有行为，F7.1-AC4 的回归保证）。
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
+	prompt = p.injectFailureMemory(rc, phase, prompt, resume)
 	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
 	channel := p.ImplementChannel
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
@@ -687,6 +721,56 @@ func channelEnv(channel string) []string {
 		return nil
 	}
 	return []string{"LATHE_AGENT_CHANNEL=" + strings.TrimSpace(channel)}
+}
+
+// injectFailureMemory 是失败记忆在**实现链路**上的唯一注入决策点。
+//
+// 「唯一」限定在实现链路这一侧：分诊那一处是**独立旁路**（它不走
+// runAgent），注入点在 stageTriage 里 Agent.Run 的 Prompt 字段上。所以
+// 全仓的注入点共两处，都在本文件里：
+//
+//  1. stageTriage → p.withFailureMemory(rc.ctx, rc.scope, TriagePrompt(...), false)
+//  2. 本函数（runAgent 入口，覆盖 implement 与 implement-reentry 两个 phase）
+//
+// 别把「实现链路收敛到一处」读成全仓只有一处：分诊那处不经过 runAgent，
+// 加/改分诊的注入要直接改它的调用点。
+//
+// ---------------------------------------------------------------------------
+// 为什么收敛在 runAgent 而不是各个 prompt 构造函数
+// ---------------------------------------------------------------------------
+//
+// 「往提示词里追加一段东西」用不着改动 prompt.go 的任何签名：本函数在
+// 提示词**构造完之后**追加，构造函数不知道自己被注入了。这样
+// ImplementPrompt / ReentryImplementPrompt / ResumeFixPrompt /
+// ContinueImplementPrompt 与它们的调用点一个字都不用改 —— 并行线（A2 的
+// PR review 二轮）改的是同一段 `implementPrompt`/`stageImplement`，
+// 两边各改各的，rebase 时不会互相顶。
+//
+// 本函数是多出来的一层，但换来的是「注入上限、渲染格式、判空、排除规则」
+// 只有一处实现（见 withFailureMemory），而不是散在四个调用点各判一次。
+//
+// ---------------------------------------------------------------------------
+// 为什么只注入实现链路
+// ---------------------------------------------------------------------------
+//
+// 排除修复轮（fix-N）：它是紧接着一次失败的 resume 会话，`tasks.failure_reason`
+// 全文已经在提示词里，再注入一遍是纯噪声。
+//
+// 分诊不在本函数管辖范围内（它不走 runAgent），见上面顶部那段。
+//
+// phase 名是**跨分支的接口约定**：PR review 二轮（A2）复用 `implement` /
+// `implement-reentry` 这两个名字，不新增第三个 —— 否则这里要跟着加白名单，
+// 两条线的 diff 会顶在一起。
+func (p *Pipeline) injectFailureMemory(rc *runCtx, phase, prompt string, resume bool) string {
+	switch phase {
+	case "implement", PhaseImplementReentry:
+		// resume 为真（ResumeFixPrompt / ContinueImplementPrompt）时提示词里
+		// 已经带着本任务那次失败的原因，排除本任务自己的记录 —— 但仍然
+		// 注入**更早的任务行**留下的历史（issue 关掉重开会新建任务行）。
+		return p.withFailureMemory(rc.ctx, rc.scope, prompt, resume)
+	default:
+		return prompt
+	}
 }
 
 // triageDir 返回分诊 agent 的中立工作目录（惰性创建）。
@@ -937,7 +1021,11 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 			}
 			cause = header + "\n" + cause
 		}
-		return p.fail(rc, StageVerifyFailed, errors.New(cause))
+		// 带上失败步骤的**输出摘要**进跨任务记忆：摘要来自报告里失败的
+		// 那一步（不是回帖用的 Summary —— 后者只有步骤名与耗时，没有
+		// 输出，下一个 agent 从中学不到任何东西）。写入侧脱敏 + 截断，
+		// 见 redact.go 的分层说明与 Pipeline.failureExcerpt。
+		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), p.failureExcerpt(report))
 	}
 
 	rc.report = report
@@ -1291,6 +1379,18 @@ func (p *Pipeline) persistAgentResult(ctx context.Context, taskID int64, res *ag
 // 失败阶段代码落进 tasks.failure_stage —— 人工重试时智能续跑（retry.go）
 // 靠它决定从哪个阶段断点续跑，还是丢弃重建。
 func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
+	return p.failWithExcerpt(rc, stage, cause, "")
+}
+
+// failWithExcerpt 是 fail 的带「验证输出摘要」版本（§3.6 第 16 条）。
+//
+// 只有拿到结构化验证结果的调用点（stageVerify）才传得上 excerpt ——
+// 那一份摘要正是跨任务记忆里最值钱的部分：失败阶段说明了「哪一步」，
+// 摘要说明「为什么」，而后者是下一个 agent 真正需要的。
+//
+// excerpt 为空与 fail() 等价。两条路径共用同一个实现，是为了让落库位置
+// 只有一个 —— 复制一份 fail 出来改，就是复制那份失败传播逻辑。
+func (p *Pipeline) failWithExcerpt(rc *runCtx, stage Stage, cause error, excerpt string) error {
 	reason := fmt.Sprintf("%s: %v", stage.label(), cause)
 	slog.Error("任务失败", "task", rc.tk.ID, "stage", string(stage), "err", cause)
 
@@ -1331,6 +1431,12 @@ func (p *Pipeline) fail(rc *runCtx, stage Stage, cause error) error {
 		mailDetail = fmt.Sprintf("工作区已保留在 %s（分支 %s），可直接进去接手；重试会优先续跑该现场。", rc.wt.Path, rc.wt.Branch)
 	}
 	p.mailTerminal(rc.ctx, failed, mailDetail)
+
+	// 跨任务失败记忆（§3.6 第 16 条）：同样放在转移之后 —— 任务没真的落成
+	// failed 就不该留下这条记忆。写它的是 fail() 而不是各调用点，
+	// 是为了让「任务失败」这一件事只对应一处记忆写入，不随失败路径增加
+	// 而漏记（stageVerify / mergepoll 的 rebase 跟进等路径都要照顾到）。
+	p.recordFailureMemory(rc, stage, cause, excerpt)
 
 	// 4) 失败传播（F2.3-AC1~AC4）：depends_on 链上所有传递后继里仍排队的
 	// 任务转 blocked_dep，并回帖说明是被本任务连累的。传播出错或某个
