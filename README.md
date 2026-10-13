@@ -126,6 +126,10 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_ADMIN_EMAIL` | 内置管理员邮箱，默认 `admin@lathe.local` |
 | `LATHE_ADMIN_PASSWORD` | 内置管理员初始口令，不配则随机生成并打印一次 |
 | `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
+| `LATHE_LINEAR_TOKEN` | Linear API 令牌的兜底值。**只对内置管理员生效**，且优先级低于设置页（界面里配了就以界面为准，改完即刻生效） |
+| `LATHE_LINEAR_WEBHOOK_SECRET` | Linear webhook 签名密钥的兜底值。**只对内置管理员生效**、优先级低于设置页 |
+| `LATHE_LINEAR_USER_ID` | 「指派给我了吗」接单判定用的 Linear 用户 ID。**只对内置管理员生效**；设置页配 Linear 令牌时会自动取到账号 ID，正常情况不用手工填 |
+| `LATHE_GITHUB_TOKEN` | GitHub 个人访问令牌的兜底值（推分支、开 PR）。**只对内置管理员生效**、优先级低于设置页 |
 | `LATHE_COOKIE_SECURE` | 覆盖会话 Cookie 的 Secure 标志，默认按 BaseURL 的协议推断 |
 | `LATHE_TRUSTED_PROXY` | 设为 `true` 才信任 `X-Forwarded-For`（限流按它取客户端 IP） |
 | `LATHE_WORKTREE_TTL` | 终态任务的工作区现场保留时长，默认 `72h`，**下限 `1h`**（配得更小启动直接报错）。注意 Go 的时长解析**不支持 `d`**，写 `72h` 不能写 `3d` |
@@ -157,7 +161,9 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 环境变量，或 `$LATHE_DATA_DIR/secret.key`，首次运行自动生成、权限 0600），
 因此拿到数据库转储也解不出凭据。
 
-也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等），优先级低于界面配置。
+也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等，见上表），优先级低于设置页，
+且**只对内置管理员生效**（`internal/creds` 的 `Factory.ProviderFor`：环境兜底只发给
+部署者自己的账号，不借给普通成员的任务 —— 普通成员在设置页各自配置）。
 
 流程：指派 issue 给自己 → 事件按你的专属 webhook 地址路由到你名下（用你的
 webhook 密钥验签）→ 接单 → 分诊 → 实现（fix/feature 必须交复现/验收
