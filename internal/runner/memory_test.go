@@ -305,7 +305,7 @@ func TestFailureMemoryInjectedOnImplementEntry(t *testing.T) {
 			{Success: false, IsError: true, Subtype: "error_during_execution", Text: "第二轮也挂了"},
 		},
 	}
-	p.Agent = ag2
+	p.Agent = &probeAgent{inner: ag2}
 	if err := p.Execute(ctx, ExecuteParams{
 		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Actor: "node:test",
 		Retry: &RetryPlan{Entry: EntryImplement, Reasons: []string{"测试指定续跑实现"}},
@@ -319,8 +319,8 @@ func TestFailureMemoryInjectedOnImplementEntry(t *testing.T) {
 	}
 	got := ag2.calls[0].Prompt
 	// 先确认走的确实是 reentry 那支（不是 resume：resume 分支排除了自记录）
-	if !strings.Contains(got, "工作区") && !strings.Contains(got, "现场") {
-		t.Logf("reentry 提示词：\n%s", got)
+	if !strings.Contains(got, "续跑场景") {
+		t.Fatalf("这条用例要走 ReentryImplementPrompt，实际提示词：\n%s", got)
 	}
 	if !strings.Contains(got, "这个需求此前失败过") {
 		t.Errorf("reentry 路径的提示词应含历史失败段，实际：\n%s", got)
@@ -362,8 +362,10 @@ func TestFailureMemoryInjectedOnResumeDegrade(t *testing.T) {
 		},
 	}
 	mem := newFakeMemory()
-	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	evts := &captureEvents{}
+	p := newPipeline(t, m, lin, gh, &probeAgent{inner: ag}, &fakeNotifier{})
 	p.Memory = mem
+	p.AgentEvents = evts
 
 	// 造一个「实现阶段失败过、现场保留、有会话 ID」的任务，再把它摆成
 	// 「人工续跑」的形态（prepareFailedTask 会建工作区 + 落会话 ID）。
@@ -421,6 +423,33 @@ func TestFailureMemoryInjectedOnResumeDegrade(t *testing.T) {
 	if !strings.Contains(got, wantMarker) {
 		t.Errorf("注入的应是那段历史输出摘要 %q，实际：\n%s", wantMarker, got)
 	}
+
+	// phase 名是**跨分支的接口约定**（injectFailureMemory 的白名单、A2 的
+	// review 二轮都按它写），而它同时喂给 newEventSink 作事件流的阶段标签
+	// —— 把调用点的 phase 改成 "implement" 会让注入照旧、事件标签静默变样。
+	// 事件是按批落库的（见 captureEvents.shownPhases 里的说明），所以这里
+	// 断言的是「**展示侧能看到的**阶段名」，正是这个约定真正关心的那件事。
+	// 取前两个（后面还有验证阶段自己的批次）：这次的两次调用必须是
+	// implement 与 implement-reentry，按这个顺序。
+	shown := evts.shownPhases()
+	if len(shown) < 2 || shown[0] != "implement" || shown[1] != "implement-reentry" {
+		t.Errorf("前两次 agent 调用的阶段标签应为 [implement implement-reentry]，得到 %v", shown)
+	}
+}
+
+// probeAgent 在每次 Run 时先投一条事件再交给内层假件。
+//
+// 存在的理由：「阶段名」既是注入决策的依据，也是事件流的标签（喂给
+// newEventSink）。要断言后者，agent 必须真的产出事件 —— 而 fakeAgent
+// 默认不投（不投的话 EventSink 一个批次都不落，事件流的阶段完全不可观测）。
+// 用装饰器而不是改 fakeAgent：改公共假件会影响所有可见性用例的计数断言。
+type probeAgent struct{ inner *fakeAgent }
+
+func (a *probeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, error) {
+	if p.OnEvent != nil {
+		p.OnEvent(agent.Event{Type: agent.EventType("probe"), Raw: []byte(`{}`)})
+	}
+	return a.inner.Run(ctx, p)
 }
 
 // ★ AC3 的对照：没有历史失败时提示词逐字不变。

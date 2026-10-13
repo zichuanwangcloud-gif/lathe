@@ -33,6 +33,20 @@ package runner
 // 且**非穷举** —— 见那里的注释。
 //
 // ---------------------------------------------------------------------------
+// 两条互相拉扯的约束
+// ---------------------------------------------------------------------------
+//
+// 这一层同时被两个方向拽着，每次改动都要两头都看：
+//
+//   - **不能漏**：漏一个就是库里/提示词里留一份明文（§7 红线）。
+//   - **不能误伤**：把正常输出抹成 [REDACTED]，摘要就失去排障价值 ——
+//     而摘要存在的全部意义就是「哪一步、为什么失败」。
+//
+// 第三轮复审抓到的三类问题正好各踩一头：邮箱被当连接串抹（误伤 + 损坏
+// JSON 结构）、`{"token":null}` 被吞掉右花括号（损坏结构）、转义引号里的
+// 口令没被抹（漏）。现在的形态是三条约束换来的，改表前先读下面每条注释。
+//
+// ---------------------------------------------------------------------------
 // 已知的代价与边界（写下来免得被当成「已经保证干净」）
 // ---------------------------------------------------------------------------
 //
@@ -40,16 +54,21 @@ package runner
 //     再宽的词根（AUTH、笼统的 URL）会把 `auth mode is disabled`、
 //     `https://host/tasks/1` 这类正常输出打成 [REDACTED]，摘要的排障价值
 //     直接归零 —— 宁可少抹一点非凭据值，也不把摘要变成筛子。代价是：
-//     **某个自定义名字的变量装着凭据、名字里又没有上面那些词根时，它的值
+//     **某个自定义名字的变量装着凭据、名字里又没有词根表那些词时，它的值
 //     不会被这一级抹掉**（那还有形态表兜底）。
 //   - 形态表认不出 PEM 私钥、自定义前缀的内部 key、以及被当成普通词出现的
 //     口令（`the password is hunter2` 这种没有键值结构的）。
+//   - 无 scheme 的连接串只在**主机部分是 IP 形状**（`lathe:pw@127.0.0.1`）
+//     时被识别：没有 scheme 又用域名主机的 `lathe:pw@db.internal` 认不出。
+//     这条是刻意的窄化 —— 放宽就必然把邮箱吃掉（见 urlCredRe 的注释），
+//     而带 scheme 的 DSN 一律覆盖（那才是实际会出现在验证输出里的形态）。
 //   - 摘要最终会随提示词经 agent.go 的 buildArgs 作为 **argv** 传给 CLI，
 //     因此它不只存在于库里：同机进程能通过 `/proc/<pid>/cmdline` 读到。
 //     （agent 子进程的环境本身是白名单化的，见 agent.go 的 sanitizedEnv；
 //     但 argv 不受它保护。）
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
@@ -73,7 +92,21 @@ const redactedMark = "[REDACTED]"
 // 会把 `auth mode is disabled, expected enabled` 抹成
 // `auth mode is [REDACTED], expected enabled` —— 摘要的排障价值直接没了，
 // 而这类输出恰恰是验证失败时最该看的东西。
-var secretKeyRe = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL)`)
+//
+// 反过来也不能窄：**别名要收齐**（第三轮复审实测 `MYSQL_PWD`、
+// `LATHE_DB_PASS`、`LATHE_SESSION_KEY`、`LATHE_SIGNING_KEY`、`LATHE_GH_PAT`
+// 的值都原样漏了出去）。这类名字下的值都是随机串，形态表认不出来 ——
+// 漏一个就是在库里留一份明文。所以：
+//
+//   - `PWD`/`PASS` 是 `PASSWORD` 的常见简写（MySQL 的 `MYSQL_PWD` 是标准名）
+//   - `SIGNING_KEY`/`SESSION_KEY`/`ENCRYPTION_KEY` 是带中缀的 KEY，
+//     光有 `API_?KEY` 盖不住
+//   - `_PAT`（personal access token）后缀同理
+//
+// 但**不收单独的 `_KEY`**：太泛（`LATHE_KEYBOARD_LAYOUT`、
+// `GPG_KEY_ID` 里的 id 不是口令）。宁可少抹一个非凭据值，也不把常见词
+// 打成标记 —— 那会让整套脱敏看起来失效。
+var secretKeyRe = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|PWD|PASS|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL|SIGNING_?KEY|SESSION_?KEY|ENCRYPTION_?KEY|_PAT$)`)
 
 // urlishKeyRe 命中值是 URL/DSN 的变量名：`postgres://user:pass@host/db` 的
 // 口令段不由上面那组词根命名，但一样是凭据。
@@ -91,6 +124,43 @@ var urlishKeyRe = regexp.MustCompile(`(?i)(^|_)(DSN|DATABASE_URL|DATABASE_URI|RE
 // 都远长于此。
 const minSecretLen = 8
 
+// minBareValueLen 是 kv 形态里**裸值**（不带引号）的最短长度。
+//
+// 引号值没有长度门槛（`"token":"x"` 也抹）—— 引号 + 键名两重信号已经说明
+// 那是个值；裸值只有键名一重信号，且和普通词混在一起（`token: expired`、
+// `password: <placeholder>`），所以要求它至少像个随机串：
+// 长度 8 起、字符集限定在凭据常用的那几类（见 kvBareValue）。
+const minBareValueLen = 8
+
+// literalValueRe 命中「明显不是凭据」的字面量：JSON 的 null/true/false、
+// 各种空值写法、纯数字、以及占位词。命中就不抹。
+//
+// 这条是第三轮复审的 B-2：`{"token":null}`、`{"input_token":5000}`、
+// `{"credentials":"default"}` 都不该被当成凭据 —— 键名像是敏感名，值却是
+// 结构字面量，抹掉只会损坏 JSON 且丢信息。
+var literalValueRe = regexp.MustCompile(`(?i)^(null|true|false|none|nil|default|undefined|nan|\[redacted\])$|^[+-]?\d+(\.\d+)?$`)
+
+// urlCredSchemeRe 与 urlCredHostRe 是 URL/连接串的 basic-auth 口令段规则，
+// 拆成两条是因为两种形态的**判据不同**（捕获组 2 都是口令）：
+//
+//	有 scheme（`postgres://lathe:pw@host`、`redis://:pw@host`、`mysql://user:pw@host`）
+//	   `://` 本身就是决定性证据，右侧一律认（主机是域名还是 IP 都行）。
+//	   用户名允许为空（Redis 的 URI 形态就是 `redis://:pw@host`）。
+//	无 scheme（`lathe:pw@127.0.0.1:5432/db`）
+//	   验证输出里常常只剩这一段（`dial lathe:pw@…`），必须覆盖；但没有
+//	   `://` 就没有证据，只能要求主机部分是 **IP 形状**（`@` 后紧邻数字或
+//	   `[`）。邮箱的 `@` 右侧是域名（字母开头），因此不被认。
+//
+// 不这么分就会踩两条：放宽到「任何 `x:y@z`」→ 邮箱被当凭据抹、JSON 结构
+// 被吃坏（第三轮复审 B-1 的回归）；只认带 scheme 的 → 无 scheme 连接串漏。
+//
+// 两条都用「吃掉主机首字符」代替 lookahead（Go 的 regexp 是 RE2，没有前后
+// 视）：该字符不在替换组里，原样保留。
+const (
+	urlCredSchemeRe = `(?:[a-zA-Z][a-zA-Z0-9+.\-]*://)([^\s/:@]*):([^\s/:@]+)@`
+	urlCredHostRe   = `(?:^|[\s(\[{,;='"])([^\s/:@]+):([^\s/:@]+)@(?:\d|\[)`
+)
+
 // tokenShape 是凭据形态表的一格：一条正则 + 「要抹掉的那一段」是哪个捕获组。
 //
 // 显式标出组号，而不是靠「组数猜语义」—— 早先版本就是后者，于是
@@ -101,8 +171,36 @@ type tokenShape struct {
 	re *regexp.Regexp
 	// group 是「值」所在的捕获组。命中这一段以外的部分（包括同一捕获组
 	// 前后的字面量）原样保留：`ghp_` 这类前缀留着是有用的排障信息，
-	// 而 `postgres://user:` 与 `@host` 留着能让摘要仍然可读。
+	// `postgres://user:` 与 `@host` 留着能让摘要仍然可读。
 	group int
+	// skip 非空时，对捕获到的值再判一次：返回 true 就不抹（值太像结构
+	// 字面量/普通词，抹了只会损坏信息）。nil 表示一律抹。
+	skip func(value string) bool
+}
+
+// 键名词根（kv 形态用）。与 secretKeyRe 是两码事：那个筛**环境变量名**，
+// 这个筛**文本里的键名**，但词根表保持一致 —— 两处漏法不同，收的词应该一样。
+const kvKeyRoots = `password|passwd|pwd|pass|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|signing[_-]?key|session[_-]?key|credentials?`
+
+// kvValue 是带引号的值：允许 `\"`/`\'` 转义。
+//
+// 老写法 `"[^"]*"` 会在第一个转义引号处截断，于是
+// `{"token":"abc\"defghijklmno"}` 只抹掉 `abc\"` 留下一截明文 ——
+// 看起来已经脱敏，实际上口令还在（第三轮复审的 B-3，§7 红线内的真泄漏）。
+const kvValue = `"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'`
+
+// kvBareValue 是裸值：没有引号包裹，只有键名一个信号。
+//
+// 字符集限定在凭据常用的那几类（字母数字 + `-_./=+`），**不接受 `,;}` 等
+// 结构字符** —— 老写法 `[^\s,;]{4,}` 是贪婪的，`{"token":null}` 会一路
+// 吃到串尾把右花括号也吞掉（第三轮复审的 B-2）。
+//
+// 长度下限交给 minBareValueLen，理由是裸值必须「像个随机串」才敢动。
+const kvBareValue = `[A-Za-z0-9_\-./+=]{%d,}`
+
+// notASecretLiteral 是 tokenShape.skip 的实现：明显不是凭据的值不抹。
+func notASecretLiteral(v string) bool {
+	return literalValueRe.MatchString(strings.Trim(v, `"'`))
 }
 
 // tokenShapes 是凭据形态的兜底表。
@@ -117,44 +215,63 @@ var tokenShapes = []tokenShape{
 	// GitHub：PAT（ghp_）、OAuth/Server-to-server（gho_/ghs_）、
 	// 用户与刷新令牌（ghu_/ghr_）、fine-grained PAT（github_pat_）。
 	// 前缀保留：「这里有个 ghp_ 开头的凭据」本身就是有用的排障信息。
-	{regexp.MustCompile(`\b(?:gh[pousr]|github_pat)_([A-Za-z0-9_]{16,})\b`), 1},
+	{re: regexp.MustCompile(`\b(?:gh[pousr]|github_pat)_([A-Za-z0-9_]{16,})\b`), group: 1},
 	// Linear API key（同上，前缀保留）。
-	{regexp.MustCompile(`\blin_api_([A-Za-z0-9]{16,})\b`), 1},
+	{re: regexp.MustCompile(`\blin_api_([A-Za-z0-9]{16,})\b`), group: 1},
 	// Anthropic / OpenAI 风格的 sk- 密钥（前缀保留）。
-	{regexp.MustCompile(`\b(sk-[A-Za-z0-9\-_]{16,})\b`), 1},
+	{re: regexp.MustCompile(`\b(sk-[A-Za-z0-9\-_]{16,})\b`), group: 1},
 	// Slack bot/app/user token（前缀保留）。
-	{regexp.MustCompile(`\b(xox[abprs]-)([A-Za-z0-9\-]{10,})\b`), 2},
+	{re: regexp.MustCompile(`\b(xox[abprs]-)([A-Za-z0-9\-]{10,})\b`), group: 2},
 	// JWT / JWS：`eyJ` 开头的三段 base64url（`eyJ` 是 `{"a`/`{"t` 的
 	// base64，任何 JSON 头的 JWT 都以它开头）。整段抹掉 —— 三段一起才是
 	// 凭据，留着 header 段等于告诉人「这里有 token」之外还漏了算法与
 	// kid；末段允许为空（未签名的 JWT）。
-	{regexp.MustCompile(`\b(eyJ[A-Za-z0-9\-_]*\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b`), 1},
+	{re: regexp.MustCompile(`\b(eyJ[A-Za-z0-9\-_]*\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b`), group: 1},
 	// AWS access key id：整段抹掉（AKIA/ASIA 这 4 位与后面 16 位一起才
 	// 构成 key id）。
-	{regexp.MustCompile(`\b((?:AKIA|ASIA)[A-Z0-9]{16})\b`), 1},
-	// URL 里的 basic-auth 口令段：`user:pass@host`。只抹口令，`user:` 与
-	// `@` 留着（`postgres://lathe:[REDACTED]@127.0.0.1` 比整段抹掉更可读，
-	// 也仍然没有泄漏）。段首的 `user` 用 `[^\s/:@]+` 而不是整条 URL：
-	// 实测验证输出里的连接串常常只留 `dial postgres://lathe:pw@host`，
-	// 没有 scheme 的变体同样要盖住。
-	{regexp.MustCompile(`[^\s/:@]+:([^\s/:@]+)@`), 1},
-	// key=value / key: value 形态：裸键（`token=…`）、带前缀的变量名
-	// （`DATABASE_PASSWORD=…`）与 JSON（`"apiKey":"…"`、`'password': '…'`）。
+	{re: regexp.MustCompile(`\b((?:AKIA|ASIA)[A-Z0-9]{16})\b`), group: 1},
+	// 带 scheme 的连接串口令段（含 `redis://:pw@host` 这种空用户名形态）。
+	{re: regexp.MustCompile(urlCredSchemeRe), group: 2},
+	// 无 scheme 但主机是 IP 形状的连接串口令段。
+	{re: regexp.MustCompile(urlCredHostRe), group: 2},
+	// kv 形态之一：**带引号的值**。三个变体各对应一类真实文本：
 	//
-	// 四个约束各有一条实测：
+	//   `token:"x"`            → 值带引号、键不带
+	//   `"apiKey":"x"`         → JSON（键带引号，且键名后直接跟 `:`）
+	//   `'password': 'x'`      → 单引号风格
 	//
-	//   - 键**允许带引号**：JSON 的键名后面直接跟 `:`，词根右边先是引号
-	//     再是冒号，不带引号时 `\s*[:=]` 接不上，`{"apiKey":"…"}` 会整体
-	//     漏出去（评审实测）。
-	//   - 前置字符类用 `[^A-Za-z0-9]`（引号算合法前置字符），**不用 `\b`**：
-	//     `_` 是词字符，`DATABASE_PASSWORD=` 的下划线之后没有边界，词根
-	//     永远匹配不上。
-	//   - 值分支吃两种引号，也吃裸串。
-	//   - 值**不设最小长度**（`token: "x"` 也抹）：这条守的是「可能泄漏就
-	//     别放行」。长度门槛只在**环境值**那一级才有意义 —— 那里有真代价
-	//     （抹 1–7 字节的短串会把普通输出打成筛子，见 minSecretLen）；
-	//     形态表命中的是明确写着 token/password 的键，误伤面天然很小。
-	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])["']?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)["']?\s*[:=]\s*("[^"]*"|'[^']*'|[^\s,;]{4,})`), 1},
+	// 键允许带引号是必需的：不带时 `\s*[:=]` 接不上 JSON 里「引号 + 冒号」
+	// 那段，`{"apiKey":"…"}` 会整体漏出去。值允许转义引号见 kvValue。
+	// 引号值不看长度（两重信号够了），但仍跳过 null/true/default 这类
+	// 结构字面量。
+	{
+		re:    regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])["']?(` + kvKeyRoots + `)["']?\s*[:=]\s*(` + kvValue + `)`),
+		group: 2,
+		skip:  notASecretLiteral,
+	},
+	// kv 形态之二：**裸值**（`token=hunter2hunter2`、`password: hunter2`）。
+	//
+	// 值必须是「像随机串」的连续字符（见 kvBareValue），长度不足
+	// minBareValueLen 或含结构字符都不动 —— 这一支是误伤的主要来源，
+	// 保守优先。
+	{
+		re: regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|[^A-Za-z0-9])["']?(`+kvKeyRoots+
+			`)["']?\s*[:=]\s*(`+kvBareValue+`)(?:[\s,;}\])"']|$|(?://))`, minBareValueLen)),
+		group: 2,
+		skip:  notASecretLiteral,
+	},
+}
+
+// isRedactedValue 报告这段文本是不是「已经脱敏过」的产物。
+//
+// 两级脱敏会互相看得见：环境值替换留下的 redactedMark 本身就是一个
+// 「token=…」形态的值，形态兜底若不跳过它就会写成 [REDACTED][REDACTED]。
+//
+// 这是**防御性**的：当前几条形态断言即使不跳过也恰好得到同样结果（标记
+// 里的方括号不在裸值字符集内），所以它挡的是「将来把某个形态的字符集放宽」
+// 这类改动 —— 有单测直接钉住这个函数本身。
+func isRedactedValue(s string) bool {
+	return strings.Trim(s, `"'`) == redactedMark
 }
 
 // redact 把这一段文本里该条目命中的「值」换成 redactedMark。
@@ -174,10 +291,11 @@ func (sh tokenShape) redact(s string) string {
 			continue // 该组没参与匹配（可选组），整段不动
 		}
 		b.WriteString(s[prev:m[i]])
-		if isRedactedValue(s[m[i]:m[i+1]]) {
-			// 上一级已经抹过这一段（环境值替换留下的标记本身长得就像
-			// `token="[REDACTED]"`），别叠成两个标记。
-			b.WriteString(s[m[i]:m[i+1]])
+		val := s[m[i]:m[i+1]]
+		// 上一级已经抹过这一段（环境值替换留下的标记本身长得就像
+		// `token="[REDACTED]"`），或这段只是结构字面量 —— 原样保留。
+		if isRedactedValue(val) || (sh.skip != nil && sh.skip(val)) {
+			b.WriteString(val)
 		} else {
 			b.WriteString(redactedMark)
 		}
@@ -185,14 +303,6 @@ func (sh tokenShape) redact(s string) string {
 	}
 	b.WriteString(s[prev:])
 	return b.String()
-}
-
-// isRedactedValue 报告这段文本是不是「已经脱敏过」的产物。
-//
-// 两级脱敏会互相看得见：环境值替换留下的 redactedMark 本身就是一个
-// 「token=…」形态的值，形态兜底若不跳过它就会写成 [REDACTED][REDACTED]。
-func isRedactedValue(s string) bool {
-	return strings.Trim(s, `"'`) == redactedMark
 }
 
 // redactSecrets 把一段自由文本里的凭据替换成 redactedMark。
@@ -239,7 +349,7 @@ func redactSecrets(s string, env map[string]string) string {
 	}
 
 	// 3) 形态兜底。每个条目只抹它标出的那一段，其余（前缀、`user:`、
-	// `@host`、引号）原样保留 —— 见 tokenShape 的注释。
+	// `@host`、引号、JSON 结构字符）原样保留 —— 见 tokenShape 的注释。
 	for _, shape := range tokenShapes {
 		s = shape.redact(s)
 	}

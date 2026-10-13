@@ -44,6 +44,15 @@ const (
 	subagentPollEvery = 3 * time.Second
 )
 
+// PhaseImplementReentry 是「resume 失败降级、同工作区开新会话」那次调用的
+// 阶段名（stageImplement 的降级分支）。
+//
+// 提成常量而不是就地写字面量：这个字符串是**跨分支的接口约定**（pipeline
+// 的 injectFailureMemory 按它决定要不要注入失败记忆，A2 的 PR review 二轮
+// 也按它写），同时是事件流的阶段标签 —— 两处各写一份字面量时，改一处就
+// 静默改变另一处语义。
+const PhaseImplementReentry = "implement-reentry"
+
 // EventSink 把一个执行阶段的事件流批量落库（每任务每阶段一个）。
 //
 // 数据通路：agent.Driver 的 OnEvent → Digest 提炼 → 有界 channel →

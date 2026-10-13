@@ -637,7 +637,7 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, rc.implSession); serr != nil {
 			slog.Warn("降级会话 ID 落库失败", "task", rc.tk.ID, "err", serr)
 		}
-		implRes, err = p.runAgent(rc, "implement-reentry",
+		implRes, err = p.runAgent(rc, PhaseImplementReentry,
 			ReentryImplementPrompt(rc.issue.Context(), rc.kind, rc.wt.Branch), rc.implSession, false)
 	}
 
@@ -752,7 +752,7 @@ func channelEnv(channel string) []string {
 // 两条线的 diff 会顶在一起。
 func (p *Pipeline) injectFailureMemory(rc *runCtx, phase, prompt string, resume bool) string {
 	switch phase {
-	case "implement", "implement-reentry":
+	case "implement", PhaseImplementReentry:
 		// resume 为真（ResumeFixPrompt / ContinueImplementPrompt）时提示词里
 		// 已经带着本任务那次失败的原因，排除本任务自己的记录 —— 但仍然
 		// 注入**更早的任务行**留下的历史（issue 关掉重开会新建任务行）。
