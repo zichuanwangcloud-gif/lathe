@@ -44,7 +44,10 @@ type fakeEnqueuer struct {
 	issues   []string
 	owners   []int64
 	requeued []int64
-	err      error
+	// modes 记录每次 Requeue 带来的重试模式（与 requeued 一一对应），
+	// 供断言「重派时带的是内部模式而不是用户可传的 auto/fresh」。
+	modes []string
+	err   error
 	// cancelledIssues 记录 T7 取消联动被调用时的 issue key；
 	// cancelIDs 是要返回的任务 id，cancelErr 用来模拟失败。
 	cancelledIssues []string
@@ -66,6 +69,7 @@ func (f *fakeEnqueuer) Requeue(ctx context.Context, taskID int64, mode string) e
 		return f.err
 	}
 	f.requeued = append(f.requeued, taskID)
+	f.modes = append(f.modes, mode)
 	return nil
 }
 

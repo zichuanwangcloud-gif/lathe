@@ -212,10 +212,15 @@ type ReviewComment struct {
 	// 三类意见在 GitHub 上是独立的 ID 序列，裸 ID 可能相撞。
 	Key    string
 	Author string
-	Body   string
-	Path   string
-	Line   int
-	URL    string
+	// AuthorAssociation 是评论者与仓库的关系（同 webhook.ReviewEvent 的
+	// 同名字段）。ReviewFeedback 据此过滤 —— 二轮派发时拉取的意见里，
+	// 无仓库关系的账号（公开仓库上的路人）不得进 prompt（A2 审计 B2：
+	// 那是一条绕过入口守卫的提示注入通道）。
+	AuthorAssociation string
+	Body              string
+	Path              string
+	Line              int
+	URL               string
 }
 
 // ReviewComments 拉取 PR 的 review 意见（含行内评论与普通评论）。

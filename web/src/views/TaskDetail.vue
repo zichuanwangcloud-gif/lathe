@@ -27,6 +27,7 @@ const retryCta = computed(() => {
   const p = retryPlan.value
   if (!p) return '重试'
   if (p.fresh) return '重试 · 从头重跑'
+  if (p.rebuild) return '重来一轮 review · 重挂现场'
   return `重试 · 从「${p.entryLabel}」续跑`
 })
 
@@ -34,8 +35,8 @@ async function load() {
   try {
     detail.value = await api.task(props.id)
     error.value = ''
-    // 失败任务拉取重试预览：体检现场 + 决策理由
-    if (detail.value.task.state === 'failed') {
+    // 失败任务、以及停在 review_feedback 的任务都拉重试预览：体检现场 + 决策理由
+    if (detail.value.task.state === 'failed' || detail.value.task.state === 'review_feedback') {
       try {
         retryPlan.value = await api.retryPlan(props.id)
       } catch {
@@ -300,6 +301,15 @@ onUnmounted(() => {
             @click="act((id) => api.retry(id, 'fresh'), '确认丢弃现有工作区与分支，从分诊从头重跑？')"
           >从头重跑</button>
         </template>
+        <!-- parked 的人工出口：通用重试会丢弃现场（第一轮分支已在远端，
+             推送必被非快进拒绝），所以只给这一个按钮 -->
+        <button
+          v-if="task.state === 'review_feedback'"
+          class="primary"
+          :disabled="acting"
+          :title="retryPlan ? retryPlan.reasons.join('\n') : ''"
+          @click="act(api.reviewRetry, '确认重来一轮 review？会重建工作区现场（远端分支原样检出），并按 review 模式派发二轮。')"
+        >{{ retryCta }}</button>
         <button
           v-if="!isTerminal"
           class="danger"
@@ -318,6 +328,23 @@ onUnmounted(() => {
       <p class="dim">
         看过改动之后点右上角「确认开 PR」；平台只补推送与开 PR 两步，
         不会重跑实现与验证。不想要这个改动就直接取消任务。
+      </p>
+    </div>
+
+    <div v-if="task.state === 'review_feedback'" class="card gate-card">
+      <div class="label">待处理的评审意见</div>
+      <p>
+        PR 上收到了评审意见，任务已经停在这里等人接手。
+        它不会自动派发 —— 要么没有可续跑的 agent 会话，要么工作区现场已不可用，
+        两种情况都会让二轮白烧一轮（第一轮的提交早已推到远端，从头重建的分支
+        在推送时会被拒）。
+      </p>
+      <p v-if="retryPlan" class="dim">
+        {{ retryPlan.rebuild ? '点「重来一轮 review」会把远端分支原样检出到本地工作区，再按 review 模式派发二轮。'
+          : '点「重来一轮 review」会按 review 模式派发二轮，逐条处理 PR 上的意见后重新走一遍完整验证。' }}
+      </p>
+      <p class="dim">
+        不想要这个改动就直接取消任务。也可以直接进现场手工处理，再点同一个按钮让平台接手收尾。
       </p>
     </div>
 

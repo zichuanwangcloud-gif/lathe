@@ -251,7 +251,22 @@ type TransitionOpts struct {
 	FailureStage   *string
 	NodeID         *int64
 	LeaseExpiresAt *time.Time
-	Payload        map[string]any
+	// ExplicitReviewRestart 声明本次转移是【人明确发起】的「重来一轮
+	// review」，即从 review_feedback 出队的显式人工出口（A2 审计 B1）。
+	// 它唯一的作用是让 RequiresSession 在 review_feedback → queued 上
+	// 放行 —— 也就是允许人在没有可 resume 的会话时，仍然把 parked 的
+	// 任务送回调度器（二轮会开新会话，见 runner.RetryReviewRetry）。
+	//
+	// 为什么需要它：约束①（review 二轮必须 resume 原会话）在【没有会话】
+	// 时无从满足，而 parked 的任务如果连这条边都走不了，就只剩人工取消
+	// 一个出口 —— 那正是 B1 要修的缺口。自动路径（webhook 回流）绝不设
+	// 这个字段，所以约束①对自动路径分毫未松动。
+	//
+	// 【收窄】transition 只在 from=review_feedback 且 to=queued 时认它，
+	// 其它任何组合设了也无效：这条能力不会外溢成一把能绕过会话约束的
+	// 万能钥匙。
+	ExplicitReviewRestart bool
+	Payload               map[string]any
 }
 
 // Transition 把任务转到 to 状态。
@@ -317,12 +332,20 @@ func (m *Machine) transition(ctx context.Context, id int64, from, to State, acto
 		return nil, err
 	}
 
-	// 约束①：review 二轮必须已有会话 —— 本次转移带上或此前已持有
+	// 约束①：review 二轮必须已有会话 —— 本次转移带上或此前已持有。
+	//
+	// 唯一的放行口是显式的人工出口，且只认 review_feedback → queued 这
+	// 一个组合（见 TransitionOpts.ExplicitReviewRestart 的注释）：
+	// → implementing 永远要求会话，webhook 回流永远要求会话。
 	if RequiresSession(cur.State, to) {
-		has := cur.AgentSessionID != nil && *cur.AgentSessionID != ""
-		bringing := opts.AgentSessionID != nil && *opts.AgentSessionID != ""
-		if !has && !bringing {
-			return nil, ErrSessionRequired
+		humanExit := opts.ExplicitReviewRestart &&
+			cur.State == StateReviewFeedback && to == StateQueued
+		if !humanExit {
+			has := cur.AgentSessionID != nil && *cur.AgentSessionID != ""
+			bringing := opts.AgentSessionID != nil && *opts.AgentSessionID != ""
+			if !has && !bringing {
+				return nil, ErrSessionRequired
+			}
 		}
 	}
 
@@ -415,15 +438,29 @@ func (m *Machine) SetPRNumber(ctx context.Context, id int64, prNumber int) error
 	return nil
 }
 
-// ListOpenPRTasks 返回所有处于 pr_open 且已记下 PR 编号的任务，按 id
+// ListOpenPRTasks 返回所有「PR 仍开着」且已记下 PR 编号的任务，按 id
 // 排序，供 F4.1 合并检测的轮询兜底遍历。
+//
+// 覆盖两个状态：pr_open，以及 review_feedback。
+//
+// 为什么必须包含 review_feedback（A2 审计 B1）：PR 评论回流入口在
+// 「没有可 resume 的会话」或「现场已不可用」时把任务停在 review_feedback
+// 等人处理（docs/02-design.md §7，runner.ReviewIntake.AcceptReview 的三条
+// 停车路径）。这是活态而不是终态：PR 仍旧开着，人照样会在 GitHub 上把它
+// 合并。只按 state='pr_open' 收集的话，合并检测看不见它 —— 任务永远驻留
+// 在 review_feedback，worktree 不回收、depends_on 后继不推进、看板永远
+// 显示待处理，唯一出口变成人工取消。这与「合并检测是 PR 状态的唯一权威
+// 收敛机制」相矛盾。
+//
+// 终态（merged/failed/cancelled）一律不收集：合并检测不该复活已经结束的
+// 任务，而它们也都有各自的收尾路径。
 func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 	rows, err := m.pool.Query(ctx, `
 		SELECT `+taskColumns+`
-		FROM tasks WHERE state = $1 AND pr_number IS NOT NULL
-		ORDER BY id`, StatePROpen)
+		FROM tasks WHERE state IN ($1, $2) AND pr_number IS NOT NULL
+		ORDER BY id`, StatePROpen, StateReviewFeedback)
 	if err != nil {
-		return nil, fmt.Errorf("task: 查询 pr_open 任务失败: %w", err)
+		return nil, fmt.Errorf("task: 查询 PR 仍开着的任务失败: %w", err)
 	}
 	defer rows.Close()
 
@@ -431,7 +468,7 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {
-			return nil, fmt.Errorf("task: 读取 pr_open 任务失败: %w", err)
+			return nil, fmt.Errorf("task: 读取 PR 仍开着的任务失败: %w", err)
 		}
 		out = append(out, t)
 	}

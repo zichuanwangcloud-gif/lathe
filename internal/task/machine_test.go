@@ -606,6 +606,20 @@ func TestMachineTasksByPRIsolatesOwners(t *testing.T) {
 	b7 := mk(userB, repoB, "CR-PR-B7", 7)
 	mk(userA, repoA, "CR-PR-A8", 8) // 同仓库不同 PR，不应命中
 
+	// 属主不一致的行：任务挂在 A 名下，仓库却属于 B。
+	//
+	// 这在正常流程里建不出来（创建任务时 repo 是当属主名下的外键），
+	// 但 TasksByPR 是一道由外部 webhook 触发的安全边界，它的两处过滤
+	// 必须各自独立成立 —— 只靠一处的话，另一处失效时（比如有人把
+	// repos 的属主改掉、或将来重构成一次 JOIN 换了写法）就会出现
+	// 「A 的评论推动 B 名下仓库上的任务」。原先的用例只覆盖了
+	// 「两边属主一致」的情形：单独删掉 tasks.user_id = $1 或单独删掉
+	// repos.user_id = $1，它都仍然全绿（MINOR-1 的缺口）。
+	mismatch := mk(userA, repoB, "CR-PR-X9", 9)
+	if mismatch.UserID != userA {
+		t.Fatalf("夹具应让任务属于 A，得到 %d", mismatch.UserID)
+	}
+
 	cases := []struct {
 		name   string
 		user   int64
@@ -614,6 +628,8 @@ func TestMachineTasksByPRIsolatesOwners(t *testing.T) {
 		wantID []int64
 	}{
 		{"A 查自己的 PR 只得到 A 的任务", userA, "acme/demo", 7, []int64{a7.ID}},
+		{"属主不一致的行（任务属 A、仓库属 B）对 A 不可见", userA, "acme/demo", 9, nil},
+		{"属主不一致的行对 B 同样不可见（两处过滤各自独立成立）", userB, "acme/demo", 9, nil},
 		{"B 查同名仓库同号 PR 只得到 B 的任务", userB, "acme/demo", 7, []int64{b7.ID}},
 		{"仓库名大小写不敏感（GitHub 不区分）", userA, "ACME/Demo", 7, []int64{a7.ID}},
 		{"别的仓库同号 PR 不命中", userA, "acme/other", 7, nil},
@@ -641,5 +657,75 @@ func TestMachineTasksByPRIsolatesOwners(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------- A2 审计修复
+
+// B1：合并检测的待判定集合必须覆盖停在 review_feedback 的任务。
+//
+// 停在 review_feedback 的任务（无可 resume 的会话、或现场不可用，见
+// runner.ReviewIntake.AcceptReview 的三条停车路径）PR 仍旧开着、仍旧会被
+// 人在 GitHub 上合并。只按 state='pr_open' 收集的话，合并检测看不见它：
+// 人不点合并则任务永远驻留，worktree 不回收、后继不推进、看板永远待处理。
+// review_feedback 是【活态】而非终态，它就是「PR 开着」的另一种表示。
+func TestMachineListMergeWatchTasksIncludesReviewFeedback(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	// 停在 review_feedback、PR 已开出（pr_number 已落库）
+	parked, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8101"})
+	toPROpen(t, m, parked.ID)
+	if err := m.SetPRNumber(ctx, parked.ID, 201); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, parked.ID, StateReviewFeedback, "system:github-review", nil); err != nil {
+		t.Fatalf("转 review_feedback 失败: %v", err)
+	}
+
+	normal, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8102"})
+	toPROpen(t, m, normal.ID)
+	if err := m.SetPRNumber(ctx, normal.ID, 202); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+
+	// 停在 review_feedback 但没有 PR 编号：无从查询，不该被收集
+	noPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8103"})
+	toPROpen(t, m, noPR.ID)
+	if _, err := m.Transition(ctx, noPR.ID, StateReviewFeedback, "system:github-review", nil); err != nil {
+		t.Fatalf("转 review_feedback 失败: %v", err)
+	}
+
+	// 终态任务不得被收集（合并检测不该复活已结束的任务）
+	merged, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8104"})
+	toPROpen(t, m, merged.ID)
+	if err := m.SetPRNumber(ctx, merged.ID, 204); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, merged.ID, StateMerged, "system:merge-poll", nil); err != nil {
+		t.Fatalf("转 merged 失败: %v", err)
+	}
+
+	tasks, err := m.ListOpenPRTasks(ctx)
+	if err != nil {
+		t.Fatalf("ListOpenPRTasks 失败: %v", err)
+	}
+	got := map[int64]bool{}
+	for _, tk := range tasks {
+		if tk.UserID == userID {
+			got[tk.ID] = true
+		}
+	}
+	for _, want := range []int64{normal.ID, parked.ID} {
+		if !got[want] {
+			t.Errorf("任务 #%d 应被合并检测收集，实际集合 %v", want, got)
+		}
+	}
+	for _, unwanted := range []int64{noPR.ID, merged.ID} {
+		if got[unwanted] {
+			t.Errorf("任务 #%d 不该被合并检测收集（无 PR 编号 / 已是终态），实际集合 %v", unwanted, got)
+		}
 	}
 }

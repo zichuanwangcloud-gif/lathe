@@ -37,18 +37,22 @@
 - `store.MetricsStatsFor` / `store.LatestFailureDigest` / `store.InsertFailureDigest`
 - migration `0030_failure_digests`
 - **PR 评论回流**（docs/02-design.md §7，roadmap §3.4 #12(a)）：GitHub PR 上的
-  review 意见驱动任务二轮修复。新入口 `POST /webhooks/github/{slug}`（与 Linear
-  共用用户的随机段），接 `pull_request_review_comment` / `pull_request_review`，
+  review 意见驱动任务二轮修复。新入口 `POST /webhooks/github/{slug}`（与 Linear，接 `pull_request_review_comment` / `pull_request_review`，
   按用户的密钥验 `X-Hub-Signature-256`，投递按 `X-GitHub-Delivery` 去重。
   任务 `pr_open → review_feedback → queued`，worker 以 `--resume` 续原实现会话
   处理全部待处理意见（排除 PR 作者本人与已处理过的），再完整重新验证后更新同一个 PR。
   approve、编辑/删除评论、无正文的普通 review 不触发；终态任务的意见安全忽略。
   没有可 resume 的会话（约束①）或工作区现场已不可用的任务，意见照样记下，但停在
-  `review_feedback` 等人处理，不交给调度器（后者只会从头重建、在推送时撞上远端已有的第一轮提交）
+  `review_feedback` 等人处理，不交给调度器（后者只会从头重建、在推送时撞上远端已有的第一轮提交）；
+  这类任务由 `POST /api/tasks/{id}/review-retry` 走出（见 Fixed）
 - 凭据类型 `github_webhook`（migration 0028）：设置页按用户配置 GitHub webhook 签名
   密钥，并展示该用户的 GitHub 回调地址；环境变量兜底 `LATHE_GITHUB_WEBHOOK_SECRET`
   （仅内置管理员）
 - `github.Client.ReviewFeedback`：一次拉齐行内评论、PR 评论与 review 总评（翻页）
+- 显式人工出口 `POST /api/tasks/{id}/review-retry`：停在 `review_feedback` 等人
+  处理的任务「重来一轮 review」。现场可用就 resume 原会话，不可用就把远端那条
+  分支就地重挂（`WorktreeManager.Reattach`）再按 review 模式派发二轮 —— 不是
+  `fresh`（丢弃重建会产出一条与远端无共同祖先的分支，二轮推送必被非快进拒绝）
 - `task.Machine.TasksByPR`：按（属主, 仓库, PR 号）路由，属主过滤做两遍
 - **内置工单体系**（`docs/09-internal-issues.md`）：任务不再只能由 Linear webhook
   产生。`issues` / `issue_comments` 两张表 + HTTP API + 工单列表与详情界面，

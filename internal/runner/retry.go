@@ -45,6 +45,25 @@ const (
 	// 【不是用户入参】：只由 runner.ReviewIntake 构造，理由与 RetryApproved
 	// 相同 —— 可由用户传入的话，任意任务都能被伪装成「收到 review 意见」。
 	RetryReview RetryMode = "review"
+	// RetryReviewRetry 是从 review_feedback 出队的【显式人工出口】
+	// （review_feedback → queued）。
+	//
+	// 背景（A2 审计 B1）：任务会停在 review_feedback 等人处理 —— 没有可
+	// resume 的会话、现场不可用，或现场可用但会话丢了。停车本身是设计
+	// 的一部分，但没有出口就成了死胡同：这个状态没有别的边能出去，人也
+	// 不能在界面上做任何事。这条模式就是那个出口，语义是「重来一轮
+	// review 回流」：重建现场、按 RetryReview 的计划派发二轮。
+	//
+	// 为什么不复用 RetryFresh：fresh 的语义是「丢弃现场、从分诊从头重跑」，
+	// 它会抹掉 parked 的全部意义 —— 任务明明已经开出过 PR、有远端分支，
+	// 从头重跑会在 push 阶段撞非快进失败（这正是停车要避免的），而且
+	// 二轮的 review 意见也一并丢了。所以这条路径要重建现场、并保留
+	// 「按 review 模式派发」的语义。
+	//
+	// 【不是用户入参】：它是一台「把任意状态的任务推去重建现场 + 跑 agent」
+	// 的机器，与 RetryApproved 同一性质，只能由显式端点在有状态前提校验
+	// （任务确实停在 review_feedback）时构造。校验用 UserSelectable。
+	RetryReviewRetry RetryMode = "review-retry"
 )
 
 // Valid 报告模式是否是本包已知的模式（含只许内部构造的 RetryApproved）。
@@ -54,7 +73,7 @@ const (
 // 是平台自己写下的值，不是用户可以塞进来的字符串。
 func (m RetryMode) Valid() bool {
 	switch m {
-	case "", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview:
+	case "", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview, RetryReviewRetry:
 		return true
 	}
 	return false
@@ -129,8 +148,16 @@ type RetryPlan struct {
 	// ResumeSession 为真时实现阶段以 --resume 续原 agent 会话。
 	ResumeSession bool
 	// Review 为真表示这是 PR review 二轮：实现阶段改用带 review 意见的
-	// prompt（见 Pipeline.implementPrompt）。只有 RetryReview 会置它。
+	// prompt（见 Pipeline.implementPrompt）。RetryReview 与 RetryReviewRetry
+	// 会置它。
 	Review bool
+	// Rebuild 为真表示现场需要重新物化：任务停在 review_feedback 的显式
+	// 人工出口，而它的工作区已不可用。重建不是「丢弃重建」（那会连第一轮
+	// 的提交一起丢掉，见 RetryReviewRetry 的注释），而是把远端已有第一轮
+	// 提交的那条分支重新检出到本地工作区，让二轮的改动仍能快进推送。
+	//
+	// 只有 RetryReviewRetry 可能置它，且仅在现场不可用时。
+	Rebuild bool
 	// Reasons 是决策依据（落任务事件 + UI 展示），按决策顺序排列。
 	Reasons []string
 }
@@ -171,6 +198,30 @@ func PlanRetry(mode RetryMode, in RetryInput) RetryPlan {
 		// 「我要这个 PR」的意图，重建虽然贵，但比卡住不动更接近意图。
 		// 理由文案写清楚，让人在事件流里看得出这一轮为什么变贵了。
 		return fresh("人工闸门已确认，但工作区现场已不可用（目录/分支缺失），只能从头重建")
+	}
+
+	if mode == RetryReviewRetry && in.InterruptedState == "" {
+		// review_feedback 的显式人工出口（见 RetryReviewRetry 的注释）。
+		// 与 RetryReview 同一套二轮语义，唯一的区别是现场不可用时不退回
+		// 重建-from-base，而是要求把远端分支重新物化（Rebuild=true）——
+		// 这是这个模式存在的全部理由。
+		//
+		// InterruptedState 非空的条件与 RetryReview 完全一致（理由见下面
+		// 那个分支的注释）：二轮途中进程崩了、被启动恢复转回 queued，那是
+		// 一次普通的崩溃恢复，交给下面的 auto 决策 —— 崩在验证就只重验，
+		// 不重放 review prompt。
+		if !in.WT.Usable() {
+			return RetryPlan{Entry: EntryImplement, Review: true, Rebuild: true,
+				ResumeSession: in.HasSession,
+				Reasons: []string{"人工从 review_feedback 重新发起一轮 review：工作区现场已不可用，" +
+					"把远端已有第一轮提交的分支重新检出到本地现场，再按 review 模式派发二轮（不是丢弃现场从头重建）"}}
+		}
+		if in.HasSession {
+			return RetryPlan{Entry: EntryImplement, Review: true, ResumeSession: true,
+				Reasons: []string{"人工从 review_feedback 重新发起一轮 review：现场可用，resume 原实现会话逐条处理意见"}}
+		}
+		return RetryPlan{Entry: EntryImplement, Review: true,
+			Reasons: []string{"人工从 review_feedback 重新发起一轮 review：现场可用但会话凭据已丢失，在同工作区开新会话处理（带全量需求与意见）"}}
 	}
 
 	if mode == RetryReview && in.InterruptedState == "" {

@@ -58,7 +58,7 @@
 | `implementing` | agent 写代码 | → `verifying` / `failed` |
 | `verifying` | 按档位跑验证（§5） | → `pr_open` / `failed` |
 | `pr_open` | PR 已开，已回帖 Linear | → `review_feedback` / `merged` / `cancelled` |
-| `review_feedback` | 收到 review 意见，待二轮 | → `implementing` / `queued`（两者都**必须持有原 session**，见约束①） |
+| `review_feedback` | 收到 review 意见，待二轮 | → `implementing` / `queued`（**自动路径**两者都必须持有原 session，见约束①）；→ `queued`（**显式人工出口**，见约束①的例外）；任务**仍算活着**，PR 仍开着，合并检测照常收集它 |
 | `merged` | 终态：已合并，回收工作区 | — |
 | `failed` | 终态：保留现场 + 回帖 + 推送（D4） | ← 人工可重新入队 |
 | `cancelled` | 终态：人工中止 | — |
@@ -69,6 +69,14 @@
 任务表持久化 `agent_session_id`；二轮用 `claude --resume <id>` 续跑，而不是带着 PR 评论重开一个会话。重开会丢掉第一轮的全部推理与代码定位上下文，这是同类系统最常见的失败点。
 
 PR 评论回流（§7）走的是 `review_feedback → queued`：webhook 只负责记下意见，把任务交还给 DB 领单调度器（它只认 `queued`），由 worker 以 `RetryReview` 计划 resume 原会话派发二轮 —— 不在 HTTP 请求里同步驱动 agent。这条边与 `→ implementing` **同受 `RequiresSession` 约束**：`queued → implementing` 本身不查会话，只约束一条边的话约束①就能经 queued 绕过。代码：`internal/task/state.go`、`internal/runner/review.go`。
+
+**约束①的例外：显式的人工出口。** 回流入口会在两种情况下把任务**停在** `review_feedback` 等人处理（`ReviewIntake.AcceptReview` 的三条停车路径）：没有可 resume 的会话，或工作区现场已不可用（详见 §7）。停车本身是设计的一部分，但这个状态原本没有出口 —— 它的两条出边都受约束①管辖，而 parked 的任务恰恰没有会话；通用重试通道又从 `review_feedback` 被挡住（那条路会丢弃现场、走分诊，把第一轮推到远端的成果全丢）。
+
+出口是 `POST /api/tasks/{id}/review-retry`（`httpapi.reviewRetryTask`），语义是**重来一轮 review**而不是重跑任务：现场可用就 resume 原会话，不可用就把远端那条分支**就地重挂**到本地工作区（`runner.PlanRetry` 的 `Rebuild`，`WorktreeManager.Reattach`），再按 `RetryReviewRetry` 计划派发二轮。它**不是** `fresh`：丢弃重建会产出一条与远端无共同祖先的分支，二轮推送必被非快进拒绝，且 review 意见会被丢掉。
+
+约束①对自动路径分毫未松动：放行口是 `TransitionOpts.ExplicitReviewRestart`，而 `Machine.transition` 只在 `review_feedback → queued` 这一个组合上认它（`→ implementing` 永远要求会话）。通用重试端点（`retryTask`）对其他任何状态都拒绝 `review_feedback` 的任务。
+
+**合并检测覆盖 `review_feedback`。** 停在 `review_feedback` 的任务 PR 仍旧开着，人照常会在 GitHub 上合并它，所以 `Machine.ListOpenPRTasks` 收集的是 `pr_open` **与** `review_feedback` 两个状态（终态不收集）。只查 `pr_open` 的话，parked 的任务被合并后永远驻留：worktree 不回收、`depends_on` 后继不推进、看板永远待处理，唯一出口是人工取消。
 
 **② 准入档位（D2 的四档）只影响 `triaging` 的出口。**
 `direct` 档下 `triaging` 只做明确度判定，通过即直接进 `implementing`，不产生 `awaiting_approval`。

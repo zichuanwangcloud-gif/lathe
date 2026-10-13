@@ -87,33 +87,98 @@ type ReviewEvent struct {
 	// Key 是意见的稳定标识（"inline:<id>" / "review:<id>"），幂等去重与
 	// 「哪些意见已处理过」都按它记账。带前缀是因为行内评论、普通评论、
 	// review 在 GitHub 上是三个独立的 ID 序列，数值可能相撞。
-	Key        string
-	Author     string
-	AuthorType string // User / Bot
-	Body       string
-	Path       string // 仅行内评论
-	Line       int    // 仅行内评论
-	URL        string
+	Key    string
+	Author string
+	// AuthorAssociation 是评论者与仓库的关系（GitHub 的 author_association）：
+	// OWNER / MEMBER / COLLABORATOR / CONTRIBUTOR / FIRST_TIME_CONTRIBUTOR /
+	// FIRST_TIMER / MANNEQUIN / NONE。空串表示载荷里没有这个字段。
+	//
+	// 为什么必须有（A2 审计 B2）：只看 Author != PRAuthor 是不够的。公开仓库
+	// 上任何 GitHub 账号都能对 PR 写评论、提交 review，此时
+	//   - 该评论会驱动一次二轮：agent 带着【任务属主的凭据】在本机跑、推分支；
+	//   - 评论正文原样进 prompt —— 一条精心构造的评论就是对 agent 的提示注入；
+	//   - 消耗的是属主的令牌与算力（无授权消耗）。
+	// 所以准入必须按「与仓库的关系」而不是「是不是 PR 作者」来判。
+	AuthorAssociation string
+	AuthorType        string // User / Bot
+	Body              string
+	Path              string // 仅行内评论
+	Line              int    // 仅行内评论
+	URL               string
 	// ReviewState 仅 pull_request_review：commented / changes_requested /
 	// approved / dismissed（统一转小写）。
 	ReviewState string
 }
 
+// 信任名单：有这些 author_association 的评论者才有资格驱动一次二轮。
+//
+// 判据刻意写成白名单（而不是「排除 NONE」）：以后 GitHub 新增取值时，
+// 默认落在「不可信」这一侧，要放行才必须显式加进来。少一个忘改的地方，
+// 就是少一条注入通道。
+//
+// 为什么是这四个（A2 审计 B2）：驱动二轮意味着评论正文会进 agent 的
+// prompt，而 agent 带着【任务属主的凭据】在本机跑、推分支 —— 一条
+// 精心构造的评论就是一次提示注入 + 无授权消耗属主的令牌与算力。
+// OWNER/MEMBER/COLLABORATOR 是对仓库有写权限的人；CONTRIBUTOR 是已经
+// 在这个仓库贡献过（有过合并）的人。这四者的意见值得让 agent 去处理。
+//
+// FIRST_TIME_CONTRIBUTOR / FIRST_TIMER / MANNEQUIN / NONE 一律拒绝：
+// 公开仓库上任何 GitHub 账号都能对 PR 写评论，未建立关系的账号不得
+// 驱动带凭据的 agent。属主要采纳这类意见，可以自己转发或让协作者转述。
+var trustedAssociations = map[string]bool{
+	"OWNER":        true,
+	"MEMBER":       true,
+	"COLLABORATOR": true,
+	"CONTRIBUTOR":  true,
+}
+
+// TrustedAssociation 报告 author_association 是否在信任名单里。
+//
+// 空串（字段缺失）与未知取值都是 false —— 白名单式判据，未知即不可信。
+// 入口（Actionable）与二轮派发时的全量拉取（ReviewFeedback）共用它，
+// 两处口径必须一致：任一处漏掉，另一处就是绕过守卫的旁路。
+func TrustedAssociation(a string) bool {
+	return trustedAssociations[strings.ToUpper(strings.TrimSpace(a))]
+}
+
 // Actionable 判定这个事件是否是一条需要 agent 处理的 review 意见；
 // 不是时给出人读理由（落进投递记录与响应体）。
 //
-// 「自身」的判定是 Author == PRAuthor：评论者就是开 PR 的账号。这挡住
-// 了「Lathe 自己的动作触发 Lathe」这类回环。已知代价：个人令牌模型下
-// Lathe 的 GitHub 身份就是任务属主本人，于是属主在自己（由 Lathe 开出的）
-// PR 上留的评论也会被当作自身而忽略 —— 意见需要由他人（或其它 bot）给出。
-// 这与 GitHub 不允许 PR 作者 approve/request changes 自己的 PR 是一致的
-// 协作形态；换 GitHub App（独立的 bot 身份）才能消除这个代价。
+// 两道守卫，缺一不可：
+//
+//  1. 作者关系（author_association 白名单）—— 谁能驱动二轮；
+//  2. 「自身」判定（Author == PRAuthor）—— 评论者就是开 PR 的账号，
+//     挡住「Lathe 自己的动作触发 Lathe」这类回环。
+//
+// 第 2 条的已知代价：个人令牌模型下 Lathe 的 GitHub 身份就是任务属主
+// 本人，于是属主在自己（由 Lathe 开出的）PR 上留的评论也会被当作自身而
+// 忽略 —— 意见需要由他人（或其它 bot）给出。这与 GitHub 不允许 PR 作者
+// approve/request changes 自己的 PR 是一致的协作形态；换 GitHub App
+// （独立的 bot 身份）才能消除这个代价。
+//
+// bot 的处理：「自身」判定已经挡住了 Lathe 自己那个账号（它就是 PR 作者），
+// 所以这里不需要额外的 AuthorType == "Bot" 排除；剩余 bot 一律走同一道
+// author_association 白名单。CodeRabbit 这类自动评审在配置了仓库权限时
+// 会带 MEMBER/COLLABORATOR（或 CONTRIBUTOR），照收 —— 这正是 brief 期望
+// 的取舍（自动评审的意见值得回流）。未配置权限的 bot 会带 NONE 而被拒绝，
+// 那时让属主按需给它仓库权限，而不是在这里对它开口子。
 func (e *ReviewEvent) Actionable() (bool, string) {
 	if e == nil {
 		return false, "空事件"
 	}
 	if e.Author != "" && strings.EqualFold(e.Author, e.PRAuthor) {
 		return false, "评论来自 PR 作者本身（Lathe 开 PR 所用的账号），不回流给自己"
+	}
+	// 字段缺失（空串）与未知取值都按最保守处理：拒绝。载荷里没有
+	// author_association 只说明上游异常或格式变化，不能据此认为可信。
+	if !TrustedAssociation(e.AuthorAssociation) {
+		who := e.Author
+		if who == "" {
+			who = "（未知账号）"
+		}
+		return false, "评论者 " + who + " 与仓库没有足够的合作关系（author_association=" +
+			describeAssociation(e.AuthorAssociation) + "），不驱动二轮：二轮会以任务属主的凭据运行 agent，" +
+			"并由评论正文进入 prompt，无授权账号不得触发"
 	}
 
 	switch e.Event {
@@ -151,6 +216,15 @@ func (e *ReviewEvent) Actionable() (bool, string) {
 	return false, "不处理的事件类型 " + e.Event
 }
 
+// describeAssociation 把 author_association 的原值渲染成人读说明，
+// 空值显式写成「缺失」而不是一个空引号 —— 拒绝理由是要给人看的。
+func describeAssociation(a string) string {
+	if strings.TrimSpace(a) == "" {
+		return "字段缺失"
+	}
+	return a
+}
+
 // 载荷里关心的字段。
 type webhookUser struct {
 	Login string `json:"login"`
@@ -167,6 +241,8 @@ type webhookPayload struct {
 		OriginalLine *int        `json:"original_line"`
 		HTMLURL      string      `json:"html_url"`
 		User         webhookUser `json:"user"`
+		// AuthorAssociation 见 ReviewEvent 的同名字段（A2 审计 B2）。
+		AuthorAssociation string `json:"author_association"`
 	} `json:"comment"`
 	Review *struct {
 		ID      int64       `json:"id"`
@@ -174,6 +250,8 @@ type webhookPayload struct {
 		State   string      `json:"state"`
 		HTMLURL string      `json:"html_url"`
 		User    webhookUser `json:"user"`
+		// AuthorAssociation 见 ReviewEvent 的同名字段（A2 审计 B2）。
+		AuthorAssociation string `json:"author_association"`
 	} `json:"review"`
 	PullRequest *struct {
 		Number int         `json:"number"`
@@ -215,6 +293,7 @@ func ParseReviewWebhook(eventType string, body []byte) (*ReviewEvent, error) {
 		c := p.Comment
 		ev.Key = fmt.Sprintf("inline:%d", c.ID)
 		ev.Author, ev.AuthorType = c.User.Login, c.User.Type
+		ev.AuthorAssociation = strings.ToUpper(c.AuthorAssociation)
 		ev.Body, ev.Path, ev.URL = c.Body, c.Path, c.HTMLURL
 		// line 是评论在当前 diff 里的行号；评论落在已过时的 diff 上时为
 		// null，此时退回 original_line —— 给 agent 一个近似定位总比没有强。
@@ -231,6 +310,7 @@ func ParseReviewWebhook(eventType string, body []byte) (*ReviewEvent, error) {
 		r := p.Review
 		ev.Key = fmt.Sprintf("review:%d", r.ID)
 		ev.Author, ev.AuthorType = r.User.Login, r.User.Type
+		ev.AuthorAssociation = strings.ToUpper(r.AuthorAssociation)
 		ev.Body, ev.URL = r.Body, r.HTMLURL
 		ev.ReviewState = strings.ToLower(r.State)
 	}
@@ -273,10 +353,14 @@ func (c *Client) ReviewFeedback(ctx context.Context, providerRepo string, number
 			return nil, fmt.Errorf("github: 读取 PR #%d 行内评论失败: %w", number, err)
 		}
 		for _, cm := range list {
+			if !TrustedAssociation(cm.GetAuthorAssociation()) {
+				continue
+			}
 			fb.Comments = append(fb.Comments, ReviewComment{
 				ID: cm.GetID(), Key: fmt.Sprintf("inline:%d", cm.GetID()),
 				Author: cm.GetUser().GetLogin(), Body: cm.GetBody(),
 				Path: cm.GetPath(), Line: cm.GetLine(), URL: cm.GetHTMLURL(),
+				AuthorAssociation: strings.ToUpper(cm.GetAuthorAssociation()),
 			})
 		}
 		page = resp.NextPage
@@ -289,9 +373,13 @@ func (c *Client) ReviewFeedback(ctx context.Context, providerRepo string, number
 			return nil, fmt.Errorf("github: 读取 PR #%d 评论失败: %w", number, err)
 		}
 		for _, cm := range list {
+			if !TrustedAssociation(cm.GetAuthorAssociation()) {
+				continue
+			}
 			fb.Comments = append(fb.Comments, ReviewComment{
 				ID: cm.GetID(), Key: fmt.Sprintf("issue:%d", cm.GetID()),
 				Author: cm.GetUser().GetLogin(), Body: cm.GetBody(), URL: cm.GetHTMLURL(),
+				AuthorAssociation: strings.ToUpper(cm.GetAuthorAssociation()),
 			})
 		}
 		page = resp.NextPage
@@ -308,9 +396,13 @@ func (c *Client) ReviewFeedback(ctx context.Context, providerRepo string, number
 			if strings.TrimSpace(rv.GetBody()) == "" || state == "APPROVED" || state == "DISMISSED" {
 				continue
 			}
+			if !TrustedAssociation(rv.GetAuthorAssociation()) {
+				continue
+			}
 			fb.Comments = append(fb.Comments, ReviewComment{
 				ID: rv.GetID(), Key: fmt.Sprintf("review:%d", rv.GetID()),
 				Author: rv.GetUser().GetLogin(), Body: rv.GetBody(), URL: rv.GetHTMLURL(),
+				AuthorAssociation: strings.ToUpper(rv.GetAuthorAssociation()),
 			})
 		}
 		page = resp.NextPage

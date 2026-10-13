@@ -655,6 +655,28 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	}
 	rc.tk = tk
 
+	// 现场重挂（A2 审计 B1）：任务从 review_feedback 的显式人工出口回来
+	// 时，工作区可能已经不在了。这一轮不能丢弃重建 —— 第一轮的提交早已
+	// 推到远端，重建会产出一条与远端无共同祖先的分支，二轮结束的推送必
+	// 被非快进拒绝，整轮白烧；也不能走分诊：那会丢掉 PR 上的 review 意见。
+	// Reattach 把远端那条分支就地检出到本地，二轮的改动落在第一轮之上，
+	// 推送仍是快进。
+	//
+	// 放在这里（已进入 implementing）而不是建现场之前：失败要落
+	// StateFailed，而 queued 没有 → failed 的合法边，此刻才转得动。
+	// 失败即 fail 而不退回重建 —— 悄悄重建正是这个模式要避免的事，
+	// 理由如实写进失败原因，让人在事件流里看得见为什么。
+	if rc.plan != nil && rc.plan.Rebuild {
+		if _, err := p.Worktrees.EnsureMirror(rc.ctx, rc.params.Repo.ProviderRepo, rc.params.CloneURL); err != nil {
+			return p.fail(rc, StageCreateWorktree, fmt.Errorf(
+				"从 review_feedback 重新发起一轮 review，但仓库镜像不可用，无法重挂现场: %w", err))
+		}
+		if err := p.Worktrees.Reattach(rc.ctx, rc.params.Repo.ProviderRepo, rc.wt.Path, rc.wt.Branch); err != nil {
+			return p.fail(rc, StageCreateWorktree, fmt.Errorf(
+				"从 review_feedback 重新发起一轮 review，但工作区现场无法重挂: %w", err))
+		}
+	}
+
 	// F7.1：节点画像损坏或字段非法时，在这里（已进入 implementing、
 	// 可以合法转 failed 的状态）以可读原因失败，不让非法值悄悄流进
 	// runAgent（ModelChannel）或后面的 stageVerify（VerifyTier）。

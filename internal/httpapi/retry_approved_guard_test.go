@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -144,4 +145,156 @@ func TestAPIApproveConcurrentOnlyOneWins(t *testing.T) {
 	if len(q.requeued) != 1 {
 		t.Errorf("并发确认后应恰好重派一次，requeued=%v", q.requeued)
 	}
+}
+
+// MAJOR-1（A2 审计）：review_feedback → queued 这条新边不能被通用重试端点
+// 当成「任意状态 → queued」的入口用。
+//
+// 修复前 retryTask 从任意状态转 queued 且只校验 mode，于是
+// {"mode":"fresh"} 与 {"mode":"auto"} 都返回 200 把 parked 的任务带回
+// queued —— 接着派发侧按 fresh 走「丢弃现场 + 分诊」：第一轮早已推到远端
+// 的分支会在二轮推送时撞非快进失败（整轮白烧），PR 上的 review 意见也
+// 一并丢掉。这正是 parking 要避免的事。
+//
+// 断言：通用重试端点对 review_feedback 一律 409、状态没被动过、没有重派；
+// 只有显式的 review-retry 端点能把它带走。
+func TestAPIRetryRejectsParkedReviewFeedback(t *testing.T) {
+	api, _, m, repoID := apiFixture(t)
+	q := &fakeEnqueuer{}
+	api.Queue = q
+	// 现场可用：通用重试在修复前正是靠这一点一路走到转 queued 的
+	api.Scenes = fakeScenes{state: &runner.WorktreeState{
+		Exists: true, Registered: true, BranchExists: true, HasCommits: true, Commits: 2,
+	}}
+	srv := apiServer(t, api)
+	ctx := context.Background()
+
+	// 两种 parked：有会话的（约束①已满足，修复前通用重试会一路 200 走
+	// PlanRetry(fresh) 丢弃现场）与没有会话的（约束①无从满足）。
+	// 两种都必须只能走显式出口。
+	tk := parkedReviewTask(t, api, m, repoID, "CR-PARKED-GUARD", true)
+
+	for _, body := range []string{`{"mode":"fresh"}`, `{"mode":"auto"}`, `{"mode":"resume"}`, ``} {
+		resp := do(t, srv, "POST", "/api/tasks/"+itoa(tk.ID)+"/retry", body, true)
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("对 review_feedback 的通用重试（body=%q）应 409，得到 %d", body, resp.StatusCode)
+		}
+	}
+
+	after, err := m.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != task.StateReviewFeedback {
+		t.Errorf("被拒的通用重试不该改动状态，得到 %s", after.State)
+	}
+	if len(q.requeued) != 0 {
+		t.Errorf("被拒的通用重试不该重派任务，requeued=%v", q.requeued)
+	}
+
+	// 没有会话的 parked 同样只能走显式出口（约束①在这里无从满足，
+	// 通用重试更不该把它带去任何地方）
+	noSess := parkedReviewTask(t, api, m, repoID, "CR-PARKED-NOSESS", false)
+	for _, body := range []string{`{"mode":"fresh"}`, `{"mode":"auto"}`, ``} {
+		resp := do(t, srv, "POST", "/api/tasks/"+itoa(noSess.ID)+"/retry", body, true)
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("对无会话 parked 任务的通用重试（body=%q）应 409，得到 %d", body, resp.StatusCode)
+		}
+	}
+	if got, _ := m.Get(ctx, noSess.ID); got.State != task.StateReviewFeedback {
+		t.Errorf("无会话的 parked 任务状态不该被动过，得到 %s", got.State)
+	}
+
+	// 显式出口：同一任务经 review-retry 可以出队
+	resp := do(t, srv, "POST", "/api/tasks/"+itoa(tk.ID)+"/review-retry", "", true)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("显式 review-retry 应 200，得到 %d", resp.StatusCode)
+	}
+	after, err = m.Get(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != task.StateQueued {
+		t.Errorf("review-retry 后 state = %s，want queued", after.State)
+	}
+	// 重派时必须带内部模式：派发侧据此走 review 二轮（不是 fresh/auto）
+	if len(q.requeued) != 1 || q.modes[0] != string(runner.RetryReviewRetry) {
+		t.Errorf("应恰好重派一次且带 review-retry 模式，requeued=%v modes=%v", q.requeued, q.modes)
+	}
+	// 事件流里记下的是内部模式，而不是用户可传的 auto/fresh
+	events, err := m.Events(ctx, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := events[len(events)-1]
+	if last.Payload["mode"] != string(runner.RetryReviewRetry) {
+		t.Errorf("转 queued 的事件应记 mode=%s，得到 %v", runner.RetryReviewRetry, last.Payload["mode"])
+	}
+}
+
+// review-retry 只认真的停在 review_feedback 的任务：不加这道检查，它就成了
+// 一台「把任意任务推去重建现场 + 跑 agent」的机器（与 approveTask 同一立场）。
+func TestAPIReviewRetryRejectsOtherStates(t *testing.T) {
+	api, _, m, repoID := apiFixture(t)
+	q := &fakeEnqueuer{}
+	api.Queue = q
+	api.Scenes = fakeScenes{state: &runner.WorktreeState{Exists: true, Registered: true, BranchExists: true}}
+	srv := apiServer(t, api)
+	ctx := context.Background()
+
+	var userID int64
+	if err := api.Store.Pool().QueryRow(ctx, `SELECT user_id FROM repos WHERE id=$1`, repoID).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	// 一条普通的 queued 任务
+	tk, err := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-NOT-PARKED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := do(t, srv, "POST", "/api/tasks/"+itoa(tk.ID)+"/review-retry", "", true)
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("非 review_feedback 状态应 409，得到 %d", resp.StatusCode)
+	}
+	if len(q.requeued) != 0 {
+		t.Errorf("被拒的请求不该重派，requeued=%v", q.requeued)
+	}
+}
+
+// parkedReviewTask 造一条真的停在 review_feedback 的任务：开出 PR、记下
+// pr_number，然后走 pr_open → review_feedback（与回流入口同一条边）。
+// withSession 控制它是否持有可 resume 的会话 —— 两种都在 parked 的现实
+// 形态里（有会话但现场不可用、或会话丢了）。
+func parkedReviewTask(t *testing.T, api *API, m *task.Machine, repoID int64, key string, withSession bool) *task.Task {
+	t.Helper()
+	ctx := context.Background()
+	var userID int64
+	if err := api.Store.Pool().QueryRow(ctx, `SELECT user_id FROM repos WHERE id=$1`, repoID).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	tk, err := m.Create(ctx, task.CreateParams{UserID: userID, RepoID: repoID, ExternalKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtPath, branch := "/tmp/scene-parked", "fix/"+strings.ToLower(key)
+	opts := &task.TransitionOpts{WorktreePath: &wtPath, BranchName: &branch}
+	if withSession {
+		sess := "sess-parked"
+		opts.AgentSessionID = &sess
+	}
+	if _, err := m.Transition(ctx, tk.ID, task.StateImplementing, "test", opts); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []task.State{task.StateVerifying, task.StatePROpen} {
+		if _, err := m.Transition(ctx, tk.ID, s, "test", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.SetPRNumber(ctx, tk.ID, 4242); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Transition(ctx, tk.ID, task.StateReviewFeedback, "system:github-review", nil); err != nil {
+		t.Fatal(err)
+	}
+	return tk
 }

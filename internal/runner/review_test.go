@@ -547,3 +547,242 @@ func lastStr(events []task.Event, key string) string {
 	s, _ := v.(string)
 	return s
 }
+
+// -------------------------------------------------- 审计 B1：parked 的人工出口
+
+// B1：从 review_feedback 的显式出口重来一轮 review —— 现场被重建（不是
+// 丢弃重建），且按 review 模式派发（不是 fresh/分诊）。
+//
+// 场景是最现实的那种：pr_open 任务收到 review 意见，但现场已经不可用
+// （目录被删），于是停在 review_feedback 等人。修复前这个状态没有出口：
+// 通用重试被状态机的会话约束挡着（或退化成丢弃现场从头重跑），任务只能
+// 被人工取消。
+//
+// 断言四件事：
+//  1. 派发计划是 review 二轮 + Rebuild（不是 Fresh/EntryTriage）；
+//  2. 现场被【重挂】：本地分支从远端第一轮的提交重建，第一轮的提交还在
+//     历史里（证明不是从头重建）；
+//  3. agent 被调用且 prompt 带 review 意见（证明没有丢掉 review 语义走
+//     分诊）；
+//  4. 最终回到 pr_open，且重新经过 verifying（验证体系不削弱）。
+func TestPipelineReviewRetryRebuildsWorkspaceAndDispatchesReview(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{URL: "https://x/pr/11", Number: reviewPR, Existing: true}}
+	ag := &fakeAgent{
+		results: []*agent.Result{{Success: true, Text: "按意见补了日志说明"}},
+		mutate: []func(string) error{func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "README.md"),
+				[]byte("# src\n\n第一轮：补充导入失败说明\n\n第二轮：失败时记一条日志\n"), 0o644)
+		}},
+	}
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.Clients = &fakeClients{lin: lin, gh: &feedbackGitHub{fakeGitHub: gh, fb: &github.ReviewFeedback{
+		PRAuthor: "lathe-bot",
+		Comments: []github.ReviewComment{
+			{Key: "inline:31", Author: "alice", Body: "错误被吞掉了，至少记一条日志", Path: "README.md", Line: 3},
+		},
+	}}}
+
+	// 第一轮：开出 PR，第一轮的提交已推到远端。
+	wt := prOpenTask(t, p, m, taskID, src, repo, true)
+	firstRound := gitOut(t, wt.Path, "rev-parse", "HEAD")
+	if err := p.Worktrees.Push(ctx, wt, repo, nil); err != nil {
+		t.Fatalf("推进远端失败: %v", err)
+	}
+	// 远端确实有第一轮的分支
+	gitOut(t, src, "rev-parse", "--verify", "refs/heads/"+wt.Branch+"^{commit}")
+
+	// 回流：pr_open → review_feedback，但现场不可用 → parked
+	out, err := (&ReviewIntake{Tasks: m, Workspaces: fakeWorkspaces{usable: false}}).
+		AcceptReview(ctx, ownerOf(t, m, taskID), inlineEvent("inline:31", "alice", "错误被吞掉了，至少记一条日志"), "d-rebuild")
+	if err != nil || out.Status != ReviewParked {
+		t.Fatalf("现场不可用时应 parked，得到 %+v %v", out, err)
+	}
+
+	// 现场真的没了（模拟目录被清理）
+	if err := os.RemoveAll(wt.Path); err != nil {
+		t.Fatalf("清理现场失败: %v", err)
+	}
+
+	// 派发侧的真实路径：RetryReviewRetry（人工出口写下的模式）
+	plan := PlanRetry(RetryReviewRetry, RetryInput{
+		HasSession: true,
+		WT: p.Worktrees.Inspect(ctx, repo.ProviderRepo, wt.Path, wt.Branch,
+			deref(baseOf(t, repo))),
+	})
+	if plan.Fresh || plan.Entry != EntryImplement || !plan.Review || !plan.Rebuild {
+		t.Fatalf("人工出口的计划应为「重挂现场 + review 二轮」，得到 %+v", plan)
+	}
+
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Retry: &plan,
+	}); err != nil {
+		t.Fatalf("重来一轮 review 执行失败: %v", err)
+	}
+
+	// 2) 现场被【重挂】而不是从头重建：第一轮那个提交仍在分支历史里。
+	//
+	// 这是本用例的关键判据 —— 「丢弃现场从头重建」会从 dev 重新分叉出
+	// 一条全新的分支，第一轮的提交（只存在于被推上去的那条分支上）不会
+	// 出现在任何位置；只有把远端分支原样检出，它才会是 HEAD 的祖先。
+	// 而它必须在线，否则二轮结束时的 push 会因非快进被拒。
+	if _, err := p.Worktrees.git(ctx, wt.Path, "merge-base", "--is-ancestor", firstRound, "HEAD"); err != nil {
+		t.Errorf("第一轮的提交 %s 应是重挂后分支的祖先（从头重建不会有它）: %v", firstRound[:8], err)
+	}
+	// 二轮的新提交确实是在第一轮之上叠加的
+	head := gitOut(t, wt.Path, "rev-parse", "HEAD")
+	if head == firstRound {
+		t.Errorf("二轮应产出新提交，HEAD 仍是第一轮的 %s", firstRound[:8])
+	}
+	// 远端分支是本地 HEAD 的祖先（二轮推送是快进，没有改写历史）
+	remoteTip := gitOut(t, src, "rev-parse", "refs/heads/"+wt.Branch)
+	if _, err := p.Worktrees.git(ctx, wt.Path, "merge-base", "--is-ancestor", remoteTip, "HEAD"); err != nil {
+		t.Errorf("远端分支 %s 应是本地 HEAD 的祖先（二轮推送保持快进，未改写历史）: %v", remoteTip[:8], err)
+	}
+
+	// 3) agent 被调用一次，prompt 带 review 意见
+	if len(ag.calls) != 1 {
+		t.Fatalf("应调用 1 次 agent，实际 %d", len(ag.calls))
+	}
+	if !strings.Contains(ag.calls[0].Prompt, "错误被吞掉了，至少记一条日志") {
+		t.Errorf("二轮 prompt 应带 review 意见（不是分诊重跑）\n---\n%s", ag.calls[0].Prompt)
+	}
+
+	// 4) 重新验证后回到 pr_open
+	final, _ := m.Get(ctx, taskID)
+	if final.State != task.StatePROpen {
+		t.Errorf("state = %s，want pr_open", final.State)
+	}
+	events := retryEvents(t, m, taskID)
+	if len(events) < 2 || events[len(events)-2].ToState != task.StateVerifying {
+		t.Errorf("二轮必须重新经过 verifying，事件尾部 = %v", events[len(events)-3:])
+	}
+}
+
+// 现场【可用】时的人工出口：不该无谓地重挂（那会丢掉工作区里可能存在的
+// 未提交改动），resume 原会话直接处理意见即可。
+func TestPipelineReviewRetryKeepsUsableWorkspace(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+
+	lin := &fakeLinear{issue: demoIssue()}
+	gh := &fakeGitHub{pr: &github.PullRequest{URL: "https://x/pr/11", Number: reviewPR, Existing: true}}
+	ag := &fakeAgent{
+		results: []*agent.Result{{Success: true, Text: "按意见改完"}},
+		mutate: []func(string) error{func(dir string) error {
+			return os.WriteFile(filepath.Join(dir, "README.md"), []byte("# src\n\n第二轮改动\n"), 0o644)
+		}},
+	}
+	p := newPipeline(t, m, lin, gh, ag, &fakeNotifier{})
+	p.Clients = &fakeClients{lin: lin, gh: &feedbackGitHub{fakeGitHub: gh, fb: &github.ReviewFeedback{
+		PRAuthor: "lathe-bot",
+		Comments: []github.ReviewComment{
+			{Key: "inline:41", Author: "alice", Body: "这里也顺手改一下", Path: "README.md", Line: 3},
+		},
+	}}}
+
+	wt := prOpenTask(t, p, m, taskID, src, repo, true)
+	// 工作区留一个未提交改动：重挂会把它抹掉，所以这条路径必须不动现场
+	writeFile(t, filepath.Join(wt.Path, "pending.txt"), "人没提交的半成品\n")
+
+	if out, err := (&ReviewIntake{Tasks: m, Workspaces: fakeWorkspaces{usable: false}}).
+		AcceptReview(ctx, ownerOf(t, m, taskID), inlineEvent("inline:41", "alice", "这里也顺手改一下"), "d-keep"); err != nil || out.Status != ReviewParked {
+		t.Fatalf("准备 parked 失败：%+v %v", out, err)
+	}
+
+	plan := PlanRetry(RetryReviewRetry, RetryInput{
+		HasSession: true,
+		WT:         p.Worktrees.Inspect(ctx, repo.ProviderRepo, wt.Path, wt.Branch, deref(baseOf(t, repo))),
+	})
+	if plan.Rebuild {
+		t.Fatalf("现场可用时不该重挂（会丢掉未提交改动），得到 %+v", plan)
+	}
+	if !plan.ResumeSession || !plan.Review {
+		t.Fatalf("现场可用且有会话时应 resume + review，得到 %+v", plan)
+	}
+
+	if err := p.Execute(ctx, ExecuteParams{
+		TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Retry: &plan,
+	}); err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	// 未提交的改动还在（没有被重挂抹掉）
+	if _, err := os.Stat(filepath.Join(wt.Path, "pending.txt")); err != nil {
+		t.Errorf("现场可用时不该重挂工作区，未提交改动应还在: %v", err)
+	}
+	if len(ag.calls) != 1 || !ag.calls[0].Resume {
+		t.Errorf("应 resume 原会话处理意见，calls=%+v", ag.calls)
+	}
+}
+
+// 远端没有第一轮分支时重挂必须明确失败，而不是悄悄退回「从头重建」——
+// 后者正是这条路径要避免的事（重建出的分支推送必被非快进拒绝）。
+func TestWorktreeReattachRequiresRemoteBranch(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, &fakeAgent{}, &fakeNotifier{})
+
+	wt := prOpenTask(t, p, m, taskID, src, repo, true)
+	// 不推送：远端没有这条分支
+	if err := os.RemoveAll(wt.Path); err != nil {
+		t.Fatalf("清理现场失败: %v", err)
+	}
+	if err := p.Worktrees.Reattach(context.Background(), repo.ProviderRepo, wt.Path, wt.Branch); err == nil {
+		t.Error("远端没有该分支时重挂应报错（而不是悄悄重建）")
+	}
+}
+
+// Reattach 的语义就是「远端那条分支原样检出到本地」：重挂之后本地分支
+// 必须与远端 tip 完全一致，且工作区是干净的（没有把远端的改动当成待提交
+// 差异）。这条用例单独钉住这个语义 —— 端到端用例从 HEAD 的祖先关系间接
+// 验证它，这里直接验证。
+func TestWorktreeReattachMirrorsRemoteTip(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	ctx := context.Background()
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, &fakeAgent{}, &fakeNotifier{})
+
+	wt := prOpenTask(t, p, m, taskID, src, repo, true)
+	firstRound := gitOut(t, wt.Path, "rev-parse", "HEAD")
+	if err := p.Worktrees.Push(ctx, wt, repo, nil); err != nil {
+		t.Fatalf("推进远端失败: %v", err)
+	}
+	remoteTip := gitOut(t, src, "rev-parse", "refs/heads/"+wt.Branch)
+	if remoteTip != firstRound {
+		t.Fatalf("远端 tip(%s) 应等于推送前的 HEAD(%s)", remoteTip[:8], firstRound[:8])
+	}
+
+	// 现场整个删掉（模拟目录被清理），再重挂
+	if err := os.RemoveAll(wt.Path); err != nil {
+		t.Fatalf("清理现场失败: %v", err)
+	}
+	if err := p.Worktrees.Reattach(ctx, repo.ProviderRepo, wt.Path, wt.Branch); err != nil {
+		t.Fatalf("重挂失败: %v", err)
+	}
+
+	if got := gitOut(t, wt.Path, "rev-parse", "HEAD"); got != remoteTip {
+		t.Errorf("重挂后 HEAD = %s，期望等于远端 tip %s", got[:8], remoteTip[:8])
+	}
+	if out := gitOut(t, wt.Path, "status", "--porcelain"); strings.TrimSpace(out) != "" {
+		t.Errorf("重挂后工作区应干净（远端分支原样检出），得到: %q", out)
+	}
+	// 第一轮的改动内容确实在工作区里
+	body, err := os.ReadFile(filepath.Join(wt.Path, "README.md"))
+	if err != nil {
+		t.Fatalf("读工作区文件失败: %v", err)
+	}
+	if !strings.Contains(string(body), "第一轮") {
+		t.Errorf("重挂后的工作区应含第一轮的内容，得到: %s", body)
+	}
+}
+
+// baseOf 取仓库默认基线分支名（测试夹具都是 fix 类任务）。
+func baseOf(t *testing.T, repo RepoConfig) *string {
+	t.Helper()
+	b, err := repo.BaseBranch(KindFix)
+	if err != nil {
+		t.Fatalf("取基线分支失败: %v", err)
+	}
+	return &b
+}

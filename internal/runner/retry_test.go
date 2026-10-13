@@ -161,7 +161,7 @@ func TestPlanRetryDecisionTable(t *testing.T) {
 
 // 非法模式与空模式。
 func TestRetryModeValid(t *testing.T) {
-	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview} {
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview, RetryReviewRetry} {
 		if !m.Valid() {
 			t.Errorf("模式 %q 应合法", m)
 		}
@@ -190,11 +190,17 @@ func TestRetryModeUserSelectableExcludesApproved(t *testing.T) {
 	if RetryReview.UserSelectable() {
 		t.Error("review 只许 PR 评论回流内部构造，不能是用户入参")
 	}
+	// review-retry 同理，且它比 review 更危险：它是一台「把任务推去重建
+	// 现场 + 跑 agent」的机器，只许 reviewRetryTask 在验过「任务确实停在
+	// review_feedback」之后构造。可由用户传入的话，任意任务都能被它推走。
+	if RetryReviewRetry.UserSelectable() {
+		t.Error("review-retry 只许 reviewRetryTask 内部构造，不能是用户入参")
+	}
 	if RetryMode("bogus").UserSelectable() {
 		t.Error("未知模式应不可选")
 	}
 	// 白名单式判据：UserSelectable 为真的一定也在 Valid 里，反向不成立。
-	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview, "bogus"} {
+	for _, m := range []RetryMode{"", RetryAuto, RetryResume, RetryFresh, RetryApproved, RetryReview, RetryReviewRetry, "bogus"} {
 		if m.UserSelectable() && !m.Valid() {
 			t.Errorf("模式 %q 可选却不是已知模式：UserSelectable 的白名单漏了 Valid 的约束", m)
 		}

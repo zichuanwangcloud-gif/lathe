@@ -514,6 +514,78 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 	return &Worktree{Path: path, Branch: branch, BaseBranch: base, Mirror: mirror}, nil
 }
 
+// Reattach 把一条【远端已存在】的任务分支重新检出到本地工作区。
+//
+// 场景（A2 审计 B1）：任务停在 review_feedback 等人处理，而它的工作区
+// 现场已经不可用（目录被删、或从来没重建过）。这个状态没有别的出口，
+// 唯一的人工出口是从 review_feedback 重新发起一轮 review —— 但那一轮
+// 不能是「丢弃现场从头重跑」：
+//
+//   - 第一轮的提交早已 push 到远端，从头重建会产出一条全新的、与远端
+//     无共同祖先的分支，二轮结束时的 push 会以非快进被拒，整轮白烧；
+//   - 二轮必须带上 PR 上的 review 意见，而丢弃重建走的是分诊路径，
+//     review 意见不会被收集。
+//
+// 所以这里的语义是【就地重挂】而不是重建：远端分支的提交原封不动地
+// 检出到本地同名分支，二轮的改动落在第一轮之上，推送仍是快进。
+//
+// 前置条件是远端确实有这条分支（origin/<branch> 在镜像里可解析）。
+// 远端没有就直接报错 —— 那种情形下「重挂」无从谈起，调用方应当放弃
+// 这一轮而不是悄悄改成重建（那正是本方法要避免的事）。
+//
+// 与 Create 的区别：Create 开新分支（-b）、会回收同名现场、并做活任务
+// 认领检查；Reattach 只认已有的远端分支，不新建任何历史。两者共用
+// 同一个 mirror 锁，互不并发。
+func (m *WorktreeManager) Reattach(ctx context.Context, providerRepo, path, branch string) error {
+	if path == "" || branch == "" {
+		return fmt.Errorf("runner: 重挂现场缺少工作区路径或分支名")
+	}
+
+	mirror := m.MirrorPath(providerRepo)
+	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err != nil {
+		return fmt.Errorf("runner: 仓库 %s 尚无 mirror，无法重挂现场", providerRepo)
+	}
+
+	unlock := m.lockMirror(mirror)
+	defer unlock()
+
+	// 先刷新镜像：远端可能在停车期间被人推过（人手改、别的自动化）。
+	// 重挂的语义是「以远端为权威」，所以这一步必须在物化本地分支之前 ——
+	// 晚于它的话，本地会查出停车前那个已经过期的 tip，二轮又是在旧内容
+	// 上改，推送仍会被拒。
+	if _, err := m.git(ctx, mirror, "fetch", "--prune", "--quiet", "origin"); err != nil {
+		return fmt.Errorf("runner: 刷新 mirror 失败: %w", err)
+	}
+
+	remoteRef := "refs/remotes/origin/" + branch
+	if _, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", remoteRef+"^{commit}"); err != nil {
+		return fmt.Errorf("runner: 远端没有分支 %q（无法就地重挂，第一轮的提交不在远端）", branch)
+	}
+
+	// 把远端分支在镜像里物化成本地分支：worktree add 检出的是本地 ref。
+	// -f 覆盖可能存在的同名残留（本地分支是上一轮现场被删后留下的尸体，
+	// 远端才是权威）。refs/heads/* 与 refs/remotes/origin/* 分属两个
+	// 命名空间，fetch --prune 只清扫后者，所以本地分支不会被后续 fetch 抹掉。
+	if _, err := m.git(ctx, mirror, "branch", "-f", branch, remoteRef); err != nil {
+		return fmt.Errorf("runner: 在本地物化分支 %q 失败: %w", branch, err)
+	}
+
+	// 清掉旧的注册与目录残骸：目录可能还在（但不是可用的工作树，否则
+	// 调用方不会走到这里），worktree add 会拒绝一个已存在的路径。
+	_, _ = m.git(ctx, mirror, "worktree", "remove", "--force", path)
+	if _, err := os.Stat(path); err == nil {
+		if rerr := os.RemoveAll(path); rerr != nil {
+			return fmt.Errorf("runner: 清理旧工作区目录 %s 失败: %w", path, rerr)
+		}
+	}
+	_, _ = m.git(ctx, mirror, "worktree", "prune")
+
+	if _, err := m.git(ctx, mirror, "worktree", "add", "--quiet", path, branch); err != nil {
+		return fmt.Errorf("runner: 重挂工作区失败（分支 %s）: %w", branch, err)
+	}
+	return nil
+}
+
 // Remove 回收工作区。
 //
 // force 为 false 时，git 会拒绝删除有未提交改动的工作区 —— 这正是

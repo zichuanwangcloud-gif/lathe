@@ -178,6 +178,9 @@ export const api = {
   cancel: (id) => request(`/api/tasks/${id}/cancel`, { method: 'POST' }),
   // 人工闸门放行（gate_mode=manual）：验证已过，人看完点这个才推分支开 PR
   approve: (id) => request(`/api/tasks/${id}/approve`, { method: 'POST' }),
+  // parked 任务的人工出口：从 review_feedback 重来一轮 review（重建现场 +
+  // 按 review 模式派发二轮，不是丢弃现场从头重跑）
+  reviewRetry: (id) => request(`/api/tasks/${id}/review-retry`, { method: 'POST' }),
 
   // 任务预览环境：worktree 里构建镜像、起容器给人手动点
   previewCandidates: (id) => request(`/api/tasks/${id}/preview/candidates`),
