@@ -161,7 +161,7 @@ onMounted(load)
           <option value="ready_for_review">待批准</option>
           <option value="approved">已批准</option>
           <option value="converted">已生成任务</option>
-          <option value="abandoned">已放弃</option>
+          <option value="abandoned">已搁置</option>
         </select>
       </label>
       <span class="dim" style="margin-left: auto">{{ total }} 份 PRD</span>

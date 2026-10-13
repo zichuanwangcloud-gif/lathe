@@ -221,6 +221,114 @@ func (s *Store) ListPRDs(ctx context.Context, p ListPRDsParams) ([]PRDRow, int, 
 	return out, total, rows.Err()
 }
 
+// ListStalledPRDs 返回「挂在 awaiting_answers 已超期」的 PRD（docs/10 §9）。
+//
+// 超时时钟取的是**最后一轮对话的 created_at**，不是 prds.updated_at。
+// 这一条是整个查询的关键，选错了会误伤：
+//
+//	updated_at 被任何一次写入推后，而哪一轮之后人没回答，只有轮次记录
+//	知道。例如人在详情页逐节点了几个「确认」（confirmSection 走
+//	UpdatePRDContent），updated_at 就跳到今天 —— 用它的时钟，一份
+//	三周没人答的 PRD 会因为昨天点了两下而永远不被判搁置。反过来，
+//	prd_rounds 是 append-only 的（0024 的建表注释），每轮一行、只增不改，
+//	最后一轮的 created_at 就是「问题提出、球踢给人」的准确时刻。
+//
+// now 由调用方传入而不是就地取 time.Now()：同一个判定里还要比
+// processing_started_at 的僵死阈值，两个时间若各取一次就可能落在
+// 不同的瞬间，让测试没法钉死边界。
+//
+// 「正在跑的这一轮不算搁置」与僵死轮次的处理见 stalledPRDPredicate。
+//
+// limit 限制单轮扫描量（最早超期的优先）—— 存量积压时靠多轮扫描排空，
+// 而不是一次拉出全表。理由同收割机：扫描是低频维护动作，
+// 单轮耗时不该随积压量线性增长。
+func (s *Store) ListStalledPRDs(ctx context.Context, now, cutoff time.Time, limit int) ([]PRDRow, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	// 判据（含「正在跑的这一轮不算搁置」与「僵死的轮次照样算」）在
+	// stalledPRDPredicate 里，与 StallPRD 共用同一份文本 —— 这里只算
+	// 两个时间参数。僵死阈值 staleBefore 与读路径（GetPRD 的
+	// clearStalePRDProcessing）共用 prdStallAfter，两处必须一致。
+	staleBefore := now.Add(-prdStallAfter)
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT p.id, p.user_id, p.repo_id, p.ref_prd_id, p.prd_type, p.state, p.round,
+		       p.original_input, p.processing, p.processing_started_at,
+		       p.generated_flow_id, p.approved_at, p.converted_at, p.created_at, p.updated_at
+		FROM prds p
+		WHERE `+stalledPRDPredicate+`
+		ORDER BY `+prdLastRoundAt+`
+		LIMIT $3`, // $1=cutoff $2=staleBefore $3=limit
+		cutoff, staleBefore, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询超期 PRD 失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PRDRow
+	for rows.Next() {
+		var it PRDRow
+		if err := rows.Scan(&it.ID, &it.UserID, &it.RepoID, &it.RefPRDID,
+			&it.PRDType, &it.State, &it.Round, &it.OriginalInput,
+			&it.Processing, &it.ProcessingStartedAt, &it.GeneratedFlowID,
+			&it.ApprovedAt, &it.ConvertedAt, &it.CreatedAt, &it.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: 读取超期 PRD 行失败: %w", err)
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// prdLastRoundAt 是超时时钟：最后一轮（按轮次号取，不按时间）对话的
+// created_at；一轮都没有时退回 prds.updated_at。理由见 ListStalledPRDs。
+const prdLastRoundAt = `COALESCE((
+			SELECT r.created_at FROM prd_rounds r
+			WHERE r.prd_id = p.id
+			ORDER BY r.round DESC
+			LIMIT 1), p.updated_at)`
+
+// stalledPRDPredicate 是「这份 PRD 现在算搁置」的完整判据（表别名 p，
+// $1 = cutoff，$2 = 僵死阈值 staleBefore）。
+//
+// ListStalledPRDs（选候选）与 StallPRD（原子转移）共用这一份文本：
+// 两处判据一旦分叉，就会出现「查出来是超期、转的时候按另一套口径」
+// 的缝 —— 那正是 StallPRD 要堵的竞态。
+const stalledPRDPredicate = `p.state = 'awaiting_answers'
+		  AND (NOT p.processing OR p.processing_started_at IS NULL
+		       OR p.processing_started_at < $2)
+		  AND ` + prdLastRoundAt + ` < $1`
+
+// StallPRD 把一份 PRD 原子地转成 abandoned —— 仅当它【此刻】仍满足
+// ListStalledPRDs 的全部判据（awaiting_answers、没有在跑的轮次、最后一轮
+// 早于 cutoff）。判据与转移在同一条 UPDATE 里，不满足就影响 0 行，
+// 返回包了 ErrPRDStateChanged 的错误，调用方据此【不发信】。
+//
+// 为什么不能用 TransitionPRD（只比 state 的 CAS）：人回答一轮的真实路径
+// （prd.Service.RunRound）全程不改 state —— BeginPRDRound 只置 processing，
+// 有新问题时 PRD 一直停在 awaiting_answers。扫描器 list 完、转移前人答了，
+// state 没变，CAS 照样成功，刚回来的人会收到一封「已搁置」。
+//
+// 并发：BeginPRDRound / EndPRDRound 都写 prds 这一行，与本 UPDATE 互斥于
+// 行锁；回答路径在 processing=true 期间才追加轮次，所以无论哪边先提交，
+// 本语句要么看到 processing=true，要么看到新的一轮，都不会误转。
+//
+// 不带 user_id：这是后台扫描器的系统动作，候选本来就来自全表查询；
+// 属主隔离是 HTTP 读写路径的事。
+func (s *Store) StallPRD(ctx context.Context, id int64, now, cutoff time.Time) (*PRDRow, error) {
+	staleBefore := now.Add(-prdStallAfter)
+	row := s.pool.QueryRow(ctx, `
+		UPDATE prds p SET state = 'abandoned'
+		WHERE p.id = $3 AND `+stalledPRDPredicate+`
+		RETURNING `+prdColumns, cutoff, staleBefore, id)
+	res, err := scanPRD(row)
+	if errors.Is(err, ErrPRDNotFound) {
+		return nil, fmt.Errorf("store: PRD %d 已不满足搁置条件（已回答、正在跑一轮、状态已变或已删除）: %w",
+			id, ErrPRDStateChanged)
+	}
+	return res, err
+}
+
 // UpdatePRDContentParams 是一轮对话产出的落库输入；nil 字段不动。
 //
 // 注意没有 OriginalInput：原文是所有推断的根，store 层不提供改它的路径
