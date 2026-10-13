@@ -383,10 +383,12 @@ func TestFailureMemoryInjectedOnResumeDegrade(t *testing.T) {
 		UserID: tk.UserID, RepoID: tk.RepoID,
 		TrackerProvider: tk.TrackerProvider, ExternalKey: tk.ExternalKey,
 	}
-	mem.InsertFailureDigest(ctx, store.FailureDigest{
+	if err := mem.InsertFailureDigest(ctx, store.FailureDigest{
 		TaskID: taskID, Stage: string(StageImplementIncomplete),
 		Reason: "实现中断", Excerpt: wantMarker,
-	}, realKey)
+	}, realKey); err != nil {
+		t.Fatalf("铺历史记忆失败: %v", err)
+	}
 	mem.written = nil // 上面那次插入只是铺记忆，不算「本次执行写下的」
 
 	if err := p.Execute(ctx, ExecuteParams{
