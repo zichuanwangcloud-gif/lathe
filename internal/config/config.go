@@ -331,6 +331,33 @@ func (c Config) PublicURL() string {
 	return "http://" + addr
 }
 
+// KnownSecrets 返回配置里**平台自身已知的凭据值**（原样，非掩码）。
+//
+// 消费方是失败记忆的脱敏权威层（internal/runner/redact.go）：它把这些值按
+// 字节精确替换掉，不依赖任何「像不像凭据」的形态猜测。
+//
+// 与 Redacted 的区别是刻意分开的两个方法：Redacted 给人看（掩码），
+// 这个给脱敏用（真值）。把它们合成一个「有时返回真值」的方法，迟早有人
+// 把真值打到日志里。
+//
+// DSN 只在配了口令时给出：`postgres://user:@host/db` 里的空口令没有意义，
+// 反而会让替换器多扫一遍。集成凭据（Linear/GitHub/webhook 密钥）全给 ——
+// 它们可能从未进过进程环境（从库里解出来直接用），形态表也认不出随机串。
+func (c Config) KnownSecrets() []string {
+	out := make([]string, 0, 5)
+	if c.Database.Password != "" {
+		out = append(out, c.Database.DSN())
+	}
+	for _, v := range []string{
+		c.LinearToken, c.LinearWebhookSecret, c.GitHubToken, c.AdminPassword,
+	} {
+		if strings.TrimSpace(v) != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // SecureCookies 报告会话 Cookie 是否应带 Secure 标志。
 //
 // 默认按 BaseURL 的协议推断：一个配置项同时说明「我的对外地址」与

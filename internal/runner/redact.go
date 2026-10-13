@@ -3,6 +3,27 @@ package runner
 // redact.go 「验证输出摘要」落库前的脱敏（§3.6 第 16 条的一部分）。
 //
 // ---------------------------------------------------------------------------
+// 两层：权威层在前，形态表兜底
+// ---------------------------------------------------------------------------
+//
+// 四轮审查的教训是同一件事：**只靠形态猜「哪些串像凭据」收敛不了**——
+// 每修好一类就会出现另一类（邮箱被当连接串、JSON 收尾被吞、转义引号漏、
+// 连续键值对只抹第一个）。所以这里按可靠性分层，顺序就是优先级：
+//
+//	层 1（权威）knownCredentialValues + redactKnown
+//	    平台在**运行期已知**的凭据值，按字节精确子串替换。
+//	    判据不依赖形态：值本身是从环境/隔离栈连接串里拿到的。
+//	    覆盖主线的绝大部分 —— 子进程回显 env 正是 leak 的头号形态。
+//
+//	层 2（兜底）tokenShapes
+//	    形态识别，盖那些「不在本进程环境里、但看得出是凭据」的值
+//	    （agent 抄进代码的 token、上游日志里的 key）。**尽力而为，非穷举**。
+//
+// 分层不只是组织方式：层 1 不受层 2 那些判据的约束 —— 值被 8KB 尾窗砍成
+// 残段、出现在域名主机的 DSN 里、挂在自定义变量名下，只要它是平台已知的
+// 凭据值，层 1 都能精确命中。层 2 的边界因此不该被当作「通过条件」。
+//
+// ---------------------------------------------------------------------------
 // 为什么必须有这一层
 // ---------------------------------------------------------------------------
 //
@@ -28,47 +49,39 @@ package runner
 // 的字段白名单。三者都假定「已知要藏什么」，而这里要回答的是「这段自由
 // 文本里混进了什么」—— 只能靠「平台知道的环境值」比对 + 形态识别兜底。
 //
-// 环境值比对是主力：它不依赖凭据长什么样，覆盖的正是最真实的那类泄漏
-// （子进程回显 env）。形态表（tokenShapes）只兜那些不来自本进程环境的值，
-// 且**非穷举** —— 见那里的注释。
-//
 // ---------------------------------------------------------------------------
-// 两条互相拉扯的约束
+// 已知接受的边界（**这些不是通过条件**，列出来免得被当成「已经保证干净」）
 // ---------------------------------------------------------------------------
 //
-// 这一层同时被两个方向拽着，每次改动都要两头都看：
+// 权威层：
+//   - 环境值按**变量名**选取（无法凭空判断「哪个值是凭据」）。词根表收的是
+//     「这个名字下的值就是凭据」；自定义名字装凭据且名字里没有词根时，这一层
+//     抓不到（还有形态表兜底）。
+//   - 名字级误伤是刻意接受的代价的对偶面：宁可少抹一点非凭据值，也不把摘要
+//     打成筛子（`LATHE_BASE_URL`、`*_AUTH_MODE`、`PWD`/`OLDPWD` 这类实测都
+//     会误伤，已逐个排除）。
+//   - **只有 8 字节及以上的值**参与替换（短串会让普通输出满屏 [REDACTED]）。
 //
-//   - **不能漏**：漏一个就是库里/提示词里留一份明文（§7 红线）。
-//   - **不能误伤**：把正常输出抹成 [REDACTED]，摘要就失去排障价值 ——
-//     而摘要存在的全部意义就是「哪一步、为什么失败」。
+// 形态表（层 2）：
+//   - 无键值结构的口令（`the password is hunter2`）。
+//   - PEM 私钥块（`-----BEGIN ... PRIVATE KEY-----`）、`file:///…` 里的路径。
+//   - 裸值 < 8 字节，或值里含 `\` / 多字节字符（裸值字符集只收
+//     `[A-Za-z0-9_\-./+=]`）。
+//   - 结构字面量白名单（`null`/`true`/`false`/`default`/纯数字）**刻意不抹**。
+//   - `a:b@c.com` 判为邮箱形态（有 `@`、无端口/路径），**不抹**；
+//     反例 `noreply@10.0.0.1` 没有冒号，同样不抹。
+//   - 无 scheme 且既无端口也无路径的 `user:pw@host`（如 `lathe:pw@db.internal`）
+//     形态表不认 —— 实际运行里这类值是隔离栈连接串的一段，由权威层精确命中。
 //
-// 第三轮复审抓到的三类问题正好各踩一头：邮箱被当连接串抹（误伤 + 损坏
-// JSON 结构）、`{"token":null}` 被吞掉右花括号（损坏结构）、转义引号里的
-// 口令没被抹（漏）。现在的形态是三条约束换来的，改表前先读下面每条注释。
-//
-// ---------------------------------------------------------------------------
-// 已知的代价与边界（写下来免得被当成「已经保证干净」）
-// ---------------------------------------------------------------------------
-//
-//   - 环境值那一级按**变量名**取值，收窄到「名字下的值就是凭据」才取。
-//     再宽的词根（AUTH、笼统的 URL）会把 `auth mode is disabled`、
-//     `https://host/tasks/1` 这类正常输出打成 [REDACTED]，摘要的排障价值
-//     直接归零 —— 宁可少抹一点非凭据值，也不把摘要变成筛子。代价是：
-//     **某个自定义名字的变量装着凭据、名字里又没有词根表那些词时，它的值
-//     不会被这一级抹掉**（那还有形态表兜底）。
-//   - 形态表认不出 PEM 私钥、自定义前缀的内部 key、以及被当成普通词出现的
-//     口令（`the password is hunter2` 这种没有键值结构的）。
-//   - 无 scheme 的连接串只在**主机部分是 IP 形状**（`lathe:pw@127.0.0.1`）
-//     时被识别：没有 scheme 又用域名主机的 `lathe:pw@db.internal` 认不出。
-//     这条是刻意的窄化 —— 放宽就必然把邮箱吃掉（见 urlCredRe 的注释），
-//     而带 scheme 的 DSN 一律覆盖（那才是实际会出现在验证输出里的形态）。
-//   - 摘要最终会随提示词经 agent.go 的 buildArgs 作为 **argv** 传给 CLI，
-//     因此它不只存在于库里：同机进程能通过 `/proc/<pid>/cmdline` 读到。
-//     （agent 子进程的环境本身是白名单化的，见 agent.go 的 sanitizedEnv；
-//     但 argv 不受它保护。）
+// 摘要本身：
+//   - 它会随提示词经 agent.go 的 buildArgs 作为 **argv** 传给 CLI，因此不只
+//     存在于库里：同机进程能通过 `/proc/<pid>/cmdline` 读到。（agent 子进程
+//     的环境是白名单化的，见 agent.go 的 sanitizedEnv；argv 不受它保护。）
+//   - 摘要是 verify 已**头部**截到 16KB 那份的尾部，取舍在 verify 侧而不是
+//     下面的 tail。
 
 import (
-	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -82,40 +95,43 @@ import (
 // 就像输出本来就是空的），而排障时需要知道「日志里有一段被平台抹掉了」。
 const redactedMark = "[REDACTED]"
 
+// ---------------------------------------------------------------- 层 1：权威层
+
 // secretKeyRe 命中「变量名本身说明它是敏感值」的环境变量。
 //
 // 与 preview 的 passwordClassRe 同一套词根，但**刻意比它窄**，而且各写一份：
 // 那一份服务的是「哪些必填变量由平台自动生成口令」，改它的词表不该牵动脱敏。
 //
-// 这里收词根的标准是「这个名字下的值**就是**凭据」，不是「可能跟认证有关」。
-// 收得再宽一点（早先版本收过 AUTH）实测就开始误伤：`LATHE_AUTH_MODE=disabled`
-// 会把 `auth mode is disabled, expected enabled` 抹成
-// `auth mode is [REDACTED], expected enabled` —— 摘要的排障价值直接没了，
-// 而这类输出恰恰是验证失败时最该看的东西。
+// 收词根的标准是「这个名字下的值**就是**凭据」，不是「可能跟认证有关」。
+// 两个方向都有实测教训：
 //
-// 反过来也不能窄：**别名要收齐**（第三轮复审实测 `MYSQL_PWD`、
-// `LATHE_DB_PASS`、`LATHE_SESSION_KEY`、`LATHE_SIGNING_KEY`、`LATHE_GH_PAT`
-// 的值都原样漏了出去）。这类名字下的值都是随机串，形态表认不出来 ——
-// 漏一个就是在库里留一份明文。所以：
+//   - **太宽**：早先收过 AUTH 与笼统的 URL，于是 `LATHE_AUTH_MODE=disabled`
+//     把 `auth mode is disabled` 抹掉、`LATHE_BASE_URL` 把
+//     `https://host/tasks/1` 抹掉。
+//   - **太窄**：`MYSQL_PWD`、`LATHE_DB_PASS`、`LATHE_SESSION_KEY`、
+//     `LATHE_GH_PAT` 的值原样落库 —— 这类名字下的值都是随机串，形态表认不出。
 //
-//   - `PWD`/`PASS` 是 `PASSWORD` 的常见简写（MySQL 的 `MYSQL_PWD` 是标准名）
-//   - `SIGNING_KEY`/`SESSION_KEY`/`ENCRYPTION_KEY` 是带中缀的 KEY，
-//     光有 `API_?KEY` 盖不住
-//   - `_PAT`（personal access token）后缀同理
-//
-// 但**不收单独的 `_KEY`**：太泛（`LATHE_KEYBOARD_LAYOUT`、
-// `GPG_KEY_ID` 里的 id 不是口令）。宁可少抹一个非凭据值，也不把常见词
-// 打成标记 —— 那会让整套脱敏看起来失效。
-var secretKeyRe = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|PWD|PASS|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL|SIGNING_?KEY|SESSION_?KEY|ENCRYPTION_?KEY|_PAT$)`)
+// `PWD`/`PASS` 必须**带前置下划线**（`_PWD$`/`_PASS$`）：带前缀的形式才是
+// 凭据别名（`MYSQL_PWD`、`LATHE_DB_PASS`）；裸的 `PWD` 是 POSIX shell 的
+// 工作目录变量，而它的值会作为**步骤目录**出现在摘要里 —— 「哪一步、在哪跑」
+// 正是摘要存在的意义，抹了它等于把排障信息换成一行 [REDACTED]。
+// 下划线锚定同时排掉 `OLDPWD`、`SSH_ASKPASS`、`BYPASS_CACHE`、
+// `COMPASS_HOME`、`LATHE_PASSIVE_MODE`（PWD/PASS 前面都不是 `_`）。
+var secretKeyRe = regexp.MustCompile(`(?i)(PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CREDENTIAL|SIGNING_?KEY|SESSION_?KEY|ENCRYPTION_?KEY|_PAT$|_PWD$|_PASS$)`)
 
 // urlishKeyRe 命中值是 URL/DSN 的变量名：`postgres://user:pass@host/db` 的
 // 口令段不由上面那组词根命名，但一样是凭据。
 //
 // **不收 BASE_URL / *_URL 这类通用地址**：`LATHE_BASE_URL` 是实例地址，
-// 里面没有口令，而它的值会出现在大量正常输出与断言消息里（实测会把
-// `got redirect https://lathe.example.com/tasks/1` 抹掉）。收窄的依据是
+// 里面没有口令，而它的值会出现在大量正常输出与断言消息里。收窄的依据是
 // 「值里必然带 user:pass@」—— DSN 这一类名字才具备这个性质。
 var urlishKeyRe = regexp.MustCompile(`(?i)(^|_)(DSN|DATABASE_URL|DATABASE_URI|REDIS_URL|AMQP_URL|BROKER_URL|CONNECTION_STRING)`)
+
+// dsnUserinfoRe 从一段连接串里抠出 `user:pass@` 的口令段。
+//
+// url.Parse 能处理标准 DSN，但兼容不了 `user:pw@tcp(host)/db` 这类非 URL
+// 形态，也接不住被截断的残段 —— 两个都试，命中即登记。
+var dsnUserinfoRe = regexp.MustCompile(`[^\s/:@]+:([^\s/:@]+)@`)
 
 // minSecretLen 是「值得脱敏的环境值」的最短长度。
 //
@@ -124,49 +140,167 @@ var urlishKeyRe = regexp.MustCompile(`(?i)(^|_)(DSN|DATABASE_URL|DATABASE_URI|RE
 // 都远长于此。
 const minSecretLen = 8
 
-// minBareValueLen 是 kv 形态里**裸值**（不带引号）的最短长度。
+// knownCredentialValues 汇总这一轮脱敏可用的「已知凭据值」（层 1 的输入）。
 //
-// 引号值没有长度门槛（`"token":"x"` 也抹）—— 引号 + 键名两重信号已经说明
-// 那是个值；裸值只有键名一重信号，且和普通词混在一起（`token: expired`、
-// `password: <placeholder>`），所以要求它至少像个随机串：
-// 长度 8 起、字符集限定在凭据常用的那几类（见 kvBareValue）。
-const minBareValueLen = 8
+// 三个来源：
+//
+//	registered  装配侧显式登记的（配置里的 DB 口令 / 集成 token / DSN）
+//	env         验证步骤的额外环境（Step.StackEnv：隔离栈连接串），一律算敏感
+//	os.Environ  本进程环境里**名字命中词根**的变量
+//
+// 对每个值还额外登记它的**口令段**：8KB 尾窗砍头会产生只剩
+// `e:REALVERYSECRETPW@db.internal:5432/app` 的残段，整串精确替换接不上，
+// 但口令段本身仍然接得上。这条正是「权威层不受形态判据约束」的体现。
+func knownCredentialValues(registered []string, extraEnv map[string]string) []string {
+	seen := map[string]bool{}
+
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if len(v) < minSecretLen || seen[v] {
+			return
+		}
+		seen[v] = true
+	}
+
+	addWithPassword := func(v string) {
+		add(v)
+		if u, err := url.Parse(strings.TrimSpace(v)); err == nil && u.User != nil {
+			if pw, ok := u.User.Password(); ok {
+				add(pw)
+			}
+		}
+		if m := dsnUserinfoRe.FindStringSubmatch(v); m != nil {
+			add(m[1])
+		}
+	}
+
+	for _, v := range registered {
+		addWithPassword(v)
+	}
+	for _, v := range extraEnv {
+		addWithPassword(v)
+	}
+	for _, kv := range os.Environ() {
+		i := strings.IndexByte(kv, '=')
+		if i <= 0 {
+			continue
+		}
+		name, val := kv[:i], kv[i+1:]
+		if secretKeyRe.MatchString(name) || urlishKeyRe.MatchString(name) {
+			addWithPassword(val)
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	// 长的先替：短值可能是长值的子串，先替短的会把长值切成两段、
+	// 让长值再也匹配不上。
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
+}
+
+// redactKnown 是层 1：把已知凭据值按字节精确替换。
+func redactKnown(s string, values []string) string {
+	if len(values) == 0 {
+		return s
+	}
+	replacers := make([]string, 0, 2*len(values))
+	for _, v := range values {
+		replacers = append(replacers, v, redactedMark)
+	}
+	return strings.NewReplacer(replacers...).Replace(s)
+}
+
+// ---------------------------------------------------------------- 层 2：形态表
 
 // literalValueRe 命中「明显不是凭据」的字面量：JSON 的 null/true/false、
 // 各种空值写法、纯数字、以及占位词。命中就不抹。
 //
-// 这条是第三轮复审的 B-2：`{"token":null}`、`{"input_token":5000}`、
-// `{"credentials":"default"}` 都不该被当成凭据 —— 键名像是敏感名，值却是
-// 结构字面量，抹掉只会损坏 JSON 且丢信息。
+// `{"token":null}`、`{"input_token":5000}`、`{"credentials":"default"}` 都不该
+// 被当成凭据 —— 键名像是敏感名，值却是结构字面量，抹掉只会损坏 JSON 且丢信息。
 var literalValueRe = regexp.MustCompile(`(?i)^(null|true|false|none|nil|default|undefined|nan|\[redacted\])$|^[+-]?\d+(\.\d+)?$`)
 
-// urlCredSchemeRe 与 urlCredHostRe 是 URL/连接串的 basic-auth 口令段规则，
-// 拆成两条是因为两种形态的**判据不同**（捕获组 2 都是口令）：
+// urlCredSchemeRe 是**带 scheme** 的连接串口令段（捕获组 2）。
 //
-//	有 scheme（`postgres://lathe:pw@host`、`redis://:pw@host`、`mysql://user:pw@host`）
-//	   `://` 本身就是决定性证据，右侧一律认（主机是域名还是 IP 都行）。
-//	   用户名允许为空（Redis 的 URI 形态就是 `redis://:pw@host`）。
-//	无 scheme（`lathe:pw@127.0.0.1:5432/db`）
-//	   验证输出里常常只剩这一段（`dial lathe:pw@…`），必须覆盖；但没有
-//	   `://` 就没有证据，只能要求主机部分是 **IP 形状**（`@` 后紧邻数字或
-//	   `[`）。邮箱的 `@` 右侧是域名（字母开头），因此不被认。
+// `://` 本身就是决定性证据，右侧一律认（主机是域名还是 IP 都行），用户名
+// 允许为空 —— 覆盖 `postgres://lathe:pw@host`、`redis://:pw@host`、
+// `mysql://user:pw@db.internal:3306/x`。
+const urlCredSchemeRe = `[a-zA-Z][a-zA-Z0-9+.\-]*://([^\s/:@]*):([^\s/:@]+)@`
+
+// urlCredHostRe 是**无 scheme** 的连接串口令段（捕获组 2）。
 //
-// 不这么分就会踩两条：放宽到「任何 `x:y@z`」→ 邮箱被当凭据抹、JSON 结构
-// 被吃坏（第三轮复审 B-1 的回归）；只认带 scheme 的 → 无 scheme 连接串漏。
+// 验证输出里常常只剩这一段（`dial lathe:pw@127.0.0.1`、被尾窗砍头的
+// `e:PW@db.internal:5432/app`），必须覆盖；但没有 `://` 就没有证据，只能靠
+// 两侧形状把它与邮箱分开：
 //
-// 两条都用「吃掉主机首字符」代替 lookahead（Go 的 regexp 是 RE2，没有前后
-// 视）：该字符不在替换组里，原样保留。
-const (
-	urlCredSchemeRe = `(?:[a-zA-Z][a-zA-Z0-9+.\-]*://)([^\s/:@]*):([^\s/:@]+)@`
-	urlCredHostRe   = `(?:^|[\s(\[{,;='"])([^\s/:@]+):([^\s/:@]+)@(?:\d|\[)`
-)
+//	左侧（userinfo）  只收 `[A-Za-z0-9._%+\-]` —— 引号、花括号、逗号都不在
+//	                  里面，于是 `{"user":"a@b.com"}` 里那个 `@` 左边是
+//	                  `"user":"a`（含引号）构不成匹配。JSON 里的邮箱因此
+//	                  天然被排除（这是上一版靠「主机必须是 IP」来避让的，
+//	                  代价是把 `@db.internal` 这类域名主机整类漏掉）。
+//	右侧（host）      要求带端口、路径、`tcp(` 参数或 IPv6 括号 ——
+//	                  `a:b@c.com` 这种裸域名不是连接串（判为邮箱形态，
+//	                  见文件头的边界清单）。
+//
+// 前导字符类不是 lookbehind（RE2 没有），用「吃掉一个前置字符」代替：
+// 该字符不在替换组里，原样保留。
+const urlCredHostRe = `(?:^|[\s(\[{,;='"|])([A-Za-z0-9._%+\-]+):([^\s/:@'"]+)@` +
+	`(?:` +
+	`(?:(?:[A-Za-z0-9\-]+\.)+[A-Za-z0-9\-]+|localhost|(?:\d{1,3}\.){3}\d{1,3}):\d+` + // host.tld:5432
+	`|(?:[A-Za-z0-9\-]+\.)+[A-Za-z0-9\-]+/` + // host.tld/path
+	`|tcp\(` + // mysql 参数形态 user:pw@tcp(host:3306)/db
+	`|\[[0-9a-fA-F:]+\]` + // [::1]:6379
+	`)`
+
+// kvKeyRoots 是 kv 形态的**键名**词根（文本级）。与 secretKeyRe 是两码事
+// （那个筛环境变量名），但两处收的词必须一致 —— 否则「文本里出现、值不在
+// env 中」的那一半就是空白（`LATHE_ENCRYPTION_KEY=…` 实测漏过）。
+//
+// `pwd`/`pass`/`pat` 写成「必须有前缀下划线」（`[a-z0-9_]*_(?:pwd|pass|pat)`）：
+// 带前缀的才是凭据别名（`MYSQL_PWD=`、`LATHE_DB_PASS=`），裸的 `PWD=` 是
+// 环境转储里的工作目录 —— `docker inspect Env` 那种输出里抹掉它，等于把
+// 「在哪跑」换成了 [REDACTED]。键名后面必须紧跟 `[:=]` 这一点另有作用：
+// `PASSIVE_MODE=`、`BYPASS=` 都接不上分隔符，天然不命中。
+const kvKeyRoots = `password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|` +
+	`signing[_-]?key|session[_-]?key|encryption[_-]?key|credentials?|` +
+	`[a-z0-9_]*_(?:pwd|pass|pat)`
+
+// kvValue 是带引号的值：允许 `\"`/`\'` 转义。
+//
+// 老写法 `"[^"]*"` 会在第一个转义引号处截断，于是
+// `{"token":"abc\"defghijklmno"}` 只抹掉 `abc\"` 留下一截明文 ——
+// 看起来已经脱敏，实际上口令还在（§7 红线内的真泄漏）。
+const kvValue = `"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'`
+
+// kvBareValue 是裸值：没有引号包裹，只有键名一个信号。
+//
+// 字符集限定在凭据常用的那几类（字母数字 + `-_./=+`）且**至少 8 字节** ——
+// 引号值没有长度门槛（`"token":"x"` 也抹，引号 + 键名两重信号够了），
+// 裸值只有键名一重信号、又和普通词混在一起（`token: expired`、
+// `password: <placeholder>`），所以要求它至少像个随机串。
+//
+// 这个字符集同时是**终止条件**：不接受 `,;}` 等结构字符、也不接受空白，
+// 于是**不再跟一个收尾守卫**。早先跟了 `(?:[\s,;}\"']|$)`，那是个消费类，
+// 匹配后从它之后继续扫，同一段里的第二个键值对永远匹配不上。
+//
+// 早先的写法是 `[^\s,;]{4,}` 后面跟 `(?:[\s,;}\])"']|$)`：那个类是**消费类**，
+// 匹配后从它之后继续扫，于是同一段里的第二个键值对永远匹配不上
+// （`TOKEN=a\nSECRET=b` 只抹第一个，`?api_key=a&x=2` 整条不匹配）。这正是
+// 子进程回显 env 的头号形态，等于「同一段输出的第二行起全漏」。
+const kvBareValue = `[A-Za-z0-9_\-./+=]{8,}`
+
+// notASecretLiteral 是 tokenShape.skip 的实现：明显不是凭据的值不抹。
+func notASecretLiteral(v string) bool {
+	return literalValueRe.MatchString(strings.Trim(v, `"'`))
+}
 
 // tokenShape 是凭据形态表的一格：一条正则 + 「要抹掉的那一段」是哪个捕获组。
 //
 // 显式标出组号，而不是靠「组数猜语义」—— 早先版本就是后者，于是
 // `\b(?:AKIA|ASIA)([A-Z0-9]{16})\b`（唯一没把整段圈进组的条目）落进
 // 「保留前缀」分支，把 AWS key id 的前 4 位与后 16 位一起原样吐了出去。
-// 组号写在表里，每个条目的意图就是它的注释，读一眼就对得上。
 type tokenShape struct {
 	re *regexp.Regexp
 	// group 是「值」所在的捕获组。命中这一段以外的部分（包括同一捕获组
@@ -174,43 +308,14 @@ type tokenShape struct {
 	// `postgres://user:` 与 `@host` 留着能让摘要仍然可读。
 	group int
 	// skip 非空时，对捕获到的值再判一次：返回 true 就不抹（值太像结构
-	// 字面量/普通词，抹了只会损坏信息）。nil 表示一律抹。
+	// 字面量/普通词）。nil 表示一律抹。
 	skip func(value string) bool
 }
 
-// 键名词根（kv 形态用）。与 secretKeyRe 是两码事：那个筛**环境变量名**，
-// 这个筛**文本里的键名**，但词根表保持一致 —— 两处漏法不同，收的词应该一样。
-const kvKeyRoots = `password|passwd|pwd|pass|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|signing[_-]?key|session[_-]?key|credentials?`
-
-// kvValue 是带引号的值：允许 `\"`/`\'` 转义。
+// tokenShapes 是凭据形态的兜底表（层 2）。
 //
-// 老写法 `"[^"]*"` 会在第一个转义引号处截断，于是
-// `{"token":"abc\"defghijklmno"}` 只抹掉 `abc\"` 留下一截明文 ——
-// 看起来已经脱敏，实际上口令还在（第三轮复审的 B-3，§7 红线内的真泄漏）。
-const kvValue = `"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'`
-
-// kvBareValue 是裸值：没有引号包裹，只有键名一个信号。
-//
-// 字符集限定在凭据常用的那几类（字母数字 + `-_./=+`），**不接受 `,;}` 等
-// 结构字符** —— 老写法 `[^\s,;]{4,}` 是贪婪的，`{"token":null}` 会一路
-// 吃到串尾把右花括号也吞掉（第三轮复审的 B-2）。
-//
-// 长度下限交给 minBareValueLen，理由是裸值必须「像个随机串」才敢动。
-const kvBareValue = `[A-Za-z0-9_\-./+=]{%d,}`
-
-// notASecretLiteral 是 tokenShape.skip 的实现：明显不是凭据的值不抹。
-func notASecretLiteral(v string) bool {
-	return literalValueRe.MatchString(strings.Trim(v, `"'`))
-}
-
-// tokenShapes 是凭据形态的兜底表。
-//
-// **非穷举**：它盖的是「无需上下文就能认出来的凭据形态」。认不出的还有
-// 不少 —— PEM 私钥块（`-----BEGIN ... PRIVATE KEY-----`）、自签名的
-// base64 blob、自定义前缀的内部 key、以及任意被当成普通词出现的口令
-// （`the password is hunter2`）。这一层的价值在于「多盖一层」而不是
-// 「盖全」：真的保证来自上面那一级（环境值与文本比对），那里不依赖
-// 凭据长什么样。
+// **非穷举** —— 见文件头「已知接受的边界」。这一层的价值在于「多盖一层」
+// 那些运行期不可知的值，而不是「盖全」；真正的保证来自层 1。
 var tokenShapes = []tokenShape{
 	// GitHub：PAT（ghp_）、OAuth/Server-to-server（gho_/ghs_）、
 	// 用户与刷新令牌（ghu_/ghr_）、fine-grained PAT（github_pat_）。
@@ -224,39 +329,27 @@ var tokenShapes = []tokenShape{
 	{re: regexp.MustCompile(`\b(xox[abprs]-)([A-Za-z0-9\-]{10,})\b`), group: 2},
 	// JWT / JWS：`eyJ` 开头的三段 base64url（`eyJ` 是 `{"a`/`{"t` 的
 	// base64，任何 JSON 头的 JWT 都以它开头）。整段抹掉 —— 三段一起才是
-	// 凭据，留着 header 段等于告诉人「这里有 token」之外还漏了算法与
-	// kid；末段允许为空（未签名的 JWT）。
+	// 凭据；末段允许为空（未签名的 JWT）。
 	{re: regexp.MustCompile(`\b(eyJ[A-Za-z0-9\-_]*\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]*)\b`), group: 1},
 	// AWS access key id：整段抹掉（AKIA/ASIA 这 4 位与后面 16 位一起才
 	// 构成 key id）。
 	{re: regexp.MustCompile(`\b((?:AKIA|ASIA)[A-Z0-9]{16})\b`), group: 1},
-	// 带 scheme 的连接串口令段（含 `redis://:pw@host` 这种空用户名形态）。
+	// 带 scheme 的连接串口令段（含 `redis://:pw@host` 空用户名形态）。
 	{re: regexp.MustCompile(urlCredSchemeRe), group: 2},
-	// 无 scheme 但主机是 IP 形状的连接串口令段。
+	// 无 scheme 的连接串口令段（判据见 urlCredHostRe）。
 	{re: regexp.MustCompile(urlCredHostRe), group: 2},
-	// kv 形态之一：**带引号的值**。三个变体各对应一类真实文本：
-	//
-	//   `token:"x"`            → 值带引号、键不带
-	//   `"apiKey":"x"`         → JSON（键带引号，且键名后直接跟 `:`）
-	//   `'password': 'x'`      → 单引号风格
-	//
-	// 键允许带引号是必需的：不带时 `\s*[:=]` 接不上 JSON 里「引号 + 冒号」
-	// 那段，`{"apiKey":"…"}` 会整体漏出去。值允许转义引号见 kvValue。
-	// 引号值不看长度（两重信号够了），但仍跳过 null/true/default 这类
-	// 结构字面量。
+	// kv 形态之一：**带引号的值**（`token:"x"`、`"apiKey":"x"`、`'password': 'x'`）。
+	// 引号值不看长度（两重信号够了），但仍跳过结构字面量。
 	{
 		re:    regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])["']?(` + kvKeyRoots + `)["']?\s*[:=]\s*(` + kvValue + `)`),
 		group: 2,
 		skip:  notASecretLiteral,
 	},
 	// kv 形态之二：**裸值**（`token=hunter2hunter2`、`password: hunter2`）。
-	//
 	// 值必须是「像随机串」的连续字符（见 kvBareValue），长度不足
-	// minBareValueLen 或含结构字符都不动 —— 这一支是误伤的主要来源，
-	// 保守优先。
+	// minBareValueLen 或含结构字符都不动 —— 这一支是误伤的主要来源。
 	{
-		re: regexp.MustCompile(fmt.Sprintf(`(?i)(?:^|[^A-Za-z0-9])["']?(`+kvKeyRoots+
-			`)["']?\s*[:=]\s*(`+kvBareValue+`)(?:[\s,;}\])"']|$|(?://))`, minBareValueLen)),
+		re:    regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9])["']?(` + kvKeyRoots + `)["']?\s*[:=]\s*(` + kvBareValue + `)`),
 		group: 2,
 		skip:  notASecretLiteral,
 	},
@@ -264,11 +357,11 @@ var tokenShapes = []tokenShape{
 
 // isRedactedValue 报告这段文本是不是「已经脱敏过」的产物。
 //
-// 两级脱敏会互相看得见：环境值替换留下的 redactedMark 本身就是一个
+// 两级脱敏会互相看得见：层 1 替换留下的 redactedMark 本身就是一个
 // 「token=…」形态的值，形态兜底若不跳过它就会写成 [REDACTED][REDACTED]。
 //
 // 这是**防御性**的：当前几条形态断言即使不跳过也恰好得到同样结果（标记
-// 里的方括号不在裸值字符集内），所以它挡的是「将来把某个形态的字符集放宽」
+// 里的方括号不在裸值字符集内），所以它挡的是「将来放宽某个形态的字符集」
 // 这类改动 —— 有单测直接钉住这个函数本身。
 func isRedactedValue(s string) bool {
 	return strings.Trim(s, `"'`) == redactedMark
@@ -292,8 +385,7 @@ func (sh tokenShape) redact(s string) string {
 		}
 		b.WriteString(s[prev:m[i]])
 		val := s[m[i]:m[i+1]]
-		// 上一级已经抹过这一段（环境值替换留下的标记本身长得就像
-		// `token="[REDACTED]"`），或这段只是结构字面量 —— 原样保留。
+		// 上一级已经抹过这一段，或这段只是结构字面量 —— 原样保留。
 		if isRedactedValue(val) || (sh.skip != nil && sh.skip(val)) {
 			b.WriteString(val)
 		} else {
@@ -305,56 +397,27 @@ func (sh tokenShape) redact(s string) string {
 	return b.String()
 }
 
-// redactSecrets 把一段自由文本里的凭据替换成 redactedMark。
+// redactText 是两层的总入口：先权威层，后形态兜底。
 //
-// env 是这次验证**实际**用的额外环境（Step.StackEnv：隔离栈的连接串），
-// 与宿主环境一起构成「平台知道的凭据值」全集。
-func redactSecrets(s string, env map[string]string) string {
+// registered 是装配侧登记的已知凭据（Pipeline.KnownSecrets）；
+// extraEnv 是这次验证步骤的额外环境（Step.StackEnv）。
+func redactText(s string, registered []string, extraEnv map[string]string) string {
 	if s == "" {
 		return ""
 	}
-
-	// 1) 收集敏感值。
-	values := map[string]bool{}
-	for _, kv := range os.Environ() {
-		i := strings.IndexByte(kv, '=')
-		if i <= 0 {
-			continue
-		}
-		name, val := kv[:i], kv[i+1:]
-		if len(val) >= minSecretLen && (secretKeyRe.MatchString(name) || urlishKeyRe.MatchString(name)) {
-			values[val] = true
-		}
-	}
-	for _, val := range env {
-		// StackEnv 一律算敏感：值就是 DSN，自带口令。
-		if len(val) >= minSecretLen {
-			values[val] = true
-		}
-	}
-
-	// 2) 长的先替：短值可能是长值的子串，先替短的会把长值切成两段、
-	// 让长值再也匹配不上。
-	if len(values) > 0 {
-		ordered := make([]string, 0, len(values))
-		for v := range values {
-			ordered = append(ordered, v)
-		}
-		sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
-		replacers := make([]string, 0, 2*len(ordered))
-		for _, v := range ordered {
-			replacers = append(replacers, v, redactedMark)
-		}
-		s = strings.NewReplacer(replacers...).Replace(s)
-	}
-
-	// 3) 形态兜底。每个条目只抹它标出的那一段，其余（前缀、`user:`、
-	// `@host`、引号、JSON 结构字符）原样保留 —— 见 tokenShape 的注释。
+	s = redactKnown(s, knownCredentialValues(registered, extraEnv))
 	for _, shape := range tokenShapes {
 		s = shape.redact(s)
 	}
 	return s
 }
+
+// redactSecrets 是 redactText 的「无登记值」入口（测试与兼容调用用）。
+func redactSecrets(s string, env map[string]string) string {
+	return redactText(s, nil, env)
+}
+
+// ---------------------------------------------------------------- 截断
 
 // tail 取字符串的尾部，按**字节**上限截断，且不切断多字节 UTF-8 字符。
 //
@@ -362,6 +425,7 @@ func redactSecrets(s string, env map[string]string) string {
 //
 //   - **尾部**而非头部：验证输出（go test / 编译器 / panic）把结论写在最后
 //     —— FAIL 行、断言消息、栈底。取头部恰好把最有用的那几行挤掉。
+//     （代价是左边界会切出 DSN 残段 —— 那正是权威层要精确命中的形态之一。）
 //   - **字节**而非 rune：上限服务的是「别把库和提示词撑爆」，那是字节预算；
 //     按字节切再回退到 rune 边界，既不用整串解码（长输出的又一次全量分配），
 //     又不会切出非法 UTF-8 —— 落库撞 SQLSTATE 22021 就是这么来的
@@ -407,8 +471,9 @@ func tail(s string, n int) string {
 // 命令本身不进摘要：它的参数里可能有 agent 直接抄进去的凭据，形态表认不出
 // 来；目录已经足够定位「哪一步、在哪跑」。
 //
-// 返回值一定是脱敏过的 —— 它只往库里和提示词里去。
-func failureExcerpt(report Report) string {
+// 返回值一定是脱敏过的（权威层用本流水线登记的已知凭据 + 这一步的隔离栈
+// 连接串）—— 它只往库里和提示词里去。
+func (p *Pipeline) failureExcerpt(report Report) string {
 	f := report.FirstFailure()
 	if f == nil {
 		return ""
@@ -427,5 +492,5 @@ func failureExcerpt(report Report) string {
 		b.WriteString("\n输出尾部：\n" + tail(out, maxStepOutput))
 	}
 
-	return tail(redactSecrets(b.String(), f.Step.StackEnv), maxDigestStoredExcerpt)
+	return tail(redactText(b.String(), p.KnownSecrets, f.Step.StackEnv), maxDigestStoredExcerpt)
 }

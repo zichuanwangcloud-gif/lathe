@@ -24,10 +24,13 @@
   `injectFailureMemory`，四个 prompt 构造函数签名不变；分诊阶段是独立
   旁路，注入点在 `stageTriage` 自己的调用处）。注入有硬上限
   （摘要 2000 / 原因 600 字节）并明确标注为历史记录；续跑场景不重复注入。
-  摘要是失败步骤输出的**尾部**（go test / 编译器的结论在后面），落库前按
-  「环境里的凭据值 + 常见 token 形态」脱敏 ——
-  验证命令继承宿主环境，输出里回显凭据是最真实的泄漏形态。mergepoll 的
-  rebase 失败路径同样落记忆
+  摘要是失败步骤输出的**尾部**（go test / 编译器的结论在后面），落库前脱敏，
+  且分两层：**权威层**先把平台已知的凭据值（配置里的 DB 口令/集成 token、
+  隔离栈连接串、名字命中词根的环境变量）按字节精确替换，形态表只作兜底。
+  验证命令继承宿主环境，输出里回显凭据是最真实的泄漏形态，而形态猜「像不像
+  凭据」收敛不了 —— 权威层不猜。已知边界（PEM 私钥、无键值结构的口令、
+  `file:///`、结构化字面量等）如实登记在 `internal/runner/redact.go` 顶部。
+  mergepoll 的 rebase 失败路径同样落记忆
 - `runner.Stage.Label()`：失败阶段代码的导出标签方法，供度量接口补中文名 ——
   措辞是 runner 包的知识，避免 store 与前端各存一份
 - `store.MetricsStatsFor` / `store.LatestFailureDigest` / `store.InsertFailureDigest`

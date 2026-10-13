@@ -116,6 +116,17 @@ type Pipeline struct {
 	// （AGENTS.md §1.3），只读不写则永远读不到东西。
 	Memory FailureMemory
 
+	// KnownSecrets 是装配侧登记的平台自身凭据（配置里的 DB 口令、集成
+	// token、拼好的 DSN），供失败记忆的脱敏**权威层**做精确替换
+	// （见 redact.go 的分层说明）。
+	//
+	// 为什么需要它而不是只靠进程环境：凭据可能来自库（creds 解出来的
+	// token）而从未进过 env；而形态表认不出随机串。凡平台已知的凭据值，
+	// 按字节精确替换是最可靠的一道 —— 它不依赖任何「像不像凭据」的猜测。
+	//
+	// 为 nil 时该层关闭，形态表照旧工作（测试与老装配）。
+	KnownSecrets []string
+
 	// Stacks 起 per-task 依赖隔离栈（T8）；为 nil 时不起栈，
 	// 验证命令用宿主环境跑 —— 与本字段引入之前完全一致。
 	//
@@ -1013,8 +1024,8 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		// 带上失败步骤的**输出摘要**进跨任务记忆：摘要来自报告里失败的
 		// 那一步（不是回帖用的 Summary —— 后者只有步骤名与耗时，没有
 		// 输出，下一个 agent 从中学不到任何东西）。写入侧脱敏 + 截断，
-		// 见 failureExcerpt。
-		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), failureExcerpt(report))
+		// 见 redact.go 的分层说明与 Pipeline.failureExcerpt。
+		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), p.failureExcerpt(report))
 	}
 
 	rc.report = report

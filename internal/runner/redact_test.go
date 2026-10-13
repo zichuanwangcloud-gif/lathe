@@ -51,7 +51,7 @@ func TestFailureExcerptKeepsOutputTail(t *testing.T) {
 		Status: StatusFailed,
 		Output: strings.Repeat("早期噪声行\n", 5000) + "TAIL-MARKER: 期望 hello 得到 world",
 	}}}
-	got := failureExcerpt(r)
+	got := (&Pipeline{}).failureExcerpt(r)
 	if !strings.Contains(got, "TAIL-MARKER") {
 		t.Errorf("摘要应保留输出尾部，got:\n%s", got)
 	}
@@ -67,7 +67,7 @@ func TestFailureExcerptKeepsOutputTail(t *testing.T) {
 // 而不是写一条空壳记录。
 func TestFailureExcerptEmptyWhenAllPassed(t *testing.T) {
 	r := Report{Results: []StepResult{{Step: Step{Name: "build"}, Status: StatusPassed}}}
-	if got := failureExcerpt(r); got != "" {
+	if got := (&Pipeline{}).failureExcerpt(r); got != "" {
 		t.Errorf("全通过时不该产生摘要：%q", got)
 	}
 }
@@ -275,6 +275,255 @@ func TestIsRedactedValue(t *testing.T) {
 		got := redactSecrets(in, nil)
 		if n := strings.Count(got, redactedMark); n != 1 {
 			t.Errorf("期望恰好一处标记，得到 %d 处：%q", n, got)
+		}
+	}
+}
+
+// ★ 第四轮复审（结构调整）：权威层 —— 平台已知的凭据值按字节精确替换。
+//
+// 这一层不依赖任何形态猜测，所以下面每条都绕开了形态表认不出的情形：
+// 被 8KB 尾窗砍头产生的 DSN 残段（不含 `://`）、域名主机、挂在自定义
+// 变量名下、以及没有任何键名提示地单独出现。
+func TestRedactKnownValuesArePrecise(t *testing.T) {
+	const (
+		pw  = "EXTREMELY-SECRET-PW-9911"
+		dsn = "postgres://lathe:" + pw + "@db.internal:5432/app"
+		// 尾窗砍头后的残段：整串精确替换接不上，口令段接得上
+		truncated = "e:" + pw + "@db.internal:5432/app"
+	)
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"整条 DSN", "连接失败: dial " + dsn, "连接失败: dial [REDACTED]"},
+		{"被砍头的残段", "残留段 " + truncated, "残留段 e:[REDACTED]@db.internal:5432/app"},
+		{"口令单独出现", "口令是 " + pw + " 记住", "口令是 [REDACTED] 记住"},
+		{"挂在自定义变量名下", "MYSELF_CUSTOM=" + dsn, "MYSELF_CUSTOM=[REDACTED]"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 只给权威层（形态表对下面几条也认不出，这里刻意先只验层 1）
+			if got := redactKnown(c.in, knownCredentialValues([]string{dsn}, nil)); got != c.want {
+				t.Errorf("got  %q\nwant %q", got, c.want)
+			}
+			// 端到端（层 1 + 层 2）同样不能留明文
+			if got := redactText(c.in, []string{dsn}, nil); strings.Contains(got, pw) {
+				t.Errorf("端到端仍含口令明文：%q", got)
+			}
+		})
+	}
+}
+
+// 权威层的另一个来源：验证步骤的 StackEnv（隔离栈连接串）。
+// 它带着口令，而且**不是**进程环境变量，只经 Step.StackEnv 流下来。
+func TestRedactKnownCoversStackEnvPassword(t *testing.T) {
+	const pw = "stack-password-4242"
+	dsn := "postgres://lathe:" + pw + "@127.0.0.1:56001/lathe_task_42"
+	got := redactText("step output: "+truncateTailForTest(dsn, 40), nil, map[string]string{"DATABASE_URL": dsn})
+	if strings.Contains(got, pw) {
+		t.Errorf("隔离栈口令泄漏：%q", got)
+	}
+}
+
+// truncateTailForTest 取一段字符串的**尾部**（模拟 8KB 尾窗砍头），让它变成
+// 不含 `://` 的残段 —— 这正是复审点名的必测路径。
+func truncateTailForTest(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+// ★ 第四轮复审点名的必测路径：被砍头的 DSN 残段（不含 `://`）。
+//
+// 残段的来源有两条，都真实：
+//   - `tail` 在窗口左边界按字节砍 —— 单元级复现见本文件
+//     TestTailProducesSchemeLessDSNResidual；
+//   - 上游本就把这行截断了（`t.Logf` 打了一半 / 日志落盘被截）。
+//
+// 两条产出的形状一样：`lathe:<pw>@db.internal:5432/app`。旧的两条规则
+// 都接不上（没有 `://`；主机是域名）。这里走**完整链路**
+// （失败报告 → 两层截断 → 脱敏 → 落库的那份）断言不留明文，
+// 并分别验「权威层」与「只靠形态表」两种配置。
+func TestFailureExcerptRedactsSchemeLessDSNResidual(t *testing.T) {
+	const pw = "REALVERYSECRETPW4242"
+	dsn := "postgres://lathe:" + pw + "@db.internal:5432/app"
+	const residual = "lathe:" + pw + "@db.internal:5432/app"
+
+	// 残段放在距尾部 ~4KB 处：8KB 尾窗一定覆盖到它
+	out := "dial " + residual + " failed\n" + strings.Repeat("z", 4000)
+
+	// 前置：夹具本身只含残段（不含 `://`），并确认它落在 8KB 尾窗内
+	if strings.Contains(out, "://") || !strings.Contains(tail(out, maxDigestStoredExcerpt), residual) {
+		t.Fatal("夹具不成立：残段不在尾窗内")
+	}
+
+	p := &Pipeline{KnownSecrets: []string{dsn}}
+	got := p.failureExcerpt(Report{Results: []StepResult{{
+		Step: Step{Name: "test"}, Status: StatusFailed, Output: out,
+	}}})
+	if strings.Contains(got, pw) {
+		t.Errorf("残段泄漏口令（权威层），前 200 字节：%q", firstN(got, 200))
+	}
+
+	// 只靠形态表（没有登记值）时也不该漏
+	bare := (&Pipeline{}).failureExcerpt(Report{Results: []StepResult{{
+		Step: Step{Name: "test"}, Status: StatusFailed, Output: out,
+	}}})
+	if strings.Contains(bare, pw) {
+		t.Errorf("仅靠形态表时残段泄漏口令，前 200 字节：%q", firstN(bare, 200))
+	}
+}
+
+// tail 在窗口左边界按字节砍，一条 DSN 会被切成不含 `://` 的残段 ——
+// 这就是上面那条用例的输入形状从哪来（用未脱敏的 tail 直接验机制本身）。
+func TestTailProducesSchemeLessDSNResidual(t *testing.T) {
+	const pw = "REALVERYSECRETPW4242"
+	dsn := "postgres://lathe:" + pw + "@db.internal:5432/app"
+	const mark = "…(已截断)\n"
+	tailRoom := maxDigestStoredExcerpt - len(mark)
+
+	// 让 cut 恰好落在 `postgres://` 之后
+	filler := strings.Repeat("z", tailRoom-(len(dsn)-len("postgres://")))
+	out := strings.Repeat("噪声行 noise line\n", 1500) + dsn + filler
+
+	residual := tail(out, maxDigestStoredExcerpt)
+	if !strings.Contains(residual, "lathe:"+pw) || strings.Contains(residual, "://") {
+		t.Fatalf("夹具没把边界压在 postgres:// 之后：前 120 字节 = %q", firstN(residual, 120))
+	}
+	// 而这一形状对形态表仍是可脱敏的（这是 B-1 修的判据）
+	if got := redactSecrets(residual, nil); strings.Contains(got, pw) {
+		t.Errorf("残段经形态表后仍含口令：%q", firstN(got, 200))
+	}
+}
+
+// ★ 第四轮复审 B-1：无 scheme 的**域名主机**连接串（整类此前漏）。
+//
+// 旧版靠「主机必须是 IP 形状」来避邮箱，代价是 `@db.internal` / `@localhost`
+// / `@redis.internal` / `@tcp(host)` 全部明文 —— 而本仓 preview 起的容器
+// 服务名就是域名（`pg`），属可达路径。现在改成「左侧 userinfo 形状 + 右侧
+// 主机带端口/路径/tcp(」来判连接串，邮箱由左侧形状自然排除。
+func TestRedactSecretsCoversSchemeLessConnectionStrings(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"dial lathe:s3cr3t-pw@db.internal:5432/app", "dial lathe:[REDACTED]@db.internal:5432/app"},
+		{"dial lathe:pw@localhost:5432", "dial lathe:[REDACTED]@localhost:5432"},
+		{"redis:secretpw@redis.internal:6379", "redis:[REDACTED]@redis.internal:6379"},
+		{"user:mysqlpw@tcp(db.internal:3306)/app", "user:[REDACTED]@tcp(db.internal:3306)/app"},
+		{"连接 postgres://lathe:pw@db.internal:5432/app 失败", "连接 postgres://lathe:[REDACTED]@db.internal:5432/app 失败"},
+		// 尾窗砍头后的残段（左边界被吃掉，只剩 `e:PW@…`）
+		{"... e:REALVERYSECRETPW@db.internal:5432/app", "... e:[REDACTED]@db.internal:5432/app"},
+		{"dial lathe:pw@10.0.0.5:5432/app", "dial lathe:[REDACTED]@10.0.0.5:5432/app"},
+	}
+	for _, c := range cases {
+		if got := redactSecrets(c.in, nil); got != c.want {
+			t.Errorf("got  %q\nwant %q", got, c.want)
+		}
+	}
+	// 反例：邮箱形态与无冒号的邮箱不抹
+	for _, in := range []string{
+		`{"user":"a@b.com"}`,
+		`{"email":"admin@example.com"}`,
+		`a:b@c.com`,
+		`noreply@10.0.0.1`,
+	} {
+		if got := redactSecrets(in, nil); got != in {
+			t.Errorf("邮箱形态被误伤：in %q out %q", in, got)
+		}
+	}
+}
+
+// ★ 第四轮复审 B-2：同一段里的**连续多个**键值对都要抹。
+//
+// 旧版的收尾守卫是消费类（`(?:[\s,;}\])"']|$)`），匹配后从它之后继续扫，
+// 于是第二个键永远匹配不上 —— 而「逐行 env 转储」正是 redact.go 自己举的
+// 头号泄漏形态，等于第二行起全漏。
+func TestRedactSecretsHandlesConsecutivePairs(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"逐行 env 转储", "TOKEN=aaaabbbbcccc\nSECRET=eeeeffffgggg", "TOKEN=[REDACTED]\nSECRET=[REDACTED]"},
+		{"三行 env 转储", "TOKEN=aaaabbbbcccc\nPASSWORD=dddddddddd\nAPI_KEY=ffffffffffff",
+			"TOKEN=[REDACTED]\nPASSWORD=[REDACTED]\nAPI_KEY=[REDACTED]"},
+		{"docker run -e", "docker run -e TOKEN=aaaabbbbcccc -e SECRET=eeeeffffgggg",
+			"docker run -e TOKEN=[REDACTED] -e SECRET=[REDACTED]"},
+		{"docker inspect Env", `"Env": ["PATH=/usr/bin","MYSQL_PWD=aaaabbbbcccc","LATHE_DB_PASS=eeeeffffgggg"]`,
+			`"Env": ["PATH=/usr/bin","MYSQL_PWD=[REDACTED]","LATHE_DB_PASS=[REDACTED]"]`},
+		{"query string", "?api_key=aaaabbbbcccc&x=2", "?api_key=[REDACTED]&x=2"},
+		{"fragment", "/path?secret=aaaabbbbcccc#frag", "/path?secret=[REDACTED]#frag"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := redactSecrets(c.in, nil); got != c.want {
+				t.Errorf("got  %q\nwant %q", got, c.want)
+			}
+		})
+	}
+}
+
+// ★ 第四轮复审 M-1：kv 词根表与环境词根表必须一致 —— 尤其是**文本里出现、
+// 值不在 env 中**的那一半。旧用例只从 t.Setenv 取值，把 kv 别名全删掉它
+// 照样绿（名不副实）。
+func TestRedactSecretsCoversTextLevelKeyAliases(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"LATHE_ENCRYPTION_KEY=zzzzzzzzzzzz", "LATHE_ENCRYPTION_KEY=[REDACTED]"},
+		{"LATHE_SIGNING_KEY=zzzzzzzzzzzz", "LATHE_SIGNING_KEY=[REDACTED]"},
+		{"LATHE_GH_PAT=yyyyyyyyyyyy", "LATHE_GH_PAT=[REDACTED]"},
+		{"_PAT=qqqqqqqqqqqq", "_PAT=[REDACTED]"},
+		{"MYSQL_PWD=aaaaaaaaaaaa", "MYSQL_PWD=[REDACTED]"},
+		{"LATHE_DB_PASS=bbbbbbbbbbbb", "LATHE_DB_PASS=[REDACTED]"},
+		{"LATHE_DB_PWD=cccccccccccc", "LATHE_DB_PWD=[REDACTED]"},
+	}
+	for _, c := range cases {
+		// 刻意**不** setenv：这条考的是文本级词根，不是环境值那一级
+		if got := redactSecrets(c.in, nil); got != c.want {
+			t.Errorf("got  %q\nwant %q", got, c.want)
+		}
+	}
+}
+
+// ★ 第四轮复审 M-2：PWD/PASS 必须锚定，别把 shell 的工作目录抹掉。
+//
+// 无界子串会命中 `PWD`/`OLDPWD`（POSIX shell 的工作目录）、`SSH_ASKPASS`、
+// `BYPASS_CACHE`、`LATHE_PASSIVE_MODE`、`COMPASS_HOME` —— 而步骤目录
+// （`/workspaces/task-313/sub`）正是摘要里「在哪跑」那部分。
+func TestRedactSecretsDoesNotEatWorkingDirectory(t *testing.T) {
+	t.Setenv("PWD", "/workspaces/task-313/sub")
+	t.Setenv("OLDPWD", "/workspaces/task-313")
+	t.Setenv("SSH_ASKPASS", "/usr/bin/askpass-helper")
+	t.Setenv("LATHE_PASSIVE_MODE", "on")
+	t.Setenv("LATHE_WORKSPACE_ROOT", "/workspaces")
+	t.Setenv("BYPASS_CACHE", "yes")
+
+	for _, in := range []string{
+		"步骤 build（/workspaces/task-313/sub）",
+		"root=/workspaces 下",
+		"helper=/usr/bin/askpass-helper",
+		"PWD=/workspaces/task-313/sub",
+		"OLDPWD=/workspaces/task-313",
+		"BYPASS_CACHE=yes",
+		"LATHE_PASSIVE_MODE=on",
+	} {
+		if got := redactSecrets(in, nil); got != in {
+			t.Errorf("非凭据值被误伤：\nin  %q\nout %q", in, got)
+		}
+	}
+	// 但带前缀的别名仍要抹（这才是真凭据别名）。裸值（文本里只出现值、
+	// 没有键名提示）的抹除由权威层负责 —— 这里显式把值登记进去。
+	for _, in := range []string{
+		"MYSQL_PWD=mysqlpwdvalue123",
+		"LATHE_DB_PASS=dbpassvalue12345",
+	} {
+		if got := redactSecrets(in, nil); !strings.Contains(got, redactedMark) {
+			t.Errorf("凭据别名应被抹：%q", got)
+		}
+	}
+	for _, in := range []string{"x mysqlpwdvalue123 y", "看到 mysqlpwdvalue123 这串"} {
+		got := redactText(in, []string{"mysqlpwdvalue123"}, nil)
+		if strings.Contains(got, "mysqlpwdvalue123") {
+			t.Errorf("权威层应精确抹掉登记过的值：%q", got)
 		}
 	}
 }
@@ -510,4 +759,12 @@ func TestRedactSecretsCoversStackEnv(t *testing.T) {
 	if !strings.Contains(got, redactedMark) {
 		t.Errorf("应当脱敏：%q", got)
 	}
+}
+
+// firstN 截前 n 个字节（失败信息里不打 8KB）。
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }

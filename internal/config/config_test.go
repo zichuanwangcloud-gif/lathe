@@ -283,3 +283,26 @@ func TestValidateRejectsDangerousWorkspaceRoot(t *testing.T) {
 		}
 	}
 }
+
+// KnownSecrets 是脱敏权威层的输入（见 runner/redact.go）：给人看的 Redacted
+// 走掩码，这里必须给**真值** —— 两者混用迟早把真值打到日志里，所以分开测。
+func TestKnownSecretsReturnsRealValues(t *testing.T) {
+	c := Config{
+		Database:      Database{User: "lathe", Password: "db-pass-1234", Host: "127.0.0.1", Port: 5432, Name: "lathe", SSLMode: "disable"},
+		LinearToken:   "lin_api_abcdefghijklmnop",
+		GitHubToken:   "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+		AdminPassword: "admin-pass-5678",
+	}
+	got := c.KnownSecrets()
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"db-pass-1234", "lin_api_abcdefghijklmnop", "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", "admin-pass-5678"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("KnownSecrets 应含 %q，得到 %v", want, got)
+		}
+	}
+	// 空值不进列表（省一次全串替换）
+	empty := Config{}
+	if n := len(empty.KnownSecrets()); n != 0 {
+		t.Errorf("没有配任何凭据时应返回空列表，得到 %d 项", n)
+	}
+}
