@@ -82,6 +82,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}/retry-plan", a.Auth.RequireFunc(a.retryPlan))
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
 	mux.Handle("POST /api/tasks/{id}/approve", a.Auth.RequireFunc(a.approveTask))
+	mux.Handle("POST /api/tasks/{id}/review-retry", a.Auth.RequireFunc(a.reviewRetryTask))
 	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
 	mux.Handle("GET /api/repos/{id}/baseline", a.Auth.RequireFunc(a.repoBaseline))
@@ -322,6 +323,24 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// review_feedback 是个没有通用出口的状态：它的两条出边（→ implementing、
+	// → queued）都受约束①（必须 resume 原会话）管辖，parked 的任务（没有
+	// 会话可续）连一条都走不了。而「重试」这条通用通道恰恰会把它推向
+	// 最坏的方向：mode=fresh/auto 转 queued 后走的是【丢弃现场 + 分诊】
+	// 路径，第一轮早已推到远端的分支会在二轮推送时撞非快进失败 —— 整轮
+	// 白烧，还丢掉了 PR 上的 review 意见。
+	//
+	// 所以从 review_feedback 出队只能走显式路径：POST
+	// /api/tasks/{id}/review-retry（下面是 reviewRetryTask）。这里把通用
+	// 重试挡在门外，理由如实回报，让人知道该点哪个按钮。
+	if tk.State == task.StateReviewFeedback {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "任务停在 review_feedback，通用重试会丢弃现场从头重跑（第一轮的分支已在远端，" +
+				"推送必被非快进拒绝）。请用「重来一轮 review」，它会重建现场并按 review 模式派发二轮。",
+		})
+		return
+	}
+
 	// resume 预检：现场不可续跑时拒绝入队，把决策理由摆给人看
 	if mode == runner.RetryResume {
 		plan, _ := a.previewRetry(r.Context(), tk)
@@ -344,6 +363,79 @@ func (a *API) retryTask(w http.ResponseWriter, r *http.Request) {
 	// 状态已回到 queued，重派【原任务行】（不新建 —— 新建会撞同一 issue
 	// 的活任务唯一索引，重试因此永远卡死；任务 #313 的教训）
 	if err := a.Queue.Requeue(r.Context(), id, string(mode)); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "queued", "taskId": id})
+}
+
+// reviewRetryTask 是 parked 任务的人工出口：从 review_feedback 重新发起
+// 一轮 review（A2 审计 B1）。
+//
+// 为什么需要这个端点：任务会停在 review_feedback 等人处理 —— PR 评论
+// 回流入口在「没有可 resume 的会话」或「现场不可用」时把它停在那里
+// （runner.ReviewIntake.AcceptReview 的三条停车路径），设计上就是这样。
+// 但这个状态原本没有出口：它的两条出边都受约束①（必须 resume 原会话）
+// 管辖，parked 的任务恰好没有会话；通用重试通道（retryTask）又从
+// review_feedback 被挡住了，因为那条路会丢弃现场、走分诊，把第一轮
+// 的成果全丢。于是「停车等人」实际上等于「等人取消」—— 这不是设计。
+//
+// 语义是「重来一轮 review」，不是「重跑这个任务」：
+//   - 现场可用 → resume 原会话（若还在）按 review 模式派发二轮；
+//   - 现场不可用 → 把远端已有第一轮提交的分支就地重挂到本地，再派发
+//     二轮（runner.PlanRetry 的 Rebuild，见 runner.RetryReviewRetry）。
+//     不是丢弃重建：那是这个模式要避免的事。
+//   - 会话在 parked 之后被清掉了也照样放行 —— 二轮开新会话，但 prompt
+//     仍带全量需求与全部待处理意见（这条路径的全部意义所在）。
+//
+// 与 approveTask 同一套成熟通道：转移回 queued 并把内部模式写进事件
+// payload，由 worker 回读、PlanRetry 决策。不在 HTTP 请求里同步驱动 agent。
+func (a *API) reviewRetryTask(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		// 不是自己的任务 = 不存在（与 taskDetail 同一原则）
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return
+	}
+
+	// 先做一次读校验，只为给出可读的快速失败；真正的判据是下面带前置
+	// 状态的转移（与 approveTask 同一立场：两个并发请求都会走过这道
+	// 锁外检查，不能让「先读后写」的窗口决定谁有权执行 —— 重派是副作用
+	// 不幂等的动作）。
+	if tk.State != task.StateReviewFeedback {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": "只有停在 review_feedback 的任务可以重来一轮 review，当前状态：" + string(tk.State),
+		})
+		return
+	}
+
+	if _, err := a.Tasks.TransitionFrom(r.Context(), id,
+		task.StateReviewFeedback, task.StateQueued, actorOf(r), &task.TransitionOpts{
+			// ExplicitReviewRestart 是约束①在这条路径上的唯一放行口，
+			// 且只在 review_feedback → queued 这个组合上生效（见
+			// task.TransitionOpts 的注释）。人明确点了这个按钮，就是
+			// 明确接受「没有原会话就开新会话」这个降级。
+			ExplicitReviewRestart: true,
+			Payload: map[string]any{
+				"reason": "manual_review_retry",
+				"mode":   string(runner.RetryReviewRetry),
+				// 与回流路径同一处理：显式置空，否则派发侧回读到本任务更早
+				// 一次崩溃恢复留下的旧值，会被当成「二轮途中崩溃」。
+				"interrupted_state": "",
+			},
+		}); err != nil {
+		transitionError(w, err)
+		return
+	}
+
+	// 重派【原任务行】，不新建 —— 新建会撞同一 issue 的活任务唯一索引
+	//（任务 #313 的教训，与 retryTask/approveTask 同一处理）。
+	if err := a.Queue.Requeue(r.Context(), id, string(runner.RetryReviewRetry)); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 		return
 	}
@@ -430,7 +522,10 @@ func (a *API) retryPlan(w http.ResponseWriter, r *http.Request) {
 		"entry":         string(plan.Entry),
 		"entryLabel":    plan.Entry.Label(),
 		"resumeSession": plan.ResumeSession,
-		"reasons":       plan.Reasons,
+		// rebuild 为真表示这一轮会把远端分支就地重挂到本地（review_feedback
+		// 的人工出口），UI 据此区分「重挂现场」与「丢弃重建」两种截然不同的措辞。
+		"rebuild": plan.Rebuild,
+		"reasons": plan.Reasons,
 	}
 	if wt != nil {
 		resp["worktree"] = map[string]any{
@@ -480,6 +575,17 @@ func (a *API) previewRetry(ctx context.Context, tk *task.Task) (runner.RetryPlan
 	var stage runner.Stage
 	if tk.FailureStage != nil {
 		stage = runner.Stage(*tk.FailureStage)
+	}
+	// review_feedback 的任务从「重来一轮 review」那条路出队，预览要按那条
+	// 路径的决策算 —— 拿 RetryAuto 去预览会显示「从头重跑」，与按钮实际
+	// 会做的事（重建现场 + 按 review 模式派发二轮）不符，那正是这次要修的
+	// 那类「说得和做的不一样」。
+	if tk.State == task.StateReviewFeedback {
+		plan := runner.PlanRetry(runner.RetryReviewRetry, runner.RetryInput{
+			HasSession: tk.AgentSessionID != nil && *tk.AgentSessionID != "",
+			WT:         wtState,
+		})
+		return plan, wtState
 	}
 	plan := runner.PlanRetry(runner.RetryAuto, runner.RetryInput{
 		Stage:      stage,

@@ -58,16 +58,34 @@ func AllStates() []State {
 //  1. triaging/implementing/verifying → queued —— 节点崩溃后租约到期，任务被
 //     重新派发（docs/02-design.md §6.4）；单机形态下即服务重启后的启动恢复。
 //     没有这条边，进程故障就等于任务永久卡死。
+//
 //  2. failed → queued —— 失败任务人工排查后可重新入队（D4 不自动重试，
 //     但允许人工重试）。
+//
 //  3. review_feedback → implementing —— 二轮实现，调用方必须带上
 //     agent_session_id 走 --resume，见 RequiresSession。
+//
 //  4. queued → implementing / verifying —— 智能重试的断点续跑：失败任务的
 //     现场（worktree/分支/提交）经检查有效时，从失败阶段续跑而非从头重跑，
 //     跳过已完成的分诊/实现阶段（runner.PlanRetry 决策）。
+//
 //  5. queued → blocked_dep —— 前驱失败或前驱 PR 被关闭未合并，后继的地基
 //     没了（docs/06-orchestration.md §5.2）；blocked_dep → queued 是前驱
 //     恢复后的唤醒路径，→ cancelled 是人工中止。
+//
+//  6. review_feedback → queued —— PR 评论回流（docs/02-design.md §7）：
+//     webhook 记下 review 意见后把任务交还给 DB 领单调度器（它只认
+//     queued），由 worker 以 resume 原会话的方式派发二轮。不让 webhook
+//     处理器直接 → implementing：那等于在 HTTP 请求里同步驱动 agent。
+//     这条边与边 3 同受 RequiresSession 约束，否则约束①可经 queued 绕过。
+//
+//     【这条边是给 Webhook 用的，不是给人工重试端点用的】。它本身是通用
+//     边：一旦让「任意状态 → queued」的人工重试端点也能走它，parked 的
+//     语义就被绕过了 —— 任务明明停在 review_feedback，人点一次「重试」
+//     就变成丢弃现场、走分诊从头跑，第一轮推上去的分支在推送时撞非快进
+//     失败。人工出口必须【显式】：见 review_feedback → queued 的调用方
+//     白名单校验（httpapi.retryTask 只放 review-retry 这一个内部模式走
+//     这条边），以及 runner.PlanRetry 对 RetryReviewRetry 的决策。
 var transitions = map[State][]State{
 	StateQueued:   {StateTriaging, StateImplementing, StateVerifying, StateBlockedDep, StateCancelled},
 	StateTriaging: {StateQueued, StateImplementing, StateAwaitingApproval, StateBlockedSpec, StateFailed, StateCancelled},
@@ -89,7 +107,7 @@ var transitions = map[State][]State{
 	StateVerifying:    {StatePROpen, StateAwaitingApproval, StateBlockedSpec, StateQueued, StateFailed, StateCancelled},
 
 	StatePROpen:         {StateReviewFeedback, StateMerged, StateFailed, StateCancelled},
-	StateReviewFeedback: {StateImplementing, StateMerged, StateFailed, StateCancelled},
+	StateReviewFeedback: {StateImplementing, StateQueued, StateMerged, StateFailed, StateCancelled},
 
 	// 终态
 	StateMerged:    {},
@@ -175,6 +193,21 @@ func Validate(from, to State) error {
 //
 // 这是 docs/02-design.md §3 约束① 的代码化：review 二轮必须 resume
 // 原会话，重开会话会丢掉第一轮的全部推理与代码定位上下文。
+//
+// review_feedback 的两条「走向二轮」的出边都受约束：→ implementing 是
+// 直接进二轮，→ queued 是交给领单调度器再进二轮（见转移表注释第 6 条）。
+// 只约束前者的话，queued → implementing 不查会话，约束①就形同虚设。
+//
+// 【自动路径一律受约束】。webhook 回流、以及任何「系统自己决定把任务
+// 送去二轮」的地方，都必须有原会话；没有就停车等人（见 runner.ReviewIntake
+// 的三条停车路径）。
+//
+// 唯一的例外是【显式的人工出口】：任务停在 review_feedback、会话已经不
+// 可恢复时，人明确选择「重来一轮 review」（TransitionOpts.
+// ExplicitReviewRestart）。那种情形下约束①本就无从满足 —— 没有会话可
+// resume，二轮只能开新会话；而拒绝这条路径的后果是任务没有出口（见
+// review_feedback → queued 的转移表注释）。Machine.transition 对这个例外
+// 的适用面做了收窄：只认 review_feedback → queued 这一个组合。
 func RequiresSession(from, to State) bool {
-	return from == StateReviewFeedback && to == StateImplementing
+	return from == StateReviewFeedback && (to == StateImplementing || to == StateQueued)
 }

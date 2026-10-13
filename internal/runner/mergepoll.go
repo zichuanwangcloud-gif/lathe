@@ -520,27 +520,53 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 // 后继可能早就顺利开出了 PR（最常见）、也可能还卡在 review 意见的
 // 二轮里——都需要在重验前归一，否则 stageVerify 自己那次
 // Transition(..., StateVerifying, ...) 会因为非法转移直接报错。
+//
+// 【每一步都用 TransitionFrom 带上前置状态，而不是裸 Transition】
+// （A2 审计 MAJOR-2）。这是一个与 PR 评论回流争同一行的路径：
+//
+//	rebase 跟进：pr_open → review_feedback → implementing
+//	评论回流：   pr_open → review_feedback → queued（mode=review）
+//
+// 两步之间回流可能把任务转去 queued。裸 Transition 不带前置条件，第二步
+// `queued → implementing` 本身又是合法边，于是它会【成功】—— 结果是
+// rebase 跟进与 worker 各做了一次 implementing 转移：埋进 queued 的那次
+// review 二轮被这次转移抹掉（前者的 mode=review 事件已经写下，但任务已经
+// 不在 queued 上了，worker 领不到它），任务停在 implementing 却没有任何
+// 执行者在跑它。
+//
+// 带上前置状态后，行锁下的比对会发现状态已经不是我们读到的那个，
+// 返回 ErrStateMismatch，调用方按既有逻辑「跳过重验并记日志」——
+// 任务留在 queued，worker 照常领到它跑 review 二轮。rebase 与 force push
+// 已经完成（那两步在归一之前），二轮在这个已 rebase 的分支上继续。
+//
+// 仍未覆盖的窗口（已知边界，不为它大改 mergepoll）：下面每一步各自
+// 带前置状态，但【两步之间】的回流仍可能让第二步以 ErrStateMismatch
+// 收场 —— 那正是这里期望的、且是安全的结局（跳过重验，不抢任务）。
+// 真正没被覆盖的只剩「第一步之前就已被回流带走」：那时 succ 读到的
+// 状态已过期，第一步自己就会以 ErrStateMismatch 返回，同样安全跳过。
 func (p *MergePoller) reenterForVerify(ctx context.Context, succ *task.Task) (*task.Task, error) {
 	cur := succ
-	if cur.State == task.StatePROpen {
-		tk, err := p.Tasks.Transition(ctx, cur.ID, task.StateReviewFeedback, "system:rebase-followup",
+	step := func(from, to task.State) (*task.Task, error) {
+		return p.Tasks.TransitionFrom(ctx, cur.ID, from, to, "system:rebase-followup",
 			&task.TransitionOpts{Payload: map[string]any{"reason": "rebase_followup_reverify"}})
+	}
+
+	if cur.State == task.StatePROpen {
+		tk, err := step(task.StatePROpen, task.StateReviewFeedback)
 		if err != nil {
 			return nil, fmt.Errorf("状态归一失败（pr_open→review_feedback）: %w", err)
 		}
 		cur = tk
 	}
 	if cur.State == task.StateReviewFeedback {
-		tk, err := p.Tasks.Transition(ctx, cur.ID, task.StateImplementing, "system:rebase-followup",
-			&task.TransitionOpts{Payload: map[string]any{"reason": "rebase_followup_reverify"}})
+		tk, err := step(task.StateReviewFeedback, task.StateImplementing)
 		if err != nil {
 			return nil, fmt.Errorf("状态归一失败（review_feedback→implementing）: %w", err)
 		}
 		cur = tk
 	}
 	if cur.State == task.StateVerifying {
-		tk, err := p.Tasks.Transition(ctx, cur.ID, task.StateQueued, "system:rebase-followup",
-			&task.TransitionOpts{Payload: map[string]any{"reason": "rebase_followup_reverify"}})
+		tk, err := step(task.StateVerifying, task.StateQueued)
 		if err != nil {
 			return nil, fmt.Errorf("状态归一失败（verifying→queued）: %w", err)
 		}

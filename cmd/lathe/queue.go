@@ -567,26 +567,7 @@ func (q *queue) planRetry(ctx context.Context, tk *task.Task, repoCfg runner.Rep
 		m = runner.RetryAuto
 	}
 
-	path, branch := "", ""
-	if tk.WorktreePath != nil {
-		path = *tk.WorktreePath
-	}
-	if tk.BranchName != nil {
-		branch = *tk.BranchName
-	}
-
-	var wtState *runner.WorktreeState
-	if path != "" {
-		kind := runner.KindFix
-		if tk.TaskKind != nil && *tk.TaskKind != "" {
-			kind = runner.TaskKind(*tk.TaskKind)
-		}
-		base, err := repoCfg.BaseBranch(kind)
-		if err != nil {
-			base = repoCfg.DefaultBranch
-		}
-		wtState = q.worktrees.Inspect(ctx, repoCfg.ProviderRepo, path, branch, base)
-	}
+	wtState := q.inspectTask(ctx, tk, repoCfg)
 
 	var stage runner.Stage
 	if tk.FailureStage != nil {
@@ -611,6 +592,43 @@ func (q *queue) planRetry(ctx context.Context, tk *task.Task, repoCfg runner.Rep
 		}
 	}
 	return plan
+}
+
+// ReviewWorkspaceUsable 实现 runner.ReviewWorkspaceChecker：PR 评论回流
+// 入口在把任务交给调度器之前体检现场，与派发侧 planRetry 共用 inspectTask
+// —— 两处口径不一致的话，入口放行的任务到了派发侧照样会落进「从头重建」。
+//
+// 仓库配置读不出来时返回 true：那不是现场的问题，交给派发侧，它有完整的
+// 失败回帖路径（loadRepoConfig 失败 → commentUnresolved）。
+func (q *queue) ReviewWorkspaceUsable(ctx context.Context, tk *task.Task) bool {
+	repoCfg, _, err := q.loadRepoConfig(ctx, tk.RepoID)
+	if err != nil {
+		slog.Warn("回流前体检现场：读取仓库配置失败，交给派发侧处理", "task", tk.ID, "err", err)
+		return true
+	}
+	return q.inspectTask(ctx, tk, repoCfg).Usable()
+}
+
+// inspectTask 体检任务行上记录的现场；任务没有 worktree_path 时返回 nil
+// （nil 的 Usable() 为假）。planRetry 与 ReviewWorkspaceUsable 共用它，
+// 保证派发决策与回流入口对「现场可用」的判定是同一个口径。
+func (q *queue) inspectTask(ctx context.Context, tk *task.Task, repoCfg runner.RepoConfig) *runner.WorktreeState {
+	if tk.WorktreePath == nil || *tk.WorktreePath == "" {
+		return nil
+	}
+	branch := ""
+	if tk.BranchName != nil {
+		branch = *tk.BranchName
+	}
+	kind := runner.KindFix
+	if tk.TaskKind != nil && *tk.TaskKind != "" {
+		kind = runner.TaskKind(*tk.TaskKind)
+	}
+	base, err := repoCfg.BaseBranch(kind)
+	if err != nil {
+		base = repoCfg.DefaultBranch
+	}
+	return q.worktrees.Inspect(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch, base)
 }
 
 // resolveRepo 查出属主名下要用的仓库：第一条配置。

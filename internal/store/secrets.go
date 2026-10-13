@@ -15,10 +15,13 @@ const (
 	KindLinear        = "linear"
 	KindLinearWebhook = "linear_webhook"
 	KindGitHub        = "github"
+	// KindGitHubWebhook 是 GitHub 仓库 webhook 的签名密钥（PR 评论回流，
+	// /webhooks/github/{slug} 按用户验签）。migration 0028 放开的取值。
+	KindGitHubWebhook = "github_webhook"
 )
 
 // KnownKinds 是界面可配置的凭据类型。
-var KnownKinds = []string{KindLinear, KindLinearWebhook, KindGitHub}
+var KnownKinds = []string{KindLinear, KindLinearWebhook, KindGitHub, KindGitHubWebhook}
 
 // ValidKind 报告 kind 是否可配置。
 func ValidKind(kind string) bool {

@@ -159,6 +159,10 @@ type Config struct {
 	LinearToken         string
 	LinearWebhookSecret string
 	GitHubToken         string
+	// GitHubWebhookSecret 是 GitHub 仓库 webhook 签名密钥的兜底
+	// （LATHE_GITHUB_WEBHOOK_SECRET）。消费方：creds.Provider.GitHubWebhookSecret，
+	// 与其它环境变量凭据一样只对内置管理员生效（creds.Factory）。
+	GitHubWebhookSecret string
 }
 
 // Database 是 Postgres 连接配置。
@@ -306,6 +310,7 @@ func Load() (Config, error) {
 		LinearToken:           env("LATHE_LINEAR_TOKEN", ""),
 		LinearWebhookSecret:   env("LATHE_LINEAR_WEBHOOK_SECRET", ""),
 		GitHubToken:           env("LATHE_GITHUB_TOKEN", ""),
+		GitHubWebhookSecret:   env("LATHE_GITHUB_WEBHOOK_SECRET", ""),
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err

@@ -36,6 +36,7 @@ type EnvFallback struct {
 	LinearToken         string
 	LinearWebhookSecret string
 	GitHubToken         string
+	GitHubWebhookSecret string
 	LinearUserID        string
 }
 
@@ -111,6 +112,8 @@ func (p *Provider) envToken(kind string) string {
 		return p.env.LinearWebhookSecret
 	case store.KindGitHub:
 		return p.env.GitHubToken
+	case store.KindGitHubWebhook:
+		return p.env.GitHubWebhookSecret
 	}
 	return ""
 }
@@ -136,6 +139,16 @@ func (p *Provider) GitHub(ctx context.Context) (*github.Client, error) {
 // WebhookSecret 取 Linear webhook 签名密钥。
 func (p *Provider) WebhookSecret(ctx context.Context) string {
 	token, _, err := p.Token(ctx, store.KindLinearWebhook)
+	if err != nil {
+		return ""
+	}
+	return token
+}
+
+// GitHubWebhookSecret 取 GitHub 仓库 webhook 签名密钥（PR 评论回流验签用）。
+// 未配置返回空串 —— 调用方据此拒绝路由，而不是用空密钥验签。
+func (p *Provider) GitHubWebhookSecret(ctx context.Context) string {
+	token, _, err := p.Token(ctx, store.KindGitHubWebhook)
 	if err != nil {
 		return ""
 	}

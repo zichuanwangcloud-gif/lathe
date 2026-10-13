@@ -57,7 +57,8 @@ func TestLegalTransitions(t *testing.T) {
 		{StatePROpen, StateMerged},
 		{StateReviewFeedback, StateImplementing}, // 二轮
 		{StateReviewFeedback, StateMerged},
-		{StateImplementing, StateQueued}, // 租约到期重新派发
+		{StateReviewFeedback, StateQueued}, // PR 评论回流：交给领单调度器以 resume 派发二轮
+		{StateImplementing, StateQueued},   // 租约到期重新派发
 		{StateVerifying, StateQueued},
 		{StateFailed, StateQueued},        // 人工重试
 		{StateQueued, StateImplementing},  // 智能重试：断点续跑（跳过已完成的分诊）
@@ -85,6 +86,9 @@ func TestIllegalTransitions(t *testing.T) {
 		{StateMerged, StateQueued},            // 终态不可复活
 		{StateCancelled, StateQueued},         // 终态不可复活
 		{StateMerged, StateImplementing},      // 终态不可复活
+		{StateMerged, StateReviewFeedback},    // 终态不可复活：已合并的 PR 收到评论不得把任务拉回来
+		{StateCancelled, StateReviewFeedback}, // 终态不可复活
+		{StateFailed, StateReviewFeedback},    // failed 只能经人工重试回 queued
 		{StateBlockedSpec, StateImplementing}, // 必须回 queued 重新分诊
 		{StateBlockedDep, StateImplementing},  // 必须先回 queued 重新分诊/派发
 		{StateTriaging, StateBlockedDep},      // blocked_dep 只从 queued 进入（调度期判定，不是分诊期）
@@ -203,6 +207,12 @@ func TestErrIllegalTransitionMessages(t *testing.T) {
 func TestRequiresSession(t *testing.T) {
 	if !RequiresSession(StateReviewFeedback, StateImplementing) {
 		t.Error("review_feedback → implementing 必须要求 agent_session_id（--resume）")
+	}
+	// review_feedback → queued 是二轮的另一条入口（交给领单调度器派发）。
+	// 不对它施加同一约束，约束①就能被「先回 queued 再进 implementing」
+	// 绕过去 —— queued → implementing 本身不查会话。
+	if !RequiresSession(StateReviewFeedback, StateQueued) {
+		t.Error("review_feedback → queued 必须同样要求 agent_session_id，否则约束①可被绕过")
 	}
 	notRequired := [][2]State{
 		{StateTriaging, StateImplementing},         // 首轮，还没有会话

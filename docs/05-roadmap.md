@@ -30,7 +30,7 @@
 |---|---|---|
 | 02-design §5 | 修复回路（验证失败带输出续跑 agent，限次数） | 未实现 —— 验证失败即任务死亡 |
 | 02-design §6.4 | 租约与故障恢复：崩溃 → 任务回 queued 重派；`implementing` 中断凭 `agent_session_id` 续跑 | 未实现 —— 重启即孤儿（#346 实证） |
-| 02-design §7 | `PR 评论 → review_feedback → implementing(--resume) → 重新验证` | 状态机跑到 `pr_open` 即止（pipeline.go:69），review 回路无入口 |
+| 02-design §7 | `PR 评论 → review_feedback → implementing(--resume) → 重新验证` | ~~状态机跑到 `pr_open` 即止，review 回路无入口~~ —— **已接线（A2）**：`/webhooks/github/{slug}` → `review_feedback → queued` → resume 二轮 → 重新验证 |
 | 02-design §7 | `合并 → merged → 回收 worktree` | `merged` 状态存在但没有代码设置它 |
 | 02-design §8 P1 | per-task compose 隔离（红绿阶段） | 未做，红绿目前在 worktree 里直接跑 |
 | 02-design §8 P3 | 多节点：`cmd/lathe-runner` 节点代理 | ~~54 行骨架，TODO 未装配~~ —— **已决：删除**，见 [08-debt-cleanup.md](./08-debt-cleanup.md) D8-1 |
@@ -130,7 +130,7 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
     全包没有任何地方在执行中途回读 task state）。在途 agent 会白跑完一轮，
     然后在下一次状态转移时因 `cancelled` 是无出边终态而被 `Validate` 拒绝。
     真正的取消信号传播列为后续项。
-12. **PR 生命周期回流**（§7 已设计）：(a) PR review comment → `review_feedback` → resume 续跑修复；(b) PR merged → 任务 `merged` + worktree 回收；(c) base 分支前进自动 rebase。
+12. **PR 生命周期回流**（§7 已设计）：(a) ✅ PR review comment → `review_feedback` → resume 续跑修复（A2，GitHub 仓库 webhook + 每用户密钥；已知边界：二轮进行中到达的意见不单独回流，等任务回到 `pr_open` 后的下一条意见触发时一并处理）；(b) PR merged → 任务 `merged` + worktree 回收；(c) base 分支前进自动 rebase。
 
 ### 3.5 安全与隔离 —— 自用也要防手滑
 

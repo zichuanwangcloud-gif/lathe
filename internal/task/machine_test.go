@@ -550,3 +550,285 @@ func TestMachineHasLiveDependentOnBranch(t *testing.T) {
 		t.Errorf("无匹配 base_ref 时应返回 false")
 	}
 }
+
+// review_feedback → queued（PR 评论回流交给调度器的那条边）与
+// → implementing 同受约束①：没有会话就不许走向二轮。
+func TestMachineReviewRequeueRequiresSession(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	tk, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-5006"})
+	for _, s := range []State{StateTriaging, StateImplementing, StateVerifying, StatePROpen, StateReviewFeedback} {
+		if _, err := m.Transition(ctx, tk.ID, s, "system", nil); err != nil {
+			t.Fatalf("转移到 %s 失败: %v", s, err)
+		}
+	}
+
+	if _, err := m.Transition(ctx, tk.ID, StateQueued, "system", nil); !errors.Is(err, ErrSessionRequired) {
+		t.Fatalf("无会话时 review_feedback → queued 应返回 ErrSessionRequired，得到 %v", err)
+	}
+	if err := m.SetSessionID(ctx, tk.ID, "sess-review"); err != nil {
+		t.Fatalf("SetSessionID 失败: %v", err)
+	}
+	got, err := m.Transition(ctx, tk.ID, StateQueued, "system", nil)
+	if err != nil {
+		t.Fatalf("持有会话时 review_feedback → queued 应成功: %v", err)
+	}
+	if got.State != StateQueued {
+		t.Errorf("state = %s，want queued", got.State)
+	}
+}
+
+// ExplicitReviewRestart 的适用面必须收窄到 review_feedback → queued 这一个
+// 组合（A2 审计 B1 的人工出口）。
+//
+// 背景：约束①（review 二轮必须 resume 原会话）在【没有会话】时无从满足，而
+// parked 的任务两条出边都受它管辖，于是没有出口。人工出口为此开了一个放行口，
+// 但那个口子必须是【最小的】：只认 review_feedback → queued（人明确点了
+// 「重来一轮 review」），绝不外溢成一把绕过会话约束的万能钥匙。
+//
+// 这条用例专门守那个「最小」。它是测试空白而不是逻辑缺陷 —— 收窄逻辑写在
+// Machine.transition 里是生效的，但此前没有任何用例会让它变红：既有用例
+// （TestMachineReviewRequeueRequiresSession）走的是裸 Transition，标志位根本
+// 没设，所以拆掉收窄也不会失败。这里逐个组合把标志位设上，钉死它：
+//
+//   - review_feedback → implementing（直接进二轮）：标志位无效，仍要会话；
+//   - 其它状态 → queued：标志位从不该被读取；
+//   - review_feedback → queued：标志位有效（这条正路另有端到端用例覆盖）。
+func TestMachineExplicitReviewRestartIsNarrowlyScoped(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+
+	// parkedReviewTask 造一条停在 review_feedback 的任务（不带会话）。
+	parkedReviewTask := func(t *testing.T) *Task {
+		t.Helper()
+		userID, repoID := fixture(t, pool)
+		tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID,
+			ExternalKey: "CR-EXPLICIT-" + strconv.FormatInt(time.Now().UnixNano(), 10)})
+		if err != nil {
+			t.Fatalf("建任务失败: %v", err)
+		}
+		for _, s := range []State{StateTriaging, StateImplementing, StateVerifying, StatePROpen, StateReviewFeedback} {
+			if _, err := m.Transition(ctx, tk.ID, s, "system", nil); err != nil {
+				t.Fatalf("转移到 %s 失败: %v", s, err)
+			}
+		}
+		return tk
+	}
+
+	t.Run("review_feedback → implementing 带上标志位仍必须要求会话", func(t *testing.T) {
+		tk := parkedReviewTask(t)
+		_, err := m.Transition(ctx, tk.ID, StateImplementing, "system",
+			&TransitionOpts{ExplicitReviewRestart: true})
+		if !errors.Is(err, ErrSessionRequired) {
+			t.Fatalf("该标志位在 → implementing 上必须无效，应返回 ErrSessionRequired，得到 %v", err)
+		}
+		// 被拒的转移不得留下任何写入
+		got, gerr := m.Get(ctx, tk.ID)
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		if got.State != StateReviewFeedback {
+			t.Errorf("被拒的转移不该改动状态，得到 %s", got.State)
+		}
+	})
+
+	// 标志位是给人工出口用的，不该被别的状态读取：对非 review_feedback 的
+	// 源状态，它既不该放宽要求也不该放宽别的任何东西。这里用「本来就没有
+	// 会话约束的边」做对照 —— 设了标志位的结果必须与不设时完全一致。
+	t.Run("其它状态带上标志位不产生额外能力", func(t *testing.T) {
+		withFlag := func(t *testing.T) State {
+			t.Helper()
+			userID, repoID := fixture(t, pool)
+			tk, err := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID,
+				ExternalKey: "CR-EXPLICIT-OTHER-" + strconv.FormatInt(time.Now().UnixNano(), 10)})
+			if err != nil {
+				t.Fatalf("建任务失败: %v", err)
+			}
+			// queued → implementing 本身不查会话：设了标志位也必须照样成功，
+			// 说明标志位没有被拿去做别的事（它唯一的语义就是那个放行口）。
+			got, err := m.Transition(ctx, tk.ID, StateImplementing, "system",
+				&TransitionOpts{ExplicitReviewRestart: true})
+			if err != nil {
+				t.Fatalf("queued → implementing 不该因这个标志位而改变行为: %v", err)
+			}
+			return got.State
+		}
+		if st := withFlag(t); st != StateImplementing {
+			t.Errorf("state = %s，want implementing", st)
+		}
+	})
+
+	// 正路：review_feedback → queued 带上标志位且无会话时放行（人工出口的全部意义）
+	t.Run("review_feedback → queued 带上标志位且无会话时放行", func(t *testing.T) {
+		tk := parkedReviewTask(t)
+		got, err := m.Transition(ctx, tk.ID, StateQueued, "system",
+			&TransitionOpts{ExplicitReviewRestart: true})
+		if err != nil {
+			t.Fatalf("人工出口应放行无会话的 parked 任务: %v", err)
+		}
+		if got.State != StateQueued {
+			t.Errorf("state = %s，want queued", got.State)
+		}
+	})
+
+	// 对照：不设标志位时同一组合必须仍被拒（webhook 回流走的就是不设的那条路）
+	t.Run("review_feedback → queued 不设标志位仍必须要求会话", func(t *testing.T) {
+		tk := parkedReviewTask(t)
+		if _, err := m.Transition(ctx, tk.ID, StateQueued, "system", nil); !errors.Is(err, ErrSessionRequired) {
+			t.Fatalf("不设标志位时该边必须要求会话，得到 %v", err)
+		}
+	})
+}
+
+// TasksByPR 是 PR 评论 webhook 的路由查询：同名仓库、同号 PR 分属两个
+// 用户时，按属主查只能看见自己的那一条（跨用户隔离，A2 验收第 4 条）。
+func TestMachineTasksByPRIsolatesOwners(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	ctx := context.Background()
+
+	userA, repoA := fixture(t, pool) // 两个 fixture 的 provider_repo 都是 acme/demo
+	userB, repoB := fixture(t, pool)
+
+	mk := func(user, repo int64, key string, pr int) *Task {
+		t.Helper()
+		tk, err := m.Create(ctx, CreateParams{UserID: user, RepoID: repo, ExternalKey: key})
+		if err != nil {
+			t.Fatalf("建任务 %s 失败: %v", key, err)
+		}
+		if err := m.SetPRNumber(ctx, tk.ID, pr); err != nil {
+			t.Fatalf("SetPRNumber 失败: %v", err)
+		}
+		return tk
+	}
+	a7 := mk(userA, repoA, "CR-PR-A7", 7)
+	b7 := mk(userB, repoB, "CR-PR-B7", 7)
+	mk(userA, repoA, "CR-PR-A8", 8) // 同仓库不同 PR，不应命中
+
+	// 属主不一致的行：任务挂在 A 名下，仓库却属于 B。
+	//
+	// 这在正常流程里建不出来（创建任务时 repo 是当属主名下的外键），
+	// 但 TasksByPR 是一道由外部 webhook 触发的安全边界，它的两处过滤
+	// 必须各自独立成立 —— 只靠一处的话，另一处失效时（比如有人把
+	// repos 的属主改掉、或将来重构成一次 JOIN 换了写法）就会出现
+	// 「A 的评论推动 B 名下仓库上的任务」。原先的用例只覆盖了
+	// 「两边属主一致」的情形：单独删掉 tasks.user_id = $1 或单独删掉
+	// repos.user_id = $1，它都仍然全绿（MINOR-1 的缺口）。
+	mismatch := mk(userA, repoB, "CR-PR-X9", 9)
+	if mismatch.UserID != userA {
+		t.Fatalf("夹具应让任务属于 A，得到 %d", mismatch.UserID)
+	}
+
+	cases := []struct {
+		name   string
+		user   int64
+		repo   string
+		pr     int
+		wantID []int64
+	}{
+		{"A 查自己的 PR 只得到 A 的任务", userA, "acme/demo", 7, []int64{a7.ID}},
+		{"属主不一致的行（任务属 A、仓库属 B）对 A 不可见", userA, "acme/demo", 9, nil},
+		{"属主不一致的行对 B 同样不可见（两处过滤各自独立成立）", userB, "acme/demo", 9, nil},
+		{"B 查同名仓库同号 PR 只得到 B 的任务", userB, "acme/demo", 7, []int64{b7.ID}},
+		{"仓库名大小写不敏感（GitHub 不区分）", userA, "ACME/Demo", 7, []int64{a7.ID}},
+		{"别的仓库同号 PR 不命中", userA, "acme/other", 7, nil},
+		{"不存在的 PR 号不命中", userA, "acme/demo", 999, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := m.TasksByPR(ctx, tc.user, tc.repo, tc.pr)
+			if err != nil {
+				t.Fatalf("TasksByPR 失败: %v", err)
+			}
+			var ids []int64
+			for _, tk := range got {
+				if tk.UserID != tc.user {
+					t.Errorf("返回了别人的任务 #%d（属主 %d，查询者 %d）", tk.ID, tk.UserID, tc.user)
+				}
+				ids = append(ids, tk.ID)
+			}
+			if len(ids) != len(tc.wantID) {
+				t.Fatalf("got %v，want %v", ids, tc.wantID)
+			}
+			for i := range ids {
+				if ids[i] != tc.wantID[i] {
+					t.Errorf("got %v，want %v", ids, tc.wantID)
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------- A2 审计修复
+
+// B1：合并检测的待判定集合必须覆盖停在 review_feedback 的任务。
+//
+// 停在 review_feedback 的任务（无可 resume 的会话、或现场不可用，见
+// runner.ReviewIntake.AcceptReview 的三条停车路径）PR 仍旧开着、仍旧会被
+// 人在 GitHub 上合并。只按 state='pr_open' 收集的话，合并检测看不见它：
+// 人不点合并则任务永远驻留，worktree 不回收、后继不推进、看板永远待处理。
+// review_feedback 是【活态】而非终态，它就是「PR 开着」的另一种表示。
+func TestMachineListMergeWatchTasksIncludesReviewFeedback(t *testing.T) {
+	pool := testPool(t)
+	m := NewMachine(pool)
+	userID, repoID := fixture(t, pool)
+	ctx := context.Background()
+
+	// 停在 review_feedback、PR 已开出（pr_number 已落库）
+	parked, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8101"})
+	toPROpen(t, m, parked.ID)
+	if err := m.SetPRNumber(ctx, parked.ID, 201); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, parked.ID, StateReviewFeedback, "system:github-review", nil); err != nil {
+		t.Fatalf("转 review_feedback 失败: %v", err)
+	}
+
+	normal, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8102"})
+	toPROpen(t, m, normal.ID)
+	if err := m.SetPRNumber(ctx, normal.ID, 202); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+
+	// 停在 review_feedback 但没有 PR 编号：无从查询，不该被收集
+	noPR, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8103"})
+	toPROpen(t, m, noPR.ID)
+	if _, err := m.Transition(ctx, noPR.ID, StateReviewFeedback, "system:github-review", nil); err != nil {
+		t.Fatalf("转 review_feedback 失败: %v", err)
+	}
+
+	// 终态任务不得被收集（合并检测不该复活已结束的任务）
+	merged, _ := m.Create(ctx, CreateParams{UserID: userID, RepoID: repoID, ExternalKey: "CR-8104"})
+	toPROpen(t, m, merged.ID)
+	if err := m.SetPRNumber(ctx, merged.ID, 204); err != nil {
+		t.Fatalf("SetPRNumber 失败: %v", err)
+	}
+	if _, err := m.Transition(ctx, merged.ID, StateMerged, "system:merge-poll", nil); err != nil {
+		t.Fatalf("转 merged 失败: %v", err)
+	}
+
+	tasks, err := m.ListOpenPRTasks(ctx)
+	if err != nil {
+		t.Fatalf("ListOpenPRTasks 失败: %v", err)
+	}
+	got := map[int64]bool{}
+	for _, tk := range tasks {
+		if tk.UserID == userID {
+			got[tk.ID] = true
+		}
+	}
+	for _, want := range []int64{normal.ID, parked.ID} {
+		if !got[want] {
+			t.Errorf("任务 #%d 应被合并检测收集，实际集合 %v", want, got)
+		}
+	}
+	for _, unwanted := range []int64{noPR.ID, merged.ID} {
+		if got[unwanted] {
+			t.Errorf("任务 #%d 不该被合并检测收集（无 PR 编号 / 已是终态），实际集合 %v", unwanted, got)
+		}
+	}
+}

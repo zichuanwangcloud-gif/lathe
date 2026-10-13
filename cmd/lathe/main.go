@@ -172,6 +172,7 @@ func serve(cfg config.Config) error {
 	factory := creds.NewFactory(secrets, creds.EnvFallback{
 		LinearToken:         cfg.LinearToken,
 		LinearWebhookSecret: cfg.LinearWebhookSecret,
+		GitHubWebhookSecret: cfg.GitHubWebhookSecret,
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID, st)
@@ -265,6 +266,16 @@ func serve(cfg config.Config) error {
 	}
 	mux.Handle("POST /webhooks/linear/{slug}", webhook)
 	mux.Handle("POST /webhooks/linear", webhook)
+
+	// PR 评论回流（docs/02-design.md §7）：GitHub 仓库 webhook 投到
+	// /webhooks/github/{slug}，与 Linear 共用用户的随机段、各用各的密钥验签。
+	// 只有带 slug 的路径 —— 新入口没有需要兼容的老部署，不给「无 slug 归
+	// 管理员」的兜底，免得把所有人的 PR 事件默认路由到同一个人名下。
+	mux.Handle("POST /webhooks/github/{slug}", &httpapi.GitHubWebhook{
+		Resolver:   &githubWebhookResolver{users: users, factory: factory},
+		Deliveries: st,
+		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
+	})
 
 	apiSrv := &httpapi.API{
 		Store:        st,
@@ -372,6 +383,8 @@ func serve(cfg config.Config) error {
 				return cfg.LinearWebhookSecret != ""
 			case store.KindGitHub:
 				return cfg.GitHubToken != ""
+			case store.KindGitHubWebhook:
+				return cfg.GitHubWebhookSecret != ""
 			}
 			return false
 		},
@@ -620,6 +633,33 @@ func (r *webhookResolver) Resolve(ctx context.Context, slug string) (*httpapi.We
 	}, nil
 }
 
+// githubWebhookResolver 把 GitHub 回调路径里的 slug 解析成投递目标。
+//
+// 与 webhookResolver 的差别：没有空 slug 的管理员兜底（见路由注册处的
+// 注释），密钥取该用户的 github_webhook 凭据。
+type githubWebhookResolver struct {
+	users   *store.Users
+	factory *creds.Factory
+}
+
+func (r *githubWebhookResolver) ResolveGitHub(ctx context.Context, slug string) (*httpapi.GitHubWebhookTarget, error) {
+	if slug == "" {
+		return nil, fmt.Errorf("缺少回调地址随机段")
+	}
+	u, err := r.users.ByWebhookSlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if u.Disabled() {
+		return nil, fmt.Errorf("账号已停用")
+	}
+	secret := r.factory.ProviderFor(u.ID).GitHubWebhookSecret(ctx)
+	if secret == "" {
+		return nil, fmt.Errorf("该用户尚未配置 GitHub webhook 签名密钥")
+	}
+	return &httpapi.GitHubWebhookTarget{OwnerID: u.ID, Secret: secret}, nil
+}
+
 // configStatus 生成给管理界面的配置状态。
 //
 // 只报告「配没配、从哪个环境变量读」，绝不包含凭据内容本身。
@@ -631,6 +671,7 @@ func configStatus(cfg config.Config) func() map[string]any {
 		return map[string]any{
 			"linear":        item(cfg.LinearToken),
 			"linearWebhook": item(cfg.LinearWebhookSecret),
+			"githubWebhook": item(cfg.GitHubWebhookSecret),
 			"linearUser":    item(os.Getenv("LATHE_LINEAR_USER_ID")),
 			"github":        item(cfg.GitHubToken),
 			"runtime": map[string]any{

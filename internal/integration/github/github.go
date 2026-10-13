@@ -207,11 +207,20 @@ func (c *Client) GetPRInfo(ctx context.Context, providerRepo string, number int)
 
 // ReviewComment 是一条需要 agent 处理的 review 意见。
 type ReviewComment struct {
-	ID     int64
+	ID int64
+	// Key 是跨类型唯一的稳定标识："inline:<id>" / "issue:<id>" / "review:<id>"。
+	// 三类意见在 GitHub 上是独立的 ID 序列，裸 ID 可能相撞。
+	Key    string
 	Author string
-	Body   string
-	Path   string
-	Line   int
+	// AuthorAssociation 是评论者与仓库的关系（同 webhook.ReviewEvent 的
+	// 同名字段）。ReviewFeedback 据此过滤 —— 二轮派发时拉取的意见里，
+	// 无仓库关系的账号（公开仓库上的路人）不得进 prompt（A2 审计 B2：
+	// 那是一条绕过入口守卫的提示注入通道）。
+	AuthorAssociation string
+	Body              string
+	Path              string
+	Line              int
+	URL               string
 }
 
 // ReviewComments 拉取 PR 的 review 意见（含行内评论与普通评论）。
@@ -233,10 +242,12 @@ func (c *Client) ReviewComments(ctx context.Context, providerRepo string, number
 	for _, cm := range inline {
 		out = append(out, ReviewComment{
 			ID:     cm.GetID(),
+			Key:    fmt.Sprintf("inline:%d", cm.GetID()),
 			Author: cm.GetUser().GetLogin(),
 			Body:   cm.GetBody(),
 			Path:   cm.GetPath(),
 			Line:   cm.GetLine(),
+			URL:    cm.GetHTMLURL(),
 		})
 	}
 
@@ -248,8 +259,10 @@ func (c *Client) ReviewComments(ctx context.Context, providerRepo string, number
 	for _, cm := range issueComments {
 		out = append(out, ReviewComment{
 			ID:     cm.GetID(),
+			Key:    fmt.Sprintf("issue:%d", cm.GetID()),
 			Author: cm.GetUser().GetLogin(),
 			Body:   cm.GetBody(),
+			URL:    cm.GetHTMLURL(),
 		})
 	}
 	return out, nil
