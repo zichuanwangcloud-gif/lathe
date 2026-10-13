@@ -160,20 +160,32 @@ const minSecretLen = 8
 //	registered  装配侧显式登记的整串（配置里的 DB DSN / 集成 token）。
 //	            整串登记 + 口令段：整串替换把 DSN 一笔抹掉，口令段兜住
 //	            被 8KB 尾窗砍头的残段。
-//	extraEnv    验证步骤的额外环境（Step.StackEnv）。**只登记含 `user:pass@`
-//	            的 DSN 值及其口令段**，绝不逐值全登记 —— 那张表里还有
-//	            `DATABASE_HOST=127.0.0.1`、`DATABASE_PORT`、`DATABASE_USER=lathe`
-//	            这类**非凭据**的运行参数，它们会成片出现在正常排障输出里
-//	            （`dial tcp 127.0.0.1:56001: refused` 就是要看的那条信息）。
-//	            两个理由使它必须收窄：
+//	extraEnv    验证步骤的额外环境（Step.StackEnv）。**按两支登记**：
+//	              ① 名字命中词根（secretKeyRe / urlishKeyRe）→ 整串 + 口令段
+//	                 （`DATABASE_PASSWORD`、`MYSQL_ROOT_PASSWORD`、`DATABASE_URL`）
+//	              ② 其余 → **只取值里 `user:pass@` 的口令段**，不登记整串
+//	            绝不逐值全登记 —— 那张表里还有 `DATABASE_HOST=127.0.0.1`、
+//	            `DATABASE_PORT`、`DATABASE_USER=lathe` 这类**非凭据**的运行参数，
+//	            它们会成片出现在正常排障输出里（`dial tcp 127.0.0.1:56001:
+//	            refused` 就是要看的那条信息）。两个理由使它必须收窄：
 //	              · 误伤：把回环地址/端口抹掉，摘要里「连的是哪个库」就没了；
 //	              · 更坏的是**自伤**：层 1 先把主机抹成 [REDACTED]，层 2 的
 //	                无 scheme 规则（要求 `@` 后是带端口/路径/域名的主机）
 //	                就再也匹配不上 —— 于是口令明文留下。收窄主机登记即消除。
 //	os.Environ  本进程环境里**名字命中词根**的变量（名字本身就是判据）。
 //
-// 名字命中词根的变量按名登记（`DATABASE_URL=…` 在内），那是刻意的：
-// 名字已经说明它是连接串/凭据。
+// ---------------------------------------------------------------------------
+// 对外契约：新增隔离栈服务时，凭据变量必须满足上面两支之一
+// ---------------------------------------------------------------------------
+//
+// `StackEnv` 的覆盖是「两支并集」，所以 **preview.InfraCatalog 以后新增服务
+// 时，它的凭据变量名必须命中词根（token/password/DSN/…），否则值里就得含
+// `user:pass@`** —— 两条都不满足的凭据变量不会被权威层覆盖（形态表对这种
+// 随机串也无能为力，等于明文进库进提示词）。
+//
+// 这条契约由 TestStackEnvCredentialVarsSatisfyAuthoritativeLayerContract
+// 守着：它按 InfraCatalog 现有服务逐个列出凭据变量并检查。新增服务时在
+// 那里补一条即可，漏了契约就会红。
 func knownCredentialValues(registered []string, extraEnv map[string]string) []string {
 	seen := map[string]bool{}
 

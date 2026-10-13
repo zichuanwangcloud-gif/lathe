@@ -385,6 +385,111 @@ func TestFailureExcerptRedactsSchemeLessDSNResidual(t *testing.T) {
 	}
 }
 
+// ★ 第六轮复审：StackEnv 收口后的两条覆盖空白（合并前的补测）。
+//
+// 收口把 `StackEnv` 的登记拆成两支，而这两支此前各有一条路径没有用例覆盖
+// （mutation 实测：把第一支降级成只认 urlishKeyRe、或把第二支整条删掉，
+// 全部已有用例仍然绿）。这个分支正是「收口之后安全性所依赖的」那一段，
+// 所以各钉一条。
+//
+// 第一支：**名字命中词根**（`DATABASE_PASSWORD`、`MYSQL_ROOT_PASSWORD` 等）
+// → 整串登记。值本身是随机串、不含 `user:pass@`，形态表认不出来，
+// 所以只有权威层能抹掉它。
+func TestRedactStackEnvPASSWORDVarsGoToKnownLayer(t *testing.T) {
+	// 名字来自真实的 preview.InfraCatalog 各服务 HostEnv（见那里的表）。
+	cases := []struct {
+		name string
+		val  string
+	}{
+		{"DATABASE_PASSWORD", "pg-root-secret-8811"},
+		{"POSTGRES_PASSWORD", "pg-super-secret-9922"},
+		{"MYSQL_ROOT_PASSWORD", "mysql-root-secret-7733"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stackEnv := map[string]string{"DATABASE_HOST": "127.0.0.1", c.name: c.val}
+			// 输入里口令裸着出现（没有键名、没有 `user:pass@`）——
+			// 形态表对随机串无能为力，只有权威层能抹。
+			in := "连接失败：口令 " + c.val + " 被拒绝"
+
+			// 对照：没有 StackEnv 时它必须留下（证明抹除来自这一支）
+			if got := redactText(in, nil, nil); !strings.Contains(got, c.val) {
+				t.Fatalf("对照不成立：无 StackEnv 时口令应留下，得到 %q", got)
+			}
+			got := redactText(in, nil, stackEnv)
+			if strings.Contains(got, c.val) {
+				t.Errorf("命中词根的栈变量值应被权威层抹掉：%q", got)
+			}
+			// 回显成 KEY=value 也要抹
+			if got := redactText(c.name+"="+c.val, nil, stackEnv); strings.Contains(got, c.val) {
+				t.Errorf("键值对回显也应被抹：%q", got)
+			}
+		})
+	}
+}
+
+// 第二支：**名字不命中词根、但值里含 `user:pass@`** → 只登记口令段。
+//
+// 夹具刻意让整串都接不住形态表：主机是域名且**没有端口/路径**
+// （`lathe:SECRETPW@db.internal`），无 scheme 规则要求带端口/路径才认。
+// 于是「抹掉口令」这件事只能来自这一支解析出的口令段。
+func TestRedactStackEnvPasswordInNonRootNamedVar(t *testing.T) {
+	const pw = "endpoint-secret-5150"
+	stackEnv := map[string]string{
+		// 名字里没有 token/password/DSN 这类词根
+		"APP_ENDPOINT": "lathe:" + pw + "@db.internal",
+	}
+	in := "连不上 lathe:" + pw + "@db.internal 这个端点"
+
+	if got := redactText(in, nil, nil); !strings.Contains(got, pw) {
+		t.Fatalf("对照不成立：无 StackEnv 时口令应留下，得到 %q", got)
+	}
+	got := redactText(in, nil, stackEnv)
+	if strings.Contains(got, pw) {
+		t.Errorf("非词根名字的值里解析出的口令段应被抹：%q", got)
+	}
+}
+
+// ★ 第六轮复审点名要写下来的**隐式契约**（收口的前提条件）。
+//
+// 权威层对 `StackEnv` 的覆盖是「两支并集」：
+//
+//	① 名字命中词根（secretKeyRe / urlishKeyRe）→ 整串登记
+//	② 否则 → 只认值里 `user:pass@` 的口令段
+//
+// 所以 **preview.InfraCatalog 的服务以后新增凭据变量时，名字必须命中词根，
+// 否则值里就得含 `user:pass@`** —— 两条都不满足的凭据变量不会被权威层覆盖
+// （形态表对这种随机串也无能为力）。这条契约以前只活在实现细节里，现在由
+// 本用例守着：它按 InfraCatalog 现有服务逐个列出凭据变量，新增服务如果
+// 漏了契约，在这里补一条就会红。
+func TestStackEnvCredentialVarsSatisfyAuthoritativeLayerContract(t *testing.T) {
+	// 键是变量名，值是「该变量是不是凭据」——凭据变量必须满足上面两支之一
+	credentialVars := []struct {
+		name  string
+		value string // 形态该服务真实给的值（口令段或连接串）
+	}{
+		// preview.InfraCatalog["postgres"].HostEnv
+		{"DATABASE_PASSWORD", "pw-abcdefgh-1234"},                                 // ① 命中 PASSWORD
+		{"POSTGRES_PASSWORD", "pw-abcdefgh-1234"},                                 // ①
+		{"DATABASE_URL", "postgres://lathe:pw-abcdefgh-1234@127.0.0.1:56001/app"}, // ①（URL）
+		// preview.InfraCatalog["mysql"].HostEnv
+		{"MYSQL_ROOT_PASSWORD", "pw-abcdefgh-1234"}, // ①
+		// ② 的示例：名字不命中，但值里有 user:pass@
+		{"APP_ENDPOINT", "lathe:pw-abcdefgh-1234@db.internal"}, // ②
+	}
+	for _, c := range credentialVars {
+		t.Run(c.name, func(t *testing.T) {
+			byName := secretKeyRe.MatchString(c.name) || urlishKeyRe.MatchString(c.name)
+			byValue := passwordOf(c.value) != ""
+			if !byName && !byValue {
+				t.Errorf("%s 既不满足「名字命中词根」也不满足「值里含 user:pass@」——"+
+					"收口后它不会被权威层覆盖。新增服务时请给变量起个命中词根的名字，或让它带 user:pass@",
+					c.name)
+			}
+		})
+	}
+}
+
 // ★ 第五轮复审 B5-1：隔离栈在跑时，层 1 不许把主机抹掉，否则层 2 失效、
 // 口令明文落库。
 //
