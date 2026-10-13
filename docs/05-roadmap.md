@@ -18,7 +18,7 @@
 | `repos.exclude_dirs` | 字段存在、配置层不 SELECT → 已修复（dd1cb09） | 任务 #316 验证挂在不维护目录 |
 | `repos.gate_mode` | ~~可配、pipeline 从不读~~ → 已接线（2026-09-09，08 T2）| 代码走查 |
 | `notify_email` | 字段有了、`internal/mail` 只接了密码重置 | 代码走查 |
-| `agent_session_id` | 注释明说为 `--resume` 留的、无 resume 逻辑 → **已接线**（`internal/runner/pipeline.go` 的 `stageImplement`） | pipeline.go 的 `runCtx` 注释 |
+| `agent_session_id` | ~~注释明说为 `--resume` 留的、无 resume 逻辑~~ → **已接线**：`internal/runner/pipeline.go` 的 `stageImplement` 取 `rc.implSession` 作 `--resume` 目标（会话 ID 在执行前落库，见该函数内「ID 在执行前落库，进程中途崩溃也留下可 `--resume` 的凭据」） | 迁移 `migrations/0001_init.up.sql` 的 `agent_session_id text, -- ★ review 二轮 --resume 用` 一行（当时确为预留） |
 | `internal/scheduler/` | 空目录 | §6 调度设计的占位 |
 | `verifications.log_ref` | ~~从不写入~~ → 已接线（2026-09-09，08 T4）| 任务 #466 排障时无日志可查 |
 
@@ -41,8 +41,8 @@
 
 | 缺陷 | 事故证据 |
 |---|---|
-| ~~重试端点语义断裂：failed→queued 后走 `tasks.Create` 撞唯一索引~~ —— **已修复**：`/retry` 转 queued 后 `Queue.Requeue` 重派**原任务行**（`internal/httpapi/api.go` retryTask，代码注释留 #313 教训），resume 预检失败返回 409 与理由 | 任务 #313 |
-| ~~前置失败不落痕：pre-flight 裸 `return` 绕过 `p.fail`~~ —— **已修复**：拉单/分诊/建区/实现各阶段失败一律走 `p.fail` 落痕（`internal/runner/pipeline.go` 的 `stageFetchIssue`…`stageCommit` 十余处） | 最初"卡排队"病根 |
+| ~~重试端点语义断裂：failed→queued 后走 `tasks.Create` 撞唯一索引~~ —— **已修复**：`/retry` 转 queued 后经 `TaskEnqueuer.Requeue`（`internal/httpapi/webhook.go` 的接口，实现在 `cmd/lathe/queue.go` 的 `(*queue).Requeue`）重派**原任务行**（`internal/httpapi/api.go` 的 `retryTask`，代码注释留 #313 教训），resume 预检失败返回 409 与理由 | 任务 #313 |
+| ~~前置失败不落痕：pre-flight 裸 `return` 绕过 `p.fail`~~ —— **已修复**：各阶段失败一律走 `p.fail` 落痕。落点即流水线的阶段函数：`internal/runner/pipeline.go` 的 `stageTriage`（拉单失败 `StageFetchIssue`、分诊 `StageTriageRun`/`StageTriageParse`）、`stageImplement`（含建区 `StageCreateWorktree`）、`stageCommit`、`stageVerify`、`stagePushAndPR`，共 20 余处 `p.fail(rc, Stage…)`。阶段常量定义在 `internal/runner/stage.go` | 最初"卡排队"病根 |
 | ~~worktree 尸体阻塞同 issue 重试（失败保留现场但无回收策略）~~ —— 已修复：`Create` 回收同名尸体再建（目录/分支/普通残留三形态），重试端点 Fresh 计划先 `Discard` | #345、#466 各撞一次 |
 | ~~EventSink 落库 UTF-8 截断 bug~~ —— **已修复**：`truncate` 回退到 rune 边界再截（`internal/integration/agent/agent.go`，注释引 SQLSTATE 22021） | 54075f4 commit body 已记录 |
 | ~~agent 进程 env 泄漏~~ —— **已修复**：`sanitizedEnv` 改白名单制（`internal/integration/agent/agent.go`），只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程；确需追加走 `LATHE_AGENT_ENV_EXTRA` | 代码走查 |
