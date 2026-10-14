@@ -65,7 +65,10 @@ onMounted(() => {
         <button @click="logout">退出</button>
       </div>
     </header>
-    <main><RouterView /></main>
+    <!-- 按 path 作 key：/tasks/1 → /tasks/2 这类同组件换参数时重建实例，
+         否则旧任务的事件、游标、轮询状态会混进新页面。只看 path 不看
+         query，看板改筛选/翻页（只动 query）不会被重建 -->
+    <main><RouterView :key="route.path" /></main>
     <ConfirmDialog />
   </div>
 </template>
