@@ -25,6 +25,8 @@ function mdOf(e) {
   let h = htmlCache.get(e.id)
   if (h === undefined) {
     h = md(e.body)
+    // 模块级缓存跨任务存活：设上限，否则 SPA 会话里看过的事件永不释放
+    if (htmlCache.size >= 2000) htmlCache.clear()
     htmlCache.set(e.id, h)
   }
   return h

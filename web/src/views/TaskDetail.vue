@@ -1,11 +1,10 @@
 <script setup>
 import { ref, onMounted, onUnmounted, computed, inject } from 'vue'
 import { useRouter } from 'vue-router'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
 import { confirmDialog } from '../confirm'
+import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
 
 const props = defineProps({ id: { type: String, required: true } })
 const router = useRouter()
@@ -15,7 +14,7 @@ const detail = ref(null)
 const error = ref('')
 const acting = ref(false)
 const retryPlan = ref(null)
-let timer = null
+let detailPoller = null
 
 const task = computed(() => detail.value?.task)
 const isTerminal = computed(() =>
@@ -70,12 +69,14 @@ async function act(fn, confirmText) {
 const events = ref([])
 const eventsError = ref('')
 const lastId = ref(0)
-let evTimer = null
+// 内存里只留最近 MAX_LIVE_EVENTS 条（见 livelog.js），裁掉的条数如实展示
+const droppedEvents = ref(0)
+let evPoller = null
 
 async function loadEvents() {
   try {
     const resp = await api.taskEvents(props.id, lastId.value)
-    if (resp.events?.length) events.value.push(...resp.events)
+    droppedEvents.value += appendCapped(events.value, resp.events)
     if (resp.last_id != null) lastId.value = resp.last_id
     eventsError.value = ''
   } catch (e) {
@@ -86,8 +87,7 @@ async function loadEvents() {
 
 // 模型输出不可信：issue 内容可以借间接提示注入让模型吐出带 onerror 的
 // 标记，marked 出 HTML 后必须过一层消毒。
-marked.setOptions({ breaks: true })
-const md = (s) => DOMPurify.sanitize(marked.parse(s || ''))
+const md = createMarkdown()
 
 const PHASE_META = {
   triage: { label: '分诊', order: 0 },
@@ -247,16 +247,21 @@ const STATUS_META = {
 onMounted(() => {
   load()
   loadEvents()
-  timer = setInterval(() => { if (!isTerminal.value) load() }, 5000)
-  evTimer = setInterval(async () => {
+  // 自链式轮询：上一轮没回来不发下一轮（慢网络下 setInterval 会叠加请求）
+  detailPoller = createPoller(async () => {
+    if (!isTerminal.value) await load()
+  }, 5000)
+  evPoller = createPoller(async () => {
     await loadEvents()
     // 终态后这一轮就是收尾：终态转移前 sink 已 drain，事件不会再多
-    if (isTerminal.value) clearInterval(evTimer)
+    return !isTerminal.value
   }, 2000)
+  detailPoller.start()
+  evPoller.start()
 })
 onUnmounted(() => {
-  clearInterval(timer)
-  clearInterval(evTimer)
+  detailPoller?.stop()
+  evPoller?.stop()
 })
 </script>
 
@@ -428,6 +433,9 @@ onUnmounted(() => {
         <span v-if="!isTerminal" class="faint live">● 实时</span>
       </div>
       <div v-if="eventsError" class="faint" style="margin-bottom: 8px">日志拉取失败：{{ eventsError }}</div>
+      <div v-if="droppedEvents" class="faint" style="margin-bottom: 8px">
+        只显示最近 {{ MAX_LIVE_EVENTS }} 条，更早的 {{ droppedEvents }} 条已省略（完整记录在库里）。
+      </div>
 
       <template v-if="orderedGroups.length">
         <details
