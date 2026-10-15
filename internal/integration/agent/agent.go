@@ -214,19 +214,19 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("agent: 建 stdout 管道失败: %w", err)
 	}
-	defer outR.Close()
+	defer func() { _ = outR.Close() }()
 	errR, errW, err := os.Pipe()
 	if err != nil {
-		outW.Close()
+		_ = outW.Close()
 		return nil, fmt.Errorf("agent: 建 stderr 管道失败: %w", err)
 	}
-	defer errR.Close()
+	defer func() { _ = errR.Close() }()
 	cmd.Stdout, cmd.Stderr = outW, errW
 
 	startErr := cmd.Start()
 	// 父进程必须关掉自己的写端，否则读端永远等不到 EOF
-	outW.Close()
-	errW.Close()
+	_ = outW.Close()
+	_ = errW.Close()
 	if startErr != nil {
 		return nil, fmt.Errorf("agent: 启动 %s 失败: %w", d.bin, startErr)
 	}
@@ -410,7 +410,7 @@ func drainOrClose(done <-chan struct{}, r *os.File, deadline time.Time) bool {
 	case <-done:
 		return false
 	case <-t.C:
-		r.Close()
+		_ = r.Close() // 读协程会因此报错退出，关闭本身的错误无可处理
 		<-done
 		return true
 	}
