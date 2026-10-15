@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -440,5 +441,120 @@ func TestRunContextCancelKillsProcess(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Errorf("取消后应迅速返回，实际 %v", elapsed)
+	}
+}
+
+// CLI 已正常给出 result 并退出，但留下一个继承了 stdout 的后台进程
+// （agent 用 Bash 起的 dev server 之类）：Run 必须在宽限期内返回已解析
+// 的结果，而不是等管道 EOF 等到执行超时；遗留的后台进程也必须被回收。
+//
+// 改动前：读管道到 EOF 先于 cmd.Wait，后台进程不退出管道就不关，
+// Run 一直挂到 driver 超时，把一次成功的执行报成「超时」。
+func TestRunReturnsWhenBackgroundChildHoldsStdout(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "bg.pid")
+	bin := fakeClaude(t, fmt.Sprintf(`
+sleep 120 &
+echo $! > %s
+echo '%s'
+exit 0
+`, pidFile, resultOKLine))
+
+	// 宽限上限按 5s 写死在断言里：被测的常量改大到超过它，这条就该红
+	const maxReturn = 10 * time.Second
+	d := NewDriver(bin, 20*time.Second)
+	start := time.Now()
+	res, err := d.Run(context.Background(), RunParams{Prompt: "x", SessionID: "s"})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("CLI 已给出成功 result，Run 不该报错: %v（耗时 %v）", err, elapsed)
+	}
+	if res == nil || !res.Success || res.Text != "完成" {
+		t.Errorf("结果不符: %+v", res)
+	}
+	if elapsed > maxReturn {
+		t.Errorf("Run 应在 %v 内返回，实际耗时 %v", maxReturn, elapsed)
+	}
+
+	raw, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Skipf("假脚本未写出后台进程 pid，跳过回收检查: %v", readErr)
+	}
+	pid, convErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if convErr != nil {
+		t.Skipf("后台进程 pid 不可解析: %v", convErr)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	t.Errorf("遗留的后台进程 %d 在 Run 返回后仍存活", pid)
+}
+
+// 后台进程用 setsid 逃出了进程组：杀进程组够不着它，管道永远不 EOF。
+// Run 必须在宽限期（pipeDrainGrace）后强关读端返回已拿到的 result，
+// 而不是挂到执行超时。
+func TestRunReturnsWhenEscapedChildHoldsStdout(t *testing.T) {
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skipf("本机没有 setsid: %v", err)
+	}
+	pidFile := filepath.Join(t.TempDir(), "escaped.pid")
+	bin := fakeClaude(t, fmt.Sprintf(`
+setsid sh -c 'echo $$ > %s; exec sleep 120' &
+sleep 0.2
+echo '%s'
+exit 0
+`, pidFile, resultOKLine))
+	t.Cleanup(func() {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+
+	d := NewDriver(bin, 60*time.Second)
+	start := time.Now()
+	res, err := d.Run(context.Background(), RunParams{Prompt: "x", SessionID: "s"})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("result 已到手，强关读端不该算失败: %v（耗时 %v）", err, elapsed)
+	}
+	if res == nil || !res.Success {
+		t.Errorf("结果不符: %+v", res)
+	}
+	if elapsed < pipeDrainGrace || elapsed > pipeDrainGrace+5*time.Second {
+		t.Errorf("应在宽限期 %v 后不久返回，实际耗时 %v", pipeDrainGrace, elapsed)
+	}
+}
+
+// stderr 只留头尾：CLI 往 stderr 狂刷时驱动内存不能跟着涨，
+// 而报错里仍要能看到开头与结尾。
+func TestRunStderrIsBounded(t *testing.T) {
+	bin := fakeClaude(t, `
+echo 'STDERR-HEAD' >&2
+head -c 8000000 /dev/zero | tr '\0' 'x' >&2
+echo >&2
+echo 'STDERR-TAIL' >&2
+exit 3
+`)
+	d := NewDriver(bin, 30*time.Second)
+	_, err := d.Run(context.Background(), RunParams{Prompt: "x", SessionID: "s"})
+	if err == nil {
+		t.Fatal("没有 result 事件应报错")
+	}
+	msg := err.Error()
+	if len(msg) > 8<<10 {
+		t.Errorf("错误信息应有界，实际 %d 字节", len(msg))
+	}
+	for _, want := range []string{"STDERR-HEAD", "STDERR-TAIL"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息应同时带上 stderr 的开头与结尾（缺 %s）", want)
+		}
 	}
 }

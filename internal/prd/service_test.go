@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
@@ -22,7 +25,10 @@ type fakeStore struct {
 	repo   RepoInfo
 
 	// events 按 phase 累计落库的事件数，验「事件有没有落」。
-	events map[string]int
+	// InsertPRDEvents 在 BatchSink 的 flush 协程里被调，读写都要加锁。
+	evMu     sync.Mutex
+	events   map[string]int
+	maxBatch int // 单次 InsertPRDEvents 收到的最大条数
 
 	busy      bool // processing 标记
 	beginErr  error
@@ -128,8 +134,17 @@ func (f *fakeStore) ListPRDRounds(context.Context, int64) ([]store.PRDRoundRow, 
 }
 
 func (f *fakeStore) InsertPRDEvents(_ context.Context, _ int64, _ *int, phase string, e []agent.Entry) error {
+	f.evMu.Lock()
+	defer f.evMu.Unlock()
 	f.events[phase] += len(e)
+	f.maxBatch = max(f.maxBatch, len(e))
 	return nil
+}
+
+func (f *fakeStore) eventCount(phase string) int {
+	f.evMu.Lock()
+	defer f.evMu.Unlock()
+	return f.events[phase]
 }
 
 func (f *fakeStore) RepoForPRD(context.Context, int64, int64) (RepoInfo, error) {
@@ -177,6 +192,8 @@ type fakeAgent struct {
 	results []*agent.Result
 	errs    []error
 	calls   []agent.RunParams
+	// during 在回调完默认事件之后、返回之前执行，模拟「一轮正在跑」。
+	during func(p agent.RunParams)
 }
 
 func (f *fakeAgent) Run(_ context.Context, p agent.RunParams) (*agent.Result, error) {
@@ -192,6 +209,9 @@ func (f *fakeAgent) Run(_ context.Context, p agent.RunParams) (*agent.Result, er
 			Raw: json.RawMessage(
 				`{"type":"assistant","message":{"content":[{"type":"text","text":"在读 internal/preview/gate.go"}]}}`),
 		})
+	}
+	if f.during != nil {
+		f.during(p)
 	}
 
 	if i < len(f.errs) && f.errs[i] != nil {
@@ -495,5 +515,145 @@ func TestSubmitForReviewBlocksOnChecklist(t *testing.T) {
 	joined := strings.Join(codes, ",")
 	if !strings.Contains(joined, CodeNoReviewReport) {
 		t.Errorf("必须拦住「没跑对抗复核」（D10-6 必跑），got codes=%v", codes)
+	}
+}
+
+func textEvent(text string) agent.Event {
+	raw, _ := json.Marshal(map[string]any{
+		"type":    "assistant",
+		"message": map[string]any{"content": []map[string]any{{"type": "text", "text": text}}},
+	})
+	return agent.Event{Type: agent.EventAssistant, Raw: raw}
+}
+
+// 事件必须边跑边落库：一轮最长 10 分钟，原来攒到跑完才一次写入，
+// 界面上的「实时」事件流在整轮期间都是空的。
+func TestRunRoundStreamsEventsWhileRunning(t *testing.T) {
+	st, wt := newFakeStore(), &fakeWorktrees{}
+	seenMidRun := 0
+	ag := &fakeAgent{
+		results: []*agent.Result{ok(`{"type":"feature","document":{"oneLiner":{"body":"x"}},"questions":[]}`)},
+		during: func(p agent.RunParams) {
+			for i := 0; i < 5; i++ {
+				p.OnEvent(textEvent("读代码中"))
+			}
+			// agent 还没返回：等过几个刷库周期，看事件是否已经落库
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && st.eventCount(store.PRDPhasePlan) == 0 {
+				time.Sleep(20 * time.Millisecond)
+			}
+			seenMidRun = st.eventCount(store.PRDPhasePlan)
+		},
+	}
+	svc := newService(st, ag, wt)
+
+	if _, err := svc.RunRound(context.Background(), RunRoundParams{PRDID: 1, UserID: 7}); err != nil {
+		t.Fatalf("RunRound 应成功: %v", err)
+	}
+	if seenMidRun == 0 {
+		t.Errorf("一轮进行中事件就应陆续落库，got 运行中已落 %d 条", seenMidRun)
+	}
+	if got, want := st.eventCount(store.PRDPhasePlan), 6; got != want {
+		t.Errorf("跑完后落库条数 got %d, want %d（1 条默认 + 5 条）", got, want)
+	}
+}
+
+// 内存有界：一轮吐出上万条事件时，单批写库不超过缓冲上限 ——
+// 原来整轮事件攒在一个无界切片里，结束时一批写入。
+func TestRunRoundEventBufferIsBounded(t *testing.T) {
+	st, wt := newFakeStore(), &fakeWorktrees{}
+	ag := &fakeAgent{
+		results: []*agent.Result{ok(`{"type":"feature","document":{"oneLiner":{"body":"x"}},"questions":[]}`)},
+		during: func(p agent.RunParams) {
+			for i := 0; i < 10000; i++ {
+				p.OnEvent(textEvent("刷屏"))
+			}
+		},
+	}
+	svc := newService(st, ag, wt)
+
+	if _, err := svc.RunRound(context.Background(), RunRoundParams{PRDID: 1, UserID: 7}); err != nil {
+		t.Fatalf("RunRound 应成功: %v", err)
+	}
+	st.evMu.Lock()
+	maxBatch := st.maxBatch
+	st.evMu.Unlock()
+	if maxBatch > 256 {
+		t.Errorf("单批写库 got %d 条，want ≤ 256（缓冲上限）", maxBatch)
+	}
+	if st.eventCount(store.PRDPhasePlan) == 0 {
+		t.Error("事件不该全部丢失")
+	}
+}
+
+// 不检出仓库的调用（阶段 A、对抗复核）必须跑在中立目录里，且透传
+// SettingSources。原来 Dir 留空 → 子进程继承 serve 的 cwd（生产是 Lathe
+// 自己的仓库根），claude 会把 Lathe 的 CLAUDE.md 与个人插件灌进目标仓库的
+// 规划上下文 —— 与分诊的 B2-3 是同一个坑（AGENTS.md §9）。
+func TestNoCheckoutRunsUseNeutralDir(t *testing.T) {
+	neutral := t.TempDir() + "/neutral"
+	cases := []struct {
+		name string
+		run  func(svc *Service, st *fakeStore) error
+		res  string
+	}{
+		{
+			name: "阶段 A 规划轮次",
+			res:  `{"type":"feature","document":{"oneLiner":{"body":"x"}},"questions":[]}`,
+			run: func(svc *Service, _ *fakeStore) error {
+				_, err := svc.RunRound(context.Background(), RunRoundParams{PRDID: 1, UserID: 7})
+				return err
+			},
+		},
+		{
+			name: "对抗复核",
+			res:  `{"findings":[],"verdict":"无洞"}`,
+			run: func(svc *Service, st *fakeStore) error {
+				st.row.Document = json.RawMessage(reviewableDoc)
+				_, err := svc.RunReview(context.Background(), 1, 7)
+				return err
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st, wt := newFakeStore(), &fakeWorktrees{}
+			ag := &fakeAgent{results: []*agent.Result{ok(tc.res)}}
+			svc := newService(st, ag, wt)
+			svc.NeutralDir = neutral
+			svc.SettingSources = "project"
+
+			if err := tc.run(svc, st); err != nil {
+				t.Fatalf("调用应成功: %v", err)
+			}
+			if wt.created != 0 {
+				t.Fatalf("这类调用不该检出仓库，got created=%d", wt.created)
+			}
+			got := ag.calls[0]
+			if got.Dir != neutral {
+				t.Errorf("Dir got %q, want 中立目录 %q（不能继承 serve 的 cwd）", got.Dir, neutral)
+			}
+			if got.SettingSources != "project" {
+				t.Errorf("SettingSources got %q, want %q", got.SettingSources, "project")
+			}
+		})
+	}
+}
+
+// 未显式配置时也不能留空：默认落在系统临时目录下（项目树之外）。
+func TestNeutralDirDefaultIsOutsideAnyProject(t *testing.T) {
+	st, wt := newFakeStore(), &fakeWorktrees{}
+	ag := &fakeAgent{results: []*agent.Result{ok(`{"type":"feature","document":{"oneLiner":{"body":"x"}},"questions":[]}`)}}
+	svc := newService(st, ag, wt)
+
+	if _, err := svc.RunRound(context.Background(), RunRoundParams{PRDID: 1, UserID: 7}); err != nil {
+		t.Fatalf("RunRound 应成功: %v", err)
+	}
+	dir := ag.calls[0].Dir
+	if dir == "" {
+		t.Fatal("Dir 不能为空（为空即继承 serve 的 cwd）")
+	}
+	if !strings.HasPrefix(dir, os.TempDir()) {
+		t.Errorf("默认中立目录 got %q, want 位于 %q 之下", dir, os.TempDir())
 	}
 }

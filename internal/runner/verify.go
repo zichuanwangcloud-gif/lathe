@@ -1,10 +1,11 @@
 package runner
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 )
 
 // VerifyTier 是验证档位（docs/02-design.md §5）。
@@ -131,6 +134,13 @@ func (r Report) FirstFailure() *StepResult {
 
 // maxStepOutput 限制单步保留的输出长度，避免把整个构建日志灌进数据库。
 const maxStepOutput = 16 << 10 // 16KB
+
+// stepOutputHead 是摘要里留给开头的部分，其余全给结尾：构建与测试工具的
+// 结论（FAIL 汇总、最后一条编译错误）在尾部，开头只留第一处报错的上下文。
+const stepOutputHead = 2 << 10
+
+// stepPipeDrainGrace 是步骤进程退出后等输出管道关闭的上限（见 runStep）。
+const stepPipeDrainGrace = 5 * time.Second
 
 // Verifier 执行验证步骤。
 type Verifier struct {
@@ -280,9 +290,21 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step, logs StepL
 	// 与 agent driver 同理：构建工具会派生子进程，用进程组保证能整棵杀掉
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	// 输出不再整份进内存：边跑边写进完整日志文件，内存里只留头尾摘要
+	// （结论在尾部，原来只留开头 16KB 会把它截掉）。原来的 bytes.Buffer
+	// 让 64MB 的输出分配出 320MB（扩容翻倍 + 两次整份拷贝），并发验证叠加。
+	summary := capbuf.New(stepOutputHead, maxStepOutput-stepOutputHead)
+	logW, closeLog := openStepLog(logs, string(st.Name))
+	var out io.Writer = summary
+	if logW != nil {
+		out = io.MultiWriter(summary, logW) // 两者都永不报错，见 openStepLog
+	}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	// Wait 要等输出管道 EOF；步骤留下的后台进程（守护进程、dev server）会
+	// 继承管道、一直不关，原来就挂到步骤超时，把通过的验证报成「超时」。
+	// WaitDelay：进程退出后最多再等这么久就强关管道。
+	cmd.WaitDelay = stepPipeDrainGrace
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
@@ -298,12 +320,20 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step, logs StepL
 
 	select {
 	case err := <-done:
+		// 回收步骤留下的后台进程。先探一下进程组是否还有成员：killGroup
+		// 内含 200ms 等待，正常步骤（组已空）不该每步白付这笔
+		if syscall.Kill(-pgid, 0) == nil {
+			killGroup(pgid)
+		}
 		res.Duration = time.Since(start)
-		// 先落完整日志，再截断成摘要 —— 顺序反了完整输出就永远不存在了。
-		// 通过的步骤也要落（T4-AC4）：排障时最想看的往往正是
+		// 通过的步骤也落了完整日志（T4-AC4）：排障时最想看的往往正是
 		// 「上一次通过时是什么样」。
-		res.LogRef = writeStepLog(logs, string(st.Name), buf.Bytes())
-		res.Output = truncate(buf.String(), maxStepOutput)
+		res.LogRef = closeLog()
+		res.Output = strings.TrimSpace(summary.String())
+		// 进程本身成功退出、只是管道被后台进程攥着被强关：不算失败
+		if errors.Is(err, exec.ErrWaitDelay) {
+			err = nil
+		}
 		if err != nil {
 			// 非零退出 = 代码有问题（failed），而非验证没跑起来（error）
 			res.Status = StatusFailed
@@ -317,8 +347,8 @@ func (v *Verifier) runStep(ctx context.Context, root string, st Step, logs StepL
 		killGroup(pgid)
 		<-done // 等 Wait 收敛，避免僵尸
 		res.Duration = time.Since(start)
-		res.LogRef = writeStepLog(logs, string(st.Name), buf.Bytes())
-		res.Output = truncate(buf.String(), maxStepOutput)
+		res.LogRef = closeLog()
+		res.Output = strings.TrimSpace(summary.String())
 		res.Status = StatusError
 		res.Err = fmt.Errorf("runner: 步骤 %s 超时（上限 %v），进程树已回收", st.Name, v.stepTimeout)
 		return res

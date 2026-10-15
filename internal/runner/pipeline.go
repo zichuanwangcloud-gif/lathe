@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
@@ -539,6 +540,9 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	}
 	triageSession := p.newID()
 	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", triageDir, triageSession)
+	// 兜底：Close 幂等，下面判错前那次显式 Close 才是正常路径；这里只防
+	// Run 里 panic 时 flush/watcher 协程泄漏
+	defer triageSink.Close()
 	// 失败记忆：分诊是全流程的第一个 agent 调用，也是「上次这个单子死过」
 	// 最该被知道的地方 —— 上次若因单子不明确 blocked_spec 过，这次分诊
 	// 直接看到那段历史，判定就有了上下文。分诊是新会话，提示词里没有
@@ -762,6 +766,7 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
 	prompt = p.injectFailureMemory(rc, phase, prompt, resume)
 	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
+	defer sink.Close() // 兜底，同 stageTriage
 	channel := p.ImplementChannel
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
 		channel = rc.profile.ModelChannel
@@ -1418,7 +1423,7 @@ func verifyStepEntry(tier VerifyTier, s StepResult) agent.Entry {
 		body += " · " + s.Err.Error()
 	}
 	if s.Status != StatusPassed && s.Output != "" {
-		body += "\n\n" + truncate(s.Output, 4<<10)
+		body += "\n\n" + capbuf.ClipMiddle(s.Output, 4<<10) // 头尾都留：结论在尾部
 	}
 	return agent.Entry{
 		Kind: "verify_step",
