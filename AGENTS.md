@@ -10,7 +10,8 @@
 1. **验证体系不可削弱**——红绿复现证明、隔离栈、验证落库（`verifications` 表）是这个
    产品的全部价值。让验证「看起来过了」的改动 = 拆产品根基。
 2. **三条产品边界不可碰**：不做合并决策（人点合并）；单子不明确就回帖提问并停下
-   （不猜）；永不 push 受保护分支，一切走 PR。对本仓提改动同样适用。
+   （不猜）；永不 push 受保护分支，一切走 PR。对本仓提改动同样适用——本仓的
+   `main`、`dev` 都受保护，日常改动 PR 到 `dev`（§10）。
 3. **每个可配置字段必须有消费方**；新增环境变量必须登记 README 变量表。
    删掉最后一个消费方时，连配置项一起删。
 4. **提交前必过 `make lint && make test`**——不是裸 `go test ./...`（§5 有原因）。
@@ -20,6 +21,7 @@
 ## 2. 开工自检（会话前 60 秒）
 
 ```bash
+make hooks                                  # 每个克隆一次：本地拦截在 main/dev 上提交
 make dev-infra                              # Postgres on 55432：测试的硬依赖
 make build && ./bin/lathe migrate up        # 建表
 make lint && make test                      # 基线必须绿
@@ -57,6 +59,8 @@ make lint && make test                      # 基线必须绿
 - 改历史迁移文件（已发布的迁移只能新增，不回改）
 - 引入新依赖（`go.mod` / `package.json` 变动）
 - force-push（即使任务分支也要先说）
+- 打正式版 tag `vX.Y.Z`、发布 Release、删除 `release/*` `hotfix/*` 分支、改规则集
+  （切 release 分支、写发布元数据、打 RC tag 在被要求发版时可自主，见 docs/11 §7）
 
 ## 5. 测试纪律
 
@@ -101,6 +105,7 @@ make lint && make test                      # 基线必须绿
 | 要动什么 | 先读 |
 |---|---|
 | 状态机 / 验证设计 / 调度 | `docs/02-design.md` |
+| 分支模型 / 版本号 / 发版与热修复 | `docs/11-branching-release.md` |
 | 编排图、多任务依赖 | `docs/07-prd-orchestration.md` → `docs/06-orchestration.md` |
 | 「为什么这么选型」 | `docs/03-tech-stack.md` |
 | agent 事件流 / 可见性 | `docs/04-agent-visibility.md` |
@@ -124,7 +129,11 @@ Keep a Changelog + 语义化版本，发布时更新。
 
 ## 10. Git 与 PR
 
-- 分支：`feat/<topic>`、`fix/<topic>`，从 `main` 切，走 PR 回合，不直接推 `main`。
+- 分支：`feat/<topic>`、`fix/<topic>`（及 `chore/` `docs/` `refactor/` `test/`），
+  **从 `dev` 切、PR 回 `dev`**。`main` 只接 `release/X.Y.Z` / `hotfix/X.Y.Z` 的 PR
+  （CI「分支流向」检查强制），`main`、`dev` 都禁止直接 push——规则集对管理员同样生效。
+- 发版、热修复、版本号怎么定：一律按 `docs/11-branching-release.md`，不即兴发挥。
+- 用户可感知的变更，在同一个 PR 里写进 `CHANGELOG.md` 的 `[Unreleased]`。
 - 提交：Conventional Commits，中文描述，scope 用模块名，如
   `fix(runner): 收割机不再会删掉正在使用的现场`。
 - PR 说清「改了什么、怎么验证的」；动状态机/验证/迁移的附测试证据。

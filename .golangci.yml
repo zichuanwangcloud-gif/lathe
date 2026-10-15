@@ -35,7 +35,8 @@ linters:
         linters: [unused]
 
 issues:
-  # 只报相对 main 的新增改动；存量告警不阻塞 CI。
+  # 只报相对 main 的新增改动；存量告警不阻塞 CI。CI 里会用
+  # --new-from-rev=origin/<PR 目标分支> 覆盖（PR 进 dev 时比 dev），见 ci.yml。
   new-from-rev: origin/main
   # 默认只报前 50 条、每类 3 条，容易掩盖问题；全量报出来便于一次修完。
   max-issues-per-linter: 0

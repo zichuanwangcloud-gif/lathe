@@ -23,6 +23,7 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/03-tech-stack.md](docs/03-tech-stack.md) | 技术选型与理由 |
 | [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
 | [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
+| [docs/11-branching-release.md](docs/11-branching-release.md) | 分支管理与发版规范（贡献者必读） |
 
 ## 技术栈
 

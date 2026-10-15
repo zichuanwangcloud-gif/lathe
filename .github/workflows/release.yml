@@ -20,6 +20,30 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 下一步要判断 tag 所在提交属于哪条分支，需要完整历史与全部远端分支。
+          fetch-depth: 0
+
+      - name: 校验 tag 落点
+        # 正式版必须打在 main 上（经 release/hotfix PR 合入后打），RC 必须打在
+        # release/* 或 hotfix/* 上。规范：docs/11-branching-release.md §5、§6。
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          sha="$(git rev-list -n 1 "$tag")"
+          if printf '%s' "$tag" | grep -q -- '-'; then
+            if ! git branch -r --contains "$sha" | grep -qE '^ *origin/(release|hotfix)/'; then
+              echo "::error::预发布 $tag 不在任何 release/* 或 hotfix/* 分支上"
+              exit 1
+            fi
+            echo "预发布 $tag 位于 release/hotfix 分支"
+          else
+            if ! git merge-base --is-ancestor "$sha" origin/main; then
+              echo "::error::正式版 $tag 不在 main 上。先把 release/hotfix 分支经 PR 合入 main，再在 main 上打 tag"
+              exit 1
+            fi
+            echo "正式版 $tag 位于 main"
+          fi
 
       - name: 解析 tag 并核对 CHANGELOG
         id: meta

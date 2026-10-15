@@ -3,11 +3,11 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, dev]
   # 供 release.yml 复用，发布前必须先过同一套门禁。
   workflow_call:
 
-# 同一分支的新 push 取消尚在跑的旧运行；main 上不取消，避免漏掉某次提交的结论。
+# 同一分支的新 push 取消尚在跑的旧运行；main/dev 上不取消，避免漏掉某次提交的结论。
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -21,6 +21,33 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
+  # 分支流向：main 只接 release/X.Y.Z、hotfix/X.Y.Z 的 PR。
+  # 规则集里它是 main/dev 的必需检查，所以非 PR 事件与其它目标分支也要
+  # 跑并直接通过，否则必需检查会一直挂在「等待」上。
+  # 分支名经 env 传入、不直接拼进脚本：head_ref 来自 PR 作者，可含 shell 元字符。
+  # 规范：docs/11-branching-release.md §2。
+  branch-flow:
+    name: 分支流向
+    runs-on: ubuntu-latest
+    steps:
+      - name: 校验 PR 源/目标分支
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "非 PR 事件（$GITHUB_EVENT_NAME），无需校验"
+            exit 0
+          fi
+          echo "$HEAD → $BASE"
+          if [ "$BASE" = "main" ]; then
+            if ! printf '%s' "$HEAD" | grep -qE '^(release|hotfix)/[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::main 只接受 release/X.Y.Z 或 hotfix/X.Y.Z 的 PR（当前源分支：$HEAD）。日常改动请把 PR 的 base 改成 dev。"
+              exit 1
+            fi
+          fi
+          echo "分支流向符合规范"
+
   lint:
     name: 静态检查
     runs-on: ubuntu-latest
@@ -61,8 +88,10 @@ jobs:
           # go 1.25.0，v2.1.6 由 go1.23 构建、装上就挂；v2.13.2 由 go1.26
           # 构建才够用。以后抬 go.mod 的 go 版本时，这里要跟着抬。
           version: v2.13
-          # 配置里已设 new-from-rev，这里只需保证能解析到 origin/main。
-          args: --timeout=5m
+          # 只报相对 PR 目标分支（feat→dev 比 dev，release→main 比 main）的
+          # 新增改动；push 事件没有 base_ref，退回配置里的 origin/main。
+          # fetch-depth: 0 已拉下全部远端分支。
+          args: --timeout=5m --new-from-rev=origin/${{ github.base_ref || 'main' }}
 
   test:
     name: 测试（真实 Postgres）

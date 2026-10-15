@@ -1,4 +1,4 @@
-.PHONY: help all build test test-ci test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev clean
+.PHONY: help all build test test-ci test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev clean hooks release-check
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
@@ -82,6 +82,13 @@ dev-infra-down: ## 停本地 Postgres
 
 clean-test-db: ## 报告开发库里的测试残留（加 YES=1 真删）
 	scripts/clean-test-db.sh $(if $(YES),--yes,)
+
+hooks: ## 安装本地 git 钩子（拒绝直接在 main/dev 上提交与推送；每个克隆执行一次）
+	git config core.hooksPath scripts/git-hooks
+	@echo "→ 已启用 scripts/git-hooks（规范见 docs/11-branching-release.md）"
+
+release-check: ## 发版就绪度核查（make release-check VERSION=x.y.z；只读）
+	@scripts/release-check.sh "$(VERSION)"
 
 clean: ## 清理构建产物
 	rm -rf $(BIN_DIR) $(UI_SRC) $(UI_EMBED)
