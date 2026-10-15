@@ -1,7 +1,5 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
 import {
   api,
   UnauthorizedError,
@@ -13,6 +11,7 @@ import {
   prdTypeLabel,
 } from '../api'
 import { confirmDialog } from '../confirm'
+import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
 
 // 模糊任务详情页（docs/10-prd-template.md）：对话区把需求问清楚，文档区
 // 逐节签字，对抗复核攻验收标准，自检过闸后批准、再一键生成正式任务。
@@ -40,8 +39,10 @@ const convertResult = ref(null)
 // marked 出 HTML 后必须过一层消毒：PRD 正文是模型写的，
 // issue 内容可以借间接提示注入让它吐出带 onerror 的标记
 // （与 TaskDetail.vue / IssueDetail.vue 同一条管线）。
-marked.setOptions({ breaks: true })
-const md = (s) => DOMPurify.sanitize(marked.parse(s || ''))
+//
+// 带缓存：回答框是 v-model，每敲一个字整页重渲染。不缓存时每个字都要把
+// 十个节 + 全部轮次 + 任务块重新 parse + sanitize，轮次一多输入就卡死。
+const md = createMarkdown()
 
 // ---------------------------------------------------------------- 常量表
 
@@ -418,8 +419,10 @@ function gotoSection(key) {
 const events = ref([])
 const eventsError = ref('')
 const lastId = ref(0)
-let timer = null
-let evTimer = null
+// 内存里只留最近 MAX_LIVE_EVENTS 条（见 livelog.js），裁掉的条数如实展示
+const droppedEvents = ref(0)
+let refreshPoller = null
+let evPoller = null
 
 // phase 分两路且刻意分开显示：plan 是作者（规划智能体）说的，plan-review 是
 // 攻击者（对抗复核）说的。混在一条流里，人就分不清哪句话是来攻它的。
@@ -432,7 +435,7 @@ const reviewEvents = computed(() => events.value.filter((e) => e.phase === REVIE
 async function loadEvents() {
   try {
     const resp = await api.prdEvents(props.id, lastId.value)
-    if (resp.events?.length) events.value.push(...resp.events)
+    droppedEvents.value += appendCapped(events.value, resp.events)
     if (resp.lastId != null) lastId.value = resp.lastId
     eventsError.value = ''
   } catch (e) {
@@ -460,18 +463,21 @@ onMounted(() => {
   // **仍可能是别的东西改的**：超时扫描器可能在页面上停着的时候把它从
   // awaiting_answers 判成搁置。所以轮询在 abandoned 上也继续 —— 只是
   // 它不会自己回来（唤醒要人点），所以刷新的意义是「看到它被搁置了」。
-  timer = setInterval(() => {
-    if (!isTerminal.value || state.value === 'abandoned') refresh()
+  // 自链式轮询：上一轮没回来不发下一轮（慢网络下 setInterval 会叠加请求）
+  refreshPoller = createPoller(async () => {
+    if (!isTerminal.value || state.value === 'abandoned') await refresh()
   }, 5000)
-  evTimer = setInterval(async () => {
+  evPoller = createPoller(async () => {
     await loadEvents()
     // 事件流只在彻底结束之后停：搁置的 PRD 被唤醒后还会有新事件。
-    if (state.value === 'converted') clearInterval(evTimer)
+    return state.value !== 'converted'
   }, 2000)
+  refreshPoller.start()
+  evPoller.start()
 })
 onUnmounted(() => {
-  clearInterval(timer)
-  clearInterval(evTimer)
+  refreshPoller?.stop()
+  evPoller?.stop()
   clearTimeout(highlightTimer)
 })
 </script>
@@ -987,6 +993,9 @@ onUnmounted(() => {
         <span v-if="processing" class="faint live">● 实时</span>
       </div>
       <div v-if="eventsError" class="faint" style="margin-top: 6px">日志拉取失败：{{ eventsError }}</div>
+      <div v-if="droppedEvents" class="faint" style="margin-top: 6px">
+        只显示最近 {{ MAX_LIVE_EVENTS }} 条，更早的 {{ droppedEvents }} 条已省略（完整记录在库里）。
+      </div>
       <ol v-if="planEvents.length" class="log">
         <li v-for="e in planEvents" :key="e.id" class="ev">
           <span v-if="e.round != null" class="badge idle">第 {{ e.round }} 轮</span>
