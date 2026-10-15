@@ -6,8 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
@@ -87,6 +88,20 @@ type Service struct {
 	// 而漏配的后果是静默降级到便宜通道 —— 对抗复核「想不出恶意实现」
 	// 就等于没跑（D10-6 落空），而且没人会发现。
 	Channel string
+
+	// SettingSources 传给 agent 的 --setting-sources（与 Pipeline 同一个
+	// 配置 LATHE_SETTING_SOURCES，默认 "project"）：规划 agent 不该带上执行
+	// 者个人环境里的插件与技能（docs/02-design.md §9）。
+	SettingSources string
+
+	// NeutralDir 是不检出仓库的调用（阶段 A、对抗复核）的工作目录。
+	//
+	// 与 Pipeline.TriageDir 同一个理由（路线图 B2-3）：不指定的话子进程
+	// 继承 serve 的 cwd（生产是 Lathe 自己的仓库根），claude 会向上收集
+	// 祖先目录的 CLAUDE.md，把 Lathe 的配置灌进目标仓库的规划上下文。
+	// 为空时用系统临时目录下的固定位置 —— 必须在任何项目树之外，
+	// WorkspaceRoot 默认在仓库根之下，不合格。
+	NeutralDir string
 
 	// CloneURL 由 ProviderRepo 推导，与 queue.loadRepoConfig 同一套规则。
 	// 留成字段是为了单测能替换掉。
@@ -262,11 +277,19 @@ type runSpec struct {
 //  1. PermissionMode="plan" —— 只读，不许改目标仓库任何东西。
 //  2. 每次新 SessionID，不 --resume —— worktree 每轮回收，续跑的会话会
 //     以为自己还在已删目录里（D10-8 的直接后果）。
-//  3. 事件先在内存里攒着，最后一次性落库 —— 单轮有 10 分钟上限，攒得下；
-//     省掉 EventSink 那套 flush 协程与它对 task_id 的依赖。
+//  3. 事件走 agent.BatchSink 边跑边落库（与任务执行链路同一套有界缓冲）。
+//     原来是攒在无界切片里、跑完一次写入：内存随事件数涨，界面的「实时」
+//     事件流在整轮期间也拉不到任何东西。
 func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, string, error) {
-	dir := ""
-	if spec.needCheckout {
+	var dir string
+	if !spec.needCheckout {
+		// 不检出也不能留空：留空即继承 serve 的 cwd（见 NeutralDir）
+		d, err := s.neutralDir()
+		if err != nil {
+			return nil, "", err
+		}
+		dir = d
+	} else {
 		mirror, err := s.Worktrees.EnsureMirror(ctx, spec.repo.ProviderRepo, s.cloneURL(spec.repo.ProviderRepo))
 		if err != nil {
 			return nil, "", fmt.Errorf("prd: 准备镜像失败: %w", err)
@@ -290,21 +313,12 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 
 	sessionID := newUUID()
 
-	// 事件缓冲：OnEvent 在驱动读协程里同步调用，这里只做加锁 append，
-	// 把落库留到最后。
-	var (
-		mu      sync.Mutex
-		entries []agent.Entry
-	)
-	onEvent := func(ev agent.Event) {
-		digested := agent.Digest(ev)
-		if len(digested) == 0 {
-			return
-		}
-		mu.Lock()
-		entries = append(entries, digested...)
-		mu.Unlock()
-	}
+	// 有界缓冲 + 批量刷库。Close 必须在判错之前：跑挂了的那一轮，
+	// 事件流正是人要看的东西（Close 会 drain 完剩余事件才返回）。
+	sink := agent.NewBatchSink(ctx, func(wctx context.Context, entries []agent.Entry) error {
+		return s.Store.InsertPRDEvents(wctx, spec.prdID, spec.round, spec.phase, entries)
+	}, fmt.Sprintf("prd=%d phase=%s", spec.prdID, spec.phase))
+	defer sink.Close()
 
 	runCtx, cancel := context.WithTimeout(ctx, roundTimeout)
 	defer cancel()
@@ -314,19 +328,12 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 		Dir:            dir,
 		SessionID:      sessionID,
 		PermissionMode: "plan",
+		SettingSources: s.SettingSources,
 		ExtraEnv:       channelEnv(s.Channel),
-		OnEvent:        onEvent,
+		OnEvent:        sink.OnEvent,
 	})
-
-	// 事件先落库再判错：跑挂了的那一轮，事件流正是人要看的东西。
-	mu.Lock()
-	buffered := entries
-	mu.Unlock()
-	if len(buffered) > 0 {
-		if err := s.Store.InsertPRDEvents(context.WithoutCancel(ctx), spec.prdID, spec.round, spec.phase, buffered); err != nil {
-			slog.Warn("落 PRD 事件失败", "prd", spec.prdID, "err", err)
-		}
-	}
+	// 先 drain 再判错（defer 里的第二次 Close 是幂等的空操作，只兜 panic 路径）
+	sink.Close()
 
 	if runErr != nil {
 		return nil, sessionID, fmt.Errorf("prd: agent 执行失败: %w", runErr)
@@ -339,6 +346,18 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 			res.TerminalReason, head(res.Text, 200))
 	}
 	return res, sessionID, nil
+}
+
+// neutralDir 返回不检出仓库时的中立工作目录（惰性创建）。
+func (s *Service) neutralDir() (string, error) {
+	dir := s.NeutralDir
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "lathe-prd")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("prd: 创建中立目录失败: %w", err)
+	}
+	return dir, nil
 }
 
 // channelEnv 把通道名拼成 agent 的环境变量（与 runner 同名函数同一形状，

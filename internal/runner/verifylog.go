@@ -25,6 +25,7 @@ package runner
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -39,13 +40,24 @@ import (
 // 放在 worktree 里等于排障时正好没有。
 const verifyLogRoot = "verify-logs"
 
-// StepLogger 把一条验证步骤的完整输出落盘，并返回可回查的引用。
+// maxStepLogBytes 是单条步骤日志的落盘上限。
 //
-// 实现必须满足：**落盘失败绝不能让验证失败**。返回错误即可，
-// 调用方会降级为「log_ref 留空 + 记 warn」继续跑。磁盘满、权限不对
-// 都不该把一次本来能通过的验证判死。
+// 完整日志是给人排障的，几十 MB 已远超人会翻的量；不设上限的话，一个
+// 刷屏的测试能把 DataDir 所在的盘写满（verify-logs 没有清理路径）。
+// 超出部分丢弃，文件末尾注明截断了多少。
+const maxStepLogBytes = 64 << 20
+
+// StepLogger 为一条验证步骤打开落盘文件，并返回可回查的引用。
+//
+// 流式而不是「跑完交一整块」：原来要先把整份输出收进内存才能落盘，
+// 一次刷屏的构建就是几百 MB 的内存峰值，并发验证时叠加。
+//
+// 实现必须满足：**落盘失败绝不能让验证失败**。Open 返回错误即可，
+// 调用方会降级为「log_ref 留空 + 记 warn」继续跑；写入中途的失败由
+// openStepLog 包一层吞掉。磁盘满、权限不对都不该把一次本来能通过的
+// 验证判死。
 type StepLogger interface {
-	WriteStepLog(step string, output []byte) (ref string, err error)
+	OpenStepLog(step string) (w io.WriteCloser, ref string, err error)
 }
 
 // fileStepLogger 把日志写进 <DataDir>/verify-logs/task-<id>/round-<n>/。
@@ -62,12 +74,14 @@ type fileStepLogger struct {
 	// 构建步骤名不会撞，但修复回路里同名步骤会反复出现，
 	// 而同一轮内也可能有多条同名的复现测试。
 	seq atomic.Int64
+	// maxBytes 是单文件上限，零值取 maxStepLogBytes（测试可调小）。
+	maxBytes int64
 }
 
-// WriteStepLog 落盘并返回相对路径。
-func (l *fileStepLogger) WriteStepLog(step string, output []byte) (string, error) {
+// OpenStepLog 建好日志文件并返回写入端与相对路径。
+func (l *fileStepLogger) OpenStepLog(step string) (io.WriteCloser, string, error) {
 	if l == nil || l.dataDir == "" {
-		return "", nil
+		return nil, "", nil
 	}
 	n := l.seq.Add(1)
 	name := fmt.Sprintf("%02d-%s.log", n, sanitizeLogName(step))
@@ -75,14 +89,66 @@ func (l *fileStepLogger) WriteStepLog(step string, output []byte) (string, error
 	abs := filepath.Join(l.dataDir, rel)
 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
-		return "", fmt.Errorf("建验证日志目录失败: %w", err)
+		return nil, "", fmt.Errorf("建验证日志目录失败: %w", err)
 	}
 	// 0600：验证输出可能包含仓库内容与环境细节，按凭据同级对待
 	// （与 internal/secret 的落盘权限一致）。
-	if err := os.WriteFile(abs, output, 0o600); err != nil {
+	f, err := os.OpenFile(abs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, "", fmt.Errorf("写验证日志失败: %w", err)
+	}
+	limit := l.maxBytes
+	if limit <= 0 {
+		limit = maxStepLogBytes
+	}
+	return &cappedLog{f: f, limit: limit}, rel, nil
+}
+
+// WriteStepLog 一次性落一整块（复现阶段等已在内存里的内容用）。
+func (l *fileStepLogger) WriteStepLog(step string, output []byte) (string, error) {
+	w, ref, err := l.OpenStepLog(step)
+	if err != nil || w == nil {
+		return ref, err
+	}
+	if _, err := w.Write(output); err != nil {
+		_ = w.Close()
 		return "", fmt.Errorf("写验证日志失败: %w", err)
 	}
-	return rel, nil
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("写验证日志失败: %w", err)
+	}
+	return ref, nil
+}
+
+// cappedLog 写满 limit 后丢弃后续内容，Close 时在末尾注明丢了多少。
+type cappedLog struct {
+	f       *os.File
+	limit   int64
+	written int64
+	dropped int64
+}
+
+func (c *cappedLog) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := c.limit - c.written; room < int64(len(p)) {
+		c.dropped += int64(len(p)) - max(room, 0)
+		p = p[:max(room, 0)]
+	}
+	if len(p) > 0 {
+		w, err := c.f.Write(p)
+		c.written += int64(w)
+		if err != nil {
+			return w, err
+		}
+	}
+	return n, nil
+}
+
+func (c *cappedLog) Close() error {
+	if c.dropped > 0 {
+		_, _ = fmt.Fprintf(c.f, "\n…（日志超过 %d MB 上限，其后 %d 字节未落盘）\n", c.limit>>20, c.dropped)
+	}
+	return c.f.Close()
 }
 
 // sanitizeLogName 把步骤名规整成安全的文件名。
@@ -134,19 +200,63 @@ func (p *Pipeline) stepLogger(taskID int64, round int) StepLogger {
 	}
 }
 
-// writeStepLog 是所有落盘点的统一入口：吞掉错误、只记日志。
+// openStepLog 是流式落盘的统一入口：打开失败、写入中途失败都吞掉、只记日志。
+//
+// 返回的 writer 永不报错 —— 它接在子进程的输出上，返回错误会让 exec 的
+// 拷贝协程中断、子进程收到 SIGPIPE，等于让磁盘问题把验证判死（T4-AC6）。
+// logs 为 nil 或打开失败时 w 为 nil、ref 为空。done 必须调用（关文件），
+// 返回最终 ref：写入中途失败时 ref 作废为空，不把残缺日志当完整的登记。
+func openStepLog(logs StepLogger, step string) (w io.Writer, done func() string) {
+	if logs == nil {
+		return nil, func() string { return "" }
+	}
+	f, ref, err := logs.OpenStepLog(step)
+	if err != nil {
+		slog.Warn("验证日志落盘失败（不影响验证结果）", "step", step, "err", err)
+		return nil, func() string { return "" }
+	}
+	if f == nil {
+		return nil, func() string { return "" }
+	}
+	bw := &bestEffortWriter{w: f, step: step}
+	return bw, func() string {
+		if err := f.Close(); err != nil && bw.err == nil {
+			bw.err = err
+			slog.Warn("验证日志落盘失败（不影响验证结果）", "step", step, "err", err)
+		}
+		if bw.err != nil {
+			return ""
+		}
+		return ref
+	}
+}
+
+// bestEffortWriter 吞掉写错误：第一次失败记 warn，之后不再写。
+type bestEffortWriter struct {
+	w    io.Writer
+	step string
+	err  error
+}
+
+func (b *bestEffortWriter) Write(p []byte) (int, error) {
+	if b.err == nil {
+		if _, err := b.w.Write(p); err != nil {
+			b.err = err
+			slog.Warn("验证日志落盘失败（不影响验证结果）", "step", b.step, "err", err)
+		}
+	}
+	return len(p), nil
+}
+
+// writeStepLog 是一次性落盘的统一入口：吞掉错误、只记日志。
 //
 // 单独抽出来是为了让「落盘失败不能让验证失败」这条约束（T4-AC6）
 // 只在一处实现 —— 散在各个调用点迟早有一处忘记吞错误，
 // 于是磁盘满就能把一次本来能通过的验证判死。
 func writeStepLog(logs StepLogger, step string, output []byte) string {
-	if logs == nil {
-		return ""
+	w, done := openStepLog(logs, step)
+	if w != nil {
+		_, _ = w.Write(output)
 	}
-	ref, err := logs.WriteStepLog(step, output)
-	if err != nil {
-		slog.Warn("验证日志落盘失败（不影响验证结果）", "step", step, "err", err)
-		return ""
-	}
-	return ref
+	return done()
 }

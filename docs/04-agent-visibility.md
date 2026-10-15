@@ -84,6 +84,8 @@ claude CLI ──stdout NDJSON──> agent.Driver ──OnEvent──> EventSin
 EventSink：
 
 - 内部：有界 channel（256）+ 单 flush 协程，每 200ms 或攒满 20 条批量 INSERT
+  （机制实现在 `agent.BatchSink`，PRD 规划链路复用同一份写 `prd_events`；
+  runner 的 EventSink 在其上只多一路 subagent 记录轮询）
 - OnEvent 只做 `Digest` + 非阻塞投递
 - 缓冲满时：优先丢弃 `thinking`（界面价值最低、量最大），计数；任务结束时
   补一条 `kind='raw'` 的"溢出 N 条"记录，不静默丢

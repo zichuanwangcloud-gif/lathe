@@ -3,10 +3,12 @@ package runner
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 )
@@ -82,13 +84,13 @@ func TestStepLoggerSeparatesRounds(t *testing.T) {
 	if l0 == nil || l1 == nil {
 		t.Fatal("配了 LogDir 就该给出 logger")
 	}
-	r0, err := l0.WriteStepLog("build", []byte("首轮"))
-	if err != nil {
-		t.Fatalf("首轮落盘失败: %v", err)
+	r0 := writeStepLog(l0, "build", []byte("首轮"))
+	if r0 == "" {
+		t.Fatal("首轮落盘失败")
 	}
-	r1, err := l1.WriteStepLog("build", []byte("修复轮"))
-	if err != nil {
-		t.Fatalf("修复轮落盘失败: %v", err)
+	r1 := writeStepLog(l1, "build", []byte("修复轮"))
+	if r1 == "" {
+		t.Fatal("修复轮落盘失败")
 	}
 	if filepath.Dir(r0) == filepath.Dir(r1) {
 		t.Errorf("不同轮次应落在不同目录，都在 %s", filepath.Dir(r0))
@@ -123,9 +125,59 @@ func TestStepLoggerDisabledWithoutLogDir(t *testing.T) {
 // 磁盘满、权限不对都不该把一次本来能通过的验证判死。
 type failingLogger struct{ calls int }
 
-func (f *failingLogger) WriteStepLog(step string, output []byte) (string, error) {
+func (f *failingLogger) OpenStepLog(step string) (io.WriteCloser, string, error) {
 	f.calls++
-	return "", errors.New("磁盘满")
+	return nil, "", errors.New("磁盘满")
+}
+
+// brokenWriterLogger 打开成功、写到一半失败（磁盘中途写满）。
+type brokenWriterLogger struct{}
+
+type brokenWriter struct{}
+
+func (brokenWriter) Write([]byte) (int, error) { return 0, errors.New("磁盘满") }
+func (brokenWriter) Close() error              { return nil }
+
+func (brokenWriterLogger) OpenStepLog(step string) (io.WriteCloser, string, error) {
+	return brokenWriter{}, "verify-logs/broken.log", nil
+}
+
+// 写入中途失败：步骤结果照常（通过就是通过），log_ref 作废为空 ——
+// 不把残缺日志当完整的登记进库。
+func TestRunStepLogWriteFailureDoesNotFailStep(t *testing.T) {
+	v := NewVerifier(30*time.Second, "")
+	st := Step{Name: StepBuild, Cmd: []string{"sh", "-c", "echo ok"}}
+	res := v.runStep(context.Background(), t.TempDir(), st, brokenWriterLogger{})
+
+	if res.Status != StatusPassed {
+		t.Fatalf("Status got %v, want passed（err=%v）", res.Status, res.Err)
+	}
+	if res.LogRef != "" {
+		t.Errorf("写入失败时 LogRef got %q, want 空", res.LogRef)
+	}
+	if !strings.Contains(res.Output, "ok") {
+		t.Errorf("摘要不受落盘失败影响，got %q", res.Output)
+	}
+}
+
+// 单条日志有上限：超出部分丢弃，文件末尾注明截了多少。
+func TestStepLogIsCappedOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	l := &fileStepLogger{dataDir: dir, rel: "logs", maxBytes: 1000}
+	ref := writeStepLog(l, "build", []byte(strings.Repeat("x", 5000)))
+	if ref == "" {
+		t.Fatal("落盘失败")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ref))
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	if got := strings.Count(string(data), "x"); got != 1000 {
+		t.Errorf("落盘内容 got %d 字节 x, want 1000", got)
+	}
+	if !strings.Contains(string(data), "4000 字节未落盘") {
+		t.Errorf("末尾应注明截断量，got 尾部 %q", string(data[len(data)-80:]))
+	}
 }
 
 func TestWriteStepLogSwallowsFailure(t *testing.T) {

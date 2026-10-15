@@ -429,6 +429,8 @@ func serve(cfg config.Config) error {
 			Issues:    prdIssues{st: st},
 			Flows:     prdFlows{svc: flowSvc},
 			Channel:   cfg.ImplementChannel,
+			// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
+			SettingSources: cfg.SettingSources,
 		},
 	}
 	prdAPI.Routes(mux)

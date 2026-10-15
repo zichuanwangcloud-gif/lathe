@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 )
 
 // maxLineBytes 是单条 stream-json 事件的上限。
@@ -26,6 +28,19 @@ import (
 // init 事件会把全部工具、技能、插件清单塞进一行，实测已达数 KB；
 // 大仓 + 多插件时可能更大，因此远高于 bufio 默认的 64KB。
 const maxLineBytes = 16 << 20 // 16MB
+
+// pipeDrainGrace 是 CLI 退出后、读端等待管道 EOF 的上限。
+//
+// 进程退出时管道里剩的内容是毫秒级读完的；等满这段还没 EOF，只能是写端
+// 被逃出进程组的后台进程攥着，再等下去也不会有新的有效输出。
+const pipeDrainGrace = 5 * time.Second
+
+// stderrHead / stderrTail 是 stderr 的保留量：只进报错信息，头尾各留一段
+// （开头常是第一个报错，结尾是退出前的最后状态）。
+const (
+	stderrHead = 1 << 10
+	stderrTail = 3 << 10
+)
 
 // EventType 是 stream-json 的事件类型。
 type EventType string
@@ -190,15 +205,30 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	cmd.Env = append(sanitizedEnv(), p.ExtraEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	stdout, err := cmd.StdoutPipe()
+	// stdout/stderr 都用自建管道、在后台读，而不是 StdoutPipe +「读到 EOF
+	// 再 Wait」。EOF 要等**所有**持有写端的进程都退出 —— agent 用 Bash
+	// 留下的后台进程（dev server 之类）会继承这两个 fd，它不退出管道就不关，
+	// Run 一直挂到执行超时：一次成功的执行被报成超时，期间进程树、事件 sink
+	// 的协程、worker 槽位全被占着。现在先等进程退出，再给读端一段宽限期。
+	outR, outW, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("agent: 接管 stdout 失败: %w", err)
+		return nil, fmt.Errorf("agent: 建 stdout 管道失败: %w", err)
 	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	defer outR.Close()
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		outW.Close()
+		return nil, fmt.Errorf("agent: 建 stderr 管道失败: %w", err)
+	}
+	defer errR.Close()
+	cmd.Stdout, cmd.Stderr = outW, errW
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("agent: 启动 %s 失败: %w", d.bin, err)
+	startErr := cmd.Start()
+	// 父进程必须关掉自己的写端，否则读端永远等不到 EOF
+	outW.Close()
+	errW.Close()
+	if startErr != nil {
+		return nil, fmt.Errorf("agent: 启动 %s 失败: %w", d.bin, startErr)
 	}
 	pgid := cmd.Process.Pid
 
@@ -213,11 +243,47 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	}()
 	defer close(killed)
 
-	result, parseErr := parseStream(stdout, p.OnEvent)
+	// 事件在后台读，OnEvent 因此在这个协程里回调（RunParams.OnEvent 的
+	// 契约本来就是「在读取协程里同步执行」，调用方的实现须并发安全）。
+	type parsed struct {
+		result *Result
+		err    error
+	}
+	var out parsed
+	parseDone := make(chan struct{})
+	go func() {
+		out.result, out.err = parseStream(outR, p.OnEvent)
+		close(parseDone)
+	}()
+	// stderr 只留头尾：只用于报错，CLI 狂刷时内存不该跟着涨。
+	stderr := capbuf.New(stderrHead, stderrTail)
+	stderrDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(stderr, errR)
+		close(stderrDone)
+	}()
 
 	waitErr := cmd.Wait()
-	// 兜底：即使正常退出也再扫一遍进程组，杀掉可能残留的孙子进程
+	// 兜底：即使正常退出也再扫一遍进程组，杀掉可能残留的孙子进程。
+	// 同组的遗留后台进程死了，它们持有的写端随之关闭，读端拿到 EOF。
 	killProcessGroup(pgid)
+
+	// 进程已退出，管道里剩下的内容一般毫秒级读完。宽限期过了还没 EOF，
+	// 说明写端被逃出进程组的进程（setsid 之类）攥着 —— 强关读端，不再等。
+	deadline := time.Now().Add(pipeDrainGrace)
+	forced := drainOrClose(parseDone, outR, deadline)
+	drainOrClose(stderrDone, errR, deadline)
+
+	result, parseErr := out.result, out.err
+	if forced {
+		if result != nil {
+			// result 已到手，读端是我们自己关的，读错误不算执行失败
+			parseErr = nil
+		} else if parseErr != nil {
+			parseErr = fmt.Errorf("agent: CLI 已退出但 stdout 被逃出进程组的后台进程占用，"+
+				"%v 后强制停止读取: %w", pipeDrainGrace, parseErr)
+		}
+	}
 
 	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
 		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", limit.Round(time.Second))
@@ -230,14 +296,14 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	}
 	if result == nil {
 		return nil, fmt.Errorf("%w（退出错误: %v，stderr: %s）",
-			ErrNoResultEvent, waitErr, truncate(stderr.String(), 2000))
+			ErrNoResultEvent, waitErr, stderr.String())
 	}
 
 	// CLI 以非零码退出但给了 result 事件时，以 result 为准：
 	// is_error/subtype 描述得比退出码精确。
 	if waitErr != nil && !result.IsError {
 		return result, fmt.Errorf("agent: CLI 非零退出（%v），stderr: %s",
-			waitErr, truncate(stderr.String(), 2000))
+			waitErr, stderr.String())
 	}
 	return result, nil
 }
@@ -331,6 +397,23 @@ func killProcessGroup(pgid int) {
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 	time.Sleep(200 * time.Millisecond)
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+}
+
+// drainOrClose 等 done 关闭（读协程拿到 EOF）；到 deadline 仍未关闭就
+// 强关读端 r 逼读协程退出，再等它收尾。返回是否走了强关。
+//
+// 读协程在 r 关闭后必然很快返回（Read 立即报错），所以第二次等待是有界的。
+func drainOrClose(done <-chan struct{}, r *os.File, deadline time.Time) bool {
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case <-done:
+		return false
+	case <-t.C:
+		r.Close()
+		<-done
+		return true
+	}
 }
 
 // sanitizedEnv 返回 agent 子进程的环境变量。

@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 )
 
 // heavy.go 实现 docs/02-design.md §5.3 的 heavy 档：红-绿复现证明。
@@ -362,7 +364,7 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 		if r.Status == StatusError {
 			res.Status = StatusError
 			res.Err = fmt.Errorf("runner: 复现测试 %s 没能跑起来: %v", rt.File, r.Err)
-			res.Output = truncate(outputs.String(), maxStepOutput)
+			res.Output = capbuf.ClipMiddle(outputs.String(), maxStepOutput)
 			res.LogRef = strings.Join(refs, " ")
 			return res
 		}
@@ -372,7 +374,7 @@ func (v *Verifier) runReproOn(ctx context.Context, runRoot, srcRoot string, test
 			failed++
 		}
 	}
-	res.Output = truncate(outputs.String(), maxStepOutput)
+	res.Output = capbuf.ClipMiddle(outputs.String(), maxStepOutput)
 	res.LogRef = strings.Join(refs, " ")
 
 	if red {
