@@ -1,0 +1,13 @@
+#!/bin/sh
+# 拒绝直接推送 main / dev（含 force-push 与删除）。一切走 PR。
+# 规范见 docs/11-branching-release.md §2.1；远端规则集是最终防线。
+# stdin 每行：<local ref> <local sha> <remote ref> <remote sha>
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/dev)
+      echo "✗ 不能直接推送 ${remote_ref#refs/heads/}，请推到功能分支后开 PR。" >&2
+      exit 1
+      ;;
+  esac
+done
+exit 0

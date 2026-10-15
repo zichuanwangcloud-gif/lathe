@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **分支与发版规范**（`docs/11-branching-release.md`）：新增 `dev` 集成分支并设为
+  默认分支，`main` 只承载已发布代码、只接 `release/X.Y.Z` / `hotfix/X.Y.Z` 的 PR；
+  CI 新增「分支流向」检查；`release.yml` 校验正式 tag 落在 `main`、RC tag 落在
+  release/hotfix 分支；新增 `make hooks`（本地拦截在 main/dev 上提交与推送）与
+  `make release-check VERSION=x.y.z`（发版就绪度核查）
+
 ### Fixed
 
 - **agent 留下后台进程时执行被挂到超时**：驱动原来「读 stdout 到 EOF 再

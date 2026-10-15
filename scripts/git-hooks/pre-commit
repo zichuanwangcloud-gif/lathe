@@ -1,0 +1,14 @@
+#!/bin/sh
+# 拒绝在受保护分支上直接提交。规范见 docs/11-branching-release.md §2.1。
+# 远端规则集同样会拒绝推送，这里只是让你在本地就知道。
+# 临时绕过：git commit --no-verify（远端照样拒绝）。
+branch=$(git symbolic-ref --short -q HEAD) || exit 0   # detached HEAD 不拦
+case "$branch" in
+  main|dev)
+    echo "✗ 不能直接在 $branch 上提交。" >&2
+    echo "  从 dev 切分支：git switch -c feat/<topic>（或 fix/<topic>），改完 PR 回 dev。" >&2
+    echo "  已经提交了的话：git branch feat/<topic> && git reset --keep origin/$branch" >&2
+    exit 1
+    ;;
+esac
+exit 0
