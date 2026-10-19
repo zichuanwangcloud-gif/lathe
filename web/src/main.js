@@ -7,8 +7,9 @@ import LinearIssues from './views/LinearIssues.vue'
 import TaskDetail from './views/TaskDetail.vue'
 import FlowList from './views/FlowList.vue'
 import FlowCanvas from './views/FlowCanvas.vue'
-import PRDList from './views/PRDList.vue'
-import PRDDetail from './views/PRDDetail.vue'
+import PRDChatLayout from './views/prd/PRDChatLayout.vue'
+import PRDNewChat from './views/prd/PRDNewChat.vue'
+import PRDConversation from './views/prd/PRDConversation.vue'
 import Issues from './views/Issues.vue'
 import IssueDetail from './views/IssueDetail.vue'
 import Repos from './views/Repos.vue'
@@ -35,9 +36,18 @@ const router = createRouter({
     { path: '/flows', name: 'flows', component: FlowList },
     { path: '/flows/new', name: 'flow-new', component: FlowCanvas },
     { path: '/flows/:id', name: 'flow', component: FlowCanvas, props: true },
-    // 模糊任务（docs/10）：说不清的需求先对话成 PRD，签字后才生成正式任务
-    { path: '/prds', name: 'prds', component: PRDList },
-    { path: '/prds/:id', name: 'prd', component: PRDDetail, props: true },
+    // 模糊任务（docs/10）：说不清的需求先对话成 PRD，签字后才生成正式任务。
+    // 对话形态：外壳（会话侧栏）常驻，子路由是新建页或某段会话。
+    // fullBleed 让外壳铺满视口；shellKey 让切会话时只重建子路由、侧栏不闪。
+    {
+      path: '/prds',
+      component: PRDChatLayout,
+      meta: { fullBleed: true, shellKey: 'prds' },
+      children: [
+        { path: '', name: 'prds', component: PRDNewChat },
+        { path: ':id', name: 'prd', component: PRDConversation, props: true },
+      ],
+    },
     // 「Linear 任务」只有绑定了 Linear API 令牌的人可见（菜单与守卫同一依据）
     { path: '/linear', name: 'linear', component: LinearIssues, meta: { linear: true } },
     { path: '/tasks/:id', name: 'task', component: TaskDetail, props: true },

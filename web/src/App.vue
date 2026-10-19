@@ -42,7 +42,7 @@ onMounted(() => {
   <!-- 公开页自带居中布局，不套导航外壳 -->
   <RouterView v-else-if="route.meta.public" />
 
-  <div v-else class="shell">
+  <div v-else class="shell" :class="{ bleed: route.meta.fullBleed }">
     <header class="topbar">
       <div class="row">
         <RouterLink to="/" class="brand">Lathe</RouterLink>
@@ -68,7 +68,7 @@ onMounted(() => {
     <!-- 按 path 作 key：/tasks/1 → /tasks/2 这类同组件换参数时重建实例，
          否则旧任务的事件、游标、轮询状态会混进新页面。只看 path 不看
          query，看板改筛选/翻页（只动 query）不会被重建 -->
-    <main><RouterView :key="route.path" /></main>
+    <main :class="{ bleed: route.meta.fullBleed }"><RouterView :key="route.meta.shellKey || route.path" /></main>
     <ConfirmDialog />
   </div>
 </template>
@@ -98,7 +98,15 @@ onMounted(() => {
 .brand:hover { text-decoration: none; }
 nav a { color: var(--text-dim); padding: 4px 2px; }
 nav a:hover { text-decoration: none; color: var(--text); }
-nav a.router-link-exact-active { color: var(--accent); }
+nav a.router-link-exact-active,
+/* 详情类子路径（/prds/3、/issues/7）也点亮所属菜单；看板是 /，用 exact 才不会处处点亮 */
+nav a.router-link-active:not([href="/"]) { color: var(--accent); }
 
 main { padding: 24px; max-width: 1280px; margin: 0 auto; }
+
+/* 铺满视口的页面（模糊任务的对话界面）：外壳定高、内容区自己管滚动，
+   输入框才能钉在底部、对话流在中间滚 —— 整页滚动做不出对话形态。 */
+.shell.bleed { height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
+.shell.bleed .topbar { position: static; flex: none; }
+main.bleed { flex: 1; min-height: 0; width: 100%; max-width: none; padding: 0; display: flex; flex-direction: column; }
 </style>

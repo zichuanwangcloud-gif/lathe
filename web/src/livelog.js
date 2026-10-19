@@ -1,6 +1,6 @@
 // livelog.js —— 详情页「实时日志 + 轮询」的三件共用工具。
 //
-// 为什么要有它：TaskDetail / PRDDetail 原来的写法是 setInterval 增量拉事件、
+// 为什么要有它：TaskDetail / PRD 详情页原来的写法是 setInterval 增量拉事件、
 // events.push 只加不减、markdown 每次渲染现算。长任务或多轮 PRD 下三者叠加：
 // 实测 3 万条事件时 DOM 涨到 8.6 万节点、JS 堆近 300MB，浏览器主线程被占满，
 // 鼠标都挪不动。这里把三处各自补上上限：
