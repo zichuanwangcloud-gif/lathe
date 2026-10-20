@@ -204,7 +204,9 @@ const liveIsReview = computed(() => {
   if (reviewing.value) return true
   return events.value.at(-1)?.phase === REVIEW_PHASE
 })
-const liveRound = computed(() => (prd.value?.round || 0) + 1)
+// 自动续推时轮次会连着涨，那条实时块要一直跟着最新一轮走；发送后到第一轮
+// 落库之前也要有个轮号给它
+const liveRound = computed(() => Math.max(prd.value?.round || 0, sendBaseRound.value) + 1)
 const liveEvents = computed(() => {
   if (liveIsReview.value) return reviewEvents.value
   const list = eventsByRound.value[liveRound.value] || []
