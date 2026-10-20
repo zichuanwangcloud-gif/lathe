@@ -233,3 +233,98 @@ func TestParseRoundTripsFullDocument(t *testing.T) {
 		t.Error("落库往返后 AC 丢了")
 	}
 }
+
+// 现行格式：patch 合并进上一版快照后再校验。合并结果里的悬空引用照样被拦
+// —— 增量不等于放松闸门。
+func TestParseRoundPatchMergesThenValidates(t *testing.T) {
+	cases := []struct {
+		name    string
+		text    string
+		wantErr string // 空 = 应成功
+	}{
+		{
+			name: "只交改动的节，没提的节与条目保留",
+			text: `{"type":"feature","patch":{"sections":{"problem":{"body":"阈值写死在 gate.go:31 与 :58"}}},
+			        "questions":[],"notes":"补了证据"}`,
+		},
+		{
+			name:    "新任务引用合并后仍不存在的 AC → 拒",
+			text:    `{"type":"feature","patch":{"tasks":[{"key":"T2","title":"前端","kind":"feature","acceptance":["AC-9"]}]}}`,
+			wantErr: "AC-9",
+		},
+		{
+			name:    "删掉仍被任务引用的 AC → 拒（悬空引用）",
+			text:    `{"type":"feature","patch":{"remove":{"criteria":["AC-1"]}}}`,
+			wantErr: "AC-1",
+		},
+		{
+			name:    "既没有 patch 也没有 document → 拒",
+			text:    `{"type":"feature","questions":[]}`,
+			wantErr: "patch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseRound(tc.text, RoundParse{Stage: StageConverge, Base: baseDoc(), Round: 3})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("应报含 %q 的错，got=%v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("应成功: %v", err)
+			}
+			if got.Document.OneLiner.Status != StatusConfirmed {
+				t.Errorf("没动的节应保留人的 confirmed，got=%q", got.Document.OneLiner.Status)
+			}
+			if len(got.Document.Tasks) != 1 || len(got.Document.Criteria) != 1 {
+				t.Errorf("没提到的任务/AC 应保留，got tasks=%d criteria=%d",
+					len(got.Document.Tasks), len(got.Document.Criteria))
+			}
+		})
+	}
+}
+
+// 旧格式（完整快照）原样放回人确认过的节：正文没变就沿用确认；正文变了
+// 或上一版本来就不是 confirmed，照旧降级 —— 模型依然不能自封。
+func TestParseFullSnapshotKeepsUnchangedConfirmation(t *testing.T) {
+	text := `{"type":"feature","document":{
+		"oneLiner":{"status":"confirmed","body":"让管理员配预览阈值"},
+		"problem":{"status":"confirmed","body":"改写过的问题陈述"}
+	}}`
+	got, err := ParseRound(text, RoundParse{Stage: StageConverge, Base: baseDoc(), Round: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Document.OneLiner.Status != StatusConfirmed {
+		t.Errorf("原样放回的已确认节应保持 confirmed，got=%q", got.Document.OneLiner.Status)
+	}
+	if got.Document.Problem.Status != StatusInferred {
+		t.Errorf("上一版不是 confirmed 的节不许被自封，got=%q", got.Document.Problem.Status)
+	}
+}
+
+// 问题预算按调用方给的上限截断，空白问题不占名额。
+func TestParseRoundQuestionBudget(t *testing.T) {
+	text := `{"type":"feature","patch":{},"questions":["  ","q1","q2","q3"]}`
+	got, err := ParseRound(text, RoundParse{Stage: StageConverge, MaxQuestions: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Questions) != 1 || got.Questions[0] != "q1" {
+		t.Errorf("上限 1 时应只留 q1，got=%q", got.Questions)
+	}
+}
+
+// 多前驱写进一个 dependsOn 是实测最常见的拒收原因（dev 实例第 6 轮）：
+// 报错必须讲清规则，修正回合才知道怎么改。
+func TestParseMultiDependsOnExplainsRule(t *testing.T) {
+	text := `{"type":"feature","patch":{"tasks":[
+		{"key":"T2","title":"a","kind":"feature"},
+		{"key":"T3","title":"b","kind":"feature","dependsOn":"T1,T2"}]}}`
+	_, err := ParseRound(text, RoundParse{Stage: StageSplit, Base: baseDoc(), Round: 5})
+	if err == nil || !strings.Contains(err.Error(), "只能填一个") {
+		t.Fatalf("应报出入度规则，got=%v", err)
+	}
+}

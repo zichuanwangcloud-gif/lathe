@@ -35,6 +35,7 @@ const emit = defineEmits([
   'close',
   'confirm-section',
   'save-dispositions',
+  'answer-reverse',
   'dismiss-report',
 ])
 
@@ -42,6 +43,17 @@ const doc = computed(() => props.prd.document || {})
 const tasks = computed(() => props.prd.taskBlocks?.tasks || [])
 const review = computed(() => props.prd.reviewReport || null)
 const findings = computed(() => review.value?.findings || [])
+
+// 挂着反向确认但人还没答复的 AC：定稿自检要求它们全部有答复。
+const unansweredReverse = computed(() =>
+  (doc.value.criteria || []).filter((c) => c.reverseConfirm && c.reverseAccepted == null),
+)
+// 「全部接受」一次提交：逐条点 20 次是另一种形式的问题轰炸。
+function acceptAllReverse() {
+  const answers = {}
+  for (const c of unansweredReverse.value) answers[c.id] = true
+  emit('answer-reverse', answers)
+}
 
 const sectionsView = computed(() =>
   SECTIONS.map((s) => ({ ...s, body: doc.value[s.key] || { status: '', body: '' } })),
@@ -230,6 +242,13 @@ function saveDispositions() {
 
           <!-- §7：AC 卡片 + 系统附加的上线条件 -->
           <template v-if="s.key === 'acceptance'">
+            <div v-if="caps.reverse && unansweredReverse.length" class="bulk">
+              <span class="faint">{{ unansweredReverse.length }} 条反向确认未答复</span>
+              <button class="link" :disabled="acting" @click="acceptAllReverse">
+                全部接受
+              </button>
+              <span class="faint tiny">接受 = 认可「这条 AC 放过的那些情况」</span>
+            </div>
             <div v-for="c in doc.criteria || []" :key="c.id" class="item ac">
               <span class="mono tag">{{ c.id }}</span>
               <div>
@@ -252,11 +271,19 @@ function saveDispositions() {
                   </div>
                   <div v-if="c.evidence" class="faint">判据：{{ c.evidence }}</div>
                   <div v-if="c.manualSteps" class="faint">走查：{{ c.manualSteps }}</div>
-                  <div v-if="c.reverseConfirm" class="faint">
+                  <div v-if="c.reverseConfirm" class="faint rev">
                     反向确认：{{ c.reverseConfirm }}
                     <span class="badge" :class="c.reverseAccepted == null ? 'bad' : 'ok'">
                       {{ c.reverseAccepted == null ? '未答复' : c.reverseAccepted ? '接受' : '不接受' }}
                     </span>
+                    <!-- 人在这里答复，而不是让智能体把每条反向确认都当对话问题问
+                         （那是问题轰炸的一大来源）。定稿自检要求每条都有答复。 -->
+                    <template v-if="caps.reverse">
+                      <button class="link" :disabled="acting"
+                        @click="emit('answer-reverse', { [c.id]: true })">接受</button>
+                      <button class="link" :disabled="acting"
+                        @click="emit('answer-reverse', { [c.id]: false })">不接受</button>
+                    </template>
                   </div>
                 </template>
               </div>
@@ -463,6 +490,13 @@ function saveDispositions() {
 .report li { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; }
 .link { border: none; background: none; padding: 0 2px; color: var(--accent); font-size: 13px; }
 .link:hover:not(:disabled) { text-decoration: underline; }
+.link:disabled { opacity: .45; }
+.bulk {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 8px; padding: 6px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2);
+}
+.rev { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 .sec {
   padding: 12px 0 14px;

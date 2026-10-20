@@ -34,17 +34,14 @@ type fakePlanner struct {
 	convertErr error
 }
 
-func (f *fakePlanner) RunRound(context.Context, prd.RunRoundParams) (*prd.RoundResult, error) {
+func (f *fakePlanner) StartRound(context.Context, prd.RunRoundParams) error {
 	f.roundCalls++
-	if f.roundErr != nil {
-		return nil, f.roundErr
-	}
-	return &prd.RoundResult{Questions: []string{"阈值上限该定多少？"}, Notes: "本轮问了一个问题"}, nil
+	return f.roundErr
 }
 
-func (f *fakePlanner) RunReview(context.Context, int64, int64) (*prd.ReviewReport, error) {
+func (f *fakePlanner) StartReview(context.Context, int64, int64) error {
 	f.reviewCalls++
-	return &prd.ReviewReport{Verdict: "攻不动"}, nil
+	return nil
 }
 
 func (f *fakePlanner) SubmitForReview(context.Context, int64, int64) (*prd.Report, error) {
@@ -236,8 +233,8 @@ func TestPRDTransitionGuards(t *testing.T) {
 		// 唤醒后能落一轮问答：否则「回来接着说」只是句空话。
 		// RunRound 走假 planner，只验状态机放行。
 		if resp, body := doReq(t, srv, http.MethodPost,
-			"/api/prds/"+id+"/rounds", `{"answer":"按内存算"}`); resp.StatusCode != http.StatusOK {
-			t.Errorf("唤醒后应能跑对话轮次，got=%d 响应=%v", resp.StatusCode, body)
+			"/api/prds/"+id+"/rounds", `{"answer":"按内存算"}`); resp.StatusCode != http.StatusAccepted {
+			t.Errorf("唤醒后应能发起对话轮次（202），got=%d 响应=%v", resp.StatusCode, body)
 		}
 	})
 
@@ -581,6 +578,120 @@ func TestExportPRD(t *testing.T) {
 		resp, _ := doRaw(t, otherSrv, "/api/prds/"+id+"/export")
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("非属主导出应 404，got=%d", resp.StatusCode)
+		}
+	})
+}
+
+// 发起轮次 / 复核是后台运行：抢到就回 202 + PRD 行，抢占冲突同步 409。
+func TestPRDStartEndpointsAreAsync(t *testing.T) {
+	api, planner, st, userID, repoID := prdFixture(t)
+	srv := prdServer(t, api)
+	row := mustPRD(t, st, userID, repoID)
+	id := strconv.FormatInt(row.ID, 10)
+
+	t.Run("发起轮次回 202 并带上 PRD 行", func(t *testing.T) {
+		resp, body := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/rounds", `{"answer":"按默认"}`)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("状态码 got=%d want=202，响应=%v", resp.StatusCode, body)
+		}
+		if p, _ := body["prd"].(map[string]any); p == nil || p["id"] == nil {
+			t.Errorf("响应应带 PRD 行供前端开始轮询，got=%v", body)
+		}
+	})
+
+	t.Run("已有一轮在跑 → 同步 409", func(t *testing.T) {
+		planner.roundErr = store.ErrPRDBusy
+		defer func() { planner.roundErr = nil }()
+		resp, body := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/rounds", "")
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("状态码 got=%d want=409，响应=%v", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("没有 AC 时复核同步拒绝，不起后台运行", func(t *testing.T) {
+		before := planner.reviewCalls
+		resp, body := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/review", "")
+		if resp.StatusCode != http.StatusConflict {
+			t.Errorf("状态码 got=%d want=409，响应=%v", resp.StatusCode, body)
+		}
+		if planner.reviewCalls != before {
+			t.Error("注定失败的复核不该起后台运行")
+		}
+	})
+
+	t.Run("有 AC 时复核回 202", func(t *testing.T) {
+		withCriteria(t, st, row.ID, userID, "")
+		resp, body := doReq(t, srv, http.MethodPost, "/api/prds/"+id+"/review", "")
+		if resp.StatusCode != http.StatusAccepted {
+			t.Errorf("状态码 got=%d want=202，响应=%v", resp.StatusCode, body)
+		}
+	})
+}
+
+// withCriteria 给 PRD 写一份带一条 AC 的快照；reverse 非空时 AC 带反向确认。
+func withCriteria(t *testing.T, st *store.Store, prdID, userID int64, reverse string) {
+	t.Helper()
+	doc := &prd.Document{Type: prd.TypeFeature, Criteria: []prd.Criterion{{
+		ID: "AC-1", Category: prd.CatHappyPath, Given: "阈值 75", When: "占用 80%", Then: "409",
+		ReverseConfirm: reverse,
+	}}}
+	raw, err := doc.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdatePRDContent(context.Background(), prdID, userID,
+		store.UpdatePRDContentParams{Document: raw}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 反向确认由人在面板上答复：原来没有任何入口能写 reverseAccepted，
+// 定稿自检却要求它非空，模型只好把每条反向确认都当对话问题来问。
+func TestAnswerReverseConfirm(t *testing.T) {
+	api, _, st, userID, repoID := prdFixture(t)
+	srv := prdServer(t, api)
+
+	cases := []struct {
+		name     string
+		reverse  string
+		body     string
+		wantCode int
+	}{
+		{"接受一条", "按此 AC，75% 整不会被拦，你接受吗", `{"answers":{"AC-1":true}}`, http.StatusOK},
+		{"未知 AC 编号 → 400", "按此 AC，75% 整不会被拦，你接受吗", `{"answers":{"AC-9":true}}`, http.StatusBadRequest},
+		{"没有反向确认的 AC → 400", "", `{"answers":{"AC-1":true}}`, http.StatusBadRequest},
+		{"空答复 → 400", "按此 AC，75% 整不会被拦，你接受吗", `{"answers":{}}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := mustPRD(t, st, userID, repoID)
+			withCriteria(t, st, row.ID, userID, tc.reverse)
+			resp, body := doReq(t, srv, http.MethodPut,
+				"/api/prds/"+strconv.FormatInt(row.ID, 10)+"/criteria/reverse", tc.body)
+			if resp.StatusCode != tc.wantCode {
+				t.Fatalf("状态码 got=%d want=%d，响应=%v", resp.StatusCode, tc.wantCode, body)
+			}
+			got, err := st.GetPRD(context.Background(), row.ID, userID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			doc, _ := prd.ParseDocument(got.Document)
+			answered := doc.Criteria[0].ReverseAccepted != nil
+			if answered != (tc.wantCode == http.StatusOK) {
+				t.Errorf("reverseAccepted 写入 got=%v want=%v（被拒的请求不许部分写入）", answered, tc.wantCode == http.StatusOK)
+			}
+		})
+	}
+
+	t.Run("非属主 → 404", func(t *testing.T) {
+		row := mustPRD(t, st, userID, repoID)
+		withCriteria(t, st, row.ID, userID, "按此 AC，75% 整不会被拦，你接受吗")
+		otherID := mustUser(t, st, "prds-rev-other-"+t.Name()+"@example.com")
+		otherSrv := prdServer(t, &PRDAPI{Store: st, Auth: authAs(otherID, "o@example.com")})
+		resp, _ := doReq(t, otherSrv, http.MethodPut,
+			"/api/prds/"+strconv.FormatInt(row.ID, 10)+"/criteria/reverse", `{"answers":{"AC-1":true}}`)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("非属主应 404（不暴露存在性），got=%d", resp.StatusCode)
 		}
 	})
 }

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -376,6 +377,31 @@ func TestRunNoResultEvent(t *testing.T) {
 //
 // 假 claude 会派生一个长命孙子进程；驱动超时杀进程组后，
 // 该孙子进程必须也已消失。
+// 静默超时：进程先输出一行，然后什么都不吐。总超时给足（30 秒），
+// 判死的应该是空闲看门狗 —— 报错必须是「卡死」而不是「超时」，两者
+// 排障方向完全不同（一个是上限太小，一个是进程死了）。
+func TestRunIdleWatchdogKillsSilentAgent(t *testing.T) {
+	bin := fakeClaude(t, fmt.Sprintf(`
+echo '%s'
+sleep 60
+`, sysInitLine))
+
+	d := &Driver{bin: bin, timeout: 30 * time.Second, idle: 500 * time.Millisecond}
+	start := time.Now()
+	_, err := d.Run(context.Background(), RunParams{Prompt: "卡住", SessionID: "s"})
+	elapsed := time.Since(start)
+
+	if err == nil || !errors.Is(err, ErrIdle) {
+		t.Fatalf("应报 ErrIdle，得到: %v", err)
+	}
+	if strings.Contains(err.Error(), "执行超时") {
+		t.Errorf("卡死不该报成总超时（会误导排障方向）: %v", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("静默判死后应迅速返回，实际耗时 %v", elapsed)
+	}
+}
+
 func TestRunTimeoutKillsEntireProcessTree(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "grandchild.pid")

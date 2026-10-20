@@ -26,19 +26,42 @@ type RoundResult struct {
 }
 
 // rawRound 是 agent 输出的线格式。
+//
+// Patch 与 Document 二选一：Patch 是现行格式（只交改动，见 patch.go），
+// Document 是旧的完整快照格式，仍然接受 —— 模型偶尔会照旧交整份，
+// 拒掉它只会白白多一次修正往返。两个都给时以 Patch 为准。
 type rawRound struct {
 	Type      string          `json:"type"`
+	Patch     json.RawMessage `json:"patch"`
 	Document  json.RawMessage `json:"document"`
 	Questions []string        `json:"questions"`
 	Notes     string          `json:"notes"`
 }
 
-// ParseRoundResult 解析一轮的 agent 输出。
+// RoundParse 是解析一轮输出所需的上下文。
+type RoundParse struct {
+	// Stage 用于放宽早期阶段的校验（见 ParseRoundResult）。
+	Stage Stage
+	// Base 是上一轮的完整快照（首轮为 nil），patch 合并进它。
+	Base *Document
+	// Round 是本轮轮次，给新决策补轮号。
+	Round int
+	// MaxQuestions 是本轮问题上限，0 取 maxQuestionsPerRound。
+	MaxQuestions int
+}
+
+// ParseRoundResult 解析一轮的 agent 输出（无上一版快照、按默认问题上限）。
 //
 // stage 用于放宽早期阶段的校验：阶段 A 还没读代码，不可能有 file:line
 // 证据，也不该要求 AC 表齐全 —— 那些是阶段 C 之后的事。定稿闸门在
 // Check()，不在这里。这里只拦「结构性说不通」的东西。
 func ParseRoundResult(text string, stage Stage) (*RoundResult, error) {
+	return ParseRound(text, RoundParse{Stage: stage})
+}
+
+// ParseRound 解析一轮的 agent 输出：截 JSON → 合并补丁（或接收完整快照）
+// → 对合并结果做结构校验。
+func ParseRound(text string, in RoundParse) (*RoundResult, error) {
 	payload, err := extractJSON(text)
 	if err != nil {
 		return nil, err
@@ -49,12 +72,25 @@ func ParseRoundResult(text string, stage Stage) (*RoundResult, error) {
 		return nil, fmt.Errorf("prd: agent 输出不是合法 JSON: %w", err)
 	}
 
-	if len(raw.Document) == 0 {
-		return nil, fmt.Errorf("prd: agent 输出缺 document 字段")
-	}
-	doc, err := ParseDocument(raw.Document)
-	if err != nil {
-		return nil, fmt.Errorf("prd: 解析 document 失败: %w", err)
+	var doc *Document
+	switch {
+	case len(raw.Patch) > 0 && string(raw.Patch) != "null":
+		var p DocPatch
+		if err := json.Unmarshal(raw.Patch, &p); err != nil {
+			return nil, fmt.Errorf("prd: 解析 patch 失败: %w", err)
+		}
+		doc, err = in.Base.Apply(&p, in.Round)
+		if err != nil {
+			return nil, err
+		}
+	case len(raw.Document) > 0:
+		doc, err = ParseDocument(raw.Document)
+		if err != nil {
+			return nil, fmt.Errorf("prd: 解析 document 失败: %w", err)
+		}
+		normalizeFullSnapshot(doc, in.Base)
+	default:
+		return nil, fmt.Errorf("prd: agent 输出缺 patch 字段")
 	}
 
 	// 类型：顶层与 document 内不一致时以顶层为准（顶层是模型的「结论」，
@@ -66,18 +102,53 @@ func ParseRoundResult(text string, stage Stage) (*RoundResult, error) {
 		return nil, fmt.Errorf("prd: PRD 类型 %q 不在 defect/feature/refactor 内", doc.Type)
 	}
 
-	if err := validateDocument(doc, stage); err != nil {
+	if err := validateDocument(doc, in.Stage); err != nil {
 		return nil, err
 	}
 
-	qs := raw.Questions
-	if len(qs) > maxQuestionsPerRound {
+	limit := in.MaxQuestions
+	if limit <= 0 {
+		limit = maxQuestionsPerRound
+	}
+	qs := make([]string, 0, len(raw.Questions))
+	for _, q := range raw.Questions {
+		if q = strings.TrimSpace(q); q != "" {
+			qs = append(qs, q)
+		}
+	}
+	if len(qs) > limit {
 		// 截断而不是报错：模型多问了不是致命错误，但不能让它绕过
-		// 「每轮 ≤ 3 问」的纪律 —— 一轮 10 个问题的结果是人不答。
-		qs = qs[:maxQuestionsPerRound]
+		// 问题预算 —— 一轮 10 个问题的结果是人不答。
+		qs = qs[:limit]
 	}
 
 	return &RoundResult{Document: doc, Questions: qs, Notes: raw.Notes}, nil
+}
+
+// normalizeFullSnapshot 处理旧格式（完整快照）的节状态。
+//
+// 模型不许自封「人已确认」—— 那是人的动作，只能由逐节确认接口写入。
+// 但「原样放回」上一轮人已确认的节时，正文没变就沿用人的确认：原来一律
+// 降级，人逐节点过的确认下一轮就全没了。
+func normalizeFullSnapshot(d, base *Document) {
+	prev := map[string]Section{}
+	if base != nil {
+		for _, s := range base.Sections() {
+			prev[s.Key] = *s.Section
+		}
+	}
+	for _, s := range d.Sections() {
+		switch s.Section.Status {
+		case "":
+			// 没给 status 视作推断 —— 缺字段不能默默当成已确认。
+			s.Section.Status = StatusInferred
+		case StatusConfirmed:
+			old, ok := prev[s.Key]
+			if !ok || old.Status != StatusConfirmed || old.Body != s.Section.Body {
+				s.Section.Status = StatusInferred
+			}
+		}
+	}
 }
 
 // extractJSON 从可能夹带解释文字的回答里截出 JSON 对象。
@@ -109,19 +180,12 @@ func head(s string, n int) string {
 func validateDocument(d *Document, stage Stage) error {
 	for _, s := range d.Sections() {
 		if s.Section.Status == "" {
-			// 没给 status 视作推断 —— 模型自己写的东西一律要人过目，
-			// 缺字段不能默默当成已确认。
 			s.Section.Status = StatusInferred
 			continue
 		}
 		if !s.Section.Status.Valid() {
 			return fmt.Errorf("prd: %s 的 status %q 未知（应为 confirmed/inferred/pending）",
 				s.Title, s.Section.Status)
-		}
-		if s.Section.Status == StatusConfirmed {
-			// 模型不许自封「人已确认」—— 那是人的动作，只能由逐节确认
-			// 接口写入。这里降级而不是报错：模型照抄模板里的示例值很常见。
-			s.Section.Status = StatusInferred
 		}
 	}
 
@@ -200,6 +264,12 @@ func validateDocument(d *Document, stage Stage) error {
 	// 依赖引用要在收齐全部 key 之后再查（前向引用是合法的）。
 	for _, t := range d.Tasks {
 		if t.DependsOn != "" && !keys[t.DependsOn] {
+			if strings.ContainsAny(t.DependsOn, ",， ") {
+				// 实测最常见的形态：模型把多个前驱写进一个字段。报错里直接
+				// 讲清规则，修正回合才知道该怎么改（编排图入度 ≤ 1）。
+				return fmt.Errorf("prd: 任务 %s 的 dependsOn %q 写了多个前驱 —— dependsOn 只能填一个 key（编排图入度 ≤ 1）；"+
+					"要么只留真正用到其代码的那一个，要么把这几个前驱串成链、或合并成一个任务", t.Key, t.DependsOn)
+			}
 			return fmt.Errorf("prd: 任务 %s 依赖的 %s 不存在", t.Key, t.DependsOn)
 		}
 	}

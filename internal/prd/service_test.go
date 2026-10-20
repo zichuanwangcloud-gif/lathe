@@ -34,6 +34,7 @@ type fakeStore struct {
 	beginErr  error
 	beginCnt  int
 	updateCnt int
+	touchCnt  int
 }
 
 func newFakeStore() *fakeStore {
@@ -104,12 +105,29 @@ func (f *fakeStore) BeginPRDRound(context.Context, int64, int64) (*store.PRDRow,
 		return nil, store.ErrPRDBusy
 	}
 	f.busy = true
+	// 与真实现一致：新一次抢占清掉上次的失败记录。
+	f.row.LastError, f.row.LastErrorInput = nil, nil
 	cp := f.row
 	return &cp, nil
 }
 
 func (f *fakeStore) EndPRDRound(context.Context, int64, int64) error {
 	f.busy = false
+	return nil
+}
+
+func (f *fakeStore) TouchPRDRound(context.Context, int64, int64) error {
+	f.touchCnt++
+	return nil
+}
+
+func (f *fakeStore) FailPRDRun(_ context.Context, _, _ int64, msg, input string) error {
+	f.row.LastError = &msg
+	if input != "" {
+		f.row.LastErrorInput = &input
+	} else {
+		f.row.LastErrorInput = nil
+	}
 	return nil
 }
 
@@ -194,9 +212,11 @@ type fakeAgent struct {
 	calls   []agent.RunParams
 	// during 在回调完默认事件之后、返回之前执行，模拟「一轮正在跑」。
 	during func(p agent.RunParams)
+	// ctxCheck 在 during 之后拿到本次调用的 ctx（验后台运行不随请求取消）。
+	ctxCheck func(ctx context.Context)
 }
 
-func (f *fakeAgent) Run(_ context.Context, p agent.RunParams) (*agent.Result, error) {
+func (f *fakeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, error) {
 	i := len(f.calls)
 	f.calls = append(f.calls, p)
 
@@ -212,6 +232,9 @@ func (f *fakeAgent) Run(_ context.Context, p agent.RunParams) (*agent.Result, er
 	}
 	if f.during != nil {
 		f.during(p)
+	}
+	if f.ctxCheck != nil {
+		f.ctxCheck(ctx)
 	}
 
 	if i < len(f.errs) && f.errs[i] != nil {

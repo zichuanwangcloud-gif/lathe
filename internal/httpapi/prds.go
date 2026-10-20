@@ -33,8 +33,11 @@ type PRDAPI struct {
 // 定成接口而非直接吃 *prd.Service：httpapi 的测试不该为了测一条路由
 // 就真起一个 agent 子进程去读仓库。
 type PRDPlanner interface {
-	RunRound(ctx context.Context, p prd.RunRoundParams) (*prd.RoundResult, error)
-	RunReview(ctx context.Context, prdID, userID int64) (*prd.ReviewReport, error)
+	// StartRound / StartReview 同步抢占、后台运行、立即返回（docs/10 §1.4）。
+	// 抢占冲突（ErrPRDBusy）与状态不允许同步返回；之后的失败落在
+	// prds.last_error，界面轮询读取。
+	StartRound(ctx context.Context, p prd.RunRoundParams) error
+	StartReview(ctx context.Context, prdID, userID int64) error
 	SubmitForReview(ctx context.Context, prdID, userID int64) (*prd.Report, error)
 	Convert(ctx context.Context, prdID, userID int64) (*prd.FlowResult, error)
 }
@@ -52,6 +55,7 @@ func (a *PRDAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/prds/{id}/review", a.Auth.RequireFunc(a.review))
 	mux.Handle("PUT /api/prds/{id}/review/dispositions", a.Auth.RequireFunc(a.setDispositions))
 	mux.Handle("POST /api/prds/{id}/sections/{key}/confirm", a.Auth.RequireFunc(a.confirmSection))
+	mux.Handle("PUT /api/prds/{id}/criteria/reverse", a.Auth.RequireFunc(a.answerReverse))
 	mux.Handle("POST /api/prds/{id}/submit", a.Auth.RequireFunc(a.submit))
 	mux.Handle("POST /api/prds/{id}/approve", a.Auth.RequireFunc(a.approve))
 	mux.Handle("POST /api/prds/{id}/reject", a.Auth.RequireFunc(a.reject))
@@ -209,8 +213,10 @@ func (a *PRDAPI) events(w http.ResponseWriter, r *http.Request) {
 
 // runRound：POST /api/prds/{id}/rounds  {answer?, stage?}
 //
-// 返回跑完后的完整 PRD 行，而不只是本轮增量：一轮跑完 state / round /
-// document / taskBlocks 可能全变了，前端与其拼增量不如直接换一份。
+// 只负责抢占，抢到后这一轮（以及没有问题时的自动续推）在后台跑，立即
+// 回 202 + 当前 PRD 行（processing=true）。原来同步跑完才回：一轮 3~10
+// 分钟，刷新或断网一次 agent 就被取消，失败原因也只有这个请求看得到。
+// 前端之后靠轮询 GET /api/prds/{id} 看 processing / round / lastError。
 func (a *PRDAPI) runRound(w http.ResponseWriter, r *http.Request) {
 	id, ok := prdPathID(w, r)
 	if !ok {
@@ -238,30 +244,29 @@ func (a *PRDAPI) runRound(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := CurrentUser(r).ID
-	res, err := a.Planner.RunRound(r.Context(), prd.RunRoundParams{
+	if err := a.Planner.StartRound(r.Context(), prd.RunRoundParams{
 		PRDID:  id,
 		UserID: userID,
 		Answer: strings.TrimSpace(body.Answer),
 		Stage:  prd.Stage(body.Stage),
-	})
-	if err != nil {
-		writePRDError(w, "跑规划轮次失败", err)
+	}); err != nil {
+		writePRDError(w, "发起规划轮次失败", err)
 		return
 	}
+	a.writeAccepted(w, r, id, userID)
+}
 
+// writeAccepted 回 202 + 抢占后的 PRD 行。
+func (a *PRDAPI) writeAccepted(w http.ResponseWriter, r *http.Request, id, userID int64) {
 	row, err := a.Store.GetPRD(r.Context(), id, userID)
 	if err != nil {
 		writePRDError(w, "查询 PRD 失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"prd":       row,
-		"questions": nonNilStrings(res.Questions),
-		"notes":     res.Notes,
-	})
+	writeJSON(w, http.StatusAccepted, map[string]any{"prd": row})
 }
 
-// review：POST /api/prds/{id}/review —— 对抗复核（§5.5）。
+// review：POST /api/prds/{id}/review —— 对抗复核（§5.5），后台跑，回 202。
 //
 // 报告不带处置：Disposition 由人在界面里逐条填，让复核自己给自己判
 // 「这条不用改」等于没复核（docs/10 §5.5 的原话）。
@@ -274,12 +279,27 @@ func (a *PRDAPI) review(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "规划管线未启用"})
 		return
 	}
-	report, err := a.Planner.RunReview(r.Context(), id, CurrentUser(r).ID)
+	userID := CurrentUser(r).ID
+	// 没有 AC 时复核无从下手：同步拒绝，不起一次注定失败的后台运行。
+	row, err := a.Store.GetPRD(r.Context(), id, userID)
 	if err != nil {
-		writePRDError(w, "对抗复核失败", err)
+		writePRDError(w, "查询 PRD 失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, report)
+	doc, err := prd.ParseDocument(row.Document)
+	if err != nil {
+		serverError(w, "解析 PRD 快照失败", err)
+		return
+	}
+	if len(doc.Criteria) == 0 {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "还没有任何验收标准，无从复核"})
+		return
+	}
+	if err := a.Planner.StartReview(r.Context(), id, userID); err != nil {
+		writePRDError(w, "发起对抗复核失败", err)
+		return
+	}
+	a.writeAccepted(w, r, id, userID)
 }
 
 // submit：POST /api/prds/{id}/submit —— 提交评审前跑定稿自检。
@@ -446,14 +466,6 @@ func writePRDError(w http.ResponseWriter, msg string, err error) {
 	}
 }
 
-// nonNilStrings 把 nil 切片兜成空数组，省掉前端一处判空。
-func nonNilStrings(in []string) []string {
-	if in == nil {
-		return []string{}
-	}
-	return in
-}
-
 // 编译期断言：*prd.Service 满足本包对规划管线的需求。
 var _ PRDPlanner = (*prd.Service)(nil)
 
@@ -514,6 +526,74 @@ func (a *PRDAPI) confirmSection(w http.ResponseWriter, r *http.Request) {
 		store.UpdatePRDContentParams{Document: raw})
 	if err != nil {
 		writePRDError(w, "确认小节失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// answerReverse：PUT /api/prds/{id}/criteria/reverse  {"answers": {"AC-1": true, "AC-2": false}}
+//
+// 反向确认（docs/10 §5.4「按此 AC，X 情况不会被拦，你接受吗？」）由人在
+// 文档面板上逐条答复。原来没有任何入口能写 reverseAccepted，而定稿自检
+// 要求每条反向确认都有答复（CodeReverseUnanswered）—— 结果是模型只能把
+// 它们当对话问题来问，每条 AC 一个问题，这是问题轰炸的一大来源。
+//
+// 只改 reverseAccepted，不碰 AC 的其他字段；未知的 AC 编号整批拒绝
+// （400），不做部分写入 —— 前端拿到的永远是一致的状态。
+func (a *PRDAPI) answerReverse(w http.ResponseWriter, r *http.Request) {
+	id, ok := prdPathID(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Answers map[string]bool `json:"answers"`
+	}
+	if err := decodeJSON(r, &body); err != nil || len(body.Answers) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体应为 {\"answers\": {\"AC-1\": true}}"})
+		return
+	}
+	userID := CurrentUser(r).ID
+
+	row, err := a.Store.GetPRD(r.Context(), id, userID)
+	if err != nil {
+		writePRDError(w, "查询 PRD 失败", err)
+		return
+	}
+	doc, err := prd.ParseDocument(row.Document)
+	if err != nil {
+		serverError(w, "解析 PRD 快照失败", err)
+		return
+	}
+
+	idx := map[string]int{}
+	for i, c := range doc.Criteria {
+		idx[c.ID] = i
+	}
+	for acID := range body.Answers {
+		i, ok := idx[acID]
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "未知的验收标准：" + acID})
+			return
+		}
+		if doc.Criteria[i].ReverseConfirm == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": acID + " 没有反向确认，无需答复"})
+			return
+		}
+	}
+	for acID, v := range body.Answers {
+		accepted := v
+		doc.Criteria[idx[acID]].ReverseAccepted = &accepted
+	}
+
+	raw, err := doc.Marshal()
+	if err != nil {
+		serverError(w, "序列化 PRD 快照失败", err)
+		return
+	}
+	updated, err := a.Store.UpdatePRDContent(r.Context(), id, userID,
+		store.UpdatePRDContentParams{Document: raw})
+	if err != nil {
+		writePRDError(w, "保存反向确认失败", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)

@@ -29,10 +29,11 @@ var ErrPRDBusy = errors.New("store: 该 PRD 正有一轮对话在进行中")
 // prdStallAfter 是 processing 的僵死阈值。超过它仍挂在 processing 的轮次
 // 视为死掉（进程被杀时没机会 CAS 回 false），读时顺手放行。
 //
-// 取 15 分钟的理由：规划 agent 的超时上限是 10 分钟（同 preview 的
-// recommendTimeout），留 5 分钟余量覆盖落库与网络抖动。比这更短会把
-// 还在正常思考的轮次误判成僵死，更长则卡着人干等。
-const prdStallAfter = 15 * time.Minute
+// 取 25 分钟的理由：一轮规划的总预算是 18 分钟（prd.roundBudget：首跑
+// 至多 15 分钟 + 输出不合规时的就地修正），留 7 分钟余量覆盖落库与网络
+// 抖动。比这更短会把还在正常修正的轮次误判成僵死，更长则卡着人干等。
+// 自动续推的多轮各自续期（TouchPRDRound），不会累加到同一个时钟上。
+const prdStallAfter = 25 * time.Minute
 
 // PRDRow 是 prds 表的一行（含 JSON 标签，直接供 API 层返回）。
 //
@@ -58,6 +59,12 @@ type PRDRow struct {
 	Processing          bool       `json:"processing"`
 	ProcessingStartedAt *time.Time `json:"processingStartedAt,omitempty"`
 
+	// LastError / LastErrorInput 描述最近一次后台运行（规划轮次或对抗复核）
+	// 的失败：原因，以及人当时说的话（界面放回输入框）。下一次抢占清空。
+	// 见 0031 迁移注释。
+	LastError      *string `json:"lastError,omitempty"`
+	LastErrorInput *string `json:"lastErrorInput,omitempty"`
+
 	GeneratedFlowID *int64 `json:"generatedFlowId,omitempty"`
 
 	ApprovedAt  *time.Time `json:"approvedAt,omitempty"`
@@ -70,14 +77,15 @@ type PRDRow struct {
 // 避免两处列序漂移（scanPRD 依赖这个顺序）。
 const prdColumns = `id, user_id, repo_id, ref_prd_id, prd_type, state, round,
 	original_input, document, task_blocks, review_report,
-	processing, processing_started_at, generated_flow_id,
-	approved_at, converted_at, created_at, updated_at`
+	processing, processing_started_at, last_error, last_error_input,
+	generated_flow_id, approved_at, converted_at, created_at, updated_at`
 
 func scanPRD(row interface{ Scan(...any) error }) (*PRDRow, error) {
 	var p PRDRow
 	if err := row.Scan(&p.ID, &p.UserID, &p.RepoID, &p.RefPRDID, &p.PRDType,
 		&p.State, &p.Round, &p.OriginalInput, &p.Document, &p.TaskBlocks,
 		&p.ReviewReport, &p.Processing, &p.ProcessingStartedAt,
+		&p.LastError, &p.LastErrorInput,
 		&p.GeneratedFlowID, &p.ApprovedAt, &p.ConvertedAt,
 		&p.CreatedAt, &p.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -438,7 +446,8 @@ var ErrPRDStateChanged = errors.New("store: PRD 状态已被并发修改")
 // 僵死的轮次不在这里处理：GetPRD 的读路径会先清掉，人刷新一下就能重试。
 func (s *Store) BeginPRDRound(ctx context.Context, id, userID int64) (*PRDRow, error) {
 	row := s.pool.QueryRow(ctx, `
-		UPDATE prds SET processing = true, processing_started_at = now()
+		UPDATE prds SET processing = true, processing_started_at = now(),
+		       last_error = NULL, last_error_input = NULL
 		WHERE id = $1 AND user_id = $2 AND processing = false
 		  AND state NOT IN ('approved', 'converted', 'abandoned')
 		RETURNING `+prdColumns, id, userID)
@@ -545,6 +554,39 @@ func (s *Store) ListPRDRounds(ctx context.Context, prdID int64) ([]PRDRoundRow, 
 		out = append(out, *r)
 	}
 	return out, rows.Err()
+}
+
+// TouchPRDRound 续期一次抢占的起始时刻。
+//
+// 自动续推（prd.Service.StartRound）在一次抢占里连跑几轮：不续期的话
+// 第二轮跑到一半就过了僵死阈值，读路径会把它当死掉的轮次放行，第二个
+// 请求就能插进来起一个并行的 agent。只在仍持有 processing 时续期。
+func (s *Store) TouchPRDRound(ctx context.Context, id, userID int64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE prds SET processing_started_at = now()
+		WHERE id = $1 AND user_id = $2 AND processing = true`, id, userID)
+	if err != nil {
+		return fmt.Errorf("store: 续期 PRD 对话轮次失败: %w", err)
+	}
+	return nil
+}
+
+// FailPRDRun 记下最近一次后台运行的失败原因与人当时说的话（0031）。
+//
+// 不碰 state / round / document：失败的一轮等于没发生，这里只留给界面
+// 一个「为什么没跑成」的当前值。input 为空存 NULL。
+func (s *Store) FailPRDRun(ctx context.Context, id, userID int64, msg, input string) error {
+	var in *string
+	if input != "" {
+		in = &input
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE prds SET last_error = $3, last_error_input = $4
+		WHERE id = $1 AND user_id = $2`, id, userID, msg, in)
+	if err != nil {
+		return fmt.Errorf("store: 记录 PRD 运行失败: %w", err)
+	}
+	return nil
 }
 
 // EndPRDRound 把 processing CAS 回 false。

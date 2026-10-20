@@ -134,12 +134,16 @@ export const api = {
   // 注意游标字段是驼峰 lastId，与既有 taskEvents 的 last_id 不同。
   prdEvents: (id, after = 0, limit = 200) =>
     request(`/api/prds/${id}/events?after=${after}&limit=${limit}`),
-  // 跑一轮对话：awaiting_answers 时带上人的回答；stage 可选，不传由后端按
-  // 轮次推进阶段。回 {prd, questions, notes} —— 跑完一轮整份 PRD 都可能变，
-  // 所以直接给新的一份
+  // 发起一轮对话：awaiting_answers 时带上人的回答；stage 可选，不传由后端按
+  // 轮次推进阶段。后台跑，回 202 {prd}（processing=true），之后轮询 prd(id)
+  // 看 processing / round / lastError（docs/10 §1.4）
   runPrdRound: (id, body = {}) =>
     request(`/api/prds/${id}/rounds`, { method: 'POST', body: JSON.stringify(body) }),
+  // 对抗复核同样后台跑，回 202 {prd}
   reviewPrd: (id) => request(`/api/prds/${id}/review`, { method: 'POST' }),
+  // 反向确认答复：answers = {"AC-1": true, "AC-2": false}，回更新后的 PRD 行
+  answerPrdReverse: (id, answers) =>
+    request(`/api/prds/${id}/criteria/reverse`, { method: 'PUT', body: JSON.stringify({ answers }) }),
   // 成功回 {state, report}；自检不过抛 422，报告在 err.data.report
   // （见 request 里的 err.data 注释）
   submitPrd: (id) => request(`/api/prds/${id}/submit`, { method: 'POST' }),
