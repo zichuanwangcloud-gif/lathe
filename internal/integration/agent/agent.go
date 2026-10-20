@@ -125,6 +125,9 @@ type envelope struct {
 type Driver struct {
 	bin     string
 	timeout time.Duration
+	// idle 是静默判死阈值（见 idleTimeout）。留成字段只为测试能调短；
+	// NewDriver 一律给 idleTimeout。
+	idle time.Duration
 }
 
 // NewDriver 构造驱动。bin 为空时取 "claude"。
@@ -135,7 +138,15 @@ func NewDriver(bin string, timeout time.Duration) *Driver {
 	if timeout <= 0 {
 		timeout = 45 * time.Minute
 	}
-	return &Driver{bin: bin, timeout: timeout}
+	return &Driver{bin: bin, timeout: timeout, idle: idleTimeout}
+}
+
+// idleTimeout 返回本次运行使用的静默判死阈值（零值退化为默认值）。
+func (d *Driver) idleTimeout() time.Duration {
+	if d.idle > 0 {
+		return d.idle
+	}
+	return idleTimeout
 }
 
 // RunParams 描述一次 agent 执行。
@@ -259,7 +270,7 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 
 	// 静默看门狗：连续 idleTimeout 没有产出任何事件就判死并杀掉进程组。
 	// 它独立于总超时 —— 「跑得久」和「卡住了」是两回事，报错也要能分开。
-	idle := newIdleWatch(idleTimeout)
+	idle := newIdleWatch(d.idleTimeout())
 	defer idle.stop()
 	go func() {
 		select {
@@ -320,7 +331,7 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	// 完全不同，报错必须能分开 —— 一个是设的上限太小，一个是进程卡住了。
 	if idle.firedNow() {
 		return result, fmt.Errorf("%w（%v 内没有任何输出，进程树已回收，stderr: %s）",
-			ErrIdle, idleTimeout, stderr.String())
+			ErrIdle, d.idleTimeout(), stderr.String())
 	}
 	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
 		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", limit.Round(time.Second))
