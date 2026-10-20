@@ -675,3 +675,111 @@ func TestStallPRDRechecksAtUpdate(t *testing.T) {
 		})
 	}
 }
+
+// 后台轮次的失败必须落库：轮次改在后台跑之后，HTTP 响应里已经没有错误可回，
+// 界面只能从 prds 行上读到「上一次为什么没跑成」以及「人当时说了什么」。
+// 下一次抢占要把它清掉，否则旧错误会挂在一份已经恢复正常的 PRD 上。
+func TestFailPRDRunRecordsAndBeginClears(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+	p := newPRD(t, st, userID, repoID)
+
+	if _, err := st.BeginPRDRound(ctx, p.ID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.FailPRDRun(ctx, p.ID, userID, "跑规划轮次失败: 输出不合规", "1. A 2. B"); err != nil {
+		t.Fatalf("记录失败: %v", err)
+	}
+	if err := st.EndPRDRound(ctx, p.ID, userID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.GetPRD(ctx, p.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastError == nil || *got.LastError != "跑规划轮次失败: 输出不合规" {
+		t.Errorf("lastError got=%v, want 失败原因", got.LastError)
+	}
+	if got.LastErrorInput == nil || *got.LastErrorInput != "1. A 2. B" {
+		t.Errorf("lastErrorInput got=%v, want 人当时的回答（界面要放回输入框）", got.LastErrorInput)
+	}
+
+	again, err := st.BeginPRDRound(ctx, p.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.LastError != nil || again.LastErrorInput != nil {
+		t.Errorf("新一轮开始应清掉上次的失败，got lastError=%v input=%v", again.LastError, again.LastErrorInput)
+	}
+}
+
+// 空回答不落成空串：前端据 null 判断「没有要放回输入框的话」。
+func TestFailPRDRunEmptyInputIsNull(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+	p := newPRD(t, st, userID, repoID)
+
+	if err := st.FailPRDRun(ctx, p.ID, userID, "对抗复核失败: 超时", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetPRD(ctx, p.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastErrorInput != nil {
+		t.Errorf("空回答应存 NULL，got=%q", *got.LastErrorInput)
+	}
+}
+
+// 失败记录也按属主隔离：别人的 PRD 写不进去。
+func TestFailPRDRunScopedToOwner(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	otherID, _ := prdFixture(t, st)
+	ctx := context.Background()
+	p := newPRD(t, st, userID, repoID)
+
+	if err := st.FailPRDRun(ctx, p.ID, otherID, "伪造的失败", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetPRD(ctx, p.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastError != nil {
+		t.Errorf("非属主不该写进失败记录，got=%q", *got.LastError)
+	}
+}
+
+// 自动续推的多轮共用一次抢占：每轮开始续期 processing_started_at，
+// 否则连跑几轮会被僵死判定当成死掉的轮次放行，第二个请求就能插进来。
+func TestTouchPRDRoundRenewsStartTime(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := prdFixture(t, st)
+	ctx := context.Background()
+	p := newPRD(t, st, userID, repoID)
+
+	if _, err := st.BeginPRDRound(ctx, p.ID, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.pool.Exec(ctx,
+		`UPDATE prds SET processing_started_at = now() - interval '10 minutes' WHERE id = $1`, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.TouchPRDRound(ctx, p.ID, userID); err != nil {
+		t.Fatalf("续期失败: %v", err)
+	}
+	got, err := st.GetPRD(ctx, p.ID, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Processing || got.ProcessingStartedAt == nil {
+		t.Fatal("续期不该放掉 processing")
+	}
+	if age := time.Since(*got.ProcessingStartedAt); age > time.Minute {
+		t.Errorf("续期后起始时刻应是现在，got 已过去 %v", age)
+	}
+}
