@@ -221,6 +221,10 @@ const showPending = computed(() => !!pendingInput.value && latestRound.value <= 
 // 服务端记下的最近一次失败（prds.last_error）。后台跑完才知道成没成，
 // 所以失败只能从行上读 —— 刷新页面、换标签页回来也看得到。
 const lastError = computed(() => (!running.value && prd.value?.lastError) || '')
+// 失败原因的前缀由 internal/prd/service.go 的 FailureReview 约定：复核失败
+// 给「重跑对抗复核」，规划轮次失败给「重试」（人的话已放回输入框）。
+const REVIEW_FAILURE_PREFIX = '对抗复核失败'
+const failedReview = computed(() => lastError.value.startsWith(REVIEW_FAILURE_PREFIX))
 
 // 一次后台运行结束（processing 由真变假）：收尾本页的发送状态；没跑成就把
 // 人的话放回输入框，一键重试。
@@ -840,7 +844,7 @@ const sendLabel = computed(() =>
                 <div class="faint tiny">
                   轮次没有推进<template v-if="prd.lastErrorInput">，你的话已放回输入框</template>。
                 </div>
-                <button v-if="caps.round && !lastError.startsWith('对抗复核')" class="retry" @click="retry">重试</button>
+                <button v-if="!failedReview && caps.round" class="retry" @click="retry">重试</button>
                 <button v-else-if="caps.review" class="retry" @click="runReview">重跑对抗复核</button>
               </div>
             </div>

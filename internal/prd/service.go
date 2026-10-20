@@ -242,7 +242,7 @@ func (s *Service) RunRound(ctx context.Context, p RunRoundParams) (*RoundResult,
 
 	res, _, err := s.round(ctx, p)
 	if err != nil {
-		s.recordFailure(ctx, p.PRDID, p.UserID, "跑规划轮次失败", err, p.Answer)
+		s.recordFailure(ctx, p.PRDID, p.UserID, FailureRound, err, p.Answer)
 		return nil, err
 	}
 	return res, nil
@@ -269,6 +269,14 @@ func (s *Service) StartRound(ctx context.Context, p RunRoundParams) error {
 	return nil
 }
 
+// 失败原因的前缀。last_error 是给人看的一句话，但界面要据它决定给哪个
+// 重试按钮（重跑这一轮 vs 重跑对抗复核），所以前缀是约定的一部分：
+// 改这里要同步 web/src/views/prd/PRDConversation.vue 的 failedReview 判断。
+const (
+	FailureRound  = "跑规划轮次失败"
+	FailureReview = "对抗复核失败"
+)
+
 // StartReview 抢占并在后台跑对抗复核，立即返回（理由同 StartRound）。
 func (s *Service) StartReview(ctx context.Context, prdID, userID int64) error {
 	if _, err := s.Store.BeginPRDRound(ctx, prdID, userID); err != nil {
@@ -276,7 +284,7 @@ func (s *Service) StartReview(ctx context.Context, prdID, userID int64) error {
 	}
 	s.background(ctx, prdID, userID, func(bg context.Context) {
 		if _, err := s.review(bg, prdID, userID); err != nil {
-			s.recordFailure(bg, prdID, userID, "对抗复核失败", err, "")
+			s.recordFailure(bg, prdID, userID, FailureReview, err, "")
 		}
 	})
 	return nil
@@ -315,7 +323,7 @@ func (s *Service) chain(ctx context.Context, p RunRoundParams) {
 		}
 		res, stage, err := s.round(ctx, p)
 		if err != nil {
-			s.recordFailure(ctx, p.PRDID, p.UserID, "跑规划轮次失败", err, p.Answer)
+			s.recordFailure(ctx, p.PRDID, p.UserID, FailureRound, err, p.Answer)
 			return
 		}
 		if len(res.Questions) > 0 {
@@ -343,7 +351,7 @@ func (s *Service) autoReview(ctx context.Context, prdID, userID int64) {
 		if errors.Is(err, ErrStageUnavailable) {
 			return
 		}
-		s.recordFailure(ctx, prdID, userID, "对抗复核失败", err, "")
+		s.recordFailure(ctx, prdID, userID, FailureReview, err, "")
 	}
 }
 
@@ -766,7 +774,7 @@ func (s *Service) RunReview(ctx context.Context, prdID, userID int64) (*ReviewRe
 
 	rep, err := s.review(ctx, prdID, userID)
 	if err != nil && !errors.Is(err, ErrStageUnavailable) {
-		s.recordFailure(ctx, prdID, userID, "对抗复核失败", err, "")
+		s.recordFailure(ctx, prdID, userID, FailureReview, err, "")
 	}
 	return rep, err
 }
