@@ -157,14 +157,22 @@ const eventsByRound = computed(() => {
 })
 const reviewEvents = computed(() => lastAttempt(events.value.filter((e) => e.phase === REVIEW_PHASE)))
 
-// 同一轮号可能跑过不止一次：解析失败的那次不推进轮次，事件却已落库，人重试
+// 同一轮号可能跑过不止一次：失败的那次不推进轮次，事件却已落库，人重试
 // 时沿用同一个轮号。每次 agent 运行都以一条 init 事件开头，按最后一条 init
 // 切出「最后一次尝试」，失败尝试的过程不混进成功那轮的思考块。
+//
+// 例外是同一轮之内的输出修正：它 --resume 同一个会话，也会发一条 init，
+// 但和首跑是同一次尝试（会话 ID 相同）—— 往前并到首跑的 init 为止，否则
+// 思考块里只剩修正那几秒，读代码的过程全被切掉了。
 function lastAttempt(list) {
+  let cut = -1
   for (let i = list.length - 1; i >= 0; i--) {
-    if (list[i].kind === 'init') return list.slice(i)
+    if (list[i].kind !== 'init') continue
+    const sid = list[i].payload?.sessionId
+    if (cut >= 0 && (!sid || sid !== list[cut].payload?.sessionId)) break
+    cut = i
   }
-  return list
+  return cut < 0 ? list : list.slice(cut)
 }
 function roundEvents(n) {
   return lastAttempt(eventsByRound.value[n] || [])
@@ -178,7 +186,6 @@ const sending = ref(false)
 // 发出去、后端还没落轮次的那句话：先乐观地摆在对话里
 const pendingInput = ref(null)
 const sendBaseRound = ref(0)
-const sendError = ref('')
 const lastSent = ref('')
 // 本页发起的一轮：只认发送之后落库的事件，计时从按下发送算起
 const sendFloor = ref(0)
@@ -186,19 +193,52 @@ const sendStartedAt = ref(null)
 
 const latestRound = computed(() => rounds.value.at(-1)?.round || 0)
 
-// 「智能体在跑」有两个来源：本页刚发出去的请求，或者打开页面时别处已经在跑
-// （processing）。前者以「新一轮还没落库」为准，避免请求回来前的那一下闪烁。
-const running = computed(
-  () => (sending.value && latestRound.value <= sendBaseRound.value) || (!sending.value && processing.value),
-)
-const liveRound = computed(() => (sending.value ? sendBaseRound.value : prd.value?.round || 0) + 1)
+// 轮次在后台跑（docs/10 §1.4）：发送只负责发起，回 202 后靠轮询 processing
+// 盯进度。「智能体在跑」= 本页刚发出去还没确认结束（sending），或者服务端
+// 说有一轮在跑（processing —— 刷新页面、别的标签页发起的都算）。
+const running = computed(() => sending.value || processing.value)
+// 后台跑的可能是对抗复核（手动发起，或定稿之后自动接上），它不在轮次序列里，
+// 思考块要换成复核的事件流。按最新一条事件的 phase 判断。
+const liveIsReview = computed(() => {
+  if (!running.value) return false
+  if (reviewing.value) return true
+  return events.value.at(-1)?.phase === REVIEW_PHASE
+})
+const liveRound = computed(() => (prd.value?.round || 0) + 1)
 const liveEvents = computed(() => {
+  if (liveIsReview.value) return reviewEvents.value
   const list = eventsByRound.value[liveRound.value] || []
   return lastAttempt(sending.value ? list.filter((e) => e.id > sendFloor.value) : list)
 })
 const liveStartedAt = computed(() =>
-  sending.value ? sendStartedAt.value : prd.value?.processingStartedAt || null,
+  sending.value && latestRound.value <= sendBaseRound.value
+    ? sendStartedAt.value
+    : prd.value?.processingStartedAt || null,
 )
+// 发出去的那句话：第一轮落库之前乐观地摆在对话里
+const showPending = computed(() => !!pendingInput.value && latestRound.value <= sendBaseRound.value)
+
+// 服务端记下的最近一次失败（prds.last_error）。后台跑完才知道成没成，
+// 所以失败只能从行上读 —— 刷新页面、换标签页回来也看得到。
+const lastError = computed(() => (!running.value && prd.value?.lastError) || '')
+
+// 一次后台运行结束（processing 由真变假）：收尾本页的发送状态；没跑成就把
+// 人的话放回输入框，一键重试。
+watch(processing, (now, before) => {
+  if (before && !now) onRunFinished()
+})
+
+function onRunFinished() {
+  sending.value = false
+  pendingInput.value = null
+  if (reviewing.value) finishReview()
+  if (prd.value?.lastError && !input.value.trim()) {
+    input.value = prd.value.lastErrorInput || lastSent.value || ''
+  }
+  seenRound = -1
+  refresh()
+  sidebar?.refresh()
+}
 
 const timeline = computed(() => {
   const items = []
@@ -238,13 +278,30 @@ function answerTemplate(qs) {
 const composer = ref(null)
 
 const canSend = computed(() => {
-  if (!caps.value.round || sending.value) return false
+  if (!caps.value.round || running.value) return false
   // 待回答时必须有内容：awaiting_answers 不能空跑过去
   return state.value !== 'awaiting_answers' || !!input.value.trim()
 })
 
+// 「别问了，按默认出稿」：直接跳到拆分，没答的问题一律按智能体给的默认值。
+// 拆分没有新问题时后端会自动接着定稿、跑对抗复核。
+const DEFAULT_DRAFT_TEXT = '其余问题都按你给的默认值处理，不用再问，直接进入任务拆分。'
+const canDraftNow = computed(
+  () =>
+    caps.value.round &&
+    !running.value &&
+    rounds.value.length > 0 &&
+    !['split', 'finalize'].includes(rounds.value.at(-1)?.stage),
+)
+function draftNow() {
+  const extra = input.value.trim()
+  input.value = extra ? `${extra}\n\n${DEFAULT_DRAFT_TEXT}` : DEFAULT_DRAFT_TEXT
+  stageOverride.value = 'split'
+  send()
+}
+
 async function send() {
-  if (!caps.value.round || sending.value) return
+  if (!caps.value.round || running.value) return
   const text = input.value.trim()
   if (state.value === 'awaiting_answers' && !text) return
 
@@ -253,7 +310,6 @@ async function send() {
   if (stageOverride.value) body.stage = stageOverride.value
 
   sending.value = true
-  sendError.value = ''
   error.value = ''
   notice.value = ''
   pendingInput.value = text
@@ -263,27 +319,29 @@ async function send() {
   sendStartedAt.value = new Date().toISOString()
   input.value = ''
   scrollToBottom(true)
-  sidebar?.refresh()
 
   try {
-    // 跑完一轮 state/round/document/task_blocks 可能全变，后端直接给一份新的
+    // 只是发起：回 202 + 抢占后的 PRD 行（processing=true），之后轮询盯进度
     const r = await api.runPrdRound(props.id, body)
-    if (r?.prd) prd.value = r.prd
-    seenRound = -1
-    await refresh()
     stageOverride.value = ''
+    if (r?.prd) prd.value = r.prd
+    sidebar?.refresh()
+    // 后台快到响应回来之前就跑完了：processing 没有经历「真 → 假」，手动收尾
+    if (!prd.value?.processing) onRunFinished()
   } catch (e) {
     if (e instanceof UnauthorizedError) return onUnauthorized()
-    // 解析失败等情况这一轮等于没发生（后端不推进轮次）：把话放回输入框，
-    // 一键重试，不让人重打一遍
-    sendError.value = e.message
+    // 发起都没成功（已有一轮在跑、状态不允许）：这一轮等于没发生
+    sending.value = false
+    pendingInput.value = null
+    error.value = e.message
     if (!input.value.trim()) input.value = text
     await refresh()
-  } finally {
-    pendingInput.value = null
-    sending.value = false
-    sidebar?.refresh()
   }
+}
+
+function retry() {
+  if (!input.value.trim() && prd.value?.lastErrorInput) input.value = prd.value.lastErrorInput
+  send()
 }
 
 // ---------------------------------------------------------------- 流程动作
@@ -309,19 +367,58 @@ async function act(fn, confirmText) {
   }
 }
 
+// 对抗复核在后台跑：发起后等 processing 结束，再按结果给提示（finishReview）。
 async function runReview() {
+  if (running.value) return
   reviewing.value = true
+  error.value = ''
+  notice.value = ''
   openPanel('review')
   try {
-    const r = await act(() => api.reviewPrd(props.id))
-    const n = r?.findings?.length || 0
-    notice.value = n
-      ? `对抗复核找到 ${n} 处可疑 —— 在右侧「复核」逐条标处置之后才能提交评审。`
-      : '对抗复核没找出洞 —— 「攻不动」本身是个有价值的结论。'
-  } catch {
-    /* act 已经把错误摆出来了 */
-  } finally {
+    const r = await api.reviewPrd(props.id)
+    if (r?.prd) prd.value = r.prd
+    if (!prd.value?.processing) onRunFinished()
+  } catch (e) {
     reviewing.value = false
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    error.value = e.message
+  }
+}
+
+function finishReview() {
+  reviewing.value = false
+  // 读的是收尾 refresh 之前的行；lastError 由 BeginPRDRound 清空、失败时写入，
+  // 所以这里看到的就是这一次复核的结论
+  if (prd.value?.lastError) return // 失败卡片会摆出来
+  api
+    .prd(props.id)
+    .then((p) => {
+      prd.value = p
+      if (p.lastError) return
+      const n = p.reviewReport?.findings?.length || 0
+      notice.value = n
+        ? `对抗复核找到 ${n} 处可疑 —— 在右侧「复核」逐条标处置之后才能提交评审。`
+        : '对抗复核没找出洞 —— 「攻不动」本身是个有价值的结论。'
+    })
+    .catch(() => {
+      /* 下一次轮询会补上 */
+    })
+}
+
+// 反向确认的答复（文档面板里逐条或一键全部接受）。
+async function answerReverse(answers) {
+  acting.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    prd.value = await api.answerPrdReverse(props.id, answers)
+    const n = Object.keys(answers).length
+    notice.value = n > 1 ? `已答复 ${n} 条反向确认。` : '反向确认已答复。'
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    error.value = e.message
+  } finally {
+    acting.value = false
   }
 }
 
@@ -566,6 +663,9 @@ onMounted(async () => {
   }, 5000)
   evPoller = createPoller(async () => {
     await loadEvents()
+    // 后台在跑时跟着事件节奏刷行：结束（processing → false）要尽快看到，
+    // 自动续推的每一轮落库也要及时出现在对话里
+    if (running.value) await refresh()
     return state.value !== 'converted'
   }, 2000)
   refreshPoller.start()
@@ -580,10 +680,10 @@ onUnmounted(() => {
 // ---------------------------------------------------------------- 输入框文案
 
 const composerPlaceholder = computed(() => {
-  if (running.value) return '智能体正在思考，这一轮跑完才能继续…'
+  if (running.value) return '智能体在后台跑，这一步跑完才能继续…'
   switch (state.value) {
     case 'awaiting_answers':
-      return '回答上面的问题（逐条答；答不了的写「读代码定」也行）'
+      return '回答上面的问题（回「按默认」即可采用智能体给的默认值）'
     case 'drafting':
       return '补充说明、纠正理解，或直接发送让智能体继续推进'
     case 'ready_for_review':
@@ -708,33 +808,40 @@ const sendLabel = computed(() =>
           </template>
 
           <!-- 发出去还没落库的那句话 -->
-          <div v-if="pendingInput" class="msg user pending">
+          <div v-if="showPending" class="msg user pending">
             <div class="bubble"><div class="md" v-html="md(pendingInput)"></div></div>
           </div>
 
-          <!-- 正在跑的这一轮 -->
+          <!-- 后台正在跑的这一轮（或对抗复核） -->
           <div v-if="running" class="msg agent">
             <div class="avatar" aria-hidden="true">L</div>
             <div class="body">
-              <div class="who faint">规划智能体 · 第 {{ liveRound }} 轮</div>
+              <div class="who faint">
+                <template v-if="liveIsReview">对抗复核 · 只看意图与验收标准</template>
+                <template v-else>规划智能体 · 第 {{ liveRound }} 轮</template>
+              </div>
               <ThinkingBlock
                 :events="liveEvents"
                 :running="true"
                 :started-at="liveStartedAt"
                 :md="md"
               />
+              <div class="faint tiny">在后台跑，刷新或离开页面不影响；没有要问你的就会自动推进到下一阶段。</div>
             </div>
           </div>
 
-          <!-- 这一轮没跑成 -->
-          <div v-if="sendError && !running" class="msg agent">
+          <!-- 最近一次后台运行没跑成（prds.last_error） -->
+          <div v-if="lastError" class="msg agent">
             <div class="avatar err" aria-hidden="true">!</div>
             <div class="body">
               <div class="fail">
-                <strong>这一轮没跑成</strong>
-                <div class="dim">{{ sendError }}</div>
-                <div class="faint tiny">轮次没有推进，你的话已放回输入框。</div>
-                <button v-if="caps.round" class="retry" @click="send">重试</button>
+                <strong>这一步没跑成</strong>
+                <div class="dim">{{ lastError }}</div>
+                <div class="faint tiny">
+                  轮次没有推进<template v-if="prd.lastErrorInput">，你的话已放回输入框</template>。
+                </div>
+                <button v-if="caps.round && !lastError.startsWith('对抗复核')" class="retry" @click="retry">重试</button>
+                <button v-else-if="caps.review" class="retry" @click="runReview">重跑对抗复核</button>
               </div>
             </div>
           </div>
@@ -828,11 +935,16 @@ const sendLabel = computed(() =>
             :placeholder="composerPlaceholder"
             :disabled="!caps.round"
             :can-send="canSend"
-            :busy="sending"
+            :busy="running"
             :send-label="sendLabel"
             @send="send"
           >
             <template #tools>
+              <button v-if="canDraftNow" type="button" class="pill draft-now"
+                title="没答的问题一律按智能体给的默认值，直接进入任务拆分；没有新问题会自动接着定稿、跑对抗复核"
+                @click="draftNow">
+                别问了，按默认出稿
+              </button>
               <label v-if="caps.round" class="pill" title="默认按轮次自动推进阶段；需要时可指定">
                 <span>阶段</span>
                 <select v-model="stageOverride" aria-label="指定阶段">
@@ -862,6 +974,7 @@ const sendLabel = computed(() =>
       @close="setPanel(false)"
       @confirm-section="confirmSection"
       @save-dispositions="saveDispositions"
+      @answer-reverse="answerReverse"
       @dismiss-report="checkReport = null"
     />
   </div>
@@ -1073,6 +1186,8 @@ h1 {
   background: var(--surface-2);
 }
 .pill select { border: none; background: transparent; padding: 2px 4px; font-size: 12.5px; }
+.pill.draft-now { padding: 3px 10px; cursor: pointer; color: var(--text); }
+.pill.draft-now:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ---------------------------------------------------------------- 面板 */
 .panel { width: 460px; flex: none; }

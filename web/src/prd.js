@@ -86,6 +86,8 @@ export function prdCaps(prd) {
     convert: is('approved'),
     // 逐节确认只在起草期有意义：冻结后改不了，待回答时该先答问题
     confirmSection: is('drafting'),
+    // 反向确认答复是编辑文档内容，待回答时也能做（挂着的 ❓ 不影响它）
+    reverse: is('drafting', 'awaiting_answers'),
     // approved 之后 PRD 冻结（D10-4）：内容一律不可编辑，只能生成任务
     frozen: ['approved', 'converted'].includes(s),
   }
