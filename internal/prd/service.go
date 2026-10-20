@@ -193,7 +193,8 @@ type RunRoundParams struct {
 //
 // 收敛（C）在两种情况下结束、进入拆分（D）：上一轮 C 没有再提问（它
 // 自己也认为想清楚了），或者已经在 C 里待满 maxConvergeRounds 轮。
-// D 之后进入定稿（E）并停在 E —— 之后人的修改意见都在 E 里处理。
+// 拆分同理：它上一轮提问了（说明拆分还有没定的事）就再审一轮拆分，
+// 否则进入定稿。定稿之后一直停在 E —— 之后人的修改意见都在 E 里处理。
 func nextStage(rounds []store.PRDRoundRow) Stage {
 	if len(rounds) == 0 {
 		return StageUnderstand
@@ -205,21 +206,28 @@ func nextStage(rounds []store.PRDRoundRow) Stage {
 	case StageExplore:
 		return StageConverge
 	case StageConverge:
-		converge := 0
-		for _, r := range rounds {
-			if Stage(r.Stage) == StageConverge {
-				converge++
-			}
-		}
-		if questionCount(last.Questions) == 0 || converge >= maxConvergeRounds {
+		if questionCount(last.Questions) == 0 || countStage(rounds, StageConverge) >= maxConvergeRounds {
 			return StageSplit
 		}
 		return StageConverge
-	case StageSplit, StageFinalize:
+	case StageSplit:
+		if questionCount(last.Questions) > 0 && countStage(rounds, StageSplit) < maxConvergeRounds {
+			return StageSplit
+		}
 		return StageFinalize
 	}
-	// 历史数据里没有阶段（或是未知值）：按最保守的收敛处理。
-	return StageConverge
+	// finalize 与历史数据里的未知阶段：停在/回到定稿，人在那里收尾。
+	return StageFinalize
+}
+
+func countStage(rounds []store.PRDRoundRow, s Stage) int {
+	n := 0
+	for _, r := range rounds {
+		if Stage(r.Stage) == s {
+			n++
+		}
+	}
+	return n
 }
 
 func questionCount(raw json.RawMessage) int {

@@ -192,8 +192,12 @@ func TestNextStage(t *testing.T) {
 		{"收敛满两轮即使还有问题 → 拆分",
 			[]store.PRDRoundRow{r("understand", 3), r("explore", 2), r("converge", 1), r("converge", 1)}, StageSplit},
 		{"拆分之后 → 定稿", []store.PRDRoundRow{r("split", 0)}, StageFinalize},
+		{"拆分提了问 → 再审一轮拆分",
+			[]store.PRDRoundRow{r("split", 1)}, StageSplit},
+		{"拆分已审两轮仍提问 → 进定稿",
+			[]store.PRDRoundRow{r("split", 1), r("split", 1)}, StageFinalize},
 		{"定稿之后停在定稿", []store.PRDRoundRow{r("split", 0), r("finalize", 1)}, StageFinalize},
-		{"历史轮次没有阶段 → 收敛", []store.PRDRoundRow{r("", 0)}, StageConverge},
+		{"历史轮次没有阶段 → 定稿（不重跑收敛）", []store.PRDRoundRow{r("", 0)}, StageFinalize},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
