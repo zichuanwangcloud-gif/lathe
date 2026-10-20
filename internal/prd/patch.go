@@ -66,18 +66,18 @@ type PatchRemove struct {
 // round 用于给没写轮次的新决策补上「第几轮拍的板」。
 // 只拦补丁自身说不通的东西（未知节 key）；合并结果的结构合法性由调用方
 // 交给 validateDocument —— 与完整快照走同一道闸门。
-func (base *Document) Apply(p *DocPatch, round int) (*Document, error) {
-	d, err := base.clone()
+func (d *Document) Apply(p *DocPatch, round int) (*Document, error) {
+	out, err := d.clone()
 	if err != nil {
 		return nil, err
 	}
 	if p == nil {
-		return d, nil
+		return out, nil
 	}
 
 	if len(p.Sections) > 0 {
 		byKey := map[string]*Section{}
-		for _, s := range d.Sections() {
+		for _, s := range out.Sections() {
 			byKey[s.Key] = s.Section
 		}
 		for key, sec := range p.Sections {
@@ -97,14 +97,14 @@ func (base *Document) Apply(p *DocPatch, round int) (*Document, error) {
 		}
 	}
 
-	d.GoalList = upsert(d.GoalList, p.GoalList, func(g Goal) string { return g.ID })
-	d.GoalList = without(d.GoalList, p.Remove.GoalList, func(g Goal) string { return g.ID })
+	out.GoalList = upsert(out.GoalList, p.GoalList, func(g Goal) string { return g.ID })
+	out.GoalList = without(out.GoalList, p.Remove.GoalList, func(g Goal) string { return g.ID })
 
-	d.ScenarioList = upsert(d.ScenarioList, p.ScenarioList, func(s Scenario) string { return s.ID })
-	d.ScenarioList = without(d.ScenarioList, p.Remove.ScenarioList, func(s Scenario) string { return s.ID })
+	out.ScenarioList = upsert(out.ScenarioList, p.ScenarioList, func(s Scenario) string { return s.ID })
+	out.ScenarioList = without(out.ScenarioList, p.Remove.ScenarioList, func(s Scenario) string { return s.ID })
 
 	prevReverse := map[string]Criterion{}
-	for _, c := range d.Criteria {
+	for _, c := range out.Criteria {
 		prevReverse[c.ID] = c
 	}
 	incoming := make([]Criterion, len(p.Criteria))
@@ -115,48 +115,48 @@ func (base *Document) Apply(p *DocPatch, round int) (*Document, error) {
 		}
 		incoming[i] = c
 	}
-	d.Criteria = upsert(d.Criteria, incoming, func(c Criterion) string { return c.ID })
-	d.Criteria = without(d.Criteria, p.Remove.Criteria, func(c Criterion) string { return c.ID })
+	out.Criteria = upsert(out.Criteria, incoming, func(c Criterion) string { return c.ID })
+	out.Criteria = without(out.Criteria, p.Remove.Criteria, func(c Criterion) string { return c.ID })
 
-	d.Tasks = upsert(d.Tasks, p.Tasks, func(t TaskBlock) string { return t.Key })
-	d.Tasks = without(d.Tasks, p.Remove.Tasks, func(t TaskBlock) string { return t.Key })
+	out.Tasks = upsert(out.Tasks, p.Tasks, func(t TaskBlock) string { return t.Key })
+	out.Tasks = without(out.Tasks, p.Remove.Tasks, func(t TaskBlock) string { return t.Key })
 
-	d.Questions = upsert(d.Questions, p.Questions, func(q Question) string { return q.ID })
-	d.Questions = without(d.Questions, p.Remove.Questions, func(q Question) string { return q.ID })
+	out.Questions = upsert(out.Questions, p.Questions, func(q Question) string { return q.ID })
+	out.Questions = without(out.Questions, p.Remove.Questions, func(q Question) string { return q.ID })
 
-	d.Evidences = upsert(d.Evidences, p.Evidences, func(e Evidence) string { return e.Ref })
-	d.Evidences = without(d.Evidences, p.Remove.Evidences, func(e Evidence) string { return e.Ref })
+	out.Evidences = upsert(out.Evidences, p.Evidences, func(e Evidence) string { return e.Ref })
+	out.Evidences = without(out.Evidences, p.Remove.Evidences, func(e Evidence) string { return e.Ref })
 
 	if p.NonGoals != nil {
-		d.NonGoals = append([]NonGoal(nil), (*p.NonGoals)...)
+		out.NonGoals = append([]NonGoal(nil), (*p.NonGoals)...)
 	}
 
 	for _, dec := range p.Decisions {
 		if dec.Round == 0 {
 			dec.Round = round
 		}
-		if hasDecision(d.Decisions, dec) {
+		if hasDecision(out.Decisions, dec) {
 			continue
 		}
-		d.Decisions = append(d.Decisions, dec)
+		out.Decisions = append(out.Decisions, dec)
 	}
-	return d, nil
+	return out, nil
 }
 
 // clone 深拷贝：走一遍 JSON，省得逐字段手抄（字段随模板演进，手抄必漏）。
-func (base *Document) clone() (*Document, error) {
-	if base == nil {
+func (d *Document) clone() (*Document, error) {
+	if d == nil {
 		return &Document{}, nil
 	}
-	raw, err := json.Marshal(base)
+	raw, err := json.Marshal(d)
 	if err != nil {
 		return nil, fmt.Errorf("prd: 复制快照失败: %w", err)
 	}
-	var d Document
-	if err := json.Unmarshal(raw, &d); err != nil {
+	var out Document
+	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("prd: 复制快照失败: %w", err)
 	}
-	return &d, nil
+	return &out, nil
 }
 
 // upsert 按 key 合并：同 key 原位替换（保持原有顺序），新 key 追加在后。
