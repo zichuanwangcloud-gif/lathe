@@ -119,18 +119,19 @@ type Service struct {
 
 // 一轮的时间预算。三个值与 store.prdStallAfter（25 分钟）必须保持
 // 「roundBudget + 落库余量 < prdStallAfter」，否则僵死判定会把还在正常
-// 修正的轮次判死、放第二个请求进来。
+// 收尾的轮次判死、放第二个请求进来。
 //
 // 首跑从 10 分钟提到 15 分钟：实测拆分轮（D）刚读代码就要 10 分钟以上，
 // 两次都恰好撞在 10 分钟上限上被切断 —— 两次各做了 40 多次工具调用，
-// 不是卡住，是预算给少了。配合 prompt 里「拆分阶段不要重新通读仓库」，
-// 正常情况下用不到这么多。
+// 不是卡住，是预算给少了。超时也不直接判死：同一个会话续跑一次要求立刻
+// 交（deadlinePrompt），所以预算要留出那一截。prompt 里同时写明了拆分与
+// 收敛阶段不要重新通读仓库，正常情况下用不到这么多。
 const (
 	roundTimeout = 15 * time.Minute
 	// repairTimeout 是单次输出修正的上限：会话与检出都还在，只是改 JSON。
 	repairTimeout = 4 * time.Minute
-	// roundBudget 是含修正在内整轮的硬上限。
-	roundBudget = 18 * time.Minute
+	// roundBudget 是含超时收尾与修正在内整轮的硬上限：首跑 15 + 收尾 4。
+	roundBudget = 19 * time.Minute
 	// minRepairWindow 是剩余预算不足以做一次修正时直接放弃的门槛。
 	minRepairWindow = 60 * time.Second
 )
@@ -557,6 +558,17 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 	for attempt := 0; ; attempt++ {
 		res, err := s.runOnce(budgetCtx, params, timeout)
 		if err != nil {
+			// 首跑超时不判死：同一个会话续跑，明确要求它立刻交 JSON。
+			// 实测拆分轮两次都撞在时间上限上 —— 模型在拼命读代码「求准」，
+			// 想清楚了却没来得及写。续跑时它带着已读的全部上下文，几十秒
+			// 就能交；重新起一轮则要把读过的全再读一遍，必然再次超时。
+			if attempt == 0 && spec.accept != nil && isTimeout(err) {
+				slog.Warn("PRD 首跑超时，续跑要求立刻交结果", "prd", spec.prdID, "phase", spec.phase)
+				params.Resume = true
+				params.Prompt = deadlinePrompt(err)
+				timeout = repairTimeout
+				continue
+			}
 			return nil, sessionID, err
 		}
 		if spec.accept == nil {
@@ -601,6 +613,24 @@ func (s *Service) runOnce(ctx context.Context, p agent.RunParams, timeout time.D
 		return nil, fmt.Errorf("prd: agent 报告失败（%s）: %s", res.TerminalReason, head(res.Text, 200))
 	}
 	return res, nil
+}
+
+// isTimeout 报告这次失败是不是「跑满时间没交结果」。
+func isTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, agent.ErrIdle) ||
+		strings.Contains(err.Error(), "超时")
+}
+
+// deadlinePrompt 是首跑超时后的收尾指令：同一个会话，不许再读，直接交。
+//
+// 与 repairPrompt 的区别是它不针对某一处错误 —— 模型此时什么都没有交，
+// 缺的是「别想了，把你已经想好的写出来」这一步。
+func deadlinePrompt(cause error) string {
+	return fmt.Sprintf(`这一轮的时间预算已经用完（%s）。
+
+不要再读任何文件、不要再跑任何命令。立刻输出你**现在已经想清楚的部分**：
+一个 JSON 对象，格式与要求同上一条指令。没想全的节可以省略（系统保留上一版内容），
+宁可少写也不要编造；拿不准的地方写进 notes。只输出 JSON，不要解释。`, head(cause.Error(), 200))
 }
 
 // repairPrompt 是同一会话里要求修正输出的指令。

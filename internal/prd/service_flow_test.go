@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -294,6 +295,62 @@ func TestStartRoundStopsWhenQuestionsAsked(t *testing.T) {
 	}
 	if st.row.State != string(StateAwaitingAnswers) {
 		t.Errorf("应挂起等人答，got %q", st.row.State)
+	}
+}
+
+// 首跑超时不判死：同一会话续跑一次，要求立刻交现在想清楚的部分。
+// 实测拆分轮两次都撞在时间上限上 —— 模型读代码「求准」，想清楚了却没交。
+//
+// 用默认预算跑太慢，这里靠 fakeAgent 直接返回超时错误，验的是续跑决策。
+func TestRunRoundRetriesOnceAfterTimeout(t *testing.T) {
+	st, wt := convergedStore(
+		store.PRDRoundRow{Round: 1, Stage: "understand"},
+		store.PRDRoundRow{Round: 2, Stage: "explore"},
+		store.PRDRoundRow{Round: 3, Stage: "converge"},
+	), &fakeWorktrees{}
+	ag := &fakeAgent{
+		errs:    []error{fmt.Errorf("prd: agent 超时（15m0s 内没有交出结果）: %w", context.DeadlineExceeded)},
+		results: []*agent.Result{nil, ok(splitOK)},
+	}
+	svc := newService(st, ag, wt)
+
+	res, err := svc.RunRound(context.Background(), RunRoundParams{PRDID: 1, UserID: 7})
+	if err != nil {
+		t.Fatalf("超时后应续跑并成功: %v", err)
+	}
+	if len(ag.calls) != 2 {
+		t.Fatalf("应跑 2 次（首跑 + 超时收尾），got=%d", len(ag.calls))
+	}
+	fix := ag.calls[1]
+	if !fix.Resume || fix.SessionID != ag.calls[0].SessionID {
+		t.Errorf("收尾必须续同一个会话，got resume=%v sid=%q", fix.Resume, fix.SessionID)
+	}
+	if !strings.Contains(fix.Prompt, "不要再读任何文件") {
+		t.Errorf("收尾指令必须明确不许再读，got=%q", fix.Prompt)
+	}
+	if len(res.Document.Tasks) != 1 || len(st.rounds) != 4 {
+		t.Errorf("收尾的产物应落库，got tasks=%d rounds=%d", len(res.Document.Tasks), len(st.rounds))
+	}
+	if st.row.LastError != nil {
+		t.Errorf("成功不该留失败记录，got %q", *st.row.LastError)
+	}
+}
+
+// 收尾也超时：这才判失败，且不无限重试。
+func TestRunRoundGivesUpWhenDeadlineRetryTimesOut(t *testing.T) {
+	st, wt := convergedStore(store.PRDRoundRow{Round: 1, Stage: "converge", Questions: qs(1)}), &fakeWorktrees{}
+	to := fmt.Errorf("prd: agent 超时（15m0s 内没有交出结果）: %w", context.DeadlineExceeded)
+	ag := &fakeAgent{errs: []error{to, to, nil}, results: []*agent.Result{nil, nil, ok(noChange)}}
+	svc := newService(st, ag, wt)
+
+	if _, err := svc.RunRound(context.Background(), RunRoundParams{PRDID: 1, UserID: 7}); err == nil {
+		t.Fatal("两次超时应判失败")
+	}
+	if len(ag.calls) != 2 {
+		t.Errorf("超时只该续跑一次，got 调用 %d 次", len(ag.calls))
+	}
+	if st.row.LastError == nil || !strings.Contains(*st.row.LastError, "失败") {
+		t.Errorf("失败原因应落库，got=%v", st.row.LastError)
 	}
 }
 
