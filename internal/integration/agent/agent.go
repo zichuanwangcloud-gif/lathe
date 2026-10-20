@@ -29,8 +29,22 @@ import (
 // 大仓 + 多插件时可能更大，因此远高于 bufio 默认的 64KB。
 const maxLineBytes = 16 << 20 // 16MB
 
-// pipeDrainGrace 是 CLI 退出后、读端等待管道 EOF 的上限。
+// idleTimeout 是「agent 长时间没有任何输出」的判死阈值。
 //
+// 总超时（LATHE_AGENT_TIMEOUT，默认 45 分钟）挡的是「跑得久」，挡不住
+// 「卡住了」：实测规划第 4 轮在 06:48:08 之后整整十分钟没吐一行 stdout
+// （thinking_tokens 停在 1150），一直挂到调用方的 10 分钟上限，期间人看到
+// 的只是「在跑」，拿到的报错是「超时」——而真实原因是进程不再产出任何东西。
+//
+// 取 12 分钟：实测一轮里最长的一段静默是单次长推理，几十秒到两三分钟；
+// 12 分钟仍无任何一行输出（含每 50 token 一条的 thinking_tokens），就不是
+// 「慢」而是「死了」。它只挡「彻底不动」，不挡「跑得久」—— 后者由总超时管。
+const idleTimeout = 12 * time.Minute
+
+// ErrIdle 表示 agent 静默超时被判死（区别于总超时）。
+var ErrIdle = errors.New("agent: 长时间没有任何输出，判定卡死")
+
+// pipeDrainGrace 是 CLI 退出后、读端等待管道 EOF 的上限。
 // 进程退出时管道里剩的内容是毫秒级读完的；等满这段还没 EOF，只能是写端
 // 被逃出进程组的后台进程攥着，再等下去也不会有新的有效输出。
 const pipeDrainGrace = 5 * time.Second
@@ -243,6 +257,18 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	}()
 	defer close(killed)
 
+	// 静默看门狗：连续 idleTimeout 没有产出任何事件就判死并杀掉进程组。
+	// 它独立于总超时 —— 「跑得久」和「卡住了」是两回事，报错也要能分开。
+	idle := newIdleWatch(idleTimeout)
+	defer idle.stop()
+	go func() {
+		select {
+		case <-idle.fired:
+			killProcessGroup(pgid)
+		case <-killed:
+		}
+	}()
+
 	// 事件在后台读，OnEvent 因此在这个协程里回调（RunParams.OnEvent 的
 	// 契约本来就是「在读取协程里同步执行」，调用方的实现须并发安全）。
 	type parsed struct {
@@ -252,7 +278,12 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	var out parsed
 	parseDone := make(chan struct{})
 	go func() {
-		out.result, out.err = parseStream(outR, p.OnEvent)
+		out.result, out.err = parseStream(outR, func(e Event) {
+			idle.touch()
+			if p.OnEvent != nil {
+				p.OnEvent(e)
+			}
+		})
 		close(parseDone)
 	}()
 	// stderr 只留头尾：只用于报错，CLI 狂刷时内存不该跟着涨。
@@ -285,6 +316,12 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 		}
 	}
 
+	// 静默判死要先于总超时判：两者都是「进程被杀、没有 result」，但原因
+	// 完全不同，报错必须能分开 —— 一个是设的上限太小，一个是进程卡住了。
+	if idle.firedNow() {
+		return result, fmt.Errorf("%w（%v 内没有任何输出，进程树已回收，stderr: %s）",
+			ErrIdle, idleTimeout, stderr.String())
+	}
 	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
 		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", limit.Round(time.Second))
 	} else if ctxErr != nil {

@@ -29,11 +29,11 @@ var ErrPRDBusy = errors.New("store: 该 PRD 正有一轮对话在进行中")
 // prdStallAfter 是 processing 的僵死阈值。超过它仍挂在 processing 的轮次
 // 视为死掉（进程被杀时没机会 CAS 回 false），读时顺手放行。
 //
-// 取 20 分钟的理由：一轮规划的总预算是 14 分钟（prd.roundBudget：首跑
-// 至多 10 分钟 + 输出不合规时的就地修正），留 6 分钟余量覆盖落库与网络
+// 取 25 分钟的理由：一轮规划的总预算是 18 分钟（prd.roundBudget：首跑
+// 至多 15 分钟 + 输出不合规时的就地修正），留 7 分钟余量覆盖落库与网络
 // 抖动。比这更短会把还在正常修正的轮次误判成僵死，更长则卡着人干等。
 // 自动续推的多轮各自续期（TouchPRDRound），不会累加到同一个时钟上。
-const prdStallAfter = 20 * time.Minute
+const prdStallAfter = 25 * time.Minute
 
 // PRDRow 是 prds 表的一行（含 JSON 标签，直接供 API 层返回）。
 //

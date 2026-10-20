@@ -117,19 +117,22 @@ type Service struct {
 	bg sync.WaitGroup
 }
 
-// 一轮的时间预算。三个值与 store.prdStallAfter（20 分钟）必须保持
+// 一轮的时间预算。三个值与 store.prdStallAfter（25 分钟）必须保持
 // 「roundBudget + 落库余量 < prdStallAfter」，否则僵死判定会把还在正常
 // 修正的轮次判死、放第二个请求进来。
+//
+// 首跑从 10 分钟提到 15 分钟：实测拆分轮（D）刚读代码就要 10 分钟以上，
+// 两次都恰好撞在 10 分钟上限上被切断 —— 两次各做了 40 多次工具调用，
+// 不是卡住，是预算给少了。配合 prompt 里「拆分阶段不要重新通读仓库」，
+// 正常情况下用不到这么多。
 const (
-	// roundTimeout 是首跑的上限：只读探索 + 出结构化结论，与预览推荐的
-	// recommendTimeout 一致。
-	roundTimeout = 10 * time.Minute
+	roundTimeout = 15 * time.Minute
 	// repairTimeout 是单次输出修正的上限：会话与检出都还在，只是改 JSON。
-	repairTimeout = 3 * time.Minute
+	repairTimeout = 4 * time.Minute
 	// roundBudget 是含修正在内整轮的硬上限。
-	roundBudget = 14 * time.Minute
+	roundBudget = 18 * time.Minute
 	// minRepairWindow 是剩余预算不足以做一次修正时直接放弃的门槛。
-	minRepairWindow = 45 * time.Second
+	minRepairWindow = 60 * time.Second
 )
 
 // maxRepairs 是一轮之内输出修正的最多次数。
