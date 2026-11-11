@@ -1,10 +1,11 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed, inject } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
 import { confirmDialog } from '../confirm'
-import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
+import { createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
+import { createEventWindow, groupSubagents, pairTools } from '../replay'
 
 const props = defineProps({ id: { type: String, required: true } })
 const router = useRouter()
@@ -66,22 +67,24 @@ async function act(fn, confirmText) {
 // ---------------------------------------------------------------- 执行日志
 // docs/04 §3.4：2s 增量轮询（after=last_id），进入终态后再拉一次收尾即停。
 
-const events = ref([])
-const eventsError = ref('')
-const lastId = ref(0)
 // 内存里只留最近 MAX_LIVE_EVENTS 条（见 livelog.js），裁掉的条数如实展示
-const droppedEvents = ref(0)
+const evWindow = createEventWindow({
+  fetchPage: ({ after }) => api.taskEvents(props.id, after),
+  max: MAX_LIVE_EVENTS,
+  isTerminal: () => isTerminal.value,
+  state: reactive({ events: [], lastId: 0, dropped: 0, error: '' }),
+})
+const events = computed(() => evWindow.state.events)
+const eventsError = computed(() => evWindow.state.error)
+const droppedEvents = computed(() => evWindow.state.dropped)
 let evPoller = null
 
 async function loadEvents() {
   try {
-    const resp = await api.taskEvents(props.id, lastId.value)
-    droppedEvents.value += appendCapped(events.value, resp.events)
-    if (resp.last_id != null) lastId.value = resp.last_id
-    eventsError.value = ''
+    await evWindow.load()
   } catch (e) {
     if (e instanceof UnauthorizedError) return onUnauthorized()
-    eventsError.value = e.message
+    evWindow.state.error = e.message
   }
 }
 
@@ -95,90 +98,6 @@ const PHASE_META = {
   verify: { label: '验证', order: 2 },
   review: { label: '评审', order: 3 },
   push: { label: '推送', order: 4 },
-}
-
-// subagent 的事件（0014）收成一个可折叠子块，插在它首次出现的位置。
-//
-// 为什么是「兄弟块」而不是真的挂在那条 Agent 调用下面：agentId 与父调用
-// toolUseId 的对应关系只存在于 transcript 的 toolUseResult 字段里，stdout
-// 这条通道给不出。与其按时间顺序猜一个父子关系，不如老实地并排放 —— 子块
-// 标题就是派给它的任务描述，与父调用那行显示的 description 是同一句话，
-// 人一眼能对上。（真要连线，得再读父会话的 transcript，见 docs/04 §7.4。）
-function groupSubagents(list) {
-  const out = []
-  const blocks = new Map() // agentId → 子块
-  for (const e of list) {
-    const aid = e.agentId
-    if (!aid) {
-      out.push(e)
-      continue
-    }
-    let b = blocks.get(aid)
-    if (!b) {
-      b = { subagent: true, id: 'sub-' + aid, agentId: aid, title: '', list: [] }
-      blocks.set(aid, b)
-      out.push(b) // 占住首次出现的位置，保持时间顺序
-    }
-    // 首行是派活描述，充当子块标题而不是块内的一条
-    if (e.kind === 'agent_start') {
-      b.title = e.body
-      continue
-    }
-    b.list.push(e)
-  }
-  return out
-}
-
-// 一次工具调用在事件流里是两条（tool_use 发起 + tool_result 结果）。平铺时
-// 两行各自漂着，只看得出「调过 Bash」，看不出这步花了多久、成没成 ——
-// 这是执行日志最难扫的根因。按 payload.toolUseId 把结果并进发起那条，
-// 顺带用两者的 at 之差算出耗时。
-//
-// 老事件的 tool_use 没有 id（该字段是后来才取的），配不上的一律原样放行，
-// 退回两行平铺 —— 降级而非崩溃，与后端 KindRaw 同一立场。
-//
-// 子块对象（groupSubagents 产出）没有 kind，会被原样放行。
-function pairTools(list) {
-  const out = []
-  const pending = new Map() // toolUseId → 已放进 out 的发起项
-  for (const e of list) {
-    const id = e.payload?.toolUseId
-
-    if (e.kind === 'tool_use') {
-      const item = { ...e, result: null, durationMs: null }
-      if (id) pending.set(id, item)
-      out.push(item)
-      continue
-    }
-
-    if (e.kind === 'tool_result' && id && pending.has(id)) {
-      const item = pending.get(id)
-      pending.delete(id) // 同一 id 只认第一条结果
-      item.result = e
-      item.durationMs = toolDuration(item.at, e.at)
-      continue
-    }
-
-    out.push(e)
-  }
-  return out
-}
-
-// 耗时按两条事件的落库时间差算，但这个差值是粗粒度的：at 取自入库时的
-// now()，而 EventSink 是 200ms 批量刷库（eventsink.go 的 sinkFlushEvery），
-// 同一批里的发起与结果拿到的是同一个时间戳。也就是说误差约 ±200ms，
-// 快调用会算出 0ms。
-//
-// 因此只在 1s 以上才显示：那时相对误差已降到 20% 以内，数字才说得上话。
-// 更低的区间与其显示一个自信的错数，不如不显示 —— 「很快」这件事，
-// 从一行 ✓ 上已经看得出来了。要拿到真实的单次工具耗时，得在事件里记
-// 发生时刻而不是入库时刻（需要加列，见 docs/04 §7.5）。
-const TOOL_DURATION_FLOOR_MS = 1000
-
-function toolDuration(useAt, resultAt) {
-  const dt = new Date(resultAt) - new Date(useAt)
-  if (!Number.isFinite(dt) || dt < TOOL_DURATION_FLOOR_MS) return null
-  return dt
 }
 
 const phaseGroups = computed(() => {
