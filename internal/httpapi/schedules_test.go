@@ -66,8 +66,8 @@ func (f *fakeIntake) Linear(ctx context.Context, userID int64) (ScheduleLinear, 
 	return linear.NewClientWithURL("tok", f.url)
 }
 func (f *fakeIntake) WebhookSecretConfigured(ctx context.Context, userID int64) bool { return f.secret }
-func (f *fakeIntake) LinearUserID(ctx context.Context, userID int64) string         { return f.userID }
-func (f *fakeIntake) TriggerLabel(ctx context.Context) string                       { return f.label }
+func (f *fakeIntake) LinearUserID(ctx context.Context, userID int64) string          { return f.userID }
+func (f *fakeIntake) TriggerLabel(ctx context.Context) string                        { return f.label }
 
 type countingFirer struct {
 	inner ScheduleFirer
