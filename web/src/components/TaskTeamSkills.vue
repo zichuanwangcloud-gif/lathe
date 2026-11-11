@@ -30,5 +30,10 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 本组件是多根片段（dt + dd），拿不到 TaskDetail 的 scoped 样式：不抄一份的话
+   标签会变黑变大、值带浏览器默认的 40px 左缩进（AC-15 手测截图发现）。
+   与 TaskDetail.vue 的 dt/dd 规则保持一致；不去改 TaskDetail（PRD R9：只挂一行）。 */
+dt { color: var(--text-dim); font-size: 13px; }
+dd { margin: 0; overflow-wrap: anywhere; }
 .pin { margin-right: 8px; }
 </style>

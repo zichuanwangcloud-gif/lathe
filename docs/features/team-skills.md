@@ -193,7 +193,7 @@ materializeTeamSkills：
 | AC-13 | 版本行被删 → `team_skill_failed`、点名 slug@version、agent 未驱动；PinsSave/PinsLoad/ListEnabled 出错同样失败；PlanRetry 五格；default 回归锁；review 二轮端到端（Inspect 证实有提交，重试仍回实现、不再推送） | `red-ac13-pinsave.txt`；`red-runner-pipeline-unwired.txt`（PlanRetry 第 2、3 格得 verify / commit） | `make test` |
 | AC-14 | 功能关闭零副作用 | —（本条只证「关掉等于没有」） | `make test` |
 | AC-14b | 共用 mirror 的用户 B 新增 `.claude/skills/b-new` 照常进 PR、共享 exclude 不含规则；对照格锁住既有残留 | `red-ac14b.txt` | `make test` |
-| AC-15 | `make ui && make build`；冒烟：:8411 上走完新建 → v1 → 改一行 v2 → 同内容 200 → 查看 v1/v2 → 恢复 → 凭据 400 → 穿越 400 → 同名 409 → 停用 → 归档 | — | `ac15-smoke-api.txt` |
+| AC-15 | `make ui && make build`；冒烟：:8411 上走完新建 → v1 → 改一行 v2 → 同内容 200 → 查看 v1/v2 → 恢复 → 凭据 400 → 穿越 400 → 同名 409 → 停用 → 归档 | `red-ac15-ui-task-row-style.txt`（+ `.png`） | `ac15-smoke-api.txt`；界面：`ac15-ui-walk.txt`、`ac15-ui-01…13-*.png`（无头 chromium 逐步截图，含任务详情「团队技能」行） |
 | AC-16 | `make lint && make test`、`make test-race`、点名测试清单（76 个 PASS） | — | `gate1-make-lint-test.txt`、`ac16-test-race.txt`、`ac16-named-tests.txt`、`ac16-existing-skill-tests.txt` |
 | AC-17 | diff 不含 `go.mod/go.sum/web/package.json/skills/**/state.go/.claude/workspaces` | — | `ac17-diff-guard.txt` |
 
