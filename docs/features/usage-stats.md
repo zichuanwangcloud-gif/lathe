@@ -1618,7 +1618,7 @@ worktree（`feat/usage-stats`，HEAD `cff5332` = origin/dev）里重新核对过
 | AC-4 | `TestRecordAgentRunIsIdempotent`、`TestRecordAgentRunClampsEndedAt`、`TestAgentRunsAttemptUniqIsNullsNotDistinct` | `red-store-42P01.txt`；约束形态的红沿用评审期 `review-r1-nulls-distinct.txt` |
 | AC-5 | `TestUsageBucket` | 编译失败 |
 | AC-6 | `TestAgentRunsIndexesValid`、`TestBackfillBucketMatchesUsageBucket`、`TestBackfillRoundTripNoDoubleCount`；命令行 `ac6-migrate.txt`、`ac6-roundtrip-no-double.txt` | `red-AC6-roundtrip.txt`（第二版 SQL：首例 `got 3/0.60, want 2/0.35`）；`red-AC6-clock-skew.txt`（第三版 SQL：节点快 120s `got 3/0.60`、节点慢 1h `got 1/0.25`，与评审期复现一致）。两版错误 SQL 存在 `internal/store/testdata/0039_backfill_v{2,3}.sql`，由 `LATHE_F03_BACKFILL_VARIANT` 切换，只用于红证据 |
-| AC-7 | `TestUsageStatsAggregates`、`TestUsageStatsGroupTaskLimit`、`TestUsageStatsByModel`、`TestUsageStatsBucketFilter`、`TestUsageGroupTaskHTTP`、`TestTaskUsageDetail` | `red-AC7-group-task.txt`（只按 `cost DESC` → T4 排第一）；`red-AC7-bymodel.txt`（直接展开 `'[]'` → `(unknown)` 消失）；`red-AC7-bucket.txt`（按 phase 过滤 → `prd_plan got 0`）；`red-AC7-labels.txt`（①写成 `title`；②JOIN 漏条件 → `Tx got issueTitle="B的工单-r"`）；`red-AC7c-AC8-AC10-httpapi.txt`（路由不存在 404） |
+| AC-7 | `TestUsageStatsAggregates`、`TestUsageStatsGroupTaskLimit`、`TestUsageStatsByModel`、`TestUsageStatsBucketFilter`、`TestUsageGroupTaskHTTP`、`TestTaskUsageDetail` | `red-AC7-group-task.txt`（只按 `cost DESC` → T4 排第一）；`red-AC7-bymodel.txt`（直接展开 `'[]'` → `(unknown)` 消失）；`red-AC7-bucket.txt`（按 phase 过滤 → `prd_plan got 0`）；`red-AC7-labels.txt`（①写成 `title`；②JOIN 两条同时漏 → `Tx got issueTitle="B的工单-r"`）；`red-AC7-labels-join-r2.txt`（两条 JOIN 条件**各自单独**漏掉也抓红，见偏离第 10 条）；`red-AC7c-AC8-AC10-httpapi.txt`（路由不存在 404） |
 | AC-7b | `TestUsageTierFollowsAttemptAcrossFreshRetry`、`TestSetAgentRunTierOnlyFillsNull` | `red-AC7b.txt`：方案 (a) JOIN `tasks.verify_tier` → `heavy=0, light=5`；写入点读 `tasks.verify_tier` → `heavy=5, light=0`（与 PRD 预期逐字一致） |
 | AC-8 / 9 / 10 | `TestUsageIsolatedByOwner`、`TestAdminUsageGlobal`、`TestAdminUsageForbiddenForMember`、`TestUsageRejectsBadParams`、`TestUsageIgnoresUnknownParams`、`TestUsageZeroValue` | `red-AC7c-AC8-AC10-httpapi.txt` |
 | AC-11 | `TestRecordTruncatesModelsByRune` | 编译失败 |
@@ -1648,6 +1648,12 @@ AC-12 的 DOM 断言（`ui/dom-checks.json`）：点「任务」分组后 URL �
 9. **AGENTS.md §3「agent 提示词 / 驱动」行要求的真实任务执行证据**：本线不连真实外网、不起真实 claude，没有跑真实任务。驱动侧的证据是
    真实 CLI 样本（`claude-result-event-sample.json`、f01 双 result fixture）喂解析路径，加上假 driver 走完整流水线（含 Fresh 改档、review 轮、
    超时/判死/无结果）落真实库。合入前若要补一次真实运行，看 `agent_runs` 里该任务的行即可。
+10. **`TestUsageGroupTaskHTTP` 多两个夹具**（第 1 轮审计后补）：PRD 的红②写的是 JOIN 漏 `t.tracker_provider='internal'` **或**
+    `i.user_id=t.user_id` 都要抓红，但只有 `Tx`（Linear 任务、key 撞 B 的工单）时，单独漏属主条件仍是绿的——`Tx` 先被
+    provider 条件挡掉了；单独漏 provider 条件也是绿的——`Tx` 会被属主条件挡掉。补 `Ty` = A 的**内置**任务、`external_key` = B 的 `LT-b`
+    （只有属主条件挡得住，want `issueTitle=null`，**不是** `B的工单-r`）与 `Tz` = A 的 **Linear** 任务、`external_key` = A 自己的 `LT-a`
+    （只有 provider 条件挡得住，want `issueTitle=null`，**不是** `内置标题-r`）。工单号来自全局序列，现实中 `Ty` 撞不上，但 JOIN 条件
+    要在 SQL 里可见、不靠这个不变量（§3.3）。三种漏法（只漏属主 / 只漏 provider / 两条都漏）的红与原 SQL 的绿在 `red-AC7-labels-join-r2.txt`。
 
 ### 与邻居的接缝（先合入者不依赖后合入者）
 

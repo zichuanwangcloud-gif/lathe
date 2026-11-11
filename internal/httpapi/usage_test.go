@@ -150,12 +150,19 @@ func TestUsageGroupTaskHTTP(t *testing.T) {
 	tl := a.task(t, "ENG-"+r, "linear")
 	ti := a.task(t, issueA.Key, "internal")
 	tx := a.task(t, issueB.Key, "linear") // external_key 故意等于 B 的工单号
+	// ty：内置任务且 external_key 等于 B 的工单号 —— tracker_provider 条件挡不住，
+	// 只有 i.user_id = t.user_id 挡得住；单独漏掉属主条件也要抓红（tx 只能抓 provider 条件）。
+	// 工单号来自全局序列，现实中撞不上，但 JOIN 条件必须在 SQL 里可见、不靠这个不变量。
+	ty := a.task(t, issueB.Key, "internal")
+	// tz：Linear 任务且 external_key 等于 A 自己的工单号 —— 属主条件挡不住，
+	// 只有 t.tracker_provider = 'internal' 挡得住；单独漏掉 provider 条件也要抓红。
+	tz := a.task(t, issueA.Key, "linear")
 	p1 := a.prd(t, `{"oneLiner":{"body":"  一句话-`+r+`  "}}`)
 	p2 := a.prd(t, "")
 	p3 := a.prd(t, `{"oneLiner":{"body":"`+strings.Repeat("长", 81)+`"}}`)
 
 	start := time.Now().Add(-time.Hour)
-	for i, id := range []int64{tl, ti, tx} {
+	for i, id := range []int64{tl, ti, tx, ty, tz} {
 		a.run(t, agent.RunRecord{Kind: "task", TaskID: id, Phase: "implement", StartedAt: start.Add(time.Duration(i) * time.Second), Result: paidRes(0.1)})
 	}
 	for i, id := range []int64{p1, p2, p3} {
@@ -181,6 +188,8 @@ func TestUsageGroupTaskHTTP(t *testing.T) {
 		{"Linear 任务：issueTitle 为 null", fmt.Sprintf("task:%d", tl), map[string]string{"externalKey": "ENG-" + r, "trackerProvider": "linear", "issueTitle": "<null>"}},
 		{"内置任务：issueTitle 取自己的工单", fmt.Sprintf("task:%d", ti), map[string]string{"externalKey": issueA.Key, "trackerProvider": "internal", "issueTitle": "内置标题-" + r}},
 		{"Linear 任务撞上 B 的工单号：不跨属主取标题", fmt.Sprintf("task:%d", tx), map[string]string{"externalKey": issueB.Key, "trackerProvider": "linear", "issueTitle": "<null>"}},
+		{"内置任务撞上 B 的工单号：不跨属主取标题", fmt.Sprintf("task:%d", ty), map[string]string{"externalKey": issueB.Key, "trackerProvider": "internal", "issueTitle": "<null>"}},
+		{"Linear 任务撞上自己的内置工单号：不取内置工单标题", fmt.Sprintf("task:%d", tz), map[string]string{"externalKey": issueA.Key, "trackerProvider": "linear", "issueTitle": "<null>"}},
 		{"PRD：oneLiner 去空白", fmt.Sprintf("prd:%d", p1), map[string]string{"oneLiner": "一句话-" + r}},
 		{"PRD 还没有 document：oneLiner 为 null", fmt.Sprintf("prd:%d", p2), map[string]string{"oneLiner": "<null>"}},
 	}
