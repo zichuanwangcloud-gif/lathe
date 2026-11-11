@@ -13,6 +13,8 @@ import PRDConversation from './views/prd/PRDConversation.vue'
 import Issues from './views/Issues.vue'
 import IssueDetail from './views/IssueDetail.vue'
 import Repos from './views/Repos.vue'
+import Teams from './views/Teams.vue'
+import TeamDetail from './views/TeamDetail.vue'
 import PersonalSettings from './views/PersonalSettings.vue'
 import SystemSettings from './views/SystemSettings.vue'
 import Users from './views/Users.vue'
@@ -52,6 +54,9 @@ const router = createRouter({
     { path: '/linear', name: 'linear', component: LinearIssues, meta: { linear: true } },
     { path: '/tasks/:id', name: 'task', component: TaskDetail, props: true },
     { path: '/repos', name: 'repos', component: Repos },
+    // 团队与角色（f12）：成员与可见性的团队，与站内管理员角色正交
+    { path: '/teams', name: 'teams', component: Teams },
+    { path: '/teams/:id', name: 'team', component: TeamDetail, props: true },
     { path: '/settings', name: 'settings', component: PersonalSettings },
     { path: '/admin/settings', name: 'system-settings', component: SystemSettings, meta: { admin: true } },
     { path: '/users', name: 'users', component: Users, meta: { admin: true } },

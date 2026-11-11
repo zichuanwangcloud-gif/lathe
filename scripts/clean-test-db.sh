@@ -21,7 +21,8 @@
 #
 # 判别条件：**email 以 @example.com 结尾**。RFC 2606 把 example.com 保留
 # 给文档与测试，真实用户不会用它，所以这个条件既充分又安全。删 user 会
-# 级联带走它的 repos / tasks / task_events / verifications / agent_events。
+# 级联带走它的 repos / tasks / task_events / verifications / agent_events
+# 与团队成员关系；之后再删「没有任何成员的团队」（孤儿团队，f12）。
 #
 # 磁盘上的 worktree 目录不在本脚本职责内 —— 数据库行会被级联带走，目录
 # 不会。那是 worktree 收割机（docs/08-debt-cleanup.md T6）的事。
@@ -30,7 +31,8 @@
 #   scripts/clean-test-db.sh          # 干跑，只报告要删什么
 #   scripts/clean-test-db.sh --yes    # 真删
 #
-# 连接串取 LATHE_TEST_DSN，未设时用 make dev-infra 的默认库。
+# 连接串取 LATHE_TEST_DSN，未设时用 make dev-infra 的默认库。输出第一节永远是
+# current_database()：跑之前先看一眼连的是哪个库。
 
 set -eu
 
@@ -71,6 +73,12 @@ SELECT count(*) AS 用户数,
 FROM users WHERE email LIKE '%@example.com';"
 
 echo
+echo "== 孤儿团队（没有任何成员的团队；fixture 用户删掉后其团队会变成这样）=="
+run_sql -c "
+SELECT count(*) AS 孤儿团队数
+FROM teams t WHERE NOT EXISTS (SELECT 1 FROM team_members m WHERE m.team_id = t.id);"
+
+echo
 echo "== 非终态任务里【不属于】测试 fixture 的部分（需人工判断，本脚本不动）=="
 run_sql -c "
 SELECT t.id, t.state, t.external_key, u.email, t.updated_at
@@ -87,7 +95,16 @@ fi
 
 echo
 echo "== 删除中 =="
+# 顺序不能反：先删 fixture 用户，team_members 随 ON DELETE CASCADE 消失，fixture
+# 团队这才成为孤儿；先删孤儿团队的话，fixture 团队此刻仍有成员，会残留。
+# 第二条也会删掉非测试用户留下的空团队 —— 正常路径上不会出现空团队（owner 不能
+# 退出），出现了就是残留；干跑段的「孤儿团队数」供人先判断。
+# 两条 DELETE 用下面的标记夹住，internal/store 的 TestCleanTestDBDeleteSQLInRollback
+# 按标记抽出原文在回滚事务里验证（测的就是这里写的）。
+# lathe:delete-sql-begin
 run_sql -c "DELETE FROM users WHERE email LIKE '%@example.com';"
+run_sql -c "DELETE FROM teams t WHERE NOT EXISTS (SELECT 1 FROM team_members m WHERE m.team_id = t.id);"
+# lathe:delete-sql-end
 echo "完成。剩余非终态任务："
 run_sql -c "
 SELECT t.id, t.state, t.external_key, u.email

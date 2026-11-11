@@ -165,6 +165,7 @@ func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // ownedTask 解析路径里的任务 ID，判定当前用户【可读】该任务（与 f04 共用的唯一任务读归属 helper）。
+// 可读 = 任务属主，或任务所属仓库共享到了当前用户所在的团队（store.RepoAccess）。
 //
 // 名字里的 owned 是历史名，语义是「当前用户可读」——只给【读】接口用（events 等）。
 // 写接口（retry/cancel/approve/review-retry）与 retryPlan 继续内联
@@ -177,9 +178,16 @@ func (a *API) ownedTask(w http.ResponseWriter, r *http.Request) (*task.Task, boo
 		return nil, false
 	}
 	tk, err := a.Tasks.Get(r.Context(), id)
-	if err != nil || tk.UserID != CurrentUser(r).ID {
+	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
 		return nil, false
+	}
+	if me := CurrentUser(r).ID; tk.UserID != me {
+		// 团队可见性（f12）：任务所属仓库共享到了我所在的团队
+		if _, err := a.Store.RepoAccess(r.Context(), tk.RepoID, me); err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+			return nil, false
+		}
 	}
 	return tk, true
 }

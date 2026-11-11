@@ -168,6 +168,14 @@ func TestCleanTestDBDeleteSQLInRollback(t *testing.T) {
 			fixtureTeam, fixtureUser, realTeam, realUser); err != nil {
 			t.Fatal(err)
 		}
+		// 存量问题（与 f12 无关，本线不修，已在 PR 里报告）：issue_comments.user_id 是
+		// ON DELETE SET NULL，而 issue_comments_author_check 要求 user_id / actor 恰有一个
+		// 非空 —— fixture 用户写过评论时，脚本既有的 DELETE FROM users 会撞 23514。
+		// 这里只在回滚事务里先清掉这些评论，好让断言落在两条 DELETE 的顺序与别名上。
+		if _, err := tx.Exec(ctx, `DELETE FROM issue_comments c USING users u
+			WHERE c.user_id = u.id AND u.email LIKE '%@example.com'`); err != nil {
+			t.Fatal(err)
+		}
 		for _, s := range stmts {
 			if _, err := tx.Exec(ctx, s); err != nil {
 				t.Fatalf("执行 %q 失败: %v", s, err)
@@ -191,7 +199,7 @@ func TestCleanTestDBDeleteSQLInRollback(t *testing.T) {
 	var usersAfter, teamsAfter int
 	_ = st.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE email LIKE '%@example.com'`).Scan(&usersAfter)
 	_ = st.pool.QueryRow(ctx, `SELECT count(*) FROM teams`).Scan(&teamsAfter)
-	// 只比较不小于：-p 1 下同包别的测试不会并发写，这里取等号断言
+	// -p 1 下同包别的测试不会并发写，这里取等号断言
 	if usersAfter != usersBefore || teamsAfter != teamsBefore {
 		t.Errorf("回滚后库被动过：users %d→%d teams %d→%d", usersBefore, usersAfter, teamsBefore, teamsAfter)
 	}

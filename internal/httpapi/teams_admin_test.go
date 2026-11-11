@@ -19,21 +19,21 @@ func TestAdminDeleteLastTeamOwnerBlocked(t *testing.T) {
 	cases := []struct {
 		name string
 		// setup 返回团队 id；target 是被删的人
-		setup      func(f *accountFixture, target int64) int64
+		setup      func(t *testing.T, f *accountFixture, target int64) int64
 		wantCode   int
 		wantUser   bool // 删完账号是否仍在
 		wantTeam   bool // 删完团队是否仍在
 		wantOwners int  // 团队仍在时 owner 数
 	}{
-		{"owner 且团队有其他成员 → 409", func(f *accountFixture, target int64) int64 {
-			other := f.mkUser(t, f.email(t, "other"), "member-password-1", store.RoleMember)
+		{"owner 且团队有其他成员 → 409", func(t *testing.T, f *accountFixture, target int64) int64 {
+			other := f.mkUser(t, f.email(t, "other-"+teamRand()), "member-password-1", store.RoleMember)
 			return teamWith(t, f.st, map[int64]string{target: "owner", other.ID: "member"})
 		}, http.StatusConflict, true, true, 1},
-		{"团队唯一成员 → 200，团队同事务删除", func(f *accountFixture, target int64) int64 {
+		{"团队唯一成员 → 200，团队同事务删除", func(t *testing.T, f *accountFixture, target int64) int64 {
 			return teamWith(t, f.st, map[int64]string{target: "owner"})
 		}, http.StatusOK, false, false, 0},
-		{"只是 member → 200，团队与 owner 不变", func(f *accountFixture, target int64) int64 {
-			other := f.mkUser(t, f.email(t, "keeper"), "member-password-1", store.RoleMember)
+		{"只是 member → 200，团队与 owner 不变", func(t *testing.T, f *accountFixture, target int64) int64 {
+			other := f.mkUser(t, f.email(t, "keeper-"+teamRand()), "member-password-1", store.RoleMember)
 			return teamWith(t, f.st, map[int64]string{other.ID: "owner", target: "member"})
 		}, http.StatusOK, false, true, 1},
 	}
@@ -41,8 +41,8 @@ func TestAdminDeleteLastTeamOwnerBlocked(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			f := newAccountFixture(t)
 			f.asAdmin(t)
-			target := f.mkUser(t, f.email(t, "target"), "member-password-1", store.RoleMember)
-			team := c.setup(f, target.ID)
+			target := f.mkUser(t, f.email(t, "target-"+teamRand()), "member-password-1", store.RoleMember)
+			team := c.setup(t, f, target.ID)
 
 			resp, _ := f.req(t, "DELETE", replaceID("/api/admin/users/{id}", target.ID), "")
 			if resp.StatusCode != c.wantCode {
@@ -87,7 +87,7 @@ func teamWith(t *testing.T, st *store.Store, members map[int64]string) int64 {
 func TestAdminRemoveWithoutStoreFailsClosed(t *testing.T) {
 	f := newAccountFixture(t)
 	admin := f.asAdmin(t)
-	target := f.mkUser(t, f.email(t, "nostore"), "member-password-1", store.RoleMember)
+	target := f.mkUser(t, f.email(t, "nostore-"+teamRand()), "member-password-1", store.RoleMember)
 
 	a := NewAuth(apiTestToken)
 	a.Bootstrap = admin

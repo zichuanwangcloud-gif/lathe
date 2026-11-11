@@ -147,7 +147,7 @@ func (e *teamEnv) raw(uid int64, method, path, body string, hdr ...string) (int,
 	if err != nil {
 		return 0, nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
 	return resp.StatusCode, b, err
 }

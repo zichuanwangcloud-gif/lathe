@@ -323,6 +323,10 @@ func serve(cfg config.Config) error {
 	}
 	adminAPI.Routes(mux)
 
+	// 团队与角色（f12）：团队共享的是任务可见性，不是凭据、执行身份或仓库配置的编辑权。
+	teamAPI := &httpapi.TeamAPI{Store: st, Auth: auth, TrustProxy: cfg.TrustedProxy}
+	teamAPI.Routes(mux)
+
 	// 任务预览环境：在 worktree 里构建镜像、起容器给人手动验证。
 	// 阈值现取现用 —— 系统设置里改完即刻生效。
 	//
