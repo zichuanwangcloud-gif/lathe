@@ -63,7 +63,7 @@ func assistantTextEvent(text string) agent.Event {
 // 且顺序与投递顺序一致。
 func TestEventSinkDrainOnClose(t *testing.T) {
 	rec := &fakeEventRecorder{}
-	s := newEventSink(context.Background(), rec, 42, "implement", "", "")
+	s := newEventSink(context.Background(), rec, 42, "implement", agent.DriverClaude, "", "")
 
 	s.OnEvent(assistantTextEvent("第一步"))
 	s.OnEvent(assistantTextEvent("第二步"))
@@ -92,7 +92,7 @@ func TestEventSinkNilSafe(t *testing.T) {
 	s.OnEvent(assistantTextEvent("不会 panic"))
 	s.Close()
 
-	if got := newEventSink(context.Background(), nil, 1, "triage", "", ""); got != nil {
+	if got := newEventSink(context.Background(), nil, 1, "triage", agent.DriverClaude, "", ""); got != nil {
 		t.Fatalf("recorder 为 nil 应返回 nil sink，得到 %v", got)
 	}
 }
@@ -129,7 +129,7 @@ func TestEventSinkCollectsSubagentEvents(t *testing.T) {
 	dir := subagentFixture(t, cwd, session)
 
 	rec := &fakeEventRecorder{}
-	s := newEventSink(context.Background(), rec, 7, "implement", cwd, session)
+	s := newEventSink(context.Background(), rec, 7, "implement", agent.DriverClaude, cwd, session)
 
 	// sink 起好之后 agent 才派活 —— 这才是真实时序
 	if err := os.WriteFile(filepath.Join(dir, "agent-a1.jsonl"),
@@ -189,7 +189,7 @@ func TestEventSinkSkipsPreexistingSubagentRecords(t *testing.T) {
 	}
 
 	rec := &fakeEventRecorder{}
-	s := newEventSink(context.Background(), rec, 7, "fix-1", cwd, session)
+	s := newEventSink(context.Background(), rec, 7, "fix-1", agent.DriverClaude, cwd, session)
 
 	// 本轮新追加的一条
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
@@ -225,7 +225,7 @@ func TestEventSinkSubagentDirAbsent(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", root)
 
 	rec := &fakeEventRecorder{}
-	s := newEventSink(context.Background(), rec, 7, "implement", "/opt/lathe/workspaces/nope", "sess-x")
+	s := newEventSink(context.Background(), rec, 7, "implement", agent.DriverClaude, "/opt/lathe/workspaces/nope", "sess-x")
 	s.OnEvent(assistantTextEvent("只有主 agent"))
 	s.Close()
 

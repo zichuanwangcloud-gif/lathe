@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a1c9c0-72ef-7703-851c-4e2430beec38"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `stub-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'echo hello-f06'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'echo hello-f06'","aggregated_output":"hello-f06\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"DONE-F06"}}
+{"type":"turn.completed","usage":{"input_tokens":61,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":12,"reasoning_output_tokens":0}}

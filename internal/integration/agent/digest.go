@@ -58,6 +58,10 @@ type Entry struct {
 // 至少还能看到"发生了什么"。这与 Event.Raw 的立场一致 —— 驱动不能被
 // 上游的格式变动打挂。
 func Digest(ev Event) []Entry {
+	// 各 CLI 的私有格式各走各的提炼；claude 分支（下面的 switch）一行不改。
+	if ev.Driver == DriverCodex {
+		return digestCodex(ev)
+	}
 	switch ev.Type {
 	case EventSystem:
 		return digestSystem(ev)

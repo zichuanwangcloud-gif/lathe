@@ -69,13 +69,20 @@ stream-json 事件流是**执行实况**，Result.Text 是终局自述；让模�
 ### 3.1 数据通路
 
 ```
-claude CLI ──stdout NDJSON──> agent.Driver ──OnEvent──> EventSink（新增）
-                                                              │ Digest 提炼
-                                                              ▼
-                                                      agent_events 表
-                                                              ▲
-前端 TaskDetail 日志面板 <── GET /api/tasks/{id}/events ──────┘
+claude CLI ──stream-json──> ClaudeDriver ─┐
+                                          ├─ 归一成 agent.Event{Driver,...} ──OnEvent──> EventSink
+codex  CLI ──exec --json──> CodexDriver ──┘                                                │ Digest（按 Driver 分派）
+                                                                                           ▼
+                                                                                   agent_events 表
+                                                                                           ▲
+前端 TaskDetail 日志面板 <── GET /api/tasks/{id}/events ───────────────────────────────────┘
 ```
+
+f06（多 CLI 驱动）起，事件先由各自的驱动归一成同一个 `agent.Event`（多一个 `Driver` 字段），
+`Digest` 按驱动分派提炼，产出的 `Entry.Kind` 只有既有那几种（`agent_events` 的 CHECK 约束一字未改）。
+codex 的工具调用映射成 `Bash` / `Edit` 等同名工具、带 `toolUseId` 配对与 `exitCode`/`isError`，
+界面不用为 codex 写分支；codex 产出的每条事件 payload 带 `driver:"codex"`。映射表见
+[features/multi-cli.md](./features/multi-cli.md)。
 
 ### 3.2 EventSink：批量落库器
 
@@ -175,6 +182,10 @@ GET /api/tasks/{id}/events?after=<id>&limit=<n>
 ---
 
 ## 7. 第二条数据源：subagent 的内部活动（0014）
+
+> **只对 claude 有效**（f06）：这条数据源读的是 claude 落在磁盘上的内部 transcript。codex 没有对应的
+> 记录契约，codex 任务明确降级为「只看主会话」——runner 经 `agent.SubagentDirFor(driver, …)` 取目录，
+> 对 codex 返回空串，不起 watcher。
 
 ### 7.1 问题：21% 的活动不在 stdout 上
 

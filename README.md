@@ -116,8 +116,8 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 ```
 
-镜像不含 Postgres 与 `claude` CLI：用 `LATHE_DB_*` 指向外部数据库
-（容器内先跑 `lathe migrate up` 建表），agent 执行需另行挂载或安装 claude。
+镜像不含 Postgres 与 `claude` / `codex` CLI：用 `LATHE_DB_*` 指向外部数据库
+（容器内先跑 `lathe migrate up` 建表），agent 执行需另行挂载或安装 claude（以及按需安装 codex）。
 
 | 环境变量 | 作用 |
 |---|---|
@@ -151,6 +151,8 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_AGENT_TIMEOUT` | agent 单次执行超时，默认 `45m` |
 | `LATHE_AGENT_ENV_EXTRA` | agent 子进程环境白名单的显式开口（逗号分隔变量名）。默认白名单只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程 |
 | `LATHE_CLAUDE_BIN` | claude 二进制名或路径，默认 `claude`（从 PATH 解析） |
+| `LATHE_CODEX_HOME` | codex 驱动的**专用** `CODEX_HOME`；不配 = codex 不启用（仓库页不能选 codex，默认部署行为不变）。子进程的 `CODEX_HOME` 指向它、`HOME` 换成 `<它>/home`（个人 `~/.codex` 与 `~/.agents/skills` 都进不来）。必须是已存在的绝对路径目录，**不得是个人 `~/.codex`**，**不得放在系统临时目录（`TMPDIR`，默认 `/tmp`）下**——codex 会拒绝在那里执行任何命令且不报错；违反任一条启动直接报错。启用步骤：`mkdir` 专用目录 → `CODEX_HOME=<dir> codex login --with-api-key` → 在 `<dir>/config.toml` 写模型/provider → 设本变量。详见 `docs/features/multi-cli.md` |
+| `LATHE_CODEX_BIN` | codex 二进制名或路径，默认 `codex`。只在配了 `LATHE_CODEX_HOME` 时校验（找不到启动报错） |
 | `LATHE_NODE_NAME` | 节点名（事件 actor 前缀、管理界面运行时面板），默认主机名 |
 | `LATHE_PNPM_STORE` | 验证器跑前端步骤时共享的 pnpm store 目录，默认 `/opt/lathe/.pnpm-store` |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |

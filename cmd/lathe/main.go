@@ -283,6 +283,7 @@ func serve(cfg config.Config) error {
 		Queue:        q,
 		Auth:         auth,
 		ConfigStatus: configStatus(cfg),
+		CodexEnabled: cfg.CodexEnabled(),
 	}
 	apiSrv.Routes(mux)
 
@@ -572,7 +573,7 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		Tasks:         task.NewMachine(st.Pool()),
 		Worktrees:     wm,
 		Verifier:      runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
-		Agent:         agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		Agent:         agentRouter(cfg),
 		ClientFactory: factory,
 		Notifier:      logNotifier{},
 		Mail:          taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
@@ -662,6 +663,21 @@ func (r *githubWebhookResolver) ResolveGitHub(ctx context.Context, slug string) 
 	return &httpapi.GitHubWebhookTarget{OwnerID: u.ID, Secret: secret}, nil
 }
 
+// agentRouter 装配任务流水线的 agent 驱动：按任务钉死的 agent_driver 分派
+// （f06，docs/features/multi-cli.md）。claude 恒在；codex 只在运维配置了
+// LATHE_CODEX_HOME 时注册 —— 没配时钉死为 codex 的任务得到
+// agent.ErrDriverUnavailable，以可读原因失败，会话 ID 原样保留。
+//
+// PRD 规划与预览推荐不走这里：它们继续只用 claude（各自有 claude 专属的
+// 输出修正与超时收尾逻辑），装配时直接给 agent.NewDriver。
+func agentRouter(cfg config.Config) *agent.Router {
+	claude := agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout)
+	if !cfg.CodexEnabled() {
+		return agent.NewRouter(claude, nil)
+	}
+	return agent.NewRouter(claude, agent.NewCodexDriver(cfg.CodexBin, cfg.CodexHome, cfg.AgentTimeout))
+}
+
 // configStatus 生成给管理界面的配置状态。
 //
 // 只报告「配没配、从哪个环境变量读」，绝不包含凭据内容本身。
@@ -681,6 +697,10 @@ func configStatus(cfg config.Config) func() map[string]any {
 				"workspaceRoot": cfg.WorkspaceRoot,
 				"pnpmStore":     cfg.PnpmStore,
 				"claudeBin":     cfg.ClaudeBin,
+				// codex 只报「可执行文件 + 启用了没有」：LATHE_CODEX_HOME 的路径与
+				// 其中的任何文件（config.toml / auth.json）都不进面板
+				"codexBin":      cfg.CodexBin,
+				"codexEnabled":  cfg.CodexEnabled(),
 				"agentTimeout":  cfg.AgentTimeout.String(),
 				"triageChannel": cfg.TriageChannel,
 				"implChannel":   cfg.ImplementChannel,

@@ -283,6 +283,9 @@ onMounted(() => {
       <dt>工作区根目录</dt><dd class="mono break">{{ runtime.workspaceRoot }}</dd>
       <dt>依赖 store</dt><dd class="mono break">{{ runtime.pnpmStore || '未配置' }}</dd>
       <dt>claude 可执行文件</dt><dd class="mono">{{ runtime.claudeBin }}</dd>
+      <dt>codex 可执行文件</dt><dd class="mono">{{ runtime.codexBin || '—' }}</dd>
+      <dt>codex 驱动</dt>
+      <dd>{{ runtime.codexEnabled ? '已启用' : '未启用（未配置 LATHE_CODEX_HOME）' }}</dd>
       <dt>agent 超时</dt><dd>{{ runtime.agentTimeout }}</dd>
       <dt>执行模式</dt><dd>{{ runtime.mode }}</dd>
     </dl>

@@ -275,6 +275,12 @@ onUnmounted(() => {
         <div class="row">
           <h1 class="mono">{{ task.externalKey }}</h1>
           <span class="badge" :class="stateTone(task.state)">{{ stateLabel(task.state) }}</span>
+          <!-- 执行 agent（f06）：只在不是默认 claude 时显示，默认部署界面不变 -->
+          <span
+            v-if="task.agentDriver && task.agentDriver !== 'claude'"
+            class="badge idle mono"
+            :title="`这个任务由 ${task.agentDriver} 执行（建任务时从仓库钉死）`"
+          >{{ task.agentDriver }}</span>
         </div>
         <div class="faint mono">
           {{ task.providerRepo }} · 任务 #{{ task.id }}
@@ -386,7 +392,9 @@ onUnmounted(() => {
         <div class="row badges">
           <span v-if="task.agentNumTurns != null" class="badge idle">{{ task.agentNumTurns }} 轮</span>
           <span v-if="task.agentDurationMs != null" class="badge idle">{{ formatDuration(task.agentDurationMs) }}</span>
-          <span v-if="task.agentCostUsd != null" class="badge idle">${{ Number(task.agentCostUsd).toFixed(4) }}</span>
+          <!-- codex 不报费用：显示「费用未知」而不是 $0（不是免费） -->
+          <span v-if="task.agentCostUsd != null && task.agentDriver === 'codex'" class="badge idle">费用未知</span>
+          <span v-else-if="task.agentCostUsd != null" class="badge idle">${{ Number(task.agentCostUsd).toFixed(4) }}</span>
         </div>
       </div>
       <div class="md" v-html="md(task.agentSummary)"></div>
