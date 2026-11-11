@@ -7,6 +7,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- **收件箱**：`/inbox` 把等你处理的事集中到一个页面，包括需求待补充、等你放行、
+  review 停车、前驱阻塞、失败待处置，以及 PRD 的待回答 / 待批准 / 待逐节确认 / 运行失败。
+  每项一键跳到处理页，顶栏显示未读计数，失败事项可以忽略。事项从现有状态实时派生，
+  新表 `inbox_marks` 只存已读/忽略（迁移 0035）；另给 `tasks` 加了 `(user_id, state)`
+  索引（迁移 0036，CONCURRENTLY）。新增接口 `GET /api/inbox`、`GET /api/inbox/count`、
+  `POST /api/inbox/items/{key}/read|unread|dismiss`、`POST /api/inbox/read-all`。
+  收件箱里的失败原因先经与失败记忆同一套两层脱敏再展示（docs/features/inbox.md）。
+
 ### Changed
 
 - **模糊任务对话：少问、跑得完、报错能救**（docs/10 §1.3–§1.5）。实测一份 feature PRD
