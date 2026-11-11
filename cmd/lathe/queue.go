@@ -13,6 +13,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // claimLeaseDuration 是 ClaimReady 打的租约时长。
@@ -477,7 +478,7 @@ func (q *queue) runOneClaimed(ctx context.Context, tk *task.Task) {
 		if tk.BranchName != nil {
 			branch = *tk.BranchName
 		}
-		q.worktrees.Discard(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch)
+		q.worktrees.Discard(ctx, repoCfg.RepoKey(), *tk.WorktreePath, branch)
 	}
 	slog.Info("重试决策", "task", tk.ID, "plan", plan.String(), "reasons", plan.Reasons)
 
@@ -628,7 +629,7 @@ func (q *queue) inspectTask(ctx context.Context, tk *task.Task, repoCfg runner.R
 	if err != nil {
 		base = repoCfg.DefaultBranch
 	}
-	return q.worktrees.Inspect(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch, base)
+	return q.worktrees.Inspect(ctx, repoCfg.RepoKey(), *tk.WorktreePath, branch, base)
 }
 
 // resolveRepo 查出属主名下要用的仓库：第一条配置。
@@ -663,12 +664,18 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 		tierOverride  string
 		excludeDirs   []string
 		verifyInfra   []string
+		vcsProvider   string
+		vcsBaseURL    string
 	)
+	// vcs_provider / vcs_base_url：仓库所在的代码平台实例（登记时钉死）。
+	// 与 runner.NewRepoLookup、store.GetRepo 三处同步读取（§6 已知债务）。
 	err = q.store.Pool().QueryRow(ctx, `
 		SELECT provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
-		       COALESCE(verify_tier_override, ''), exclude_dirs, verify_infra
+		       COALESCE(verify_tier_override, ''), exclude_dirs, verify_infra,
+		       vcs_provider, COALESCE(vcs_base_url, '')
 		FROM repos WHERE id = $1`, repoID,
-	).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs, &verifyInfra)
+	).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs, &verifyInfra,
+		&vcsProvider, &vcsBaseURL)
 	if err != nil {
 		return cfg, "", fmt.Errorf("读取仓库配置失败（repo_id=%d）: %w", repoID, err)
 	}
@@ -682,8 +689,11 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 		ExcludeDirs:        excludeDirs,
 		VerifyTierOverride: tierOverride,
 		VerifyInfra:        verifyInfra,
+		VCSProvider:        vcs.Provider(vcsProvider),
+		VCSBaseURL:         vcsBaseURL,
 	}
-	return cfg, "git@github.com:" + providerRepo + ".git", nil
+	// 单一真相源：GitHub 仍是 "git@github.com:<repo>.git"（与此前逐字节相同）。
+	return cfg, cfg.CloneURL(), nil
 }
 
 // commentUnresolved 在无法接单时尽力回帖说明原因。

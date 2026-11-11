@@ -18,10 +18,32 @@ const (
 	// KindGitHubWebhook 是 GitHub 仓库 webhook 的签名密钥（PR 评论回流，
 	// /webhooks/github/{slug} 按用户验签）。migration 0028 放开的取值。
 	KindGitHubWebhook = "github_webhook"
+	// GitLab / Gitea（f07，migration 0052）：平台令牌必须带实例地址
+	// （integrations.base_url，0051），webhook 密钥不需要。
+	KindGitLab        = "gitlab"
+	KindGitLabWebhook = "gitlab_webhook"
+	KindGitea         = "gitea"
+	KindGiteaWebhook  = "gitea_webhook"
 )
 
 // KnownKinds 是界面可配置的凭据类型。
-var KnownKinds = []string{KindLinear, KindLinearWebhook, KindGitHub, KindGitHubWebhook}
+var KnownKinds = []string{
+	KindLinear, KindLinearWebhook, KindGitHub, KindGitHubWebhook,
+	KindGitLab, KindGitLabWebhook, KindGitea, KindGiteaWebhook,
+}
+
+// KindNeedsBaseURL 报告该种类的凭据是否必须带实例地址（自建平台的令牌）。
+func KindNeedsBaseURL(kind string) bool { return kind == KindGitLab || kind == KindGitea }
+
+// KindAcceptsBaseURL 报告该种类是否允许带实例地址。其余种类传了地址由 API
+// 层拒绝（400），不静默忽略 —— 避免「配了没生效」。
+func KindAcceptsBaseURL(kind string) bool {
+	switch kind {
+	case KindGitLab, KindGitLabWebhook, KindGitea, KindGiteaWebhook:
+		return true
+	}
+	return false
+}
 
 // ValidKind 报告 kind 是否可配置。
 func ValidKind(kind string) bool {
@@ -48,6 +70,8 @@ type IntegrationStatus struct {
 	VerifyError *string    `json:"verifyError"`
 	// Source 说明凭据从哪来：db（界面配置）或 env（环境变量兜底）。
 	Source string `json:"source"`
+	// BaseURL 是自建 GitLab/Gitea 的实例地址（非密，可展示）；其余种类为空。
+	BaseURL string `json:"baseUrl,omitempty"`
 }
 
 // Secrets 读写加密凭据。
@@ -66,6 +90,12 @@ func (s *Store) NewSecrets(sealer secret.Sealer) *Secrets {
 // 保存时清空上一次的验证结果：凭据变了，旧的验证结论不再有效，
 // 界面上继续显示「已验证」会误导人。
 func (s *Secrets) Save(ctx context.Context, userID int64, kind, plaintext string) error {
+	return s.SaveWithBaseURL(ctx, userID, kind, plaintext, "")
+}
+
+// SaveWithBaseURL 是 Save 的带实例地址版本（自建 GitLab/Gitea）。baseURL 为空
+// 存 NULL；地址是非密列，明文入库。调用方负责校验与规范化（vcs.NormalizeBaseURL）。
+func (s *Secrets) SaveWithBaseURL(ctx context.Context, userID int64, kind, plaintext, baseURL string) error {
 	if !ValidKind(kind) {
 		return fmt.Errorf("store: 未知凭据类型 %q", kind)
 	}
@@ -73,17 +103,22 @@ func (s *Secrets) Save(ctx context.Context, userID int64, kind, plaintext string
 	if err != nil {
 		return err
 	}
+	var base *string
+	if baseURL != "" {
+		base = &baseURL
+	}
 
 	_, err = s.store.pool.Exec(ctx, `
-		INSERT INTO integrations (user_id, kind, secret_enc, token_ref, scopes)
-		VALUES ($1, $2, $3, NULL, '{}')
+		INSERT INTO integrations (user_id, kind, secret_enc, token_ref, scopes, base_url)
+		VALUES ($1, $2, $3, NULL, '{}', $4)
 		ON CONFLICT (user_id, kind) DO UPDATE SET
 			secret_enc   = EXCLUDED.secret_enc,
+			base_url     = EXCLUDED.base_url,
 			account_name = NULL,
 			verified_at  = NULL,
 			verify_error = NULL,
 			updated_at   = now()`,
-		userID, kind, enc)
+		userID, kind, enc, base)
 	if err != nil {
 		return fmt.Errorf("store: 保存凭据失败: %w", err)
 	}
@@ -106,6 +141,34 @@ func (s *Secrets) Get(ctx context.Context, userID int64, kind string) (string, e
 		return "", ErrIntegrationNotFound
 	}
 	return s.sealer.Open(enc)
+}
+
+// GetWithBaseURL 解密读取凭据，并一并返回实例地址（未设为空串）。
+func (s *Secrets) GetWithBaseURL(ctx context.Context, userID int64, kind string) (token, baseURL string, err error) {
+	var (
+		enc  []byte
+		base *string
+	)
+	err = s.store.pool.QueryRow(ctx,
+		`SELECT secret_enc, base_url FROM integrations WHERE user_id = $1 AND kind = $2`,
+		userID, kind).Scan(&enc, &base)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrIntegrationNotFound
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("store: 读取凭据失败: %w", err)
+	}
+	if len(enc) == 0 {
+		return "", "", ErrIntegrationNotFound
+	}
+	token, err = s.sealer.Open(enc)
+	if err != nil {
+		return "", "", err
+	}
+	if base != nil {
+		baseURL = *base
+	}
+	return token, baseURL, nil
 }
 
 // Delete 删除凭据。
@@ -173,7 +236,7 @@ func (s *Secrets) ExternalAccountID(ctx context.Context, userID int64, kind stri
 // 这样界面能展示完整清单而不必自己拼。
 func (s *Secrets) Status(ctx context.Context, userID int64) ([]IntegrationStatus, error) {
 	rows, err := s.store.pool.Query(ctx, `
-		SELECT kind, secret_enc, account_name, verified_at, verify_error
+		SELECT kind, secret_enc, account_name, verified_at, verify_error, COALESCE(base_url, '')
 		FROM integrations WHERE user_id = $1`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询凭据状态失败: %w", err)
@@ -188,15 +251,16 @@ func (s *Secrets) Status(ctx context.Context, userID int64) ([]IntegrationStatus
 			account *string
 			at      *time.Time
 			verr    *string
+			base    string
 		)
-		if err := rows.Scan(&kind, &enc, &account, &at, &verr); err != nil {
+		if err := rows.Scan(&kind, &enc, &account, &at, &verr, &base); err != nil {
 			return nil, fmt.Errorf("store: 读取凭据状态失败: %w", err)
 		}
 
 		st := IntegrationStatus{
 			Kind: kind, Configured: len(enc) > 0,
 			AccountName: account, VerifiedAt: at, VerifyError: verr,
-			Source: "db",
+			Source: "db", BaseURL: base,
 		}
 		// 掩码需要解密后才能生成；解不开说明主密钥换了，如实告知
 		if len(enc) > 0 {

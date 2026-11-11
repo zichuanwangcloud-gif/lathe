@@ -481,7 +481,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 	if berr != nil {
 		base = repoCfg.DefaultBranch
 	}
-	state := r.Worktrees.Inspect(ctx, repoCfg.ProviderRepo, path, branch, base)
+	state := r.Worktrees.Inspect(ctx, repoCfg.RepoKey(), path, branch, base)
 	if !state.Exists {
 		// 目录不在（上面已判过）或不是 git 工作树：没有「文化性现场」
 		// 可保护，走 Discard 清掉残留的分支与注册。
@@ -513,7 +513,7 @@ func (r *WorktreeReaper) reapTask(ctx context.Context, tk *task.Task, cutoff tim
 		"path", path, "branch", branch, "keep_branch", keepBranch,
 		"理由", "终态超期、无人认领、已校验认领")
 
-	res := r.Worktrees.Discard(ctx, repoCfg.ProviderRepo, path, discardBranch)
+	res := r.Worktrees.Discard(ctx, repoCfg.RepoKey(), path, discardBranch)
 
 	// 事件流里要看得见「真删掉了什么」，不是「打算删什么」。
 	reason["dir_removed"] = res.DirRemoved

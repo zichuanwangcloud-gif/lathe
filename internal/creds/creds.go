@@ -53,7 +53,10 @@ type Provider struct {
 type cached struct {
 	value string
 	src   string
-	at    time.Time
+	// base 是凭据的实例地址（自建 GitLab/Gitea；其余种类为空）。与值一起缓存：
+	// 派发时要拿它与仓库钉死的实例比对（不一致即拒绝）。
+	base string
+	at   time.Time
 }
 
 // NewProvider 构造凭据提供者。
@@ -77,31 +80,37 @@ func (p *Provider) Invalidate(kind string) {
 
 // Token 取某类凭据，返回值与来源（db / env）。
 func (p *Provider) Token(ctx context.Context, kind string) (token, source string, err error) {
+	token, _, source, err = p.TokenWithBaseURL(ctx, kind)
+	return token, source, err
+}
+
+// TokenWithBaseURL 取某类凭据及其实例地址（自建平台）。缓存键仍是 kind。
+func (p *Provider) TokenWithBaseURL(ctx context.Context, kind string) (token, baseURL, source string, err error) {
 	p.mu.RLock()
 	c, ok := p.cache[kind]
 	p.mu.RUnlock()
 	if ok && time.Since(c.at) < cacheTTL {
-		return c.value, c.src, nil
+		return c.value, c.base, c.src, nil
 	}
 
-	token, err = p.secrets.Get(ctx, p.userID, kind)
+	token, baseURL, err = p.secrets.GetWithBaseURL(ctx, p.userID, kind)
 	source = "db"
 	if err != nil {
 		if !errors.Is(err, store.ErrIntegrationNotFound) {
 			// 解密失败等真实错误要透出，不能静默退回环境变量 ——
 			// 那会让人以为界面上配的凭据在生效
-			return "", "", err
+			return "", "", "", err
 		}
-		token, source = p.envToken(kind), "env"
+		token, baseURL, source = p.envToken(kind), "", "env"
 	}
 	if strings.TrimSpace(token) == "" {
-		return "", "", fmt.Errorf("%w（%s）", ErrNotConfigured, kind)
+		return "", "", "", fmt.Errorf("%w（%s）", ErrNotConfigured, kind)
 	}
 
 	p.mu.Lock()
-	p.cache[kind] = cached{value: token, src: source, at: time.Now()}
+	p.cache[kind] = cached{value: token, src: source, base: baseURL, at: time.Now()}
 	p.mu.Unlock()
-	return token, source, nil
+	return token, baseURL, source, nil
 }
 
 func (p *Provider) envToken(kind string) string {

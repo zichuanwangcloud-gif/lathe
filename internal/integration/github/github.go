@@ -6,7 +6,6 @@ package github
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,6 +13,13 @@ import (
 	"time"
 
 	gh "github.com/google/go-github/v66/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
+)
+
+// 编译期断言：GitHub 客户端满足代码平台契约（docs/features/vcs-gitlab-gitea.md §3.1）。
+var (
+	_ vcs.Client               = (*Client)(nil)
+	_ vcs.ReviewFeedbackSource = (*Client)(nil)
 )
 
 // Client 封装 GitHub API 访问。
@@ -50,37 +56,23 @@ func NewClientWithBaseURL(token, baseURL string) (*Client, error) {
 	return c, nil
 }
 
-// SplitRepo 把 owner/name 拆开。
+// SplitRepo 把 owner/name 拆开：vcs.SplitRef(ProviderGitHub, …) 的薄包装，
+// 语义（恰好两段）与错误文案不变。
 func SplitRepo(providerRepo string) (owner, name string, err error) {
-	parts := strings.Split(strings.TrimSpace(providerRepo), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("github: 仓库标识 %q 格式应为 owner/name", providerRepo)
-	}
-	return parts[0], parts[1], nil
+	return vcs.SplitRef(vcs.ProviderGitHub, providerRepo)
 }
+
+// 以下五个纯数据类型是 vcs 契约包同名类型的别名（无方法，别名合法）：
+// 包内与老调用方零改动，GitHubAPI 与 vcs.Client 的方法集因此完全相同。
 
 // PRParams 描述要创建的 PR。
-type PRParams struct {
-	ProviderRepo string // owner/name
-	Head         string // 任务分支
-	Base         string // 目标分支（dev / main）
-	Title        string
-	Body         string
-	// Draft 为真时开草稿 PR。
-	Draft bool
-}
+type PRParams = vcs.PRParams
 
 // PullRequest 是已创建或已存在的 PR。
-type PullRequest struct {
-	Number int
-	URL    string
-	State  string
-	// Existing 为真表示这是复用的既有 PR，而非本次新建。
-	Existing bool
-}
+type PullRequest = vcs.PullRequest
 
 // ErrNoCommits 表示 head 与 base 无差异，没东西可开 PR。
-var ErrNoCommits = errors.New("github: head 与 base 无差异，无可提交的改动")
+var ErrNoCommits = vcs.ErrNoCommits
 
 // CreatePR 开 PR；若该 head→base 的 PR 已存在则复用。
 //
@@ -172,23 +164,9 @@ func (c *Client) GetPR(ctx context.Context, providerRepo string, number int) (*g
 	return pr, nil
 }
 
-// PRInfo 是 GetPR 结果的精简摘要，供 runner.GitHubAPI（F4.1 合并检测的
-// 轮询兜底）消费——定义在这里而不是 runner 包，是因为 runner 包已经
-// 依赖本包（CreatePR 用到 PRParams/PullRequest），反过来若 runner 定义
-// 这个类型会成环。
-type PRInfo struct {
-	Number int
-	Merged bool
-	// State 是 "open" / "closed"。
-	State string
-	// BaseRef 是 PR 当前指向的 base 分支名 —— GitHub 在 base 分支被删除
-	// 或 PR 被 retarget 后会变化。仅用于诊断，不强制消费。
-	BaseRef string
-	// HeadSHA 是 PR head 分支当前指向的 commit SHA——F4.4（前驱被改
-	// 重验）用它检测"PR 仍 open 但内容被 force-push 改写"：与轮询上
-	// 一次观察到的值不一致即判定发生了 force-push。
-	HeadSHA string
-}
+// PRInfo 是 GetPR 结果的精简摘要（vcs.PRInfo 的别名），供 runner.GitHubAPI
+// （F4.1 合并检测的轮询兜底）消费。
+type PRInfo = vcs.PRInfo
 
 // GetPRInfo 是 GetPR 的精简包装，供 F4.1 合并检测的轮询兜底使用。
 func (c *Client) GetPRInfo(ctx context.Context, providerRepo string, number int) (*PRInfo, error) {
@@ -205,23 +183,10 @@ func (c *Client) GetPRInfo(ctx context.Context, providerRepo string, number int)
 	}, nil
 }
 
-// ReviewComment 是一条需要 agent 处理的 review 意见。
-type ReviewComment struct {
-	ID int64
-	// Key 是跨类型唯一的稳定标识："inline:<id>" / "issue:<id>" / "review:<id>"。
-	// 三类意见在 GitHub 上是独立的 ID 序列，裸 ID 可能相撞。
-	Key    string
-	Author string
-	// AuthorAssociation 是评论者与仓库的关系（同 webhook.ReviewEvent 的
-	// 同名字段）。ReviewFeedback 据此过滤 —— 二轮派发时拉取的意见里，
-	// 无仓库关系的账号（公开仓库上的路人）不得进 prompt（A2 审计 B2：
-	// 那是一条绕过入口守卫的提示注入通道）。
-	AuthorAssociation string
-	Body              string
-	Path              string
-	Line              int
-	URL               string
-}
+// ReviewComment 是一条需要 agent 处理的 review 意见（vcs.ReviewComment 的别名）。
+// Key 是跨类型唯一的稳定标识："inline:<id>" / "issue:<id>" / "review:<id>"；
+// AuthorAssociation 供 ReviewFeedback 过滤（A2 审计 B2）。
+type ReviewComment = vcs.ReviewComment
 
 // ReviewComments 拉取 PR 的 review 意见（含行内评论与普通评论）。
 //
@@ -273,21 +238,5 @@ func (c *Client) ReviewComments(ctx context.Context, providerRepo string, number
 // 验证证据必须进 PR 正文：审阅者第一眼要能看到这份改动被验证过什么，
 // 这是本产品与「agent 随手产出的 diff」的根本区别。
 func BuildPRBody(issueKey, issueURL, verifySummary, agentSummary string) string {
-	var b strings.Builder
-
-	if issueKey != "" {
-		if issueURL != "" {
-			fmt.Fprintf(&b, "关联 issue: [%s](%s)\n\n", issueKey, issueURL)
-		} else {
-			fmt.Fprintf(&b, "关联 issue: %s\n\n", issueKey)
-		}
-	}
-	if agentSummary != "" {
-		fmt.Fprintf(&b, "## 改动说明\n\n%s\n\n", strings.TrimSpace(agentSummary))
-	}
-	if verifySummary != "" {
-		fmt.Fprintf(&b, "## 验证结果\n\n```\n%s```\n\n", verifySummary)
-	}
-	b.WriteString("---\n由 [Lathe](https://github.com/zichuanwangcloud-gif/lathe) 自动生成。**合并前请人工复核。**\n")
-	return b.String()
+	return vcs.BuildPRBody(issueKey, issueURL, verifySummary, agentSummary)
 }

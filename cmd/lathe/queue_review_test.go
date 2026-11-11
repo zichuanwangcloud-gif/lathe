@@ -8,6 +8,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // PR 评论回流（A2）的派发侧：ReviewIntake 把任务转回 queued 并写下
@@ -63,8 +64,9 @@ func TestRunOneClaimedDispatchesReviewRound(t *testing.T) {
 		t.Fatalf("读仓库名失败: %v", err)
 	}
 
-	out, err := (&runner.ReviewIntake{Tasks: q.tasks}).AcceptReview(ctx, userID, &github.ReviewEvent{
-		Event: github.EventReviewComment, Action: "created", Repo: repoName, PRNumber: 5,
+	out, err := (&runner.ReviewIntake{Tasks: q.tasks}).AcceptReview(ctx, userID, &vcs.ReviewEvent{
+		Provider: vcs.ProviderGitHub,
+		Event:    github.EventReviewComment, Action: "created", Repo: repoName, PRNumber: 5,
 		PRAuthor: "lathe-bot", Key: "inline:1", Author: "alice", Body: "改一下",
 	}, "deliv-q")
 	if err != nil || out.Status != runner.ReviewQueued {

@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // RepoLookup 按 repoID 查询该仓库的分支策略配置。
@@ -38,12 +40,16 @@ func NewRepoLookup(pool *pgxpool.Pool) RepoLookup {
 			pattern       string
 			tierOverride  string
 			excludeDirs   []string
+			vcsProvider   string
+			vcsBaseURL    string
 		)
 		err := pool.QueryRow(ctx, `
 			SELECT provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
-			       COALESCE(verify_tier_override, ''), exclude_dirs
+			       COALESCE(verify_tier_override, ''), exclude_dirs,
+			       vcs_provider, COALESCE(vcs_base_url, '')
 			FROM repos WHERE id = $1`, repoID,
-		).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs)
+		).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs,
+			&vcsProvider, &vcsBaseURL)
 		if err != nil {
 			return cfg, fmt.Errorf("runner: 读取仓库配置失败（repo_id=%d）: %w", repoID, err)
 		}
@@ -55,6 +61,8 @@ func NewRepoLookup(pool *pgxpool.Pool) RepoLookup {
 			BranchPattern:      pattern,
 			ExcludeDirs:        excludeDirs,
 			VerifyTierOverride: tierOverride,
+			VCSProvider:        vcs.Provider(vcsProvider),
+			VCSBaseURL:         vcsBaseURL,
 		}
 		return cfg, nil
 	}
@@ -164,13 +172,19 @@ func (p *MergePoller) pollTask(ctx context.Context, tk *task.Task) error {
 	if err != nil {
 		return fmt.Errorf("解析任务属主客户端失败: %w", err)
 	}
-	gh, err := clients.GitHub(ctx)
-	if err != nil {
-		return fmt.Errorf("获取 GitHub 客户端失败: %w", err)
-	}
+	// 仓库配置先于客户端：客户端按仓库所在平台实例分派（resolveVCS）。
 	repoCfg, err := p.RepoLookup(ctx, tk.RepoID)
 	if err != nil {
 		return fmt.Errorf("查询仓库配置失败: %w", err)
+	}
+	// 任何错误（含凭据实例与仓库不一致）都只报错跳过本轮：合并检测本来就是
+	// 「查不到下一轮再查」，任务停在 pr_open 不动，属主修好凭据后自然收敛。
+	gh, auth, err := resolveVCS(ctx, clients, repoCfg.Target())
+	if err != nil {
+		if repoCfg.Target().Provider == vcs.ProviderGitHub {
+			return fmt.Errorf("获取 GitHub 客户端失败: %w", err)
+		}
+		return fmt.Errorf("获取代码平台客户端失败（%s）: %w", repoCfg.Target().Provider, err)
 	}
 
 	info, err := gh.GetPRInfo(ctx, repoCfg.ProviderRepo, *tk.PRNumber)
@@ -180,7 +194,7 @@ func (p *MergePoller) pollTask(ctx context.Context, tk *task.Task) error {
 
 	switch {
 	case info.Merged:
-		return p.handleMerged(ctx, tk)
+		return p.handleMerged(ctx, tk, auth)
 	case info.State == "closed":
 		// closed 且未合并：PR 被关闭未合并（F2.3-AC2 的触发源）
 		return p.handleClosedUnmerged(ctx, tk, clients)
@@ -249,7 +263,10 @@ func (p *MergePoller) checkForcePush(ctx context.Context, tk *task.Task, headSHA
 
 // handleMerged 把任务转到 merged（F4.1-AC1/AC2），随后交给 onMerged
 // 处理合并后的跟进动作。
-func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task) error {
+//
+// auth 是已合并任务属主对仓库所在平台的 git 鉴权（pollTask 解出），透传给
+// onMerged → resolveMirrorTip 刷新那个仓库的 mirror。
+func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task, auth vcs.GitAuth) error {
 	merged, err := p.Tasks.Transition(ctx, tk.ID, task.StateMerged, "system:merge-poll", &task.TransitionOpts{
 		Payload: map[string]any{"pr_number": *tk.PRNumber},
 	})
@@ -268,7 +285,7 @@ func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task) error {
 		p.Pipeline.mailTerminal(ctx, merged, "")
 	}
 
-	if err := p.onMerged(ctx, merged); err != nil {
+	if err := p.onMerged(ctx, merged, auth); err != nil {
 		// 合并这个事实本身已经落库成功；跟进动作（现场回收等）失败
 		// 不该反过来污染合并检测的主结果，只告警。
 		slog.Warn("合并后跟进处理失败", "task", merged.ID, "err", err)
@@ -289,7 +306,7 @@ func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task) error {
 // 回收 worktree（F4.2-AC2），且只回收工作目录，不删分支之外的东西——
 // Worktrees.Remove(force=true) 本身会顺带删掉本地分支副本，远端分支
 // 不受影响（Lathe 从不删除远端分支）。
-func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task) error {
+func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task, auth vcs.GitAuth) error {
 	if merged.BranchName == nil || *merged.BranchName == "" ||
 		merged.WorktreePath == nil || *merged.WorktreePath == "" {
 		return nil // 没有可回收的现场（字段缺失：老数据或异常路径）
@@ -303,7 +320,7 @@ func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task) error {
 	// F4.3：oldBaseTip 必须在任何改写发生之前捕获——顶层入口这里，
 	// "改写"指的是下面即将对直接后继做的 rebase，merged 分支自己此时
 	// 还没被任何人动过，直接解析它在镜像里的当前 tip 即可。
-	if oldTip, terr := p.resolveMirrorTip(ctx, repoCfg, *merged.BranchName); terr != nil {
+	if oldTip, terr := p.resolveMirrorTip(ctx, repoCfg, *merged.BranchName, auth); terr != nil {
 		slog.Warn("解析已合并分支当前 tip 失败，跳过 rebase 跟进",
 			"task", merged.ID, "branch", *merged.BranchName, "err", terr)
 	} else if ferr := p.rebaseFollowup(ctx, *merged.BranchName, oldTip, repoCfg.DefaultBranch); ferr != nil {
@@ -323,7 +340,7 @@ func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task) error {
 	wt := &Worktree{
 		Path:   *merged.WorktreePath,
 		Branch: *merged.BranchName,
-		Mirror: p.Worktrees.MirrorPath(repoCfg.ProviderRepo),
+		Mirror: p.Worktrees.MirrorPath(repoCfg.RepoKey()),
 	}
 	if err := p.Worktrees.Remove(ctx, wt, true); err != nil {
 		return fmt.Errorf("回收工作区失败: %w", err)
@@ -338,9 +355,8 @@ func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task) error {
 // 此时镜像必然早就存在），再按镜像命名空间（refs/remotes/origin/*）
 // 解析，避免与 refs/heads/* 下可能存在的同名残留分支产生歧义——
 // 与 ChangedFiles/HasCommitsAhead 解析基线的立场一致。
-func (p *MergePoller) resolveMirrorTip(ctx context.Context, repoCfg RepoConfig, branch string) (string, error) {
-	cloneURL := cloneURLFor(repoCfg.ProviderRepo)
-	mirror, err := p.Worktrees.EnsureMirror(ctx, repoCfg.ProviderRepo, cloneURL)
+func (p *MergePoller) resolveMirrorTip(ctx context.Context, repoCfg RepoConfig, branch string, auth vcs.GitAuth) (string, error) {
+	mirror, err := p.Worktrees.EnsureMirror(ctx, repoCfg.RepoKey(), cloneURLFor(repoCfg), auth)
 	if err != nil {
 		return "", fmt.Errorf("刷新 mirror 失败: %w", err)
 	}
@@ -351,12 +367,11 @@ func (p *MergePoller) resolveMirrorTip(ctx context.Context, repoCfg RepoConfig, 
 	return strings.TrimSpace(out), nil
 }
 
-// cloneURLFor 按 provider repo 拼 SSH clone URL，与 cmd/lathe/queue.go
-// 的 loadRepoConfig 用的是同一套约定（"git@github.com:<repo>.git"）；
-// runner 包不能反向依赖 cmd/lathe，因此这里单独拼一份，跟 RepoLookup
-// 的 NewRepoLookup 是同一类"各自维护一份等价实现"的理由。
-func cloneURLFor(providerRepo string) string {
-	return "git@github.com:" + providerRepo + ".git"
+// cloneURLFor 是仓库的 git 远端地址：单一真相源 RepoConfig.CloneURL()
+// （GitHub 仍是 "git@github.com:<repo>.git"，与 cmd/lathe/queue.go 的
+// loadRepoConfig 同一个实现，不再各拼一份）。
+func cloneURLFor(repo RepoConfig) string {
+	return repo.CloneURL()
 }
 
 // rebaseFollowup 是 F4.3 后继链自动跟进的统一入口，处理一次"分支历史
@@ -410,11 +425,19 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 		return
 	}
 
+	// 后继的 git 鉴权按【后继任务属主】解析（succ 由 TasksWithBaseRef 查出，不假设
+	// 与前驱同属主），在任何改写之前。GitHub 仓库不调 resolveVCS（走宿主 SSH，
+	// 零值 auth）—— 不新增 Clients.GitHub 调用，跟进路径与此前逐字节相同。
+	auth, ok := p.followupAuth(ctx, succ, repoCfg)
+	if !ok {
+		return
+	}
+
 	wt := &Worktree{
 		Path:       *succ.WorktreePath,
 		Branch:     *succ.BranchName,
 		BaseBranch: newBaseBranch,
-		Mirror:     p.Worktrees.MirrorPath(repoCfg.ProviderRepo),
+		Mirror:     p.Worktrees.MirrorPath(repoCfg.RepoKey()),
 	}
 
 	// 必须在做任何改动之前捕获：这是下一级递归要用的 oldBaseTip——
@@ -426,13 +449,13 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 	}
 	succThisOldTip := strings.TrimSpace(tipOut)
 
-	if err := p.Worktrees.RebaseOnto(ctx, wt, oldBaseTip, newBaseBranch); err != nil {
-		p.failRebaseFollowup(ctx, succ, "自动 rebase", err)
+	if err := p.Worktrees.RebaseOnto(ctx, wt, oldBaseTip, newBaseBranch, cloneURLFor(repoCfg), auth); err != nil {
+		p.failRebaseFollowup(ctx, succ, StageRebaseConflict, "自动 rebase", err, auth)
 		return
 	}
 
-	if err := p.Worktrees.ForcePush(ctx, wt, repoCfg, nil); err != nil {
-		p.failRebaseFollowup(ctx, succ, "推送改写后的分支（force-with-lease）", err)
+	if err := p.Worktrees.ForcePush(ctx, wt, repoCfg, auth, nil); err != nil {
+		p.failRebaseFollowup(ctx, succ, StageRebaseConflict, "推送改写后的分支（force-with-lease）", err, auth)
 		return
 	}
 
@@ -474,7 +497,7 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 	if err := p.Pipeline.Execute(ctx, ExecuteParams{
 		TaskID:   succ.ID,
 		Repo:     execRepo,
-		CloneURL: cloneURLFor(repoCfg.ProviderRepo),
+		CloneURL: cloneURLFor(repoCfg),
 		IssueRef: IssueRefOf(succ),
 		Actor:    "system:rebase-followup",
 		Retry:    &RetryPlan{Fresh: false, Entry: EntryVerify},
@@ -502,6 +525,34 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 	branch := deref(succ.BranchName)
 	if err := p.rebaseFollowup(ctx, branch, succThisOldTip, branch); err != nil {
 		slog.Warn("级联 rebase 跟进失败", "task", succ.ID, "err", err)
+	}
+}
+
+// followupAuth 解析 rebase 跟进用的 git 鉴权（后继任务属主）。ok 为假表示已处理
+// 完毕（确定性配置错误 → 落 failed；暂时性错误 → 跳过本次跟进、不改状态）。
+func (p *MergePoller) followupAuth(ctx context.Context, succ *task.Task, repoCfg RepoConfig) (vcs.GitAuth, bool) {
+	if repoCfg.Target().Provider == vcs.ProviderGitHub {
+		return vcs.GitAuth{}, true
+	}
+	if p.ClientFactory == nil {
+		slog.Warn("未装配客户端工厂，无法解析后继任务的代码平台凭据，跳过 rebase 跟进", "task", succ.ID)
+		return vcs.GitAuth{}, false
+	}
+	clients, err := p.ClientFactory.ForUser(ctx, succ.UserID)
+	if err != nil {
+		slog.Warn("解析后继任务属主客户端失败，跳过 rebase 跟进", "task", succ.ID, "err", err)
+		return vcs.GitAuth{}, false
+	}
+	_, auth, err := resolveVCS(ctx, clients, repoCfg.Target())
+	switch {
+	case err == nil:
+		return auth, true
+	case isVCSConfigErr(err):
+		p.failRebaseFollowup(ctx, succ, StageVCSCredential, "解析代码平台凭据", err, vcs.GitAuth{})
+		return vcs.GitAuth{}, false
+	default: // 暂时性错误：与 RepoLookup 失败同口径，跳过本次跟进、不改状态
+		slog.Warn("解析后继任务的代码平台凭据失败，跳过 rebase 跟进", "task", succ.ID, "err", err)
+		return vcs.GitAuth{}, false
 	}
 }
 
@@ -582,7 +633,18 @@ func (p *MergePoller) reenterForVerify(ctx context.Context, succ *task.Task) (*t
 //
 // 调用方处理完这个失败后必须停止：不清空 base_ref、不重验、不级联到
 // 更深层的后继——这个任务需要人工介入解决冲突。
-func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, action string, cause error) {
+//
+// stage 是落库的失败阶段码（rebase 冲突 / 代码平台凭据不可用）；auth 是这次
+// RebaseOnto/ForcePush 用的同一个 GitAuth，用于脱敏 reason（git 错误文案可能
+// 回显远端内容）。凭据解析本身失败时传零值，此时也没有 token 可回显。
+func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, stage Stage, action string, cause error, auth vcs.GitAuth) {
+	var known []string
+	if p.Pipeline != nil {
+		known = p.Pipeline.registeredSecrets(auth.RedactValues())
+	} else {
+		known = auth.RedactValues()
+	}
+	cause = errors.New(redactText(cause.Error(), known, nil))
 	reason := fmt.Sprintf("%s失败: %v", action, cause)
 	slog.Error("rebase 跟进失败，任务转 failed", "task", succ.ID, "action", action, "err", cause)
 
@@ -621,8 +683,8 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 
 	failed, err := p.Tasks.Transition(ctx, succ.ID, task.StateFailed, "system:rebase-followup", &task.TransitionOpts{
 		FailureReason: &reason,
-		FailureStage:  strPtr(string(StageRebaseConflict)),
-		Payload:       map[string]any{"stage": string(StageRebaseConflict)},
+		FailureStage:  strPtr(string(stage)),
+		Payload:       map[string]any{"stage": string(stage)},
 	})
 	if err != nil {
 		slog.Error("rebase 跟进失败后转 failed 也失败", "task", succ.ID, "err", err)
@@ -632,7 +694,11 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 	// 终态通知（T3）：这一条尤其该发 —— 自动 rebase 撞冲突是必须人工
 	// 介入才能往下走的状态，不通知就只能靠人自己发现栈卡住了。
 	if p.Pipeline != nil {
-		p.Pipeline.mailTerminal(ctx, failed, "前驱已合并，自动 rebase 撞上冲突，需要人工处理。")
+		detail := "前驱已合并，自动 rebase 撞上冲突，需要人工处理。"
+		if stage == StageVCSCredential {
+			detail = "前驱已更新，但本任务的代码平台凭据不可用（未配置或实例与仓库登记的不一致），rebase 跟进未执行。"
+		}
+		p.Pipeline.mailTerminal(ctx, failed, detail)
 		// 跨任务失败记忆（§3.6 第 16 条）。这条路径没有 runCtx、调不了
 		// fail()，所以在这里单独补一次 —— 否则「自动 rebase 撞冲突」这类
 		// 失败就是记忆里的一个黑洞：它恰恰是最该被记住的一类（同一个栈
@@ -642,7 +708,7 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 			RepoID:          failed.RepoID,
 			TrackerProvider: failed.TrackerProvider,
 			ExternalKey:     failed.ExternalKey,
-		}, StageRebaseConflict, fmt.Errorf("%s失败: %v", action, cause), "")
+		}, stage, fmt.Errorf("%s失败: %v", action, cause), "")
 	}
 
 	// 5) 失败传播（F2.3-AC1~AC4，与 pipeline.go 的 fail() 一致）：

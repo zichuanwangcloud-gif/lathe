@@ -14,7 +14,10 @@ import (
 var ErrRepoNotFound = errors.New("store: 仓库不存在")
 
 // ErrRepoExists 表示该用户名下已登记过这个仓库。
-var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
+//
+// 唯一约束是 (user_id, provider_repo)，与平台无关：同一路径不能同时登记在
+// 两个平台（docs/features/vcs-gitlab-gitea.md §4）。
+var ErrRepoExists = errors.New("store: 该仓库已在你的配置中（同一路径不能同时登记在两个平台）")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
@@ -302,7 +305,15 @@ type RepoRow struct {
 	// 的 estimate 超限就拒绝进 ready_for_review，除非 §10 记了「接受超限」。
 	PRDTaskMaxLines int `json:"prdTaskMaxLines"`
 	PRDTaskMaxFiles int `json:"prdTaskMaxFiles"`
+	// VCSProvider / VCSBaseURL 是仓库所在的代码平台实例（migration 0050）：
+	// 登记时写入、之后不可改（UpdateRepo 的 SET 子句不含它们）。GitHub 的
+	// VCSBaseURL 恒为空串。
+	VCSProvider string `json:"vcsProvider"`
+	VCSBaseURL  string `json:"vcsBaseUrl"`
 }
+
+// repoVCSCols 是四处仓库查询共用的平台列（追加在各自列清单末尾）。
+const repoVCSCols = `, vcs_provider, COALESCE(vcs_base_url, '')`
 
 // ListRepos 返回指定用户名下的仓库配置。
 func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) {
@@ -310,7 +321,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
 		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		       verify_infra, prd_task_max_lines, prd_task_max_files
+		       verify_infra, prd_task_max_lines, prd_task_max_files`+repoVCSCols+`
 		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -323,7 +334,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra,
-			&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles); err != nil {
+			&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.VCSProvider, &r.VCSBaseURL); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
@@ -339,12 +350,12 @@ func (s *Store) GetRepo(ctx context.Context, id, userID int64) (*RepoRow, error)
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
 		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		       prd_task_max_lines, prd_task_max_files
+		       prd_task_max_lines, prd_task_max_files`+repoVCSCols+`
 		FROM repos WHERE id = $1 AND user_id = $2`, id, userID,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir,
-		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
+		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.VCSProvider, &r.VCSBaseURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
@@ -423,14 +434,14 @@ func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoPa
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
 		          exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		          verify_infra, prd_task_max_lines, prd_task_max_files`,
+		          verify_infra, prd_task_max_lines, prd_task_max_files`+repoVCSCols,
 		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
 		p.ExcludeDirs, p.VerifyTierOverride, p.BaselineDir, p.VerifyInfra,
 		p.PRDTaskMaxLines, p.PRDTaskMaxFiles,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra,
-		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
+		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.VCSProvider, &r.VCSBaseURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
@@ -445,6 +456,10 @@ type CreateRepoParams struct {
 	ProviderRepo  string
 	DefaultBranch string
 	HotfixBase    string
+	// VCSProvider 空串按 github；VCSBaseURL 只对 gitlab/gitea 有意义，由
+	// handler 从该用户同平台凭据的 integrations.base_url 复制（不来自请求体）。
+	VCSProvider string
+	VCSBaseURL  string
 }
 
 // CreateRepo 给用户登记一个仓库配置。
@@ -455,18 +470,20 @@ type CreateRepoParams struct {
 func (s *Store) CreateRepo(ctx context.Context, userID int64, p CreateRepoParams) (*RepoRow, error) {
 	var r RepoRow
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO repos (user_id, provider_repo, default_branch, hotfix_base)
+		INSERT INTO repos (user_id, provider_repo, default_branch, hotfix_base, vcs_provider, vcs_base_url)
 		VALUES ($1, $2,
 		        COALESCE(NULLIF($3,''), 'dev'),
-		        COALESCE(NULLIF($4,''), 'main'))
+		        COALESCE(NULLIF($4,''), 'main'),
+		        COALESCE(NULLIF($5,''), 'github'),
+		        NULLIF($6,''))
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
 		          COALESCE(verify_tier_override, ''),
-		          prd_task_max_lines, prd_task_max_files`,
-		userID, p.ProviderRepo, p.DefaultBranch, p.HotfixBase,
+		          prd_task_max_lines, prd_task_max_files`+repoVCSCols,
+		userID, p.ProviderRepo, p.DefaultBranch, p.HotfixBase, p.VCSProvider, p.VCSBaseURL,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.VerifyTierOverride, &r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
+		&r.VerifyTierOverride, &r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.VCSProvider, &r.VCSBaseURL)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		// 23505 = unique_violation，这里只可能是 (user_id, provider_repo)
@@ -476,6 +493,21 @@ func (s *Store) CreateRepo(ctx context.Context, userID int64, p CreateRepoParams
 		return nil, fmt.Errorf("store: 创建仓库配置失败: %w", err)
 	}
 	return &r, nil
+}
+
+// IntegrationBaseURL 读某用户某类凭据的实例地址（非密列，不解密）。
+// 凭据行不存在或地址为空时返回 ErrIntegrationNotFound。
+func (s *Store) IntegrationBaseURL(ctx context.Context, userID int64, kind string) (string, error) {
+	var base *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT base_url FROM integrations WHERE user_id = $1 AND kind = $2`, userID, kind).Scan(&base)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (base == nil || *base == "")) {
+		return "", ErrIntegrationNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: 读取凭据实例地址失败: %w", err)
+	}
+	return *base, nil
 }
 
 func nilIfEmpty(s []string) any {

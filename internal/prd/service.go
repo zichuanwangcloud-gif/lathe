@@ -14,6 +14,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 本文件是规划管线的编排层：把 store（持久化）、agent（只读驱动）与
@@ -27,9 +28,12 @@ import (
 //
 // 窄接口而非直接吃 *runner.WorktreeManager：一是避免 prd → runner 的包
 // 依赖（runner 已经很重），二是单测里用假实现就能跑完整轮次。
+//
+// 键参数是镜像键（RepoInfo.RepoKey()）：GitHub 即 providerRepo，GitLab/Gitea
+// 带实例主机。auth 为零值时走原无鉴权路径（GitHub 走宿主 SSH）。
 type Worktrees interface {
-	EnsureMirror(ctx context.Context, providerRepo, cloneURL string) (string, error)
-	CreateDetached(ctx context.Context, providerRepo, base, name string) (*Checkout, error)
+	EnsureMirror(ctx context.Context, key, cloneURL string, auth vcs.GitAuth) (string, error)
+	CreateDetached(ctx context.Context, key, base, name string) (*Checkout, error)
 	RemoveDetached(ctx context.Context, c *Checkout) error
 }
 
@@ -67,10 +71,39 @@ type Store interface {
 }
 
 // RepoInfo 是一份 PRD 的目标仓库信息（含 §4.2 的量级阈值）。
+//
+// VCSProvider/VCSBaseURL 只来自 repos 行（StoreAdapter 不碰凭据）；鉴权是另一条
+// 依赖（Service.GitAuth）。
 type RepoInfo struct {
 	ProviderRepo  string
 	DefaultBranch string
 	Limits        Limits
+	VCSProvider   vcs.Provider
+	VCSBaseURL    string
+}
+
+func (r RepoInfo) provider() vcs.Provider {
+	if r.VCSProvider == "" {
+		return vcs.ProviderGitHub
+	}
+	return r.VCSProvider
+}
+
+// Target 是仓库所在的平台实例。
+func (r RepoInfo) Target() vcs.Target {
+	return vcs.Target{Provider: r.provider(), BaseURL: r.VCSBaseURL}
+}
+
+// RepoKey 是镜像键（GitHub 即 ProviderRepo）。
+func (r RepoInfo) RepoKey() string { return vcs.RepoKey(r.provider(), r.VCSBaseURL, r.ProviderRepo) }
+
+// CloneURL 是 git 远端地址（GitHub 即 git@github.com:<repo>.git）。
+func (r RepoInfo) CloneURL() string { return vcs.CloneURL(r.provider(), r.VCSBaseURL, r.ProviderRepo) }
+
+// GitAuthSource 为规划检出解析代码平台鉴权（按 PRD 属主）。prd 只依赖零依赖的
+// vcs 契约包，不依赖 runner/creds；装配在 cmd/lathe（prdGitAuth）。
+type GitAuthSource interface {
+	GitAuth(ctx context.Context, userID int64, t vcs.Target) (vcs.GitAuth, error)
 }
 
 // Service 跑规划对话与对抗复核。
@@ -106,9 +139,13 @@ type Service struct {
 	// WorkspaceRoot 默认在仓库根之下，不合格。
 	NeutralDir string
 
-	// CloneURL 由 ProviderRepo 推导，与 queue.loadRepoConfig 同一套规则。
-	// 留成字段是为了单测能替换掉。
-	CloneURL func(providerRepo string) string
+	// CloneURL 由仓库信息推导，与 queue.loadRepoConfig 同一套规则
+	// （RepoInfo.CloneURL）。留成字段是为了单测能替换掉；nil 用默认。
+	CloneURL func(RepoInfo) string
+
+	// GitAuth 为规划检出解析代码平台鉴权（按 PRD 属主）。nil：GitHub 仓库照旧
+	// （零值 auth，走宿主 SSH）；GitLab/Gitea 仓库直接报错，不做无鉴权克隆。
+	GitAuth GitAuthSource
 
 	// Now 可注入，便于测试。
 	Now func() time.Time
@@ -166,11 +203,24 @@ func (s *Service) now() time.Time {
 	return time.Now()
 }
 
-func (s *Service) cloneURL(providerRepo string) string {
+func (s *Service) cloneURL(repo RepoInfo) string {
 	if s.CloneURL != nil {
-		return s.CloneURL(providerRepo)
+		return s.CloneURL(repo)
 	}
-	return "git@github.com:" + providerRepo + ".git"
+	return repo.CloneURL()
+}
+
+// gitAuth 取规划检出用的 git 鉴权：GitHub → 零值、不调 GitAuth；非 GitHub 且
+// 未装配 → 明确报错（不做无鉴权克隆，也不静默路由到错误平台）。
+func (s *Service) gitAuth(ctx context.Context, userID int64, repo RepoInfo) (vcs.GitAuth, error) {
+	t := repo.Target()
+	if t.Provider == vcs.ProviderGitHub {
+		return vcs.GitAuth{}, nil
+	}
+	if s.GitAuth == nil {
+		return vcs.GitAuth{}, fmt.Errorf("prd: 未装配代码平台鉴权（%s）", t.Provider)
+	}
+	return s.GitAuth.GitAuth(ctx, userID, t)
 }
 
 // ErrStageUnavailable 表示当前状态不允许跑这一步。
@@ -439,6 +489,7 @@ func (s *Service) round(ctx context.Context, p RunRoundParams) (*RoundResult, St
 	var parsed *RoundResult
 	_, sessionID, err := s.runAgent(ctx, runSpec{
 		prdID:  p.PRDID,
+		userID: p.UserID,
 		round:  &round,
 		phase:  store.PRDPhasePlan,
 		prompt: BuildRoundPrompt(in),
@@ -478,7 +529,10 @@ func (s *Service) round(ctx context.Context, p RunRoundParams) (*RoundResult, St
 
 // runSpec 是一次 agent 调用的全部参数（规划轮次与对抗复核共用）。
 type runSpec struct {
-	prdID  int64
+	prdID int64
+	// userID 是 PRD 属主：规划检出用他的代码平台凭据（与「任务按任务属主取
+	// 凭据」同一立场；不用 repos.user_id，f12 之后仓库可能被团队共享）。
+	userID int64
 	round  *int // 对抗复核为 nil：它不在轮次序列里
 	phase  string
 	prompt string
@@ -513,12 +567,16 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 		}
 		dir = d
 	} else {
-		if _, err := s.Worktrees.EnsureMirror(ctx, spec.repo.ProviderRepo, s.cloneURL(spec.repo.ProviderRepo)); err != nil {
+		auth, err := s.gitAuth(ctx, spec.userID, spec.repo)
+		if err != nil {
+			return nil, "", fmt.Errorf("prd: 解析代码平台鉴权失败: %w", err)
+		}
+		if _, err := s.Worktrees.EnsureMirror(ctx, spec.repo.RepoKey(), s.cloneURL(spec.repo), auth); err != nil {
 			return nil, "", fmt.Errorf("prd: 准备镜像失败: %w", err)
 		}
 
 		name := fmt.Sprintf("prd-%d-%d", spec.prdID, s.now().UnixNano())
-		co, err := s.Worktrees.CreateDetached(ctx, spec.repo.ProviderRepo, spec.repo.DefaultBranch, name)
+		co, err := s.Worktrees.CreateDetached(ctx, spec.repo.RepoKey(), spec.repo.DefaultBranch, name)
 		if err != nil {
 			return nil, "", fmt.Errorf("prd: 只读检出失败: %w", err)
 		}
@@ -851,6 +909,7 @@ func (s *Service) review(ctx context.Context, prdID, userID int64) (*ReviewRepor
 	var report *ReviewReport
 	if _, _, err := s.runAgent(ctx, runSpec{
 		prdID:  prdID,
+		userID: userID,
 		phase:  store.PRDPhasePlanReview,
 		prompt: BuildReviewPrompt(doc),
 		repo:   repo,

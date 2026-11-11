@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- **仓库可选代码平台（GitHub / GitLab / Gitea），支持自建实例；GitHub 行为不变**
+  （docs/features/vcs-gitlab-gitea.md）。仓库登记时选平台（登记后不可改），GitLab/Gitea
+  的实例地址取自个人设置里该平台凭据的「实例地址」并固定到仓库上；PR/MR 开到仓库所在
+  平台，合并检测与 rebase 跟进按平台查询。设置页新增 GitLab/Gitea 令牌（与实例地址一起
+  保存并验证）与两类 webhook 密钥；`/webhooks/gitlab/{slug}`、`/webhooks/gitea/{slug}`
+  接收 MR/PR 评论回流，只有项目成员（GitLab ≥ Reporter）/有写权限的协作者（Gitea）的意见
+  能触发二轮，成员查询失败一律拒绝。带 token 的 git 调用在 Lathe 私有的临时 GIT_DIR 里
+  进行，agent 写进仓库 config 或 hooks 的任何东西都碰不到 token；凭据实例地址事后被改成
+  与仓库不同的实例时任务以「代码平台凭据不可用」失败，token 不发往别的实例。
+  新增迁移 0050–0052；不新增环境变量，不引入依赖。
+
 ### Changed
 
 - **模糊任务对话：少问、跑得完、报错能救**（docs/10 §1.3–§1.5）。实测一份 feature PRD

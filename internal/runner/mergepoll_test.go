@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 本文件测 F2.3-AC2（PR 被关闭未合并 → blocked_dep）的完整驱动链路：
@@ -195,8 +196,9 @@ func TestMergePollMergesTaskParkedInReviewFeedback(t *testing.T) {
 		t.Fatalf("设置 task1.pr_number 失败: %v", err)
 	}
 	// 回流：pr_open → review_feedback。无会话，所以会停在 parked。
-	out, err := (&ReviewIntake{Tasks: m}).AcceptReview(ctx, userID, &github.ReviewEvent{
-		Event: github.EventReviewComment, Action: "created",
+	out, err := (&ReviewIntake{Tasks: m}).AcceptReview(ctx, userID, &vcs.ReviewEvent{
+		Provider: vcs.ProviderGitHub,
+		Event:    github.EventReviewComment, Action: "created",
 		Repo: repo.ProviderRepo, PRNumber: 77, PRAuthor: "lathe-bot",
 		Key: "inline:900", Author: "alice", Body: "改一下",
 	}, "d-parked")
