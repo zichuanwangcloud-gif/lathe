@@ -8,6 +8,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/yunxiao"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
@@ -99,6 +100,8 @@ type Clients struct {
 	// 凭据提供者是同一个人 —— 都来自 ForUser 的调用参数。
 	store  *store.Store
 	userID int64
+	// yunxiao 是云效连接存储（f08）；nil 时云效 tracker 不可用。
+	yunxiao *store.YunxiaoConnections
 }
 
 // NewClients 包装 Provider 供流水线使用。st 为 nil 时内置工单
@@ -120,8 +123,35 @@ func (c *Clients) Tracker(ctx context.Context, provider string) (tracker.Tracker
 	case tracker.ProviderLinear, "":
 		// 空串按 linear 处理：存量任务行与旧调用方的默认语义。
 		return c.p.Linear(ctx)
+	case tracker.ProviderYunxiao:
+		return c.yunxiaoTracker(ctx)
 	}
 	return nil, fmt.Errorf("creds: 未知需求平台 %q", provider)
+}
+
+// yunxiaoTracker 用属主的云效连接构造 tracker（f08）。允许列表现取：
+// 管理员撤掉某 Region 域名后，已存连接下一次调用即失效。
+func (c *Clients) yunxiaoTracker(ctx context.Context) (tracker.Tracker, error) {
+	if c.yunxiao == nil || c.store == nil {
+		return nil, errors.New("creds: 云效连接未配置（云效存储未接线）")
+	}
+	conn, err := c.yunxiao.Get(ctx, c.userID)
+	if errors.Is(err, store.ErrYunxiaoNotConfigured) {
+		return nil, errors.New("creds: 云效连接未配置（请在设置页配置云效连接）")
+	}
+	if err != nil {
+		return nil, err
+	}
+	cl, err := yunxiao.NewClient(yunxiao.Config{
+		Endpoint: conn.Endpoint, OrganizationID: conn.OrganizationID, Token: conn.Token,
+		AllowedHosts: c.store.YunxiaoAllowedHosts(ctx),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creds: 云效连接不可用: %w", err)
+	}
+	return yunxiao.NewTracker(cl, yunxiao.StatusMapping{
+		Started: conn.StatusStarted, PROpen: conn.StatusPROpen, Merged: conn.StatusMerged,
+	}), nil
 }
 
 // GitHub 实现 runner.Clients。

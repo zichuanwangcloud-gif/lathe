@@ -261,6 +261,9 @@ func (p *MergePoller) handleMerged(ctx context.Context, tk *task.Task) error {
 	// 内置工单联动（09 §3 F4-AC3）：任务 merged → 工单 done。
 	// 联动失败不掩盖合并事实（已落库），只告警。
 	p.applyIssueOutcome(ctx, merged, store.OutcomeMerged)
+	// 外部平台状态同步（merged，f08 云效）：只对实现 StatusSyncer 的
+	// tracker 生效；失败只告警，不掩盖合并事实。
+	p.syncMergedStatus(ctx, merged)
 
 	// 终态通知（T3）。走 Pipeline.mailTerminal 而不是自己再拼一套：
 	// 同一份渲染逻辑只该有一处，否则两边的正文迟早不一致。
@@ -676,6 +679,26 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, a
 			slog.Warn("阻塞回帖失败", "task", bt.ID, "err", err)
 		}
 	}
+}
+
+// syncMergedStatus 按任务属主与任务行钉死的 provider 现取 tracker，同步
+// merged 状态。内置工单走 applyIssueOutcome，不在这里重复（它的 tracker
+// 不实现 StatusSyncer，类型断言自然跳过；这里提前返回省一次凭据解析）。
+func (p *MergePoller) syncMergedStatus(ctx context.Context, tk *task.Task) {
+	if p.ClientFactory == nil || tk.TrackerProvider == tracker.ProviderInternal {
+		return
+	}
+	clients, err := p.ClientFactory.ForUser(ctx, tk.UserID)
+	if err != nil {
+		slog.Warn("合并后状态同步：解析属主凭据失败", "task", tk.ID, "err", err)
+		return
+	}
+	tr, err := clients.Tracker(ctx, tk.TrackerProvider)
+	if err != nil {
+		slog.Warn("合并后状态同步：取需求平台客户端失败", "task", tk.ID, "provider", tk.TrackerProvider, "err", err)
+		return
+	}
+	syncTrackerStatus(ctx, tr, tk, IssueRefOf(tk), tracker.LifecycleMerged)
 }
 
 // applyIssueOutcome 把任务终态联动到内置工单（仅 internal 任务）。
