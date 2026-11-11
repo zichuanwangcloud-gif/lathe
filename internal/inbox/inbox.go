@@ -10,9 +10,15 @@
 package inbox
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
@@ -110,7 +116,9 @@ type Item struct {
 type Redactor func(string) string
 
 // ---------------------------------------------------------------- 键
-// 桩（先红后绿第一次提交）：实现见下一次提交。
+
+// keyRe 是事项键的封闭语法。不合法的键直接 400，既不查库也不回显输入。
+var keyRe = regexp.MustCompile(`^(task:[1-9][0-9]{0,18}:e[1-9][0-9]{0,18}|prd:[1-9][0-9]{0,18}:(answers|review|confirm|run_failed):r[0-9]{1,9}(:[0-9a-f]{8})?)$`)
 
 // ErrBadKey 表示事项键不合法。
 var ErrBadKey = errors.New("inbox: 事项键不合法")
@@ -130,21 +138,235 @@ func (k Key) Subject() store.InboxSubject {
 	return store.InboxSubject{PRDID: k.SubjectID}
 }
 
-// ParseKey 按封闭语法解析事项键（桩）。
-func ParseKey(s string) (Key, error) { return Key{}, nil }
+// ParseKey 按封闭语法解析事项键，返回主体类型与主体 id。
+func ParseKey(s string) (Key, error) {
+	if len(s) == 0 || len(s) > maxKeyLen || !keyRe.MatchString(s) {
+		return Key{}, ErrBadKey
+	}
+	parts := strings.SplitN(s, ":", 3)
+	id, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || id <= 0 {
+		// 19 位数字可能超出 int64：正则放过了，这里兜住
+		return Key{}, ErrBadKey
+	}
+	if parts[0] == SubjectTask {
+		ev, err := strconv.ParseInt(strings.TrimPrefix(parts[2], "e"), 10, 64)
+		if err != nil || ev <= 0 {
+			return Key{}, ErrBadKey
+		}
+	}
+	return Key{Raw: s, SubjectType: parts[0], SubjectID: id}, nil
+}
 
-func taskKey(taskID, eventID int64) string { return fmt.Sprintf("task:%d:e%d", taskID, eventID) }
+func taskKey(taskID, eventID int64) string {
+	return fmt.Sprintf("task:%d:e%d", taskID, eventID)
+}
 
 func prdKey(prdID int64, kind string, round int) string {
 	return fmt.Sprintf("prd:%d:%s:r%d", prdID, kind, round)
 }
 
-func truncateRunes(s string, n int) string { return s }
+// errHash8 是 last_error 的 sha256 前 8 个十六进制字符：同一轮第二次失败、
+// 原因不同时就是新事项（processing_started_at 跑完被置 NULL，当不了锚点）。
+func errHash8(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:8]
+}
 
-func reasonText(raw string, red Redactor) string { return raw }
+// ---------------------------------------------------------------- 文本
 
-// TaskItem 把一条任务候选行派生成事项（桩）。
-func TaskItem(r store.InboxTaskRow, red Redactor) (Item, bool) { return Item{}, false }
+// truncateRunes 按 rune 截断到 n，超长时补一个省略号。结果保证 utf8.ValidString
+// （按 byte 切会把多字节字符切断，事件落库因此出过 SQLSTATE 22021）。
+func truncateRunes(s string, n int) string {
+	s = strings.ToValidUTF8(s, "�")
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	i := 0
+	for pos := range s {
+		if i == n {
+			return s[:pos] + "…"
+		}
+		i++
+	}
+	return s
+}
 
-// PRDItem 把一条 PRD 候选行派生成事项（桩）。
-func PRDItem(r store.InboxPRDRow, doc *prd.Document, red Redactor) (Item, bool) { return Item{}, false }
+// reasonText 是全部自由文本原因的唯一出口：**先脱敏、再截断**。
+// 顺序不能反：先截断可能把一个 token 切成形态表认不出的残段。
+func reasonText(raw string, red Redactor) string {
+	if red != nil {
+		raw = red(raw)
+	}
+	return truncateRunes(strings.TrimSpace(raw), maxReasonRunes)
+}
+
+func payloadString(p map[string]any, key string) string {
+	if v, ok := p[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(*s)
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
+// ---------------------------------------------------------------- 任务
+
+// TaskItem 把一条任务候选行派生成事项。不在等人状态的行返回 false。
+func TaskItem(r store.InboxTaskRow, red Redactor) (Item, bool) {
+	var (
+		kind   Kind
+		reason string
+	)
+	switch r.State {
+	case "blocked_spec":
+		kind = KindTaskBlockedSpec
+		if q := payloadString(r.Payload, "question"); q != "" {
+			reason = q
+		} else {
+			reason = deref(r.FailureReason)
+		}
+		reason = reasonText(reason, red)
+	case "awaiting_approval":
+		kind = KindTaskAwaitingApproval
+		reason = reasonText(payloadString(r.Payload, "reason"), red)
+	case "review_feedback":
+		kind = KindTaskReviewParked
+		reason = reviewParkedReason
+	case "blocked_dep":
+		kind = KindTaskBlockedDep
+		reason = reasonText(deref(r.FailureReason), red)
+	case "failed":
+		kind = KindTaskFailed
+		reason = reasonText(deref(r.FailureReason), red)
+	default:
+		return Item{}, false
+	}
+
+	title := r.ExternalKey
+	if r.IssueTitle != nil && strings.TrimSpace(*r.IssueTitle) != "" {
+		title = r.ExternalKey + " " + strings.TrimSpace(*r.IssueTitle)
+	}
+
+	it := Item{
+		Key:         taskKey(r.ID, r.EventID),
+		Kind:        kind,
+		SubjectType: SubjectTask,
+		SubjectID:   r.ID,
+		Title:       truncateRunes(title, maxTitleRunes),
+		Repo:        r.ProviderRepo,
+		Reason:      reason,
+		Since:       r.Since,
+		Link:        fmt.Sprintf("/tasks/%d", r.ID),
+		Dismissible: kind == KindTaskFailed,
+	}
+	if r.TrackerProvider == "internal" && r.IssueID != nil {
+		it.Extra = append(it.Extra, Link{Label: "工单", Href: fmt.Sprintf("/issues/%d", *r.IssueID)})
+	}
+	// 前驱链接只认 SQL 判过归属的 PredecessorID，从不读 payload 的 blocked_by 拼链接。
+	if kind == KindTaskBlockedDep && r.PredecessorID != nil {
+		it.Extra = append(it.Extra, Link{Label: "前驱任务", Href: fmt.Sprintf("/tasks/%d", *r.PredecessorID)})
+	}
+	return it, true
+}
+
+// ---------------------------------------------------------------- PRD
+
+// PRDItem 把一条 PRD 候选行派生成事项（每份 PRD 至多一条）。doc 为 nil 表示
+// document 为空或解析失败。优先级 run_failed > answers > review > confirm。
+func PRDItem(r store.InboxPRDRow, doc *prd.Document, red Redactor) (Item, bool) {
+	it := Item{
+		SubjectType: SubjectPRD,
+		SubjectID:   r.ID,
+		Title:       truncateRunes(prdTitle(r, doc), maxTitleRunes),
+		Repo:        r.ProviderRepo,
+		Since:       r.UpdatedAt,
+		Link:        fmt.Sprintf("/prds/%d", r.ID),
+	}
+
+	active := r.State == "drafting" || r.State == "awaiting_answers"
+	switch {
+	case active && !r.Processing && r.LastError != nil:
+		it.Kind = KindPRDRunFailed
+		it.Key = prdKey(r.ID, "run_failed", r.Round) + ":" + errHash8(*r.LastError)
+		it.Reason = reasonText(*r.LastError, red)
+	case r.State == "awaiting_answers" && !r.Processing:
+		it.Kind = KindPRDAnswers
+		it.Key = prdKey(r.ID, "answers", r.Round)
+		if n := openQuestions(doc); n > 0 {
+			it.Reason = fmt.Sprintf("%d 个问题待回答", n)
+		} else {
+			it.Reason = "有问题待回答"
+		}
+	case r.State == "ready_for_review":
+		it.Kind = KindPRDReview
+		it.Key = prdKey(r.ID, "review", r.Round)
+		it.Reason = "已提交评审，等你批准或打回"
+	case r.State == "drafting" && !r.Processing && r.LastError == nil:
+		first, n := inferredSections(doc)
+		if n == 0 {
+			return Item{}, false
+		}
+		it.Kind = KindPRDConfirm
+		it.Key = prdKey(r.ID, "confirm", r.Round)
+		it.Reason = fmt.Sprintf("%d 节待确认", n)
+		// first 只可能取 Document.Sections() 的固定 key
+		it.Link += "?section=" + first
+	default:
+		return Item{}, false
+	}
+	return it, true
+}
+
+func prdTitle(r store.InboxPRDRow, doc *prd.Document) string {
+	if doc != nil {
+		if t := firstLine(doc.OneLiner.Body); t != "" {
+			return t
+		}
+	}
+	if t := firstLine(r.OriginalInput); t != "" {
+		return t
+	}
+	return fmt.Sprintf("PRD #%d", r.ID)
+}
+
+func openQuestions(doc *prd.Document) int {
+	if doc == nil {
+		return 0
+	}
+	n := 0
+	for _, q := range doc.Questions {
+		if q.Status == "" || q.Status == prd.QuestionOpen {
+			n++
+		}
+	}
+	return n
+}
+
+func inferredSections(doc *prd.Document) (first string, n int) {
+	if doc == nil {
+		return "", 0
+	}
+	for _, s := range doc.Sections() {
+		if s.Section.Status == prd.StatusInferred {
+			if n == 0 {
+				first = s.Key
+			}
+			n++
+		}
+	}
+	return first, n
+}

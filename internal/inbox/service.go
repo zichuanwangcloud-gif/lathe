@@ -3,7 +3,9 @@ package inbox
 import (
 	"context"
 	"errors"
+	"sort"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
@@ -76,16 +78,108 @@ type Page struct {
 	Total  int    `json:"total"`
 }
 
-// 桩（先红后绿第一次提交）：实现见下一次提交。
+// derive 是 Items / Count / Mark / ReadAll 共用的唯一派生路径：候选 + 标记
+// 合并 → 去掉已忽略的 → 按 Since 倒序。不另写计数 SQL，免得两边口径漂移。
+func (s *Service) derive(ctx context.Context, userID int64) ([]Item, error) {
+	tasks, err := s.store.InboxTaskCandidates(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	prds, err := s.store.InboxPRDCandidates(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	marks, err := s.store.InboxMarks(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
 
-// Items 返回本人的事项列表（桩）。
-func (s *Service) Items(ctx context.Context, userID int64, f Filter) (*Page, error) {
-	return &Page{Items: []Item{}}, nil
+	out := make([]Item, 0, len(tasks)+len(prds))
+	for _, r := range tasks {
+		if it, ok := TaskItem(r, s.redact); ok {
+			out = append(out, it)
+		}
+	}
+	for _, r := range prds {
+		// 解析失败当作空文档：一份坏快照不该拖垮整个收件箱
+		doc, err := prd.ParseDocument(r.Document)
+		if err != nil {
+			doc = nil
+		}
+		if it, ok := PRDItem(r, doc, s.redact); ok {
+			out = append(out, it)
+		}
+	}
+
+	kept := out[:0]
+	for _, it := range out {
+		m, ok := marks[it.Key]
+		if ok && m.DismissedAt != nil {
+			continue
+		}
+		it.Read = ok && m.ReadAt != nil
+		kept = append(kept, it)
+	}
+	sort.SliceStable(kept, func(i, j int) bool {
+		if !kept[i].Since.Equal(kept[j].Since) {
+			return kept[i].Since.After(kept[j].Since)
+		}
+		return kept[i].Key < kept[j].Key
+	})
+	return kept, nil
 }
 
-// Count 返回未读数与总数（桩）。
+func counts(items []Item) (unread, total int) {
+	for _, it := range items {
+		if !it.Read {
+			unread++
+		}
+	}
+	return unread, len(items)
+}
+
+// Items 返回本人的事项列表。
+func (s *Service) Items(ctx context.Context, userID int64, f Filter) (*Page, error) {
+	all, err := s.derive(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	unread, total := counts(all)
+
+	sel := make([]Item, 0, len(all))
+	for _, it := range all {
+		if f.Show == FilterUnread && it.Read {
+			continue
+		}
+		if f.Kind != "" && it.Kind != f.Kind {
+			continue
+		}
+		sel = append(sel, it)
+	}
+
+	limit := f.Limit
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	offset := max(f.Offset, 0)
+	if offset > len(sel) {
+		offset = len(sel)
+	}
+	end := min(offset+limit, len(sel))
+	return &Page{Items: sel[offset:end], Unread: unread, Total: total}, nil
+}
+
+// Count 返回未读数与总数（徽标轮询用），与 Items 走同一条派生路径。
 func (s *Service) Count(ctx context.Context, userID int64) (unread, total int, err error) {
-	return 0, 0, nil
+	all, err := s.derive(ctx, userID)
+	if err != nil {
+		return 0, 0, err
+	}
+	unread, total = counts(all)
+	return unread, total, nil
 }
 
 // StaleError 携带 409 时该主体当前的事项（可能为 nil）。
@@ -98,12 +192,88 @@ func (e *StaleError) Error() string { return ErrStale.Error() }
 // Unwrap 让 errors.Is(err, ErrStale) 成立。
 func (e *StaleError) Unwrap() error { return ErrStale }
 
-// Mark 对本人的一条事项执行 read / unread / dismiss（桩）。
+// Mark 对本人的一条事项执行 read / unread / dismiss，返回标记后的事项。
+//
+//  1. 键不合法 → ErrBadKey。
+//  2. 重新派生本人的当前事项，按键查找。
+//  3. 找不到：主体属于本人 → *StaleError（附当前事项）；否则 → ErrNotFound。
+//     「不存在」与「属于别人」在这一步之前不做任何区分，也不写任何行。
+//  4. dismiss 只允许 Dismissible 的事项。
+//
+// 已忽略的事项不在派生结果里，对它的再次操作同样落到第 3 步（409）。
 func (s *Service) Mark(ctx context.Context, userID int64, rawKey string, op store.InboxMarkOp) (*Item, error) {
-	return nil, nil
+	switch op {
+	case store.InboxMarkRead, store.InboxMarkUnread, store.InboxMarkDismiss:
+	default:
+		return nil, errors.New("inbox: 未知的标记操作")
+	}
+	key, err := ParseKey(rawKey)
+	if err != nil {
+		return nil, ErrBadKey
+	}
+
+	all, err := s.derive(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	var hit *Item
+	var current *Item
+	for i := range all {
+		if all[i].Key == key.Raw {
+			hit = &all[i]
+			break
+		}
+		if all[i].SubjectType == key.SubjectType && all[i].SubjectID == key.SubjectID {
+			current = &all[i]
+		}
+	}
+
+	if hit == nil {
+		owned, err := s.store.InboxSubjectOwned(ctx, userID, key.Subject())
+		if err != nil {
+			return nil, err
+		}
+		if !owned {
+			return nil, ErrNotFound
+		}
+		return nil, &StaleError{Current: current}
+	}
+
+	if op == store.InboxMarkDismiss && !hit.Dismissible {
+		return nil, ErrNotDismissible
+	}
+	if err := s.store.UpsertInboxMark(ctx, userID, key.Raw, key.Subject(), op); err != nil {
+		return nil, err
+	}
+	it := *hit
+	switch op {
+	case store.InboxMarkRead:
+		it.Read = true
+	case store.InboxMarkUnread:
+		it.Read = false
+	}
+	return &it, nil
 }
 
-// ReadAll 把全部未读事项标为已读（桩）。
+// ReadAll 把当前派生出的、未忽略的全部未读事项标为已读，返回标记的条数。
 func (s *Service) ReadAll(ctx context.Context, userID int64) (int, error) {
-	return 0, nil
+	all, err := s.derive(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	batch := make([]store.InboxKeySubject, 0, len(all))
+	for _, it := range all {
+		if it.Read {
+			continue
+		}
+		subj := store.InboxSubject{TaskID: it.SubjectID}
+		if it.SubjectType == SubjectPRD {
+			subj = store.InboxSubject{PRDID: it.SubjectID}
+		}
+		batch = append(batch, store.InboxKeySubject{Key: it.Key, Subject: subj})
+	}
+	if err := s.store.MarkInboxRead(ctx, userID, batch); err != nil {
+		return 0, err
+	}
+	return len(batch), nil
 }
