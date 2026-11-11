@@ -134,7 +134,11 @@ func TestVerificationLogNormalChunks(t *testing.T) {
 			t.Errorf("第 %d 块不是合法 UTF-8", i)
 		}
 	}
-	_ = nexts // 块终点落在换行之后是安全切点的性质，提交 B 起断言
+	for i, n := range nexts {
+		if data[n-1] != '\n' {
+			t.Errorf("第 %d 块的 nextOffset=%d 前一个字节 got %q, want '\\n'", i, n, data[n-1])
+		}
+	}
 	if got, want := strings.Join(chunks, ""), runner.RedactForDisplay(data, f.api.KnownSecrets); got != want {
 		t.Errorf("逐块拼接 != 整份脱敏: got len %d, want len %d", len(got), len(want))
 	}
@@ -190,6 +194,140 @@ func TestVerificationLogRedactsSecrets(t *testing.T) {
 		}
 	}
 }
+
+// 切分场景：块边界只能落在安全切点上，任何一块都不得出现半截凭据。
+func TestVerificationLogChunkNeverSplitsSecret(t *testing.T) {
+	const boundary = 65536
+	filler := func(n int) string { // n 字节、以 \n 结尾的填充行
+		var b strings.Builder
+		for b.Len() < n {
+			line := "filler line for chunk boundary testing ................................\n"
+			if b.Len()+len(line) > n {
+				line = strings.Repeat("f", n-b.Len()-1) + "\n"
+			}
+			b.WriteString(line)
+		}
+		return b.String()
+	}
+	tail := filler(4096)
+
+	type tc struct {
+		name   string
+		build  func(r string) (data, secret string, reg []string)
+		assert func(t *testing.T, f *logFixture, vid int64, data, sec string)
+	}
+	checkHalves := func(t *testing.T, f *logFixture, vid int64, data, sec string) {
+		t.Helper()
+		chunks, _ := f.readAll(t, vid, "&limit=65536")
+		joined := strings.Join(chunks, "")
+		if strings.Contains(joined, sec) {
+			t.Errorf("拼接结果含凭据明文 %q", sec)
+		}
+		h1, h2 := sec[:len(sec)/2], sec[len(sec)/2:]
+		for i, c := range chunks {
+			if strings.Contains(c, h1) || strings.Contains(c, h2) {
+				t.Errorf("第 %d 块含半截凭据: got 含 %q 或 %q, want 都不含", i, h1, h2)
+			}
+		}
+		if want := runner.RedactForDisplay(data, f.api.KnownSecrets); joined != want {
+			t.Errorf("逐块拼接 != 整份脱敏（got len %d, want len %d）", len(joined), len(want))
+		}
+	}
+	cases := []tc{
+		{
+			name: "给定登记凭据 DSN 横跨 64KiB 标称边界 断言无半截",
+			build: func(r string) (string, string, []string) {
+				dsn := "postgres://u:" + r + r + "@db.internal:5432/app"
+				line := dsn + " " + strings.Repeat("x", 200-len(dsn)-2) + "\n"
+				return filler(65520) + line + tail, dsn, []string{dsn}
+			},
+			assert: checkHalves,
+		},
+		{
+			name: "给定凭据所在行超过 4KiB 的单行 JSON 断言无半截",
+			build: func(r string) (string, string, []string) {
+				tok := r + r + r[:8]
+				pre := filler(boundary - 5000)
+				head := `{"a":"` + strings.Repeat("a", 5000-len(`{"a":"`)-len(`","token":"`)-10) + `","token":"`
+				line := head + tok + `","b":"` + strings.Repeat("b", 10<<10-len(head)-len(tok)-10) + `"}` + "\n"
+				return pre + line + tail, tok, nil
+			},
+			assert: checkHalves,
+		},
+		{
+			name: "给定裸值 API_KEY= 横跨边界 断言无半截",
+			build: func(r string) (string, string, []string) {
+				key := r + r + r[:8]
+				pre := filler(boundary - 20)
+				return pre + "API_KEY=" + key + "\n" + tail, key, nil
+			},
+			assert: checkHalves,
+		},
+		{
+			name: "给定跨行形态 password:\\n 换行正好在边界后 断言首块不在该换行处结束",
+			build: func(r string) (string, string, []string) {
+				sec := r + r[:4]
+				pre := filler(boundary - 8) // password: 从 65528 起，\n 落在 65537
+				return pre + "password:\n  " + sec + "\n" + tail, sec, nil
+			},
+			assert: func(t *testing.T, f *logFixture, vid int64, data, sec string) {
+				_, body, raw := f.get(t, vid, "?offset=0&limit=65536")
+				if n, ok := body["nextOffset"].(float64); ok && int(n) == boundary+2 {
+					t.Errorf("首块在 password:\\n 之后结束（nextOffset=%d），这会把跨行凭据切开: %.200s", int(n), raw)
+				}
+				checkHalves(t, f, vid, data, sec)
+			},
+		},
+		{
+			name: "给定超过 1MiB 的单行 断言 withheld 且不返回任何片段",
+			build: func(r string) (string, string, []string) {
+				sec := "f04-long-line-secret-" + r
+				half := strings.Repeat("z", 768<<10)
+				return "hello\n" + half + sec + half + "\n" + tail, sec, []string{sec}
+			},
+			assert: func(t *testing.T, f *logFixture, vid int64, data, sec string) {
+				code, body, raw := f.get(t, vid, "?offset=0&limit=65536")
+				if code != http.StatusOK || body["withheld"] != true || body["text"] != "" || body["nextOffset"] != nil {
+					t.Fatalf("got %d withheld=%v text.len=%d nextOffset=%v, want 200 withheld=true text=\"\" nextOffset=null",
+						code, body["withheld"], len(asString(body["text"])), body["nextOffset"])
+				}
+				if strings.Contains(raw, strings.Repeat("z", 64)) || strings.Contains(raw, sec[:16]) {
+					t.Errorf("withheld 响应含该行片段: %.300s", raw)
+				}
+			},
+		},
+		{
+			name: "给定 offset 指向凭据中间 断言 400 且只含错误信息",
+			build: func(r string) (string, string, []string) {
+				key := r + r + r[:8]
+				return filler(1000) + "API_KEY=" + key + "\n" + tail, key, nil
+			},
+			assert: func(t *testing.T, f *logFixture, vid int64, data, sec string) {
+				mid := strings.Index(data, sec) + len(sec)/2
+				code, body, raw := f.get(t, vid, "?offset="+strconv.Itoa(mid))
+				if code != http.StatusBadRequest {
+					t.Fatalf("got %d %.200s, want 400", code, raw)
+				}
+				if _, has := body["text"]; has || strings.Contains(raw, sec[len(sec)/2:]) {
+					t.Errorf("400 响应不应带内容: %s", raw)
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := rhex(t) + rhex(t) // 24 字节随机串
+			data, sec, reg := c.build(r)
+			f := newLogFixture(t, reg...)
+			ref := f.rel(0, "01-build.log")
+			f.write(t, ref, []byte(data))
+			vid, _ := insertVerification(t, f.api, f.tk.ID, "build", "failed", strp(ref))
+			c.assert(t, f, vid, data, sec)
+		})
+	}
+}
+
+func asString(v any) string { s, _ := v.(string); return s }
 
 func TestVerificationLogPathTraversal(t *testing.T) {
 	f := newLogFixture(t)
@@ -275,3 +413,4 @@ func TestVerificationLogOwnership(t *testing.T) {
 		}
 	})
 }
+
