@@ -69,13 +69,18 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    - GitHub 令牌：GitHub → Settings → Developer settings → Personal access tokens
 #    - Linear Webhook 密钥：建 webhook 时 Linear 生成
 #    - GitHub Webhook 密钥（可选，PR 评论回流用）：建仓库 webhook 时自己填的 Secret
+#    - GitLab / Gitea 令牌（仓库在 GitLab / Gitea 上时，含自建实例）：与「实例地址」
+#      一起填（如 https://gitlab.example.com；仅 localhost/127.0.0.1 允许 http）。
+#      实例地址只在设置页填，不走环境变量；登记仓库时会把它固定到仓库上
+#    - GitLab / Gitea Webhook 密钥（可选，PR/MR 评论回流用）
 #    - 邮件发送（SMTP）：用于「忘记密码」，保存时会真投一封测试邮件
 #    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
 #    接单判定直接使用，无需手工填写。
 #
 # 6. 「设置」页顶部有你的专属 Linear webhook 地址（/webhooks/linear/<你的随机段>），
 #    在 Linear → Settings → API → Webhooks 里指过去，勾选 Issue 事件
-# 7. 在「仓库配置」页登记目标仓库（owner/repo）并设置分支策略
+# 7. 在「仓库配置」页登记目标仓库（owner/repo；GitLab 可为 group/subgroup/repo）、
+#    选代码平台（GitHub / GitLab / Gitea，登记后不可改）并设置分支策略
 #
 # 7.5（可选）PR 评论回流：「设置」页还有一个 GitHub webhook 地址
 #    （/webhooks/github/<同一个随机段>）。在目标仓库 → Settings → Webhooks 新建：
@@ -83,6 +88,14 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    事件勾 Pull request reviews 与 Pull request review comments。
 #    之后他人在 Lathe 开的 PR 上留 review 意见 → 任务 resume 原会话修改 →
 #    完整重新验证 → 更新同一个 PR。PR 作者本人的评论与 approve 不触发。
+#    GitLab：项目 Settings → Webhooks，URL 填 /webhooks/gitlab/<同一个随机段>，
+#      勾 Comments（Note events），Secret token 与「GitLab Webhook 密钥」一致；
+#      项目成员（Reporter 及以上）的 MR 评论触发二轮。
+#    Gitea：仓库 Settings → Webhooks，URL 填 /webhooks/gitea/<同一个随机段>，
+#      选「自定义事件」勾 Pull Request Comment（Gitea 以 X-Gitea-Event: issue_comment
+#      + is_pull 发出，Lathe 按此识别），Secret 与「Gitea Webhook 密钥」一致；
+#      在 PR 对话里发评论触发二轮。Gitea 的 review（含行内评论）本身不触发，
+#      但会在二轮时一并带给 agent。
 #
 # 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
 #    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。

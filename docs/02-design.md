@@ -25,7 +25,7 @@
 │   (Linear 事件)       (状态机/事件流)   (能力匹配/租约)      │        │
 │                            ▲                                │       │
 │  Integrations ─────────────┘                                │       │
-│   Linear OAuth · GitHub App · CloudRouter Token             │       │
+│   Linear · GitHub · GitLab/Gitea token · CloudRouter        │       │
 └─────────────────────────────────────────────────────────────┼───────┘
                                                               │
         ┌──────────────────────┬──────────────────────────────┘
@@ -83,7 +83,7 @@ PR 评论回流（§7）走的是 `review_feedback → queued`：webhook 只负�
 
 **③ 幂等。**
 Linear webhook 会重投递。用 `webhook_deliveries(delivery_id PK)` 去重表，先落库再处理。
-GitHub webhook 共用这张表（去重键加 `github:` 前缀，两平台的投递 ID 各自生成）。投递去重之外，PR 评论回流再按**意见**去重（`inline:<id>` / `issue:<id>` / `review:<id>`，记在任务事件流里）：同一条意见经不同投递到达、或二轮结束后旧投递姗姗来迟，都不会再开一轮。
+GitHub / GitLab / Gitea webhook 共用这张表（去重键加 `github:` / `gitlab:` / `gitea:` 前缀，各平台的投递 ID 各自生成）。投递去重之外，PR 评论回流再按**意见**去重（`inline:<id>` / `issue:<id>` / `review:<id>`，记在任务事件流里）：同一条意见经不同投递到达、或二轮结束后旧投递姗姗来迟，都不会再开一轮。
 
 ---
 
@@ -106,10 +106,14 @@ smtp_settings(id=1, host, port, username, password_enc, from_addr, from_name,
               verified_at, verify_error)
       -- 单行全局表。SMTP 是「系统怎么发信」而非「某人的凭据」，
       -- 因此不挂 user_id，也不并入 integrations
-integrations(id, user_id, kind, -- linear | linear_webhook | github
+integrations(id, user_id, kind, -- linear | linear_webhook | github | github_webhook
+                                -- | gitlab | gitlab_webhook | gitea | gitea_webhook（0052）
                                 -- 预留：linear_oauth | github_app | cloudrouter
-             external_account_id, token_ref, secret_enc, scopes, expires_at)
+             external_account_id, token_ref, secret_enc, scopes, expires_at,
+             base_url)          -- 自建 GitLab/Gitea 的实例地址（非密；gitlab/gitea 令牌必填，0051/0052）
 repos(id, user_id, provider_repo, default_branch, -- e.g. dev
+      vcs_provider,          -- github | gitlab | gitea（0050）：登记时钉死、之后不可改，任务经 repo_id 继承平台
+      vcs_base_url,          -- GitLab/Gitea 的实例地址：登记时从同平台凭据复制，GitHub 恒为 NULL
       branch_pattern,        -- fix/{key}-{slug}
       verify_profile_ref,    -- 见 §5
       dep_strategy)          -- pnpm-store | none
@@ -279,6 +283,9 @@ Linear: issue 指派给用户
               pr_open      推分支 → 开 PR → 回帖 Linear（含验证证据）
   ...人 review...
   PR 评论 → review_feedback → implementing(--resume 原 session) → 重新验证
+           （三个平台：GitHub / GitLab / Gitea。验签与信任判定各自实现在平台包里，
+             通过后统一构造 vcs.ReviewEvent，回流入口 ReviewIntake.AcceptReview 共用；
+             详见 docs/features/vcs-gitlab-gitea.md）
   合并 → merged → 回收 worktree
 ```
 
