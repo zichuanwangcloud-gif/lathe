@@ -1250,6 +1250,12 @@ C（覆盖判定）三个提交；前端分「提交 1 纯抽取」（`f54a4ee`�
   也是先看到当前现场，而不是从头拉 200 条再追。
 - **定位与本地开关**：`jumpTo` 的目标被「只看工具调用」等本地开关藏起来时，自动关掉开关再滚动；
   被阶段 chip（服务端过滤）挡住时清掉 chip 再取一次。PRD 没写，属交互细节。
+- **分页游标写成行比较**：§3.1 写的查询形状是 `id <|> $3 ORDER BY id`。全量 `make test` 下
+  `TestEventsQueriesUseTaskIndex` 抓到：`id < $before ORDER BY id DESC LIMIT n` 被规划成主键倒序
+  范围扫描再按 `task_id` 过滤（大表上等于从全表最新的事件往回翻）。实现改为
+  `(task_id, id) < ($1, $before) ORDER BY task_id DESC, id DESC`，语义不变，只有复合索引能承接。
+  测试同时加固：用真实形态的参数（本任务 `max(id)+1`），事务内造跨任务数据并 `ANALYZE`，
+  旧写法上稳定复现主键扫描（`red/ac4-explain-hardened.txt`）。
 - **AC-9 手测里的一次 fail-closed**：种子数据把 `verifications.at` 回拨到 08:00，而日志文件是
   当下写的，第一次 curl 时覆盖判定的时间规则如实返回 `404 log_overwritten`。把种子日志的 mtime
   设为各自 `at - 1s` 后复测为 200。这正是 §3.2.3 规则 2 的预期行为，不是缺陷；记在这里，
@@ -1264,7 +1270,7 @@ C（覆盖判定）三个提交；前端分「提交 1 纯抽取」（`f54a4ee`�
 | AC-1 0041 / 每个 phase 可落库 / 常量绑定 | 先红：`implement-reentry` 报 SQLSTATE 23514（store 与 httpapi 两条）；后绿。空数据上 up→down→up 退出码 0，down 后约束与 0015 一致 | `red/ac1.txt`、`green/ac1-migrate.txt` |
 | AC-2 反向分页 / 兼容契约 / failures=1 | 先红：`before` 被忽略（got `[56..155]` want `[206..305]`）、`paged=1` 无 `first_id`、`paged=2` 返回 200；后绿。不带新参数时顶层键恰为 `{events,last_id}`（新测试函数，未改 `TestTaskEventsEndpoint`） | `red/ac2-ac4.txt`、`green/ac2-ac4.txt` |
 | AC-3 phase/kind 过滤与隔离 | 先红：`phase=verify` 返回其他阶段；后绿。非属主带扩展参数仍 404 `{"error":"任务不存在"}` | 同上 |
-| AC-4 summary / EXPLAIN | 先红：路由不存在；后绿。205 条失败时 `failures` 200 条、`failuresTruncated=true`、`failureCount=205`、`lastFailure.id` = 独立 SQL 的 `max(id)` 且大于 `failures[199].id`。五条查询的 EXPLAIN 都走 `agent_events_task_id` | 同上 |
+| AC-4 summary / EXPLAIN | 先红：路由不存在；后绿。205 条失败时 `failures` 200 条、`failuresTruncated=true`、`failureCount=205`、`lastFailure.id` = 独立 SQL 的 `max(id)` 且大于 `failures[199].id`。六条查询的 EXPLAIN 都走 `agent_events_task_id`（游标改行比较的经过见 §9.2） | 同上，及 `red/ac4-explain-hardened.txt`、`red/gates-first-run-explain-fail.txt` |
 | AC-5 日志读取 | 三段先红：base 路由不存在（`red/ac5-base.txt`）；提交 A `6e0e92d` 上切分用例 1–4 报半截凭据、5/6 状态码不符（`red/ac5-commitA.txt`）；提交 B `a5acaf8` 上覆盖用例 1、2、4 返回 200 并带出 `RUN-2`（`red/ac5-commitB.txt`）。后绿：40 个子用例全过 | `green/ac5.txt` |
 | AC-6 前端纯函数 | 提交 1 实现上 `node --test` 退出码 1（1 过 98 挂），8 个新导出各自出现 `is not a function`，无 `SyntaxError`/`ERR_MODULE_NOT_FOUND`；后绿 99/99。五个变异补丁都让规定用例失败 | `red/ac6-commit1.txt`、`red/segmentRuns-mut-*.patch`、`red/ac6-mutation-*.txt`、`green/ac6.txt` |
 | AC-7 渲染契约 | `make ui && make build` 0；`make ui-test` 白名单一致（12 行，本线未新增）；在日志查看器里临时加一行 `v-html` → 退出非 0 并打印 diff；`logRef` 在 TaskDetail 命中 3 次（base 为 0）；`implement-reentry` 在 replay.js 命中 | `green/ac7.txt`、`red/ac7-vhtml-mutation.txt` |
@@ -1283,3 +1289,11 @@ C（覆盖判定）三个提交；前端分「提交 1 纯抽取」（`f54a4ee`�
 - **被覆盖的旧日志不可读**：重试复用日志路径，旧运行的日志在界面上只显示 status、不给入口；
   根治需要写入侧按运行分目录（§4，建议另开 `fix/verify-log-per-run`）。
 - **0041 只救未来**：0041 之前被拒收的 `implement-reentry` 事件已经丢失，无法补回。
+
+### 9.5 门禁
+
+`LATHE_TEST_REQUIRE_DB=1 make lint && LATHE_TEST_REQUIRE_DB=1 make test` 通过；`gofmt -l`
+（含未入库 `.go`）为空；`golangci-lint run --new-from-rev=origin/dev` 0 issues；
+`make ui && make build`、`make ui-test` 通过；`lathe_migrate up`、`lathe_migrate down && lathe_migrate up`
+退出码 0。原样输出见 `green/gates.txt`。
+
