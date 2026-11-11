@@ -210,6 +210,23 @@ webhook 验签与投递语义（`internal/integration/linear/linear.go:408` 那�
 
 不做探针就定接口是闭门造车，抽象错了上层白做。
 
+#### 探针结论（2026-11，f08 云效任务来源交付）
+
+f08 按官方 OpenAPI 把云效接成了第二个 tracker（`internal/integration/yunxiao`，
+设计与取证见 [features/tracker-yunxiao.md](features/tracker-yunxiao.md) §2.6）。上面预判的轴逐条落实为：
+
+- **状态由项目模板定义** → 状态不能硬编码：用户按**状态显示名**配置，调用时经工作流接口现解析成 id；
+- **评论有 RICHTEXT(HTML) 与 MARKDOWN 两种** → 读侧转纯文本，写侧固定发 MARKDOWN；
+- **webhook 无 `updatedFrom`、无投递 ID、签名是明文共享密钥** → 不能照搬 Linear 的「这次改了什么」判定，
+  改为状态快照 + 边沿检测，载荷除 `id` 外一律不信、回源拉权威数据；
+- **无依赖关系表达** → 与 §3.3「编排不依赖可选能力」一致，不影响任何编排功能。
+
+**关于 §3.3 的 `Caps()`：未采用，待评审确认。** 平台差异止步于 `Issue()` / `Comment()` 两个方法，
+外加一个可选扩展接口 `tracker.StatusSyncer`（与既有 `AttributedTracker` 同形，类型断言只出现在
+`runner.syncTrackerStatus` 一处）。这跟随的是 `internal/tracker/tracker.go` 包注释与
+docs/09-internal-issues.md 的现行口径（不做 Caps），而不是本节 §3.3 的草案；编排图接入云效
+（需要 `flows.tracker_provider`）仍在范围外。
+
 ### 3.5 连带改造
 
 - **凭据**：设置页的单一「Linear API 令牌」变成**按 provider 的槽位**。建 flow 时

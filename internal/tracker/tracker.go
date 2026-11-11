@@ -7,7 +7,10 @@
 //
 // 纪律（05-roadmap §0）：接口方法就是这两个，禁止在没有真实消费方之前
 // 加新方法；07 F6.2 的 Caps() 能力位刻意不做——内置 tracker 全能力、
-// 无 webhook、无凭据，等第二个外部平台（云效）探针落地时再谈。
+// 无 webhook、无凭据。第二个外部平台（云效，internal/integration/yunxiao）
+// 落地后这条纪律仍然成立：平台差异走可选扩展接口（AttributedTracker 的
+// 消费方是 pipeline 的评论署名，StatusSyncer 的消费方是
+// runner.syncTrackerStatus），Tracker 本身一个方法都没加。
 package tracker
 
 import (
@@ -26,11 +29,15 @@ const (
 	// external_id 为 NULL——内置 tracker 按 (属主, key) 解析，不需要
 	// 第二个标识）。
 	ProviderInternal = "internal"
+	// ProviderYunxiao 需求载体是阿里云云效（Projex）工作项（external_id 是
+	// 工作项 id，external_key 是 serialNumber，为空时退回 id）。migration
+	// 0053 放开的取值；实现见 internal/integration/yunxiao。
+	ProviderYunxiao = "yunxiao"
 )
 
 // Valid 报告 p 是否为已知平台标识。
 func ValidProvider(p string) bool {
-	return p == ProviderLinear || p == ProviderInternal
+	return p == ProviderLinear || p == ProviderInternal || p == ProviderYunxiao
 }
 
 // Tracker 是 pipeline 对需求平台的窄接口。
@@ -54,6 +61,32 @@ type AttributedTracker interface {
 	Tracker
 	// WithActor 返回一个以 actor 署名评论的新句柄；原句柄不受影响。
 	WithActor(actor string) Tracker
+}
+
+// Lifecycle 是任务生命周期里值得同步回需求平台的时刻。
+type Lifecycle string
+
+// 三个同步时刻（docs/features/tracker-yunxiao.md §3.4）：都在状态机转移
+// 成功之后触发，且只是尽力而为——同步失败不影响任务状态。
+const (
+	// LifecycleStarted 任务开跑（转 triaging 之后）。
+	LifecycleStarted Lifecycle = "started"
+	// LifecyclePROpen PR 已开出（转 pr_open 并回帖之后）。
+	LifecyclePROpen Lifecycle = "pr_open"
+	// LifecycleMerged PR 已合并（转 merged 之后）。
+	LifecycleMerged Lifecycle = "merged"
+)
+
+// StatusSyncer 是可把任务生命周期同步成平台侧状态的 Tracker 扩展接口。
+//
+// 与 AttributedTracker 同一种「可选扩展」形态：Tracker 接口本身不加方法，
+// Linear 与内置实现不实现它；pipeline / mergepoll 只在
+// runner.syncTrackerStatus 这一处做类型断言、可选消费。云效实现它
+// （按用户配置的状态名推进工作项状态）。
+type StatusSyncer interface {
+	// SyncStatus 把 ref 指向的工单推到 ev 对应的状态。未配置该时刻的
+	// 映射时返回 nil 且不发任何请求。错误只供调用方告警，不得影响状态机。
+	SyncStatus(ctx context.Context, ref string, ev Lifecycle) error
 }
 
 // Issue 是 Lathe 需要的工单字段（平台无关）。

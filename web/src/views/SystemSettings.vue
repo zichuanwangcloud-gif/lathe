@@ -3,6 +3,7 @@ import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth } from '../auth'
 import { confirmDialog } from '../confirm'
+import YunxiaoAllowedHosts from '../components/YunxiaoAllowedHosts.vue'
 
 // 系统设置（仅管理员）：SMTP 发信通道是全站唯一的发件人，
 // 所有系统邮件（密码重置、通知类）都经它发出；收件人由每个人
@@ -275,6 +276,8 @@ onMounted(() => {
     </button>
     <span v-if="thresholdSaved" class="faint" style="margin-left: 10px">已保存，即刻生效</span>
   </div>
+
+  <YunxiaoAllowedHosts />
 
   <div v-if="runtime" class="card">
     <div class="label">运行时</div>

@@ -1,0 +1,30 @@
+{
+  "id": "a1b2c3d4e5f6a7b8c9d0e1f2",
+  "serialNumber": "LATHE-42",
+  "subject": "导入按钮点了没反应",
+  "description": "<p>点导入没反应</p><p>期望弹出文件选择框</p>",
+  "formatType": "RICHTEXT",
+  "status": {
+    "id": "100005",
+    "name": "待处理",
+    "displayName": "待处理",
+    "nameEn": "To do"
+  },
+  "assignedTo": {
+    "id": "user-0001",
+    "name": "张三"
+  },
+  "creator": {
+    "id": "user-0002",
+    "name": "李四"
+  },
+  "labels": [
+    {"id": "lbl-1", "name": "lathe:go", "color": "#1E90FF"},
+    {"id": "lbl-2", "name": "前端", "color": "#FF8C00"}
+  ],
+  "logicalStatus": "normal",
+  "space": {"id": "space-1", "name": "示例项目"},
+  "workitemType": {"id": "type-1", "name": "缺陷"},
+  "gmtCreate": 1731300000000,
+  "gmtModified": 1731310000000
+}

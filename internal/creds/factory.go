@@ -25,6 +25,10 @@ type Factory struct {
 	// 概念，直接由 DB 支撑）。可为 nil：那时内置 tracker 在 Clients
 	// 层被明确拒绝，不影响 Linear/GitHub 路径。
 	store *store.Store
+	// yunxiao 供云效 tracker（tracker.ProviderYunxiao）读属主的连接。
+	// 可为 nil：那时云效 tracker 在 Clients 层被明确拒绝。经 WithYunxiao
+	// 注入而不改 NewFactory 签名，免得动所有调用方。
+	yunxiao *store.YunxiaoConnections
 
 	mu        sync.Mutex
 	providers map[int64]*Provider
@@ -37,6 +41,12 @@ func NewFactory(secrets *store.Secrets, env EnvFallback, adminID int64, st *stor
 		secrets: secrets, env: env, adminID: adminID, store: st,
 		providers: map[int64]*Provider{},
 	}
+}
+
+// WithYunxiao 接上云效连接存储（f08），返回 f 本身便于链式装配。
+func (f *Factory) WithYunxiao(yc *store.YunxiaoConnections) *Factory {
+	f.yunxiao = yc
+	return f
 }
 
 // ProviderFor 取某用户的凭据提供者（按用户缓存，重复调用零成本）。
@@ -57,7 +67,9 @@ func (f *Factory) ProviderFor(userID int64) *Provider {
 
 // ForUser 实现 runner.ClientFactory。
 func (f *Factory) ForUser(_ context.Context, userID int64) (runner.Clients, error) {
-	return NewClients(f.ProviderFor(userID), f.store), nil
+	c := NewClients(f.ProviderFor(userID), f.store)
+	c.yunxiao = f.yunxiao
+	return c, nil
 }
 
 // Invalidate 使某用户某类凭据的缓存立即失效；kind 为空清该用户全部。
