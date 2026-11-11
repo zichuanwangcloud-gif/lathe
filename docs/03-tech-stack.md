@@ -30,7 +30,7 @@
 | 依赖注入 | **手写 constructor 注入**（不用 Wire） |
 | Web UI | **Vue 3 + Vite SPA**，`go:embed` 打进二进制 |
 | 数据库 | PostgreSQL |
-| Agent 驱动 | `claude` CLI + `--output-format stream-json` |
+| Agent 驱动 | `claude` CLI（`--output-format stream-json`）/ `codex` CLI（`exec --json`），统一事件模型，按任务钉死（[features/multi-cli.md](./features/multi-cli.md)） |
 | 部署 | 单静态二进制 + Docker（二选一皆可） |
 
 ---
@@ -60,6 +60,12 @@ TS 的两个真实优势：**Claude Agent SDK 原生是 TS**（session 管理/re
 **① SDK 的优势被 CLI 抵消了。** 实测 `claude` CLI 已提供 `--print` + `--output-format stream-json` + `--resume`，Go 侧读结构化 JSON 事件流即可，不必解析人类可读输出。SDK 剩下的净收益很薄。
 
 > 额外发现：CLI 还有 **`--from-pr`**（resume a session linked to a PR）——[02-design.md](./02-design.md) §3 约束① 要求"review 二轮必须 resume 原会话"，CLI 原生支持，无需自己维护 PR↔session 映射的全部逻辑。
+
+> **第二种 CLI（f06）：codex 为什么用 `exec --json` 而不是 app-server。** `codex exec --json` 是逐行 JSONL、
+> 进程跑完即退，形态与 claude 的 `--print --output-format stream-json` 一致：同一个 `supervise()`（独立进程组、
+> 杀整棵树、静默看门狗、管道宽限）原样复用，不写第二套进程监管。app-server 是常驻的 JSON-RPC 服务、在
+> 0.146.1 里仍标着 experimental，要为它另做连接管理与重连，收益只是「省一次进程启动」。续跑用
+> `codex exec resume <thread_id>`（实测保持原会话）。详见 [features/multi-cli.md](./features/multi-cli.md)。
 
 **② Node 的弱项正好是 Lathe 的主战场。** 长期驻留 + 高频 subprocess churn 的 Node 守护进程，在信号处理、孤儿回收上更容易出错，而这是本产品的核心风险面而非边缘功能。
 
@@ -106,7 +112,7 @@ TS 的两个真实优势：**Claude Agent SDK 原生是 TS**（session 管理/re
 │   ├── integration/
 │   │   ├── linear/       # OAuth + GraphQL + 回帖
 │   │   ├── github/       # GitHub App + PR
-│   │   └── agent/        # claude CLI driver (stream-json)
+│   │   └── agent/        # claude / codex CLI driver（统一事件模型 + 共用进程监管 supervise）
 │   └── httpapi/
 ├── migrations/
 ├── web/                  # Vue 3 SPA → go:embed

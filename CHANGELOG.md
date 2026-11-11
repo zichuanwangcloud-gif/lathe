@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- **仓库可选 codex 作为执行 agent**（f06，`docs/features/multi-cli.md`）。仓库设置页新增「执行 agent」
+  下拉（claude / codex），默认 claude、**不配置的部署行为不变**；运维配置 `LATHE_CODEX_HOME`
+  （专用 codex 目录）后 codex 才可选。验证体系（heavy/light、红-绿证明、修复回路、闸门）对两种
+  agent 完全相同。驱动在建任务时从仓库钉死（迁移 0047/0048），分诊、实现、修复回路、review 二轮、
+  rebase 跟进重验都用同一个；review 意见续跑用 `codex exec resume <thread_id>` 保持原会话。
+  codex 子进程同样走环境变量白名单与显式工作目录，并隔离个人 `~/.codex` 与 `~/.agents/skills`。
+  任务详情页显示驱动徽标（codex 的费用显示为「未知」），系统设置页显示 codex 是否启用。
+  新增 `GET /api/agent-drivers`；新增环境变量 `LATHE_CODEX_HOME`、`LATHE_CODEX_BIN`。
+
 ### Changed
 
 - **模糊任务对话：少问、跑得完、报错能救**（docs/10 §1.3–§1.5）。实测一份 feature PRD
