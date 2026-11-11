@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
@@ -11,6 +12,9 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs/gitea"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs/gitlab"
 )
 
 // Verifier 用给定凭据实际连一次外部服务，验证其可用性。
@@ -46,9 +50,59 @@ func (Verifier) Verify(ctx context.Context, req httpapi.VerifyRequest) httpapi.V
 			Detail: "已保存。webhook 密钥无法主动验证：在 GitHub 仓库 → Settings → Webhooks 的 Recent Deliveries 里，" +
 				"ping 投递返回 200 即说明密钥配对成功。",
 		}
+	case store.KindGitLab:
+		return verifyGitLab(ctx, req.BaseURL, token)
+	case store.KindGitea:
+		return verifyGitea(ctx, req.BaseURL, token)
+	case store.KindGitLabWebhook:
+		if len(token) < 8 {
+			return httpapi.VerifyResult{OK: false, Error: "webhook 密钥过短，请使用足够长的随机串（GitLab 项目 webhook 的 Secret Token）"}
+		}
+		return httpapi.VerifyResult{
+			OK: true,
+			Detail: "已保存。webhook 密钥无法主动验证：在 GitLab 项目 → Settings → Webhooks 里对该 webhook 点 Test" +
+				"（选 Note events）投递一次，返回 200 即说明密钥配对成功。",
+		}
+	case store.KindGiteaWebhook:
+		if len(token) < 8 {
+			return httpapi.VerifyResult{OK: false, Error: "webhook 密钥过短，请使用足够长的随机串（Gitea 仓库 webhook 的 Secret）"}
+		}
+		return httpapi.VerifyResult{
+			OK: true,
+			Detail: "已保存。webhook 密钥无法主动验证：在 Gitea 仓库 → Settings → Webhooks 里点 Test Delivery，" +
+				"返回 200 即说明密钥配对成功。",
+		}
 	default:
 		return httpapi.VerifyResult{OK: false, Error: "未知凭据类型 " + kind}
 	}
+}
+
+func verifyGitLab(ctx context.Context, baseURL, token string) httpapi.VerifyResult {
+	c, err := gitlab.New(baseURL, token)
+	if err != nil {
+		return httpapi.VerifyResult{OK: false, Error: err.Error()}
+	}
+	acct, err := c.Verify(ctx)
+	if err != nil {
+		return httpapi.VerifyResult{OK: false, Error: err.Error()}
+	}
+	return httpapi.VerifyResult{OK: true, AccountName: acct.Username, AccountID: acct.Username,
+		Detail: fmt.Sprintf("已连接到 %s 上的 GitLab 账号 %s。令牌需要 api 权限（开 MR、读评论与项目成员）；"+
+			"成员查询权限不足时所有 review 回流都会被拒（安全的默认）。", baseURL, acct.Username)}
+}
+
+func verifyGitea(ctx context.Context, baseURL, token string) httpapi.VerifyResult {
+	c, err := gitea.New(baseURL, token)
+	if err != nil {
+		return httpapi.VerifyResult{OK: false, Error: err.Error()}
+	}
+	acct, err := c.Verify(ctx)
+	if err != nil {
+		return httpapi.VerifyResult{OK: false, Error: err.Error()}
+	}
+	return httpapi.VerifyResult{OK: true, AccountName: acct.Login, AccountID: acct.Login,
+		Detail: fmt.Sprintf("已连接到 %s 上的 Gitea 账号 %s。令牌需要仓库读写权限（推分支、开 PR、读评论与协作者权限）。",
+			baseURL, acct.Login)}
 }
 
 func verifyLinear(ctx context.Context, token string) httpapi.VerifyResult {
@@ -128,4 +182,46 @@ func (c *Clients) Tracker(ctx context.Context, provider string) (tracker.Tracker
 // GitHub 实现 runner.Clients。
 func (c *Clients) GitHub(ctx context.Context) (runner.GitHubAPI, error) {
 	return c.p.GitHub(ctx)
+}
+
+// VCS 实现 runner.VCSClients：按仓库所在平台实例取客户端与 git 鉴权。
+//
+// 凭据行不存在或没有实例地址 → vcs.ErrCredentialMissing；凭据地址与仓库登记时
+// 钉死的地址不一致 → vcs.ErrInstanceMismatch（token 不发往与仓库不同的实例）。
+// 两者都是确定性配置错误，流水线据此在入口阶段落 failed；其它错误（读库、解密）
+// 是暂时性的，原样返回。未知平台报错，不静默路由到错误的平台。
+func (c *Clients) VCS(ctx context.Context, t vcs.Target) (runner.GitHubAPI, vcs.GitAuth, error) {
+	var kind string
+	switch t.Provider {
+	case vcs.ProviderGitHub, "":
+		gh, err := c.GitHub(ctx)
+		return gh, vcs.GitAuth{}, err
+	case vcs.ProviderGitLab:
+		kind = store.KindGitLab
+	case vcs.ProviderGitea:
+		kind = store.KindGitea
+	default:
+		return nil, vcs.GitAuth{}, fmt.Errorf("creds: 未知代码平台 %q", t.Provider)
+	}
+	token, base, _, err := c.p.TokenWithBaseURL(ctx, kind)
+	if err != nil {
+		if errors.Is(err, ErrNotConfigured) || errors.Is(err, store.ErrIntegrationNotFound) {
+			return nil, vcs.GitAuth{}, fmt.Errorf("%w：请在个人设置里配置 %s 令牌与实例地址（%v）",
+				vcs.ErrCredentialMissing, t.Provider.DisplayName(), err)
+		}
+		return nil, vcs.GitAuth{}, err
+	}
+	if base == "" {
+		return nil, vcs.GitAuth{}, fmt.Errorf("%w：%s 凭据缺少实例地址", vcs.ErrCredentialMissing, t.Provider.DisplayName())
+	}
+	if strings.TrimRight(base, "/") != strings.TrimRight(t.BaseURL, "/") {
+		return nil, vcs.GitAuth{}, vcs.InstanceMismatch(t.Provider, t.BaseURL, base)
+	}
+	auth := vcs.NewGitAuth("oauth2", token)
+	if t.Provider == vcs.ProviderGitLab {
+		cl, err := gitlab.New(base, token)
+		return cl, auth, err
+	}
+	cl, err := gitea.New(base, token)
+	return cl, auth, err
 }

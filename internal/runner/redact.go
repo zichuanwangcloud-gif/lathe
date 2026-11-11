@@ -538,6 +538,17 @@ func tail(s string, n int) string {
 // 返回值一定是脱敏过的（权威层用本流水线登记的已知凭据 + 这一步的隔离栈
 // 连接串）—— 它只往库里和提示词里去。
 func (p *Pipeline) failureExcerpt(report Report) string {
+	return p.failureExcerptWith(nil, report)
+}
+
+// failureExcerptFor 是带本任务运行期凭据的版本：替换表 = 装配期登记的
+// Pipeline.KnownSecrets + 本任务属主解出的 vcs token（rc.secrets）。新切片，
+// 不改共享的 KnownSecrets —— 并发任务互不可见、无锁、无界增长也不会发生。
+func (p *Pipeline) failureExcerptFor(rc *runCtx, report Report) string {
+	return p.failureExcerptWith(rc.secrets, report)
+}
+
+func (p *Pipeline) failureExcerptWith(extra []string, report Report) string {
 	f := report.FirstFailure()
 	if f == nil {
 		return ""
@@ -556,5 +567,15 @@ func (p *Pipeline) failureExcerpt(report Report) string {
 		b.WriteString("\n输出尾部：\n" + tail(out, maxStepOutput))
 	}
 
-	return tail(redactText(b.String(), p.KnownSecrets, f.Step.StackEnv), maxDigestStoredExcerpt)
+	return tail(redactText(b.String(), p.registeredSecrets(extra), f.Step.StackEnv), maxDigestStoredExcerpt)
+}
+
+// registeredSecrets 返回 KnownSecrets 与 extra 的并集（总是新切片）。
+func (p *Pipeline) registeredSecrets(extra []string) []string {
+	if len(extra) == 0 {
+		return p.KnownSecrets
+	}
+	out := make([]string, 0, len(p.KnownSecrets)+len(extra))
+	out = append(out, p.KnownSecrets...)
+	return append(out, extra...)
 }

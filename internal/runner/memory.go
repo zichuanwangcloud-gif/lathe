@@ -48,6 +48,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -201,6 +202,11 @@ func (p *Pipeline) withFailureMemory(ctx context.Context, sc failureScope, promp
 // 任何失败都只告警：记忆是辅助信息，它绝不能反过来成为任务失败的第二个
 // 原因，也不能改变 fail() 的返回值语义。
 func (p *Pipeline) recordFailureMemory(rc *runCtx, stage Stage, cause error, excerpt string) {
+	if len(rc.secrets) > 0 && cause != nil {
+		// 本任务属主的 vcs token 也可能经错误文案回显（远端报错、验证输出）：
+		// 原因与摘要用同一张本任务的替换表。
+		cause = errors.New(redactText(cause.Error(), p.registeredSecrets(rc.secrets), nil))
+	}
 	p.recordFailureMemoryFor(rc.ctx, rc.scope.taskID, rc.scope.lookup(), stage, cause, excerpt)
 }
 

@@ -214,6 +214,14 @@ type runCtx struct {
 	// auth 是本任务属主对仓库所在平台实例的 git 鉴权（GitLab/Gitea）；GitHub
 	// 恒为零值（走宿主 SSH）。setup 里经 resolveVCS 解出，随 runCtx 生命周期结束。
 	auth vcs.GitAuth
+	// vcsErr 是 setup 记下的代码平台确定性配置错误（凭据缺失 / 实例不一致）。
+	// setup 失败时任务留在 queued，而 queued 没有 →failed 的边，所以这里只记下，
+	// 由各入口阶段第一次合法转移之后的 vcsGate 落 failed。
+	vcsErr error
+	// secrets 是本任务属主解出的 vcs token（脱敏权威层用）。每任务一份、随
+	// runCtx 结束，不追加进共享的 Pipeline.KnownSecrets（无共享可变状态，无锁，
+	// A 的 token 也不会进 B 任务的替换表）。
+	secrets []string
 
 	tk   *task.Task // 任务行（每次转移后刷新）
 	plan *RetryPlan // 非空表示断点续跑
@@ -437,12 +445,23 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	if at, ok := tr.(tracker.AttributedTracker); ok {
 		tr = at.WithActor(fmt.Sprintf("task-%d", tk.ID))
 	}
-	gh, err := clients.GitHub(ctx)
+	// 代码平台按仓库行上钉死的 (平台, 实例) 分派。GitHub 与此前完全同一调用、
+	// 同一失败文案；GitLab/Gitea 的确定性配置错误（凭据缺失/实例不一致）只记下，
+	// 由入口阶段的 vcsGate 落 failed，暂时性错误与 GitHub 同口径留 queued。
+	var vcsErr error
+	gh, auth, err := resolveVCS(ctx, clients, params.Repo.Target())
 	if err != nil {
-		return nil, "", fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		if params.Repo.Target().Provider == vcs.ProviderGitHub {
+			return nil, "", fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		}
+		if !isVCSConfigErr(err) {
+			return nil, "", fmt.Errorf("获取代码平台客户端失败（%s）: %w", params.Repo.Target().Provider, err)
+		}
+		gh, auth, vcsErr = nil, vcs.GitAuth{}, err
 	}
 
-	rc := &runCtx{ctx: ctx, params: params, actor: actor, clients: clients, tracker: tr, gh: gh, tk: tk}
+	rc := &runCtx{ctx: ctx, params: params, actor: actor, clients: clients, tracker: tr, gh: gh, tk: tk,
+		auth: auth, vcsErr: vcsErr, secrets: auth.RedactValues()}
 	rc.scope = failureScopeOf(tk)
 	rc.profile, rc.profileErr = ParseProfile(tk.Profile)
 	entry := EntryTriage
@@ -494,7 +513,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	// 或都已在之前的轮次处理过）就不该唤起 agent —— 让它对着空意见列表
 	// 「改点什么」只会产出无意义的 diff。降级为只重新验证，任务照常回到
 	// pr_open，验证证据照常落库。
-	if rc.plan.Review && entry == EntryImplement {
+	if rc.plan.Review && entry == EntryImplement && rc.vcsErr == nil {
 		rc.review = p.collectReview(rc)
 		if len(rc.review.Comments) == 0 {
 			plan := *rc.plan
@@ -506,7 +525,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	}
 
 	// 提交/验证入口的 diff 与基线工作区都解析自 mirror 命名空间，先刷新。
-	if entry == EntryCommit || entry == EntryVerify {
+	if (entry == EntryCommit || entry == EntryVerify) && rc.vcsErr == nil {
 		if _, err := p.Worktrees.EnsureMirror(ctx, params.Repo.RepoKey(), params.CloneURL, rc.auth); err != nil {
 			return nil, "", fmt.Errorf("续跑前刷新 mirror 失败: %w", err)
 		}
@@ -529,6 +548,9 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateTriaging, rc.actor, &task.TransitionOpts{
 		Payload: rc.takeRetryPayload(),
 	}); err != nil {
+		return err
+	}
+	if err := p.vcsGate(rc); err != nil {
 		return err
 	}
 
@@ -662,6 +684,9 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		return err
 	}
 	rc.tk = tk
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
 	// 现场重挂（A2 审计 B1）：任务从 review_feedback 的显式人工出口回来
 	// 时，工作区可能已经不在了。这一轮不能丢弃重建 —— 第一轮的提交早已
@@ -877,6 +902,9 @@ func (p *Pipeline) stageCommit(rc *runCtx) error {
 		}
 		rc.tk = tk
 	}
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
 	changed, err := p.Worktrees.HasChanges(rc.ctx, rc.wt)
 	if err != nil {
@@ -945,6 +973,9 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		return err
 	}
 	rc.tk = tk
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
 	// F7.1：节点画像损坏或字段非法时，在这里（已进入 verifying、可以
 	// 合法转 failed 的状态）以可读原因失败——覆盖 stageImplement 没
@@ -1100,7 +1131,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		// 那一步（不是回帖用的 Summary —— 后者只有步骤名与耗时，没有
 		// 输出，下一个 agent 从中学不到任何东西）。写入侧脱敏 + 截断，
 		// 见 redact.go 的分层说明与 Pipeline.failureExcerpt。
-		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), p.failureExcerpt(report))
+		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), p.failureExcerptFor(rc, report))
 	}
 
 	rc.report = report
@@ -1123,6 +1154,9 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 			return err
 		}
 		rc.tk = tk
+	}
+	if err := p.vcsGate(rc); err != nil {
+		return err
 	}
 
 	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo, rc.auth, func(prog PushProgress) {
