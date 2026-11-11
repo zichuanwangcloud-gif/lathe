@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
@@ -109,6 +110,9 @@ type Service struct {
 	// CloneURL 由 ProviderRepo 推导，与 queue.loadRepoConfig 同一套规则。
 	// 留成字段是为了单测能替换掉。
 	CloneURL func(providerRepo string) string
+
+	// ReviewNotifier 在 PRD 进 ready_for_review 后推站外通知（f09）。nil 即关闭。
+	ReviewNotifier ReviewNotifier
 
 	// Now 可注入，便于测试。
 	Now func() time.Time
@@ -918,10 +922,46 @@ func (s *Service) SubmitForReview(ctx context.Context, prdID, userID int64) (*Re
 		return check, check.Error()
 	}
 
-	if _, err := s.Store.TransitionPRD(ctx, prdID, userID, store.TransitionPRDParams{
+	submitted, err := s.Store.TransitionPRD(ctx, prdID, userID, store.TransitionPRDParams{
 		From: string(StateDrafting), To: string(StateReadyForReview),
-	}); err != nil {
+	})
+	if err != nil {
 		return check, err
 	}
+	s.notifyReview(ctx, submitted, repo.ProviderRepo)
 	return check, nil
+}
+
+// ReviewNotifier 把「PRD 待签字」写进站外渠道的 outbox（docs/features/notify-channels.md）。
+// 实现是 *store.NotifyChannels；nil 即关闭。
+type ReviewNotifier interface {
+	EnqueuePRDEvent(ctx context.Context, ev notify.PRDEvent) (int, error)
+}
+
+// reviewNotifyTimeout：这里只是一条 INSERT … ON CONFLICT，超时说明库有问题，记日志走人。
+const reviewNotifyTimeout = 3 * time.Second
+
+// notifyReview 在转移**之后**同步入队一条通知（与 StallNotifier 同理：不在串行热路径上）。
+//
+// 通知是副作用：不返回 error、独立 3s 预算、panic 兜底 —— 提交评审的结果与它无关。
+// 快照取自 TransitionPRD 的 RETURNING（UpdatedAt 是转移那一刻），不回读。
+func (s *Service) notifyReview(ctx context.Context, row *store.PRDRow, repo string) {
+	n := s.ReviewNotifier
+	if n == nil || row == nil {
+		return
+	}
+	ev := notify.PRDEvent{
+		PRDID: row.ID, UserID: row.UserID, ToState: row.State,
+		EventType: notify.EventPRDReady, At: row.UpdatedAt, Repo: repo,
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("PRD 待签字通知 panic（已在边界兜住）", "prd", ev.PRDID, "panic", r)
+		}
+	}()
+	c, cancel := context.WithTimeout(context.WithoutCancel(ctx), reviewNotifyTimeout)
+	defer cancel()
+	if _, err := n.EnqueuePRDEvent(c, ev); err != nil {
+		slog.Warn("PRD 待签字通知入队失败（不影响提交评审）", "prd", ev.PRDID, "err", err)
+	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 )
@@ -87,6 +88,10 @@ type Pipeline struct {
 	// 通知是副作用，缺了不影响任何流程。实现在 cmd/lathe，
 	// 见 notify.go 的 TaskMail 注释。
 	Mail TaskMail
+
+	// Chat 把等人出手的事件推到站外渠道（Slack / 飞书，f09）。为 nil 时关闭。
+	// 与 Mail 并排、互不影响：见 notify.go 的 ChatNotifier 注释。
+	Chat ChatNotifier
 
 	// BaseURL 是本实例对外地址，通知邮件里的详情页链接用它拼。
 	// 空串时邮件省略链接那一行，而不是拼一个指向 localhost 的无用链接。
@@ -371,6 +376,7 @@ func (p *Pipeline) gateBeforePush(rc *runCtx) error {
 	// 不发信就只能靠人主动去翻面板才发现「活早就干完了」。
 	p.mailTerminal(rc.ctx, gated,
 		"这个仓库配了人工闸门（gate_mode=manual）：到任务详情页点「确认开 PR」后才会推分支并开 PR。")
+	p.chatTerminal(rc.ctx, gated, notify.EventAwaitingApproval)
 
 	slog.Info("人工闸门拦住了开 PR，等人确认",
 		"task", rc.tk.ID, "issue", rc.tk.ExternalKey, "gate_mode", rc.tk.GateMode)
@@ -573,12 +579,15 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		if _, cerr := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); cerr != nil {
 			slog.Warn("回帖失败", "task", rc.tk.ID, "err", cerr)
 		}
-		if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
+		blocked, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
 			FailureReason: strPtr(verdict.Reason),
 			Payload:       map[string]any{"question": verdict.Question},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		// 站外通知（f09）：任务停下来等人补需求，邮件面此前对它沉默。
+		p.chatTerminal(rc.ctx, blocked, notify.EventBlockedSpec)
 		return errHalt
 	}
 
@@ -1058,12 +1067,14 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		if _, cerr := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); cerr != nil {
 			slog.Warn("回帖失败", "task", rc.tk.ID, "err", cerr)
 		}
-		if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
+		blocked, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
 			FailureReason: strPtr(red.Err.Error()),
 			Payload:       map[string]any{"reason": "repro_not_red"},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		p.chatTerminal(rc.ctx, blocked, notify.EventBlockedSpec)
 		return errHalt
 	}
 
@@ -1170,6 +1181,7 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		headline = "**Lathe 已按 review 意见更新 PR，并重新通过验证**"
 	}
 	p.mailTerminal(rc.ctx, opened, "PR："+pr.URL+"\n\n"+verifySummary)
+	p.chatTerminal(rc.ctx, opened, notify.EventPROpen)
 
 	body := fmt.Sprintf("%s\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
 		headline, pr.URL, verifySummary)
@@ -1507,6 +1519,7 @@ func (p *Pipeline) failWithExcerpt(rc *runCtx, stage Stage, cause error, excerpt
 		mailDetail = fmt.Sprintf("工作区已保留在 %s（分支 %s），可直接进去接手；重试会优先续跑该现场。", rc.wt.Path, rc.wt.Branch)
 	}
 	p.mailTerminal(rc.ctx, failed, mailDetail)
+	p.chatTerminal(rc.ctx, failed, notify.EventFailed)
 
 	// 跨任务失败记忆（§3.6 第 16 条）：同样放在转移之后 —— 任务没真的落成
 	// failed 就不该留下这条记忆。写它的是 fail() 而不是各调用点，
