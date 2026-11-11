@@ -487,6 +487,9 @@ CLI 的加载方式。`agent.Driver` 已在正确的抽象位置上。
       （02-design §10 的"AI 推荐 + 人确认"，commit `41334f0`/`9834bae`），
       且 `stageTriage`（`pipeline.go:329`）本来就在做只读拆解
 - [ ] **skills 存哪**：Lathe 自己的 git 仓库（可 review、可版本化，倾向）vs DB（部署简单）
+      > **用户侧技能（团队自定义技能）：已决，见 [features/team-skills.md](./features/team-skills.md)。
+      > 产品技能仍走本仓 `skills/` + `go:embed`；团队技能存 DB、版本不可变，物化时用
+      > `team-<slug>/` 前缀与产品技能分命名空间。**
 - [ ] **flow 能否跨仓库**：`resolveRepo`（`cmd/lathe/queue.go:353`）现在是"每用户第一个仓库"
 - [x] ~~**`cmd/lathe-runner` 骨架**：并行编排后多节点执行的价值上升，是否重启 P3？~~
       **已决：删除骨架**（08 D8-1）。并行编排的价值上升是真的，但那论证的是「未来可能要做」，

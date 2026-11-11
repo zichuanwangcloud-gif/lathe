@@ -285,6 +285,18 @@ func PlanRetry(mode RetryMode, in RetryInput) RetryPlan {
 		return RetryPlan{Entry: EntryImplement,
 			Reasons: []string{"实现中断，工作区在但无会话凭据，在同工作区开新会话收尾"}}
 
+	case stage == StageTeamSkillFailed:
+		// 团队技能（f11）钉版本/物化/提交前复位失败。物化只在 stageImplement
+		// 里发生，任何跳过它的入口（EntryCommit/EntryVerify/EntryPush）都会让
+		// 团队技能被静默绕过 —— 不管分支上有没有提交（PR review 二轮就有第一轮
+		// 的提交），所以不看 HasCommits/Dirty：stageImplement 之后的 stageCommit
+		// 会照常处理现场里已有的提交与未提交改动。
+		if !usable {
+			return fresh("团队技能物化失败，且工作区现场已不可用")
+		}
+		return RetryPlan{Entry: EntryImplement, ResumeSession: in.HasSession,
+			Reasons: []string{"团队技能物化失败（发生在驱动 agent 之前），回到实现阶段重新物化；不跳到提交/验证，避免技能被静默绕过"}}
+
 	case stage == StageCheckChanges || stage == StageCommit:
 		if !usable {
 			return fresh("提交阶段失败，但工作区现场已不可用")

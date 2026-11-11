@@ -94,6 +94,7 @@ package runner
 //     下面的 tail。
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"regexp"
@@ -557,4 +558,54 @@ func (p *Pipeline) failureExcerpt(report Report) string {
 	}
 
 	return tail(redactText(b.String(), p.KnownSecrets, f.Step.StackEnv), maxDigestStoredExcerpt)
+}
+
+// ---------------------------------------------------------------- 检出入口（f11）
+
+// pemPrivateKeyHeader 只供 FindCredential 用，**不加入 tokenShapes**：脱敏
+// （替换）语义保持不变 —— 文件头「已知接受的边界」里写明了 PEM 私钥块不在
+// 层 2 覆盖范围内，那是刻意的取舍，不是疏漏。
+//
+// 检出侧需要它：团队技能（docs/features/team-skills.md）保存时要拦住被贴进
+// 技能内容的私钥，而形态表认不出 `-----BEGIN … PRIVATE KEY-----`（kv 词根
+// private[_-]?key 要求后面跟 `:`/`=`）。两处规则没有重叠项，所以不存在
+// 「同一种凭据两份正则会漂移」的问题。将来若决定让脱敏也覆盖 PEM，
+// TestFindCredential_PEMDoesNotChangeRedaction 会先红：届时把这条合并进
+// tokenShapes、删掉这里的重复。
+//
+// 只认 BEGIN 头而不认整块：技能里贴半截私钥也要拦。
+var pemPrivateKeyHeader = regexp.MustCompile(`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----`)
+
+// FindCredential 报告 s 里第一个像凭据的位置（行号，1 起）；没有则 ok=false。
+//
+// 只返回行号不返回值 —— 调用方的错误信息会进界面与日志，绝不能把发现的凭据
+// 回显出去。registered 是已知凭据值（装配侧 KnownSecrets + 调用方解密出的
+// 用户集成凭据），走层 1 的精确比对。
+//
+// 两步：
+//  1. 复用脱敏总入口 redactText（同一张 tokenShapes 表，不复制第二份正则）：
+//     脱敏结果与原串不同，第一处差异所在的行就是命中行；
+//  2. 逐行匹配 pemPrivateKeyHeader。
+//
+// 两步都命中时取较小的行号。
+func FindCredential(s string, registered []string) (line int, ok bool) {
+	if r := redactText(s, registered, nil); r != s {
+		i := 0
+		for i < len(s) && i < len(r) && s[i] == r[i] {
+			i++
+		}
+		line, ok = strings.Count(s[:i], "\n")+1, true
+	}
+	if loc := pemPrivateKeyHeader.FindStringIndex(s); loc != nil {
+		if pl := strings.Count(s[:loc[0]], "\n") + 1; !ok || pl < line {
+			line, ok = pl, true
+		}
+	}
+	return line, ok
+}
+
+// CredentialRejectMessage 是凭据命中时给人看的拒绝原因：带文件与行号，不带内容。
+func CredentialRejectMessage(path string, line int) string {
+	return fmt.Sprintf("%s 第 %d 行像一段凭据（已拦下，不回显）。技能内容会物化进每个任务的工作区，"+
+		"不能放凭据；请改用环境变量或设置页的凭据配置。", path, line)
 }
