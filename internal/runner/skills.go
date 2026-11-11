@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/skills"
 )
 
@@ -17,9 +18,11 @@ import (
 // 常量定义在这里（离消费方最近），中文标签在 stage.go 的 label() 里。
 const StageSkillMissing Stage = "skill_missing"
 
-// materializeSkills 把 rc.profile.Skills 声明的每个技能物化进 worktree 的
-// .claude/skills/<name>/，并把 .claude/skills/ 排进 worktree 的
+// materializeSkills 把 rc.profile.Skills 声明的每个技能物化进 worktree 里
+// 任务驱动的技能目录（agent.SkillsDir：claude 是 .claude/skills/<name>/，
+// codex 是 .codex/skills/<name>/），并把该目录排进 worktree 的
 // .git/info/exclude，不让它进 git status/diff/add -A（F7.2-AC3）。
+// skills 包本身不变：codex 只是换了个目标目录（P8/P9，frontmatter 兼容）。
 //
 // 无条件对每个声明的技能调用一次，不区分全新执行与断点续跑：曾经有
 // fresh==false（续跑）时直接跳过的"优化"，但 PlanRetry
@@ -36,17 +39,18 @@ func (p *Pipeline) materializeSkills(rc *runCtx) error {
 		return nil
 	}
 
+	dir := agent.SkillsDir(rc.driver())
 	for _, ref := range rc.profile.Skills {
-		dest := filepath.Join(rc.wt.Path, ".claude", "skills", ref.Name)
+		dest := filepath.Join(rc.wt.Path, dir, ref.Name)
 		if err := skills.Materialize(ref.Name, ref.Version, dest); err != nil {
 			return fmt.Errorf("技能 %s@%s 物化失败: %w", ref.Name, ref.Version, err)
 		}
 	}
-	return excludeSkillsDir(rc.wt.Path)
+	return excludeSkillsDir(rc.wt.Path, filepath.ToSlash(dir)+"/")
 }
 
-// excludeSkillsDir 往 worktree 的 .git/info/exclude 追加 ".claude/skills/"
-// 一行，让物化进 worktree 的技能文件对 git 不可见——git status/diff/add -A
+// excludeSkillsDir 往 worktree 的 .git/info/exclude 追加 rule（技能目录，
+// 如 ".claude/skills/"）一行，让物化进 worktree 的技能文件对 git 不可见——git status/diff/add -A
 // 都看不到它们，stageCommit 完全不需要感知这件事（B2-3 同类教训：靠 commit
 // 阶段记得排除是脆的，容易在将来被绕开，见 docs/06-orchestration.md §6.2(b)）。
 //
@@ -56,9 +60,7 @@ func (p *Pipeline) materializeSkills(rc *runCtx) error {
 // --git-path info/exclude` 让 git 自己解析出实际路径（info/exclude 是
 // worktree 间共享的，通常落在 mirror 自己的 git 目录下；这样同一个 mirror
 // 下的其它 worktree 也自动受益，不需要逐个 worktree 重复追加）。
-func excludeSkillsDir(worktreePath string) error {
-	const rule = ".claude/skills/"
-
+func excludeSkillsDir(worktreePath, rule string) error {
 	out, err := exec.Command("git", "-C", worktreePath, "rev-parse", "--git-path", "info/exclude").Output()
 	if err != nil {
 		return fmt.Errorf("解析 worktree 的 git 目录失败: %w", err)

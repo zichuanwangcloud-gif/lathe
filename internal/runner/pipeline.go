@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
@@ -241,6 +242,15 @@ type runCtx struct {
 
 	retryNoted bool // 重试决策是否已落进某次转移的 payload
 }
+
+// driver 是本任务钉死的执行 agent（tasks.agent_driver，建任务时从仓库复制）。
+//
+// runner 里唯一的取值点：分诊、实现、implement-reentry、fix-N、review 二轮都从
+// 这里取，于是 Execute 的所有调用点（派发、rebase 跟进重验……）自动拿到同一个
+// 驱动 —— RepoConfig 上根本没有驱动字段，不存在「某个调用方忘了填」。
+// 与 gate_mode 同一做法（gateBeforePush 读 rc.tk.GateMode）。NULL 已在
+// taskColumns 里读成 claude，这里永远非空。
+func (rc *runCtx) driver() string { return rc.tk.AgentDriver }
 
 // IssueRefOf 给出某任务行在需求平台上的定位引用：
 // 平台侧主键（Linear UUID）优先；为空时退回人读 key —— 内置工单的
@@ -539,7 +549,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		return p.fail(rc, StageTriageRun, err)
 	}
 	triageSession := p.newID()
-	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", triageDir, triageSession)
+	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", rc.driver(), triageDir, triageSession)
 	// 兜底：Close 幂等，下面判错前那次显式 Close 才是正常路径；这里只防
 	// Run 里 panic 时 flush/watcher 协程泄漏
 	defer triageSink.Close()
@@ -555,6 +565,8 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		SettingSources: p.SettingSources,
 		ExtraEnv:       channelEnv(p.TriageChannel),
 		OnEvent:        triageSink.OnEvent,
+		// 分诊会话不落 agent_session_id（只用来建事件汇），所以不传 OnSession
+		Driver: rc.driver(),
 	})
 	// 成功与失败路径都必须 drain：失败时缓冲里恰是排障最关键的现场
 	triageSink.Close()
@@ -689,17 +701,30 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	}
 
 	// F7.2：worktree 已就位（新建或续跑复用现场），画像也已确认合法，
-	// 在驱动 agent 之前把节点画像声明的技能物化进 .claude/skills/。
+	// 在驱动 agent 之前把节点画像声明的技能物化进驱动的技能目录
+	// （claude 读 .claude/skills/，codex 读 .codex/skills/）。
 	if err := p.materializeSkills(rc); err != nil {
 		return p.fail(rc, StageSkillMissing, err)
 	}
 
 	prompt, resumeFlag := p.implementPrompt(rc)
-	implRes, err := p.runAgent(rc, "implement", prompt, rc.implSession, resumeFlag)
+	implRes, reported, err := p.runAgent(rc, "implement", prompt, rc.implSession, resumeFlag)
+	// 驱动上报的真实会话 ID 永远优先（codex 不接受预分配 ID，P3）：库已由
+	// OnSession 闭包写过，这里只更新 rc。claude 恒为空串，行为不变。
+	if reported != "" {
+		rc.implSession = reported
+	}
 
 	// resume 失败降级：会话数据丢失（被清理/不在本机）时 claude --resume
-	// 报错退出。降级为同工作区新会话收尾，而不是把可用现场一起判死。
-	if err != nil && resumeFlag {
+	// （codex exec resume）报错退出。降级为同工作区新会话收尾，而不是把
+	// 可用现场一起判死。
+	//
+	// 两类错误不降级：本节点没有这个驱动（ErrDriverUnavailable）、驱动不支持
+	// 所需能力（ErrUnsupportedParam）。它们不是「会话丢了」—— 降级会先
+	// SetSessionID(newID) 冲掉库里有效的会话 ID，之后在有该驱动的节点上重试
+	// 也续不上了。直接落到下面的 p.fail(StageImplementRun)，会话原样保留。
+	if err != nil && resumeFlag &&
+		!errors.Is(err, agent.ErrDriverUnavailable) && !errors.Is(err, agent.ErrUnsupportedParam) {
 		slog.Warn("resume 会话失败，降级为同工作区新会话", "task", rc.tk.ID, "err", err)
 		rc.implSession = p.newID()
 		if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, rc.implSession); serr != nil {
@@ -710,7 +735,10 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 			// 新会话没有第一轮的记忆，review 意见更得带上，否则这一轮白跑。
 			reentry += "\n\n" + reviewPromptOf(rc.review)
 		}
-		implRes, err = p.runAgent(rc, PhaseImplementReentry, reentry, rc.implSession, false)
+		implRes, reported, err = p.runAgent(rc, PhaseImplementReentry, reentry, rc.implSession, false)
+		if reported != "" {
+			rc.implSession = reported
+		}
 	}
 
 	// 终局摘要落库含 fail 路径：有 result 就存（docs/04 §3.5）
@@ -763,15 +791,22 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 // 半场，通道不该中途换。通道优先取节点画像的 ModelChannel（F7.1-AC2：
 // 不同节点可路由到不同通道），画像未设置该字段时回落到仓库/流水线级
 // 的 p.ImplementChannel（既有行为，F7.1-AC4 的回归保证）。
-func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
+//
+// reported 是驱动在这次执行里上报的真实会话 ID（RunParams.OnSession，
+// codex 的 thread_id）；没上报（claude 恒如此）为空串。上报时 OnSession 闭包
+// 已经把它落了库（SetSessionID 是字段记账、不是状态转移）；rc 的字段只由
+// 调用方在 runner 自己的协程里改 —— 闭包跑在驱动的读协程里，不碰 rc。
+func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (res *agent.Result, reported string, err error) {
 	prompt = p.injectFailureMemory(rc, phase, prompt, resume)
-	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
+	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.driver(), rc.wt.Path, session)
 	defer sink.Close() // 兜底，同 stageTriage
 	channel := p.ImplementChannel
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
 		channel = rc.profile.ModelChannel
 	}
-	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
+	var got atomic.Value // string
+	ctx, taskID := rc.ctx, rc.tk.ID
+	res, err = p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            rc.wt.Path,
 		SessionID:      session,
@@ -780,9 +815,21 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 		SettingSources: p.SettingSources,
 		ExtraEnv:       channelEnv(channel),
 		OnEvent:        sink.OnEvent,
+		Driver:         rc.driver(),
+		OnSession: func(id string) {
+			if id == "" {
+				return
+			}
+			// 一拿到就落库：进程中途崩溃，库里也已是可 resume 的真实 ID
+			if serr := p.Tasks.SetSessionID(ctx, taskID, id); serr != nil {
+				slog.Warn("驱动上报的会话 ID 落库失败", "task", taskID, "phase", phase, "err", serr)
+			}
+			got.Store(id)
+		},
 	})
 	sink.Close()
-	return res, err
+	reported, _ = got.Load().(string)
+	return res, reported, err
 }
 
 // channelEnv 把 cc-switch 通道名编成注入 agent 子进程的环境变量；
@@ -1006,7 +1053,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 			fixSession = p.newID()
 			fixResume = false
 		}
-		fixRes, ferr := p.runAgent(rc, fmt.Sprintf("fix-%d", attempt),
+		fixRes, reported, ferr := p.runAgent(rc, fmt.Sprintf("fix-%d", attempt),
 			FixPrompt(attempt, p.MaxFixAttempts, f, report.Summary()), fixSession, fixResume)
 		p.persistAgentResult(rc.ctx, rc.tk.ID, fixRes)
 		if ferr != nil {
@@ -1014,10 +1061,19 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 			break
 		}
 		if !fixResume {
-			if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, fixSession); serr != nil {
+			// 驱动上报的真实 ID 优先：codex 下 fixSession 只是 Lathe 自己编的
+			// UUID，codex 不认识它，用它覆盖刚落库的 thread_id 会让下一轮
+			// resume 撞 no rollout found。claude 下 reported 恒为空，id == fixSession。
+			id := fixSession
+			if reported != "" {
+				id = reported
+			}
+			if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, id); serr != nil {
 				slog.Warn("修复会话 ID 落库失败", "task", rc.tk.ID, "err", serr)
 			}
-			rc.implSession = fixSession
+			rc.implSession = id
+		} else if reported != "" {
+			rc.implSession = reported
 		}
 		if fixRes.IsError {
 			slog.Warn("修复轮未成功完成", "task", rc.tk.ID, "subtype", fixRes.Subtype)
