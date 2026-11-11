@@ -2,7 +2,6 @@ package runner
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"net"
 	"net/http"
@@ -130,18 +129,6 @@ func (s *gitHTTPStub) sawAuth(user, pass string) int {
 	return n
 }
 
-func (s *gitHTTPStub) sawAnyAuthExcept(pass string) []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []string
-	for _, a := range s.authSeen {
-		if !strings.HasSuffix(a, ":"+pass) {
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
 func (s *gitHTTPStub) uploadPackSizes() []int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -240,10 +227,6 @@ func authRepo(s *gitHTTPStub, repo string) RepoConfig {
 	cfg.VCSProvider = vcs.ProviderGitLab
 	cfg.VCSBaseURL = s.base
 	return cfg
-}
-
-func basicOf(user, pass string) string {
-	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 }
 
 // commitIn 在工作区里改一个文件并提交，返回新 HEAD。

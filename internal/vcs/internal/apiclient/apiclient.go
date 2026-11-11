@@ -76,7 +76,7 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) (*Res
 	if err != nil {
 		return nil, fmt.Errorf("%s: %s %s 失败: %s", c.ServiceTag, method, path, c.scrub(err.Error()))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		msg := strings.TrimSpace(string(raw))

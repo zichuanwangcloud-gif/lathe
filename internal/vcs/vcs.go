@@ -200,7 +200,7 @@ func SplitRef(p Provider, s string) (namespace, name string, err error) {
 				return "", "", bad("段不能以 . 或 - 开头")
 			}
 			for _, r := range seg {
-				if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-') {
+				if !pathRune(r) {
 					return "", "", bad(fmt.Sprintf("含不允许的字符 %q", r))
 				}
 			}
@@ -208,6 +208,15 @@ func SplitRef(p Provider, s string) (namespace, name string, err error) {
 		return strings.Join(parts[:len(parts)-1], "/"), parts[len(parts)-1], nil
 	}
 	return "", "", fmt.Errorf("vcs: 未知代码平台 %q", p)
+}
+
+// pathRune 报告 r 是否是仓库路径段允许的字符 [A-Za-z0-9._-]。
+func pathRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return r == '.' || r == '_' || r == '-'
 }
 
 // BuildPRBody 生成带验证证据的 PR 正文（与平台无关）。

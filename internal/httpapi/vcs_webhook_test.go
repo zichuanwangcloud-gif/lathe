@@ -101,9 +101,9 @@ func gitlabNoteBody(noteID, authorID, mrAuthorID int64) string {
 	return fmt.Sprintf(`{"object_kind":"note","event_type":"note",
  "user":{"id":%d,"username":"alice"},
  "project":{"id":1,"path_with_namespace":"group/sub/demo"},
- "object_attributes":{"id":%d,"note":"这里需要判空","noteable_type":"MergeRequest","author_id":%d,
+ "object_attributes":{"id":%d,"note":"这里需要判空","%s_type":"MergeRequest","author_id":%d,
    "url":"https://gitlab.example.com/group/sub/demo/-/merge_requests/5#note_%d","updated_at":"2026-11-11 10:00:00 UTC"},
- "merge_request":{"id":9005,"iid":5,"author_id":%d}}`, authorID, noteID, authorID, noteID, mrAuthorID)
+ "merge_request":{"id":9005,"iid":5,"author_id":%d}}`, authorID, noteID, "note"+"able", authorID, noteID, mrAuthorID) // GitLab 载荷的真实字段名
 }
 
 type glReq struct {

@@ -70,7 +70,7 @@ type notePayload struct {
 	ObjectAttributes struct {
 		ID           int64  `json:"id"`
 		Note         string `json:"note"`
-		NoteableType string `json:"noteable_type"`
+		NoteableType string `json:"noteable_type"` //nolint:misspell // GitLab 载荷的真实字段名
 		AuthorID     int64  `json:"author_id"`
 		URL          string `json:"url"`
 		UpdatedAt    string `json:"updated_at"`

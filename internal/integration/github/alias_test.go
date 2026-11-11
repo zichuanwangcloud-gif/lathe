@@ -13,10 +13,12 @@ var (
 	_ vcs.ReviewFeedbackSource = (*Client)(nil)
 )
 
+func takesVCSParams(p vcs.PRParams) string { return p.ProviderRepo }
+
 func TestGitHubTypesAreVCSAliases(t *testing.T) {
-	var p vcs.PRParams = PRParams{ProviderRepo: "acme/demo"} // 同一类型才能直接赋值
-	if p.ProviderRepo != "acme/demo" {
-		t.Fatalf("PRParams 赋值后字段丢失: %+v", p)
+	// 同一类型才能直接作为 vcs.PRParams 实参传入（不同命名类型在这里编译失败）
+	if got := takesVCSParams(PRParams{ProviderRepo: "acme/demo"}); got != "acme/demo" {
+		t.Fatalf("PRParams 传给 vcs.PRParams 后字段丢失: %q", got)
 	}
 	pairs := []struct {
 		name     string

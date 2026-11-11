@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
-	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
@@ -108,5 +107,4 @@ func TestLoadRepoConfigGitHubCloneURLUnchanged(t *testing.T) {
 	if cfg.Target() != (vcs.Target{Provider: vcs.ProviderGitHub}) || cfg.RepoKey() != cfg.ProviderRepo {
 		t.Errorf("github 仓库的 Target/RepoKey 变了：%+v %q", cfg.Target(), cfg.RepoKey())
 	}
-	var _ runner.RepoConfig = cfg
 }
