@@ -7,11 +7,63 @@
 //
 // 入参 ev 是 TaskDetail 里 pairTools 处理过的形状：tool_use 上挂了
 // result 与 durationMs。
+//
+// 回放（docs/features/run-replay.md §3.3.3）：工具输出与 thinking 是**受控**
+// 展开 —— 展开状态由父组件按事件 id 保存（open 集合），折叠时 DOM 里只有
+// summary 行、不渲染 <pre>（长输出常驻 DOM 是卡顿的根因）。日志与工具输出
+// 一律 {{ }} 插值，禁止 HTML 注入式渲染；只有 text 与 result 正文沿用 marked + DOMPurify。
+import { ref } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { formatDuration } from '../api'
 
-defineProps({ ev: { type: Object, required: true } })
+const props = defineProps({
+  ev: { type: Object, required: true },
+  // 受控展开：父组件持有的「已展开事件 id」集合与切换函数
+  open: { type: Object, default: null },
+  // 父组件的切换函数：toggle(id)
+  toggle: { type: Function, default: null },
+})
+const emit = defineEmits(['full-log'])
+
+// 未受控（open 未传）时退回组件内部状态，保持在别处复用时的旧行为
+const localOpen = ref(new Set())
+function isOpen(id) {
+  return (props.open || localOpen.value).has(id)
+}
+function flip(id) {
+  if (props.toggle) return props.toggle(id)
+  const s = new Set(localOpen.value)
+  s.has(id) ? s.delete(id) : s.add(id)
+  localOpen.value = s
+}
+// <details> 的原生 toggle 只用来同步受控状态；open 属性由我们给
+function onToggle(id, e) {
+  if (e.target.open !== isOpen(id)) flip(id)
+}
+
+// 超过 40 行的输出先显示前 40 行，「显示全部」后才整段渲染
+const PREVIEW_LINES = 40
+const fullShown = ref(new Set())
+function linesOf(s) {
+  return (s || '').split('\n')
+}
+function previewOf(id, s) {
+  const lines = linesOf(s)
+  if (fullShown.value.has(id) || lines.length <= PREVIEW_LINES) return s
+  return lines.slice(0, PREVIEW_LINES).join('\n')
+}
+function hiddenLines(id, s) {
+  const n = linesOf(s).length
+  return fullShown.value.has(id) || n <= PREVIEW_LINES ? 0 : n
+}
+function showAll(id) {
+  fullShown.value = new Set(fullShown.value).add(id)
+}
+// 事件流只存 4KB 摘要（agent.go 的「…(已截断)」与 capbuf 的「中间省略」）
+function truncated(s) {
+  return /…\(已截断\)$/.test(s || '') || /…（中间省略 \d+ 字节）…/.test(s || '')
+}
 
 // 模型输出不可信：issue 内容可以借间接提示注入让模型吐出带 onerror 的
 // 标记，marked 出 HTML 后必须过一层消毒。
@@ -69,9 +121,12 @@ function verifyOutput(e) {
   <div v-else-if="ev.kind === 'text'" class="md" v-html="mdOf(ev)"></div>
 
   <!-- thinking：灰显折叠 -->
-  <details v-else-if="ev.kind === 'thinking'" class="ev-fold">
+  <details v-else-if="ev.kind === 'thinking'" class="ev-fold" :open="isOpen(ev.id)" @toggle="onToggle(ev.id, $event)">
     <summary class="faint">思考过程</summary>
-    <pre>{{ ev.body }}</pre>
+    <template v-if="isOpen(ev.id)">
+      <pre>{{ previewOf(ev.id, ev.body) }}</pre>
+      <button v-if="hiddenLines(ev.id, ev.body)" class="link-btn" @click="showAll(ev.id)">显示全部 {{ hiddenLines(ev.id, ev.body) }} 行</button>
+    </template>
   </details>
 
   <!-- tool_use：工具名 + 参数摘要，结果缝在同一条上（✓/✗ + 耗时） -->
@@ -88,20 +143,28 @@ function verifyOutput(e) {
         {{ formatDuration(ev.durationMs) }}
       </span>
     </div>
-    <details v-if="ev.result" class="ev-fold tool-out">
+    <details v-if="ev.result" class="ev-fold tool-out" :open="isOpen(ev.id)" @toggle="onToggle(ev.id, $event)">
       <summary :class="ev.result.payload?.isError ? 'bad-text' : 'faint'">
         {{ ev.result.payload?.isError ? '报错输出' : '输出' }}
       </summary>
-      <pre>{{ ev.result.body }}</pre>
+      <template v-if="isOpen(ev.id)">
+        <pre>{{ previewOf(ev.id, ev.result.body) }}</pre>
+        <button v-if="hiddenLines(ev.id, ev.result.body)" class="link-btn" @click="showAll(ev.id)">显示全部 {{ hiddenLines(ev.id, ev.result.body) }} 行</button>
+        <div v-if="truncated(ev.result.body)" class="faint trunc-note">事件流里只保留了 4KB 摘要</div>
+      </template>
     </details>
   </div>
 
   <!-- tool_result：配不上发起方时才单独成行（老数据无 toolUseId） -->
-  <details v-else-if="ev.kind === 'tool_result'" class="ev-fold">
+  <details v-else-if="ev.kind === 'tool_result'" class="ev-fold" :open="isOpen(ev.id)" @toggle="onToggle(ev.id, $event)">
     <summary :class="ev.payload?.isError ? 'bad-text' : 'faint'">
       工具结果{{ ev.payload?.isError ? '（报错）' : '' }}
     </summary>
-    <pre>{{ ev.body }}</pre>
+    <template v-if="isOpen(ev.id)">
+      <pre>{{ previewOf(ev.id, ev.body) }}</pre>
+      <button v-if="hiddenLines(ev.id, ev.body)" class="link-btn" @click="showAll(ev.id)">显示全部 {{ hiddenLines(ev.id, ev.body) }} 行</button>
+      <div v-if="truncated(ev.body)" class="faint trunc-note">事件流里只保留了 4KB 摘要</div>
+    </template>
   </details>
 
   <!-- result：徽章行（耗时/成本/轮数）+ 终局正文 -->
@@ -126,6 +189,10 @@ function verifyOutput(e) {
       {{ verifyLine(ev) }}
     </div>
     <pre v-if="verifyOutput(ev)" class="ev-output">{{ verifyOutput(ev) }}</pre>
+    <div v-if="verifyOutput(ev)" class="row trunc-row">
+      <span v-if="truncated(verifyOutput(ev))" class="faint trunc-note">事件流里只保留了 4KB 摘要</span>
+      <button class="link-btn" @click="emit('full-log', ev)">查看完整日志</button>
+    </div>
   </div>
 
   <div v-else class="faint mono ev-line">{{ ev.body }}</div>
@@ -174,6 +241,17 @@ function verifyOutput(e) {
 .bad-text { color: var(--bad); }
 
 .verify-line { font-size: 12.5px; }
+
+.link-btn {
+  border: none;
+  background: none;
+  padding: 2px 0;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+.trunc-note { font-size: 11.5px; margin-top: 4px; }
+.trunc-row { gap: 10px; }
 .verify-line.st-passed { color: var(--ok); }
 .verify-line.st-failed { color: var(--bad); }
 .verify-line.st-error { color: var(--warn); }

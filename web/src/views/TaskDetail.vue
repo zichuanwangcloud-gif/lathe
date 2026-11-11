@@ -1,11 +1,15 @@
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, computed, inject } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, inject, nextTick, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
+import VerifyLogViewer from '../components/VerifyLogViewer.vue'
 import { confirmDialog } from '../confirm'
 import { createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
-import { createEventWindow, groupSubagents, pairTools } from '../replay'
+import {
+  applyFilter, comparePhases, createEventWindow, formatOffset, groupSubagents, pairTools,
+  phaseMeta, proofOf, segmentRuns, severityOf, silenceLabel, withTiming,
+} from '../replay'
 
 const props = defineProps({ id: { type: String, required: true } })
 const router = useRouter()
@@ -65,26 +69,45 @@ async function act(fn, confirmText) {
 }
 
 // ---------------------------------------------------------------- 执行日志
-// docs/04 §3.4：2s 增量轮询（after=last_id），进入终态后再拉一次收尾即停。
+// docs/04 §3.4 + docs/features/run-replay.md §3.3：实时任务 2s 增量轮询；
+// 终态任务进入回放模式 —— 先取最后一页，「加载更早」按需向前翻页。
 
-// 内存里只留最近 MAX_LIVE_EVENTS 条（见 livelog.js），裁掉的条数如实展示
 const evWindow = createEventWindow({
   fetchPage: ({ after, limit = 200, ...opts }) => api.taskEvents(props.id, after, limit, opts),
   max: MAX_LIVE_EVENTS,
   isTerminal: () => isTerminal.value,
   state: reactive({}),
 })
-const events = computed(() => evWindow.state.events)
-const eventsError = computed(() => evWindow.state.error)
-const olderAvailable = computed(() => evWindow.state.olderAvailable)
+const ws = evWindow.state
+const events = computed(() => ws.events)
+const eventsError = computed(() => ws.error)
 let evPoller = null
 
 async function loadEvents() {
   try {
-    await evWindow.load()
+    await evWindow.tick()
   } catch (e) {
     if (e instanceof UnauthorizedError) return onUnauthorized()
-    evWindow.state.error = e.message
+    ws.error = e.message
+  }
+}
+
+async function guarded(fn) {
+  try {
+    await fn()
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    ws.error = e.message
+  }
+}
+
+// summary：不受内存窗口影响的全局视图（阶段条数/失败数、首末失败）
+const summary = ref(null)
+async function loadSummary() {
+  try {
+    summary.value = await api.taskEventsSummary(props.id)
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
   }
 }
 
@@ -92,13 +115,50 @@ async function loadEvents() {
 // 标记，marked 出 HTML 后必须过一层消毒。
 const md = createMarkdown()
 
-const PHASE_META = {
-  triage: { label: '分诊', order: 0 },
-  implement: { label: '实现', order: 1 },
-  verify: { label: '验证', order: 2 },
-  review: { label: '评审', order: 3 },
-  push: { label: '推送', order: 4 },
+// ---- 工具栏状态
+const selectedPhases = ref([])
+const onlyFailures = ref(false)
+const hideThinking = ref(false)
+const onlyTools = ref(false)
+
+const TIME_MODES = { task: '相对任务起点', phase: '相对阶段起点', abs: '绝对时间' }
+const TIME_KEY = 'lathe.taskDetail.timeMode'
+function readTimeMode() {
+  try {
+    const v = localStorage.getItem(TIME_KEY)
+    return v in TIME_MODES ? v : 'task'
+  } catch {
+    return 'task'
+  }
 }
+const timeMode = ref(readTimeMode())
+watch(timeMode, (v) => {
+  try {
+    localStorage.setItem(TIME_KEY, v)
+  } catch {
+    // 隐私窗口等场景读写会抛，偏好只是便利，不影响渲染
+  }
+})
+
+function togglePhase(phase) {
+  const cur = selectedPhases.value
+  selectedPhases.value = cur.includes(phase) ? cur.filter((p) => p !== phase) : [...cur, phase]
+  guarded(() => evWindow.setFilter({ phase: selectedPhases.value }))
+}
+function clearPhases() {
+  selectedPhases.value = []
+  guarded(() => evWindow.setFilter({}))
+}
+
+// ---- 受控展开：工具输出 / thinking / 子块 / 阶段，按 id 记在集合里
+const openSet = ref(new Set())
+function toggleOpen(id) {
+  const s = new Set(openSet.value)
+  s.has(id) ? s.delete(id) : s.add(id)
+  openSet.value = s
+}
+const openPhases = ref(new Set())
+const closedPhases = ref(new Set())
 
 const phaseGroups = computed(() => {
   const groups = new Map()
@@ -106,16 +166,177 @@ const phaseGroups = computed(() => {
     if (!groups.has(e.phase)) groups.set(e.phase, [])
     groups.get(e.phase).push(e)
   }
+  const taskOrigin = summary.value?.firstAt || events.value[0]?.at
   return [...groups.entries()]
-    .map(([phase, list]) => ({
-      phase,
+    .map(([phase, list]) => {
       // 先把 subagent 收成子块，再对主流与每个子块分别做工具配对
-      list: pairTools(groupSubagents(list)).map((x) =>
+      const paired = pairTools(groupSubagents(list)).map((x) =>
         x.subagent ? { ...x, list: pairTools(x.list) } : x
-      ),
-      meta: PHASE_META[phase] || { label: phase, order: 9 },
-    }))
-    .sort((a, b) => a.meta.order - b.meta.order)
+      )
+      const filtered = applyFilter(paired, {
+        onlyFailures: onlyFailures.value,
+        hideThinking: hideThinking.value,
+        onlyTools: onlyTools.value,
+      })
+      const ps = summary.value?.phases?.find((p) => p.phase === phase)
+      const origin = timeMode.value === 'phase' ? ps?.firstAt || list[0]?.at : taskOrigin
+      return { phase, list: withTiming(filtered, origin), total: list.length, meta: phaseMeta(phase), stat: ps }
+    })
+    .sort((a, b) => comparePhases(a.phase, b.phase))
+})
+
+function timeLabel(e) {
+  const at = e.subagent ? e.list[0]?.at : e.at
+  if (timeMode.value === 'abs') return at ? new Date(at).toLocaleTimeString() : ''
+  return formatOffset(e.offsetMs)
+}
+function timeTitle(e) {
+  const at = e.subagent ? e.list[0]?.at : e.at
+  return at ? `${new Date(at).toLocaleString()}（入库时间，粒度约 ±200ms）` : ''
+}
+function rowSeverity(e) {
+  if (e.subagent) return e.list.some((x) => severityOf(x) === 'error') ? 'error' : null
+  return severityOf(e)
+}
+
+// ---- 失败定位
+const highlightId = ref(null)
+const currentFailure = ref(null)
+const jumpError = ref('')
+
+function containerOf(id) {
+  for (const g of phaseGroups.value) {
+    for (const x of g.list) {
+      if (x.id === id) return { phase: g.phase, sub: null, item: x }
+      if (x.subagent && x.list.some((y) => y.id === id)) return { phase: g.phase, sub: x.id, item: x.list.find((y) => y.id === id) }
+    }
+    // 配对后的 tool_result 并进了发起那条
+    for (const x of g.list) {
+      if (x.result?.id === id) return { phase: g.phase, sub: null, item: x }
+      if (x.subagent) {
+        const y = x.list.find((z) => z.result?.id === id)
+        if (y) return { phase: g.phase, sub: x.id, item: y }
+      }
+    }
+  }
+  return null
+}
+
+async function jumpTo(id) {
+  if (id == null) return
+  jumpError.value = ''
+  let ok = false
+  await guarded(async () => {
+    ok = await evWindow.jumpTo(id)
+  })
+  if (!ok) {
+    // 阶段过滤之外的事件：清掉过滤再找一次
+    if (selectedPhases.value.length) {
+      selectedPhases.value = []
+      await guarded(() => evWindow.setFilter({}))
+      await guarded(async () => {
+        ok = await evWindow.jumpTo(id)
+      })
+    }
+    if (!ok) {
+      jumpError.value = `事件 #${id} 不存在或已被清理`
+      return
+    }
+  }
+  currentFailure.value = id
+  await nextTick()
+  let c = containerOf(id)
+  if (!c && (onlyFailures.value || hideThinking.value || onlyTools.value)) {
+    // 本地开关把目标藏起来了（例如「只看工具调用」藏掉了 verify_step）：放开再找
+    onlyFailures.value = hideThinking.value = onlyTools.value = false
+    await nextTick()
+    c = containerOf(id)
+  }
+  if (c) {
+    const op = new Set(openPhases.value).add(c.phase)
+    openPhases.value = op
+    const cp = new Set(closedPhases.value)
+    cp.delete(c.phase)
+    closedPhases.value = cp
+    const s = new Set(openSet.value)
+    if (c.sub) s.add(c.sub)
+    s.add(c.item.id)
+    openSet.value = s
+  }
+  const anchor = c ? c.item.id : id
+  highlightId.value = anchor
+  try {
+    history.replaceState(history.state, '', `#ev-${id}`)
+  } catch {
+    // 沙箱里 replaceState 可能被拒，定位本身不受影响
+  }
+  await nextTick()
+  document.getElementById(`ev-${anchor}`)?.scrollIntoView({ block: 'center' })
+  setTimeout(() => {
+    if (highlightId.value === anchor) highlightId.value = null
+  }, 1500)
+}
+
+async function jumpFailure(dir) {
+  const from = currentFailure.value ?? (dir === 'next' ? 0 : Number.MAX_SAFE_INTEGER)
+  let id = null
+  await guarded(async () => {
+    id = await evWindow.findFailure(dir, from)
+  })
+  if (id == null) {
+    jumpError.value = dir === 'next' ? '后面没有更多失败了' : '前面没有更多失败了'
+    return
+  }
+  await jumpTo(id)
+}
+
+function expandAll(open) {
+  const s = new Set()
+  const ph = new Set()
+  if (open) {
+    for (const g of phaseGroups.value) {
+      ph.add(g.phase)
+      for (const x of g.list) {
+        s.add(x.id)
+        if (x.subagent) for (const y of x.list) s.add(y.id)
+      }
+    }
+  }
+  openSet.value = s
+  openPhases.value = ph
+  closedPhases.value = open ? new Set() : new Set(phaseGroups.value.map((g) => g.phase))
+}
+
+function phaseOpen(g) {
+  if (closedPhases.value.has(g.phase)) return false
+  return openPhases.value.has(g.phase) || g.phase === activePhase.value
+}
+function onPhaseToggle(g, e) {
+  const want = e.target.open
+  if (want === phaseOpen(g)) return
+  const op = new Set(openPhases.value)
+  const cp = new Set(closedPhases.value)
+  if (want) {
+    op.add(g.phase)
+    cp.delete(g.phase)
+  } else {
+    op.delete(g.phase)
+    cp.add(g.phase)
+  }
+  openPhases.value = op
+  closedPhases.value = cp
+}
+
+function phaseDuration(stat) {
+  if (!stat) return ''
+  const d = new Date(stat.lastAt) - new Date(stat.firstAt)
+  return Number.isFinite(d) && d >= 1000 ? formatDuration(d) : ''
+}
+
+// summary 里有、窗口里还没有的阶段也要出 chip（条数来自 summary）
+const phaseChips = computed(() => {
+  const list = summary.value?.phases || []
+  return [...list].sort((a, b) => comparePhases(a.phase, b.phase)).map((p) => ({ ...p, meta: phaseMeta(p.phase) }))
 })
 
 // 子块头上的计数：显示它调了多少次工具，比"多少条事件"更能说明它干了多少活
@@ -148,24 +369,82 @@ const orderedGroups = computed(() => {
   return cur ? [cur, ...g.filter((x) => x !== cur)] : g
 })
 
-const STEP_LABEL = {
-  build: '构建',
-  lint: '静态检查',
-  typecheck: '类型检查',
-  repro_fail: '改动前复现（应失败）',
-  repro_pass: '改动后复现（应通过）',
-  regression: '回归测试',
-}
-const STATUS_META = {
+// ---------------------------------------------------------------- 验证区
+// 证明条只读 detail.verifications（证据本体），不从事件流推断：事件流可能因
+// 溢出丢事件，verifications 是可审计的那一份（docs/features/run-replay.md §3.3.4）。
+
+const runs = computed(() => {
+  const d = detail.value
+  if (!d) return []
+  return segmentRuns(d.verifications || [], d.events || [])
+    .map((run) => ({
+      ...run,
+      rounds: run.rounds.map((r) => ({ ...r, proof: proofOf(r, run) })).reverse(),
+    }))
+    .reverse() // 最新一次运行在最上面
+})
+
+const VERDICT = {
+  proven: { mark: '✓', tone: 'ok', label: '已证明' },
   passed: { mark: '✓', tone: 'ok', label: '通过' },
   failed: { mark: '✗', tone: 'bad', label: '未通过' },
-  error: { mark: '!', tone: 'warn', label: '未跑起来' },
-  skipped: { mark: '–', tone: 'idle', label: '跳过' },
+  unknown: { mark: '?', tone: 'idle', label: '归属为推断，不下结论' },
 }
 
-onMounted(() => {
+function roundTitle(run, round) {
+  if (run.boundary === 'order') return `第 ${round.round + 1} 段（按顺序推断）`
+  return round.round === 0 ? '第 1 轮' : `第 ${round.round + 1} 轮（修复第 ${round.round} 轮之后）`
+}
+function runTitle(run) {
+  return `第 ${run.run} 次运行 · ${run.cause} · ${formatTime(run.startedAt)}`
+}
+function stepTitle(row) {
+  const t = []
+  if (row.logOverwritten) t.push(`该运行的日志已被第 ${row.overwrittenByRun} 次运行覆盖`)
+  if (row.placementUncertain) t.push('该步日志落盘失败，归属的轮次是按顺序推断的')
+  t.push(`${row.tier} · ${formatDuration(row.durationMs)} · ${formatTime(row.at)}`)
+  return t.join('\n')
+}
+
+const openRuns = ref(new Set())
+const viewing = ref(null) // 正在看完整日志的 verification 行
+function openLog(row) {
+  viewing.value = viewing.value?.id === row.id ? null : row
+}
+// 时间线里 verify_step 的「查看完整日志」：按 step 找同名、最新的、有日志的验证行
+function openLogForEvent(ev) {
+  const step = ev.payload?.step
+  for (const run of runs.value) {
+    for (const r of run.rounds) {
+      const row = [...r.rows].reverse().find((x) => x.step === step && x.logRef && !x.logOverwritten)
+      if (row) {
+        viewing.value = row
+        openRuns.value = new Set(openRuns.value).add(run.run)
+        nextTick(() => document.getElementById('verify-card')?.scrollIntoView({ block: 'start' }))
+        return
+      }
+    }
+  }
+}
+
+// 终态切换时刷新 summary；实时模式下每 15 秒刷一次（不放进 5 秒的详情轮询）
+watch(isTerminal, (t, was) => {
+  if (t && !was) loadSummary()
+})
+let summaryPoller = null
+
+onMounted(async () => {
   load()
-  loadEvents()
+  loadSummary()
+  summaryPoller = createPoller(async () => {
+    if (isTerminal.value) return false
+    await loadSummary()
+  }, 15000)
+  summaryPoller.start()
+  await loadEvents()
+  // 深链接：#ev-<id> 先定位再滚动过去
+  const m = /^#ev-(\d+)$/.exec(location.hash || '')
+  if (m) jumpTo(Number(m[1]))
   // 自链式轮询：上一轮没回来不发下一轮（慢网络下 setInterval 会叠加请求）
   detailPoller = createPoller(async () => {
     if (!isTerminal.value) await load()
@@ -182,6 +461,7 @@ onMounted(() => {
 onUnmounted(() => {
   detailPoller?.stop()
   evPoller?.stop()
+  summaryPoller?.stop()
 })
 </script>
 
@@ -274,7 +554,11 @@ onUnmounted(() => {
     </div>
 
     <div v-if="task.failureReason" class="card fail-card">
-      <div class="label">失败原因</div>
+      <div class="spread">
+        <div class="label">失败原因</div>
+        <!-- 跳到最后一个失败事件：数据源是 summary.lastFailure（不受 200 条截断影响） -->
+        <button v-if="summary?.lastFailure" @click="jumpTo(summary.lastFailure.id)">在日志中定位</button>
+      </div>
       <pre>{{ task.failureReason }}</pre>
       <p v-if="task.worktreePath" class="dim tip">
         现场已保留，可直接进去接手：
@@ -350,12 +634,49 @@ onUnmounted(() => {
     <div class="card">
       <div class="spread">
         <div class="label">执行日志</div>
-        <span v-if="!isTerminal" class="faint live">● 实时</span>
+        <span v-if="!isTerminal && !ws.detached" class="faint live">● 实时</span>
       </div>
+
+      <!-- 工具栏（吸顶）：阶段 chip、开关、时间显示、失败导航、全部展开/折叠 -->
+      <div class="toolbar">
+        <div v-if="phaseChips.length" class="chips">
+          <button class="chip" :class="{ on: !selectedPhases.length }" @click="clearPhases">全部</button>
+          <button
+            v-for="p in phaseChips"
+            :key="p.phase"
+            class="chip"
+            :class="{ on: selectedPhases.includes(p.phase) }"
+            @click="togglePhase(p.phase)"
+          >
+            {{ p.meta.label }} {{ p.count }}<span v-if="p.failures" class="chip-bad"> ✗{{ p.failures }}</span>
+          </button>
+        </div>
+        <div class="tools">
+          <label><input v-model="onlyFailures" type="checkbox" /> 只看失败</label>
+          <label><input v-model="hideThinking" type="checkbox" /> 隐藏思考</label>
+          <label><input v-model="onlyTools" type="checkbox" /> 只看工具调用</label>
+          <select v-model="timeMode" aria-label="时间显示">
+            <option v-for="(label, k) in TIME_MODES" :key="k" :value="k">{{ label }}</option>
+          </select>
+          <span v-if="summary" class="fail-nav">
+            <span :class="summary.failureCount ? 'bad-text' : 'faint'">✗ {{ summary.failureCount }} 个失败</span>
+            <button :disabled="!summary.firstFailure" @click="jumpTo(summary.firstFailure?.id)">第一个</button>
+            <button :disabled="!summary.failures.length" title="上一个失败" @click="jumpFailure('prev')">↑</button>
+            <button :disabled="!summary.failures.length" title="下一个失败" @click="jumpFailure('next')">↓</button>
+            <span v-if="summary.failuresTruncated" class="faint">（列表仅列前 200 个，↑/↓ 仍可继续）</span>
+          </span>
+          <button @click="expandAll(true)">全部展开</button>
+          <button @click="expandAll(false)">全部折叠</button>
+        </div>
+      </div>
+
       <div v-if="eventsError" class="faint" style="margin-bottom: 8px">日志拉取失败：{{ eventsError }}</div>
-      <div v-if="olderAvailable" class="faint" style="margin-bottom: 8px">
-        还有更早的事件未加载（完整记录在库里）。
-        <button @click="evWindow.loadOlder()">加载更早的 200 条</button>
+      <div v-if="jumpError" class="faint" style="margin-bottom: 8px">{{ jumpError }}</div>
+      <div class="faint window-info">
+        <template v-if="summary">共 {{ summary.total }} 条，</template>已加载 {{ events.length }} 条
+        <button v-if="ws.olderAvailable" @click="guarded(() => evWindow.loadOlder())">加载更早的 200 条</button>
+        <button v-if="ws.newerAvailable" @click="guarded(() => evWindow.loadNewer())">加载更新的 200 条</button>
+        <button v-if="ws.detached" @click="guarded(() => evWindow.backToLatest())">回到最新</button>
       </div>
 
       <template v-if="orderedGroups.length">
@@ -363,33 +684,58 @@ onUnmounted(() => {
           v-for="g in orderedGroups"
           :key="g.phase"
           class="phase"
-          :open="g.phase === activePhase"
+          :open="phaseOpen(g)"
+          @toggle="onPhaseToggle(g, $event)"
         >
           <summary>
             <span class="phase-name">{{ g.meta.label }}</span>
-            <span class="faint">{{ g.list.length }} 条</span>
+            <span class="faint">{{ g.stat ? g.stat.count : g.total }} 条</span>
+            <span v-if="g.stat?.failures" class="bad-text small">✗ {{ g.stat.failures }}</span>
+            <span v-if="g.stat" class="faint small" :title="`${new Date(g.stat.firstAt).toLocaleString()} → ${new Date(g.stat.lastAt).toLocaleString()}`">
+              {{ phaseDuration(g.stat) }}
+            </span>
             <span v-if="g.phase === activePhase && !isTerminal" class="badge run">进行中</span>
           </summary>
 
-          <ol class="log">
-            <li v-for="e in g.list" :key="e.id" class="ev" :class="e.subagent ? 'ev-sub' : 'ev-' + e.kind">
-              <!-- subagent 子块（0014）：它的内部步骤 stdout 里没有，
-                   来自 transcript。默认折叠，标题是派给它的任务 -->
-              <details v-if="e.subagent" class="subagent">
-                <summary>
-                  <span class="sub-tag">子 agent</span>
-                  <span class="sub-title">{{ e.title || e.agentId }}</span>
-                  <span class="faint sub-count">{{ subagentToolCount(e) }} 次工具调用</span>
-                </summary>
-                <ol class="log sub-log">
-                  <li v-for="se in e.list" :key="se.id" class="ev" :class="'ev-' + se.kind">
-                    <AgentEventItem :ev="se" />
-                  </li>
-                </ol>
-              </details>
+          <ol v-if="phaseOpen(g)" class="log">
+            <template v-for="e in g.list" :key="e.id">
+              <li
+                :id="'ev-' + e.id"
+                class="ev"
+                :class="[
+                  e.subagent ? 'ev-sub' : 'ev-' + e.kind,
+                  rowSeverity(e) === 'error' ? 'ev-failed' : rowSeverity(e) === 'warn' ? 'ev-warn' : '',
+                  highlightId === e.id ? 'ev-flash' : '',
+                ]"
+              >
+                <span class="ev-time mono" :title="timeTitle(e)">{{ timeLabel(e) }}</span>
+                <div class="ev-body">
+                  <!-- subagent 子块（0014）：它的内部步骤 stdout 里没有，
+                       来自 transcript。默认折叠，标题是派给它的任务 -->
+                  <details v-if="e.subagent" class="subagent" :open="openSet.has(e.id)" @toggle="($event.target.open !== openSet.has(e.id)) && toggleOpen(e.id)">
+                    <summary>
+                      <span class="sub-tag">子 agent</span>
+                      <span class="sub-title">{{ e.title || e.agentId }}</span>
+                      <span class="faint sub-count">{{ subagentToolCount(e) }} 次工具调用</span>
+                    </summary>
+                    <ol v-if="openSet.has(e.id)" class="log sub-log">
+                      <li
+                        v-for="se in e.list"
+                        :id="'ev-' + se.id"
+                        :key="se.id"
+                        class="ev"
+                        :class="['ev-' + se.kind, severityOf(se) === 'error' ? 'ev-failed' : '', highlightId === se.id ? 'ev-flash' : '']"
+                      >
+                        <AgentEventItem :ev="se" :open="openSet" :toggle="toggleOpen" @full-log="openLogForEvent" />
+                      </li>
+                    </ol>
+                  </details>
 
-              <AgentEventItem v-else :ev="e" />
-            </li>
+                  <AgentEventItem v-else :ev="e" :open="openSet" :toggle="toggleOpen" @full-log="openLogForEvent" />
+                </div>
+              </li>
+              <li v-if="silenceLabel(e.gapMs)" class="silence faint">{{ silenceLabel(e.gapMs) }}</li>
+            </template>
           </ol>
         </details>
       </template>
@@ -398,26 +744,64 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="card">
+    <!-- 验证区：按运行、再按轮次分块的红绿证明条；只读 detail.verifications -->
+    <div id="verify-card" class="card">
       <div class="label">验证结果</div>
-      <table v-if="detail.verifications.length">
-        <thead>
-          <tr><th>步骤</th><th>结果</th><th>档位</th><th>耗时</th><th>时间</th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="v in detail.verifications" :key="v.id">
-            <td>{{ STEP_LABEL[v.step] || v.step }}</td>
-            <td>
-              <span class="badge" :class="STATUS_META[v.status]?.tone">
-                {{ STATUS_META[v.status]?.mark }} {{ STATUS_META[v.status]?.label || v.status }}
+      <template v-if="runs.length">
+        <!-- 只有一次运行时不显示运行这一层（component 换成 div，不留空 summary） -->
+        <component
+          :is="runs.length > 1 ? 'details' : 'div'"
+          v-for="(run, ri) in runs"
+          :key="run.run"
+          class="run"
+          :open="runs.length > 1 ? ri === 0 || openRuns.has(run.run) : undefined"
+        >
+          <summary v-if="runs.length > 1">
+            <span class="phase-name">{{ runTitle(run) }}</span>
+            <span v-if="run.boundary === 'order'" class="faint small">运行边界按顺序推断，可能把相邻两次运行并在一起</span>
+          </summary>
+          <div
+            v-for="(round, k) in run.rounds"
+            :key="round.round"
+            class="round"
+            :class="{ 'round-old': k > 0 }"
+          >
+            <div class="row round-head">
+              <span class="round-name">{{ roundTitle(run, round) }}</span>
+              <span class="faint small">{{ round.rows[0]?.tier }}</span>
+              <span class="badge" :class="VERDICT[round.proof.verdict].tone">
+                {{ VERDICT[round.proof.verdict].mark }} {{ VERDICT[round.proof.verdict].label }}
               </span>
-            </td>
-            <td class="dim">{{ v.tier }}</td>
-            <td class="dim">{{ formatDuration(v.durationMs) }}</td>
-            <td class="dim">{{ formatTime(v.at) }}</td>
-          </tr>
-        </tbody>
-      </table>
+            </div>
+            <div class="proof">
+              <template v-for="(st, i) in round.proof.steps" :key="st.id">
+                <span v-if="i > 0" class="arrow faint">→</span>
+                <span
+                  class="step"
+                  :class="['st-' + st.tone, { 'step-bad': st.status === 'failed' || st.status === 'error' }]"
+                  :title="stepTitle(st)"
+                >
+                  {{ st.label }}
+                  <span v-if="st.logOverwritten" class="faint small">（日志已覆盖）</span>
+                  <button
+                    v-else-if="st.logRef"
+                    class="link-btn"
+                    :data-log-ref="st.logRef"
+                    @click="openLog(st)"
+                  >完整日志</button>
+                </span>
+              </template>
+            </div>
+            <VerifyLogViewer
+              v-if="viewing && round.rows.some((r) => r.id === viewing.id)"
+              :task-id="props.id"
+              :row="viewing"
+              @close="viewing = null"
+              @unauthorized="onUnauthorized"
+            />
+          </div>
+        </component>
+      </template>
       <div v-else class="empty" style="padding: 24px">
         尚无验证记录。任务走到验证阶段后这里会显示逐步结果。
       </div>
@@ -483,6 +867,9 @@ dd { margin: 0; overflow-wrap: anywhere; }
 }
 .timeline li:last-child { border-bottom: none; }
 .payload { width: 100%; font-size: 11.5px; }
+@media (max-width: 600px) {
+  .ev-time { width: 48px; }
+}
 
 /* ---------------------------------------------------------------- 执行日志 */
 
@@ -512,6 +899,64 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .log { list-style: none; margin: 0; padding: 0 0 8px 18px; }
 .ev { padding: 5px 0; border-bottom: 1px dashed var(--border); font-size: 13px; }
 .ev:last-child { border-bottom: none; }
+
+/* 回放：时间列 + 失败高亮 + 静默分隔线（docs/features/run-replay.md §3.3.2） */
+.log > .ev { display: flex; gap: 10px; align-items: baseline; }
+.ev-time { flex: none; width: 64px; color: var(--text-faint); font-size: 11.5px; text-align: right; }
+.ev-body { flex: 1; min-width: 0; }
+.ev-failed { box-shadow: inset 3px 0 0 var(--bad); background: var(--bad-bg); padding-left: 6px; }
+.ev-warn { box-shadow: inset 3px 0 0 var(--warn); background: var(--warn-bg); padding-left: 6px; }
+.ev-flash { animation: ev-flash 1.5s ease-out; }
+@keyframes ev-flash { from { background: var(--run-bg); } to { background: transparent; } }
+.silence { list-style: none; text-align: center; font-size: 11.5px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface);
+  padding: 6px 0 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+.chips, .tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chips { margin-bottom: 6px; }
+.chip { font-size: 12px; padding: 2px 10px; border-radius: 999px; }
+.chip.on { border-color: var(--accent); color: var(--accent); }
+.chip-bad { color: var(--bad); }
+.tools label { font-size: 12.5px; display: inline-flex; gap: 4px; align-items: center; }
+.tools select, .tools button { font-size: 12px; padding: 2px 8px; }
+.fail-nav { display: inline-flex; gap: 4px; align-items: center; font-size: 12.5px; }
+.window-info { font-size: 12.5px; margin-bottom: 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.window-info button { font-size: 12px; padding: 2px 8px; }
+.bad-text { color: var(--bad); }
+.small { font-size: 12px; }
+
+/* 验证区：证明条 */
+.run { border-top: 1px solid var(--border); padding: 4px 0; }
+.run:first-of-type { border-top: none; }
+.run > summary { cursor: pointer; padding: 8px 0; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.round { padding: 8px 0; }
+.round-old { opacity: .85; }
+.round-head { gap: 10px; margin-bottom: 6px; }
+.round-name { font-weight: 500; font-size: 13px; }
+.proof { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.arrow { font-size: 12px; }
+.step {
+  font-size: 12.5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.step.st-ok { color: var(--ok); }
+.step.st-bad { color: var(--bad); }
+.step.st-warn { color: var(--warn); }
+.step.st-idle { color: var(--idle); }
+.step-bad { border: 2px solid var(--bad); font-weight: 600; }
+.link-btn { border: none; background: none; padding: 0; color: var(--accent); font-size: 12px; cursor: pointer; }
 
 /* 单条事件的排版在 components/AgentEventItem.vue 里（作用域样式不跨组件，
    两边各管自己那部分）。这里只留容器与 subagent 子块。 */
