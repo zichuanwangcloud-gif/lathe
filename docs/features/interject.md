@@ -1127,6 +1127,11 @@ EVIDENCE=/opt/lathe-wt/evidence/f01
 > 纪律：该测试**默认 `t.Skip`**（要真 CLI 与真凭据，不能进 `make test`），但**必须**在 PR 里贴一次完整输出；
 > 当天凭据不可用时**不允许**改写成「假 CLI 通过就算过」：如实写「未取证」并把 PR 标 draft 等人拍板；
 > 全程隔离 `HOME`、临时仓库、**不碰** `:8200`/`:8300` 实例与其库、不外推任何 GitHub 仓库。
+>
+> **取证实况（2026-11-11 18:16）**：本机 claude 不走 `~/.claude/.credentials.json`（里面只有 `mcpOAuth.*`），而走 cc-switch 通道
+> （`~/.claude/settings.json` 的 `env` 块：`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`）。所以隔离 `HOME` 里复制的是 `settings.json` 与
+> `~/.cc-switch/config.json`（`chmod -R go-rwx`），claude 二进制用生产同款 wrapper `/opt/lathe/bin/claude-cc-switch`（只读调用；它在
+> `--setting-sources project` 下从 `$HOME` 现取通道注入后 exec claude）。隔离 HOME 用完即删；证据入库前扫 token 值、`sk-`、`Bearer`、真实路径。
 
 ### UI
 
@@ -1234,6 +1239,14 @@ ss -ltn | grep -c ':8401 '                                                      
 `worktree.diff` 里的标记断言是最强的一档证据（强于回显）：它证明插话文本到达了模型并影响了产出；如果 agent 没照做（模型自由度），
 脚本记 `markApplied:false`，这两行断言即为**失败**，AC-22 不算通过；PR 里如实贴出（同时附 `isReplay` 回显 = 「CLI 收到了」的证据），换措辞重跑至多一次，仍不过则标 draft 等人拍板。不得放宽断言。
 纪律同 AC-14：要真 CLI 与真凭据；当天不可用就**不**以假 CLI 替代，PR 标 draft 等人拍板。
+
+> **取证实况（2026-11-11）**：① 为避开 `lathe_f01` 的测试残留（36 个非终态任务，按 AGENTS.md §4 不删），e2e 使用**独立空库 `lathe_f01e2e`**
+> （已跑完迁移、`tasks=0`），第 0 步的前置检查改查这个库；② 凭据同 AC-14 的取证实况：隔离 HOME 复制 `settings.json` + cc-switch config，
+> serve 以 `LATHE_CLAUDE_BIN` 指向一个 tee 包装（内部 exec `/opt/lathe/bin/claude-cc-switch`，把 claude stdout 全量落盘以核对回显）；
+> ③ 内置管理员首次登录必须改口令（`mustChangePassword`），且 `LATHE_ADMIN_PASSWORD` 只给没有口令的账号设初值，所以每次运行用新的
+> `LATHE_ADMIN_EMAIL=f01e2e-<ts>@lathe.local`（只新增用户行），登录后先 `POST /api/password/change`；
+> ④ AC-15 截图用本机已装的 playwright（python）+ 无头 chromium（`e2e/shot.py`），插话一、二经界面发送（POST 响应原样落 `interject*.json`）。
+> 结果见 §10。
 
 ### 启动恢复
 
@@ -1362,47 +1375,70 @@ ss -ltn | grep -c ':8401 '                                                      
 | AC-18 取消后不接受 | 通过 | `TestInterjectRejectedAfterCancelEvenWithLiveSession` |
 | AC-19 queued 一定有结局 | 通过（管线 6 场景、两组竞态各 100 次、cancelTask / CancelForIssue / blocked_dep 级联 / 周期清扫 / 不误判）；机检：`internal/task/`、`queue.go` 无改动，`api.go` 三个 hunk 都不在 `cancelTask`（610–634）内 | `TestQueuedInterjectionsSettled*`、`TestInterjectRace*`、`TestInterjectSettledOnReadAfterCancel*`；`dev/22-…` |
 | AC-20 客户端断开 | 通过（三个子用例，handler ≤ 3s） | `TestSubmitSurvivesClientDisconnect` |
-| AC-14 驱动级真实证据 | **未取证**（真凭据不可用，见 10.3）。驱动机制项在真实 claude 二进制上全部成立（stub provider 补充证据 12/12；真 provider 那次 8/12，失败的 4 项都是「未登录」导致模型没跑） | `run_real_cli.sh`、`real-cli/real-20261111-172800/`、`real-cli/`（stub） |
-| AC-15 UI | 机检通过（`TaskDetail.vue` numstat `2 0`、`AgentEventItem.vue` 无 diff、`v-html` 0、`InterjectPanel` 2 次）；`make ui && make build` 成功。**截图未做**：手测按 PRD 定义在 AC-22 那次 :8401 运行上做，见 10.4 | `dev/09-ui-build.txt` |
-| AC-22 :8401 端到端 | **未执行**，见 10.4（两个前置都不满足：库里残留、真凭据不可用） | `e2e/run.sh`、`e2e/run-attempt-1.txt` |
+| AC-14 驱动级真实证据 | **通过（12/12，真 claude 2.1.322 + 真 provider）**：a 段回显 uuid 一致、末条 result 含 MARK、首条 result 后 0.230s 退出非 `ErrIdle`、result 后 `Deliver` → `ErrSessionClosed` 且只有 1 条 result；c 段（`--resume` + 流式）回显一致、单 result、同时含第一段暗号与 MARK2、`session_id` 不变、0.229s 退出；仓库无改动；secret-scan 0 命中 | `run_real_cli.sh`、`real-cli/real-20261111-181627/` |
+| AC-15 UI | 机检通过（`TaskDetail.vue` numstat `2 0`、`AgentEventItem.vue` 无 diff、`v-html` 0、`InterjectPanel` 2 次）；`make ui && make build` 成功。**截图已做**（无头 chromium，在 AC-22 两次 :8401 运行上）：implementing 发一句 → 「已送达」；verifying 时输入框在且带提示；修复轮之间发的一句「已记录待投递」→ 被 fix-1 补投时「投递中」；awaiting_approval 后输入框消失、列表仍在、该句「未进入模型」+ 原因。缺一张：第 1 次运行终态截图因 `/api/login` 限流 429 没截到（已改为复用会话） | `e2e/run-20261111-182145/ac15-{1,2,3}-*.png`、`e2e/run-20261111-182515/ac15-{1,2,4}-*.png`、`*.panel.txt` |
+| AC-22 :8401 端到端 | **按 PRD 的严格断言未通过（两次运行都没有同时满足「出 fix-1」与「终态 awaiting_approval」）**；插话链路本身（实时投递、`--resume` 会话里投递、修复轮之间 queued → 开场补投、验证通过后 queued → 结算 failed + 原因）在真实运行上全部走通，详见 10.4 | `e2e/run.sh`、`e2e/run-20261111-182145/`、`e2e/run-20261111-182515/` |
 
-### 10.3 AC-14：真实 claude 2.1.322（真 provider 未取证；stub provider 补充证据）
+### 10.3 AC-14：真实 claude 2.1.322 + 真 provider（2026-11-11 18:16，通过）
 
-**真 provider：未取证。** 包装脚本 `/opt/lathe-wt/evidence/f01/run_real_cli.sh` 按 PRD 形态建隔离 `HOME`、复制
-`~/.claude/.credentials.json`、建临时仓库、`uuidgen` 生成 `INTERJECT-MARK-…`，再以 `-real-home/-real-dir/-real-mark` 跑
-`TestRealCLIInterject`（给了 `-real-home` 就不注入 stub 的 `ANTHROPIC_BASE_URL`/假 token）。2026-11-11 17:28 那次两段的 result 都是
-`Not logged in · Please run /login`：本机凭据文件里只有 `mcpOAuth.*`（只看了键名），**没有 `claudeAiOauth`**，P7「复制即登录」的
-前提今天不成立。按 PRD 纪律，不拿 stub 结果顶替，也没有挪用当前 agent 会话环境里的 `ANTHROPIC_*`（那不是 PRD 规定的凭据来源）。
-那次仍然成立的机制项：首条 result 后 0.536s / 0.257s 退出、非 `ErrIdle`；result 后 `Deliver` → `ErrSessionClosed`；单条 result；
-`--resume` 参数形状；`session_id` 不变；仓库无改动（`real-cli/real-20261111-172800/`，含 `ATTEMPT.md`、完整 go test 输出、secret-scan 0 命中）。
-**需要人**：提供可复制的 Claude 登录凭据（或指定凭据来源）后重跑脚本；补齐前 PR 保持 draft。
+包装脚本 `/opt/lathe-wt/evidence/f01/run_real_cli.sh`：隔离 `HOME` 里复制 `~/.claude/settings.json` 与 `~/.cc-switch/config.json`
+（本机 claude 走 cc-switch 通道，不走 `.credentials.json`；上一次 17:28 复制 `.credentials.json` 得到 `Not logged in` 的记录保留在
+`real-cli/real-20261111-172800/`），`-real-bin /opt/lathe/bin/claude-cc-switch`（只读调用生产同款 wrapper），临时 git 仓库，
+`uuidgen` 生成 `INTERJECT-MARK-…`，用 Lathe 自己的 `Driver` 跑 `TestRealCLIInterject`。`go test` 输出 `--- PASS: TestRealCLIInterject (35.96s)`，
+12 项自检全部 `ok:true`：
 
-**补充证据（stub provider，可离线复现，不算 AC-14 通过）：**
-`TestRealCLIInterject`（默认跳过）用 Lathe 自己的 `Driver` 起真实 `claude` 二进制：显式 `Dir`（`t.TempDir()` 里的 git 仓库）、`sanitizedEnv` 白名单 + `ExtraEnv`
-（隔离 `HOME`/`CLAUDE_CONFIG_DIR`、`ANTHROPIC_BASE_URL` 指向测试进程内的 httptest stub、假 token），不用真凭据、不连外网。
-stub 对「F01-SLEEP」回一个 `Bash sleep 8` 的 tool_use，之后的请求里看到什么标记就回什么 —— 所以「result 含 MARK」证明的是**注入帧被
-真实 CLI 并进了同一个 turn 的下一次模型请求**，不是模型的理解能力（与 PRD 写的真凭据版本相比，这一档证据弱在「模型照做」那一层，
-强在完全可复现）。12 项自检全部通过（`real-cli/real-cli-20261111-165750-*`）：
+- a 段（新会话）：注入帧 `isReplay` 回显、uuid 一致（stdout 第 10 行）；末条 result 是模型写的
+  「暗号：ZEBRA-dd5160d6 / 你中途要求原样包含的标记：INTERJECT-MARK-d6acf323-…」——注入被真模型吸收；首条 result 后 **0.230s** 退出、非 `ErrIdle`；
+  result 之后 `Deliver` → `agent: 会话已收尾，stdin 已关闭`（`ErrSessionClosed`），stdout 只有 1 条 result。
+- c 段（`--print --output-format stream-json --verbose --resume <sid> … --input-format stream-json --replay-user-messages`）：回显一致；
+  只有 1 条 result，同时含第一段暗号 `ZEBRA-dd5160d6` 与 `…-2`；`session_id` = sid；result 后 **0.229s** 退出。
+- 临时仓库 `git status --porcelain` 为空；交给 `OnEvent` 的事件里没有 replay / `command_lifecycle`。
+- secret-scan（token 值、`sk-`、`Bearer`、`accessToken`、真实 home 路径）0 命中；隔离 HOME 由 trap 删除（事后 `find /tmp` 复核无残留）。
 
-- a 段（新会话）：注入帧 `isReplay` 回显 uuid 一致；末条 result `DONE ZEBRA-… MARK1-…`；**首条 result 后 0.228s 退出**、非 `ErrIdle`；
-  result 之后 `Deliver` → `ErrSessionClosed`，stdout 只有 1 条 result。
-- c 段（`--resume <sid> --input-format stream-json --replay-user-messages`，与 fix-N 生产参数同形）：回显一致；只有 1 条 result；
-  result 同时含第一段暗号与 `MARK2`；`session_id` = sid；result 后 0.225s 退出。
-- 临时仓库 `git status --porcelain` 为空；交给 `OnEvent` 的事件里没有 `command_lifecycle` / replay。
-- 证据已扫：无 token 形态串，`cwd` 只有 `/tmp/TestRealCLIInterject…` 临时仓库。
+stub provider 的补充证据（`real-cli/real-cli-20261111-165750-*`，12/12）保留，可离线复现。
 
-### 10.4 未完成项（如实）
+### 10.4 AC-22：两次真实 :8401 运行（如实）
 
-1. **AC-22（:8401 端到端）未执行**。PRD 第 0 步要求 `lathe_f01` 里非终态任务数为 0，实测为 6（脚本运行时 10）：
-   全部是既有测试 `TestPipelineInternalIssueHappyPath` / `TestPipelineInternalBlockedSpecRoundTrip` 的残留（每跑一次 `make test` 多 2 行，
-   `queued` 的 CR-777 与 `pr_open` 的 LT-xx）。serve 会领 queued 行、merge poller 会拿 stub token 轮询 pr_open 行，不能带着残留起实例；
-   按 AGENTS.md §4「真删任何东西必须先问人」停下。另：`make clean-test-db` 在宿主无 psql 时走 docker 分支并写死 `-d lathe`，
-   **清不到 `lathe_f01`**（只读查询，未改任何东西），清理方式需人决定。脚本 `e2e/run.sh` 已就绪，前置满足后可直接跑。
-   第 2 轮复查（17:30）残留仍在（10 行，id 197–1324），仍未获清理授权。此外 `run.sh` 用的也是复制 `~/.claude/.credentials.json`
-   的隔离 HOME，而本机该文件里没有 Claude 登录凭据（见 10.3），即使清掉残留，实例里的 claude 也会 `Not logged in`。
-2. **AC-15 截图**依赖 AC-22 的那次运行，同上未做。
-3. **AC-14 真 provider 未取证**（见 10.3）。
-4. 因此按 §3.6 的约定（P10 + AC-14 + AC-22 缺一即 draft），PR 保持 draft，等人决定：① `lathe_f01` 残留怎么清；② 用哪份凭据。
+环境：独立空库 **`lathe_f01e2e`**（为避开 `lathe_f01` 的 36 个测试残留，不删它们）、`127.0.0.1:8401`、隔离 HOME（cc-switch 通道）、
+本地 bare fixture + 预置 mirror、`LATHE_GITHUB_TOKEN=stub-not-a-token`、`gate_mode=manual`、`verifyTierOverride=light`、`LATHE_FIX_ATTEMPTS=1`。
+另有一次未起任务的尝试 `e2e/run-20261111-182012/`（内置管理员要求先改口令，`start` 返回 `请先修改初始密码`；脚本已改为每次新建管理员邮箱并先改口令）。
+两次运行结束时都核对：生产二进制 `/opt/lathe/bin/lathe` sha256 未变、:8401 已停、secret-scan 0 命中。
+
+**第 1 次（措辞 1，任务 #1，`e2e/run-20261111-182145/`）—— 出了 `--resume` 的 fix-1，但终态 `failed`**
+
+| 断言 | 期望 | 实际 |
+|---|---|---|
+| 终态 | `awaiting_approval` | **`failed`**（`verify_failed`：`lint (.)` 即 `go vet` copylocks 仍红） |
+| 插话行 | `implement\|delivered\|t\|t`、`fix-1\|delivered\|t\|t` | `implement\|delivered\|t\|t`（界面发送，200，回显确认）；修复轮之间那句 `fix-1\|delivered\|t\|f`（202 `no_live_session` → fix-1 开场补投，补投行按设计无 `delivery_id`）；插话二 **`fix-1\|delivered\|f\|t`**（200，`error='no_replay_ack'`：写进了 stdin，2s 内没等到回显） |
+| fix-1 事件数 | ≥1 | 82 |
+| 失败验证数 | ≥1 | 2（两轮 `lint` 都红） |
+| 最后一次验证 | `passed` | **`failed`** |
+| worktree.diff 里的标记 | 两个都 ≥1 | **未导出**：脚本在终态截图处因 429 中止，trap 删了临时现场。agent 的 result 自述在 `calc.go` 首行加 `// f01-mark-0e2c1e16`（实现轮）、在 `calc.go` 末尾加 `// f01-gap-a642a547`、在 `calc_test.go` 加了插话二的注释（fix-1），事件流里有对应的 `Edit calc.go`/`Edit calc_test.go`，但没有 diff 实物，不算机检通过 |
+| `command_lifecycle` raw | 0 | 0 |
+| user 回显冒充 text | 0 | 0 |
+| fix-1 会话 = 实现会话 | true | true（两个 init 的 sessionId 都是 `9a6c2642-…`） |
+| stub token 出现在事件里 | 0 | 0 |
+
+失败原因（`agent_events` id 183 原文）：「我没有修这次 lint 失败，因为它不是我的改动引起的，是仓库原来就有的问题。按你"无关的问题不要硬改"的要求，我把它留着。」
+即 R4 的 copylocks fixture 与 `FixPrompt`（`prompt.go:121`「如果失败原因与本次改动无关（仓库既有问题…）…不要硬改无关代码」）冲突：
+fix-1 能确定性地以 `--resume` 起来，但修复轮会按提示词把预置的 vet 问题判为既有问题拒修，验证无法转绿。这是 fixture 设计问题，不是插话代码缺陷。
+
+**第 2 次（措辞 2，任务 #2，`e2e/run-20261111-182515/`）—— 终态 `awaiting_approval`，但没有 fix-1（`fixRound:false`）**
+
+措辞改为在 issue 里写明「calc.go 整个文件都在本任务范围内，流水线验证在 calc.go 里报出的任何问题都算本任务要解决的」（不提 Copy/vet）。
+结果实现轮自己发现并修掉了 `Copy`（改成 `*S`，交付摘要原文：「Copy(s S) S 改为 Copy(s *S) *S…go vet 的 copylocks 检查会报出来」），
+第一轮验证 build/lint 全绿 → 没有 fix-1 → 插话二没发。断言：终态 `awaiting_approval` ✓；`implement|delivered|t|t` ✓；
+修复轮之间那句（202 queued）在验证通过后被结算为 `failed`，原因「验证已通过、没有后续 agent 轮次，这句话没有进入模型；如需生效请在 PR review 里提出」（AC-19 的界面面）；
+fix-1 事件 0 ✗；失败验证 0 ✗；最后验证 `passed` ✓；`f01-mark-d540c414` 在 worktree.diff ✓、插话二标记 0 ✗；`command_lifecycle` raw 0 ✓；user 回显冒充 text 0 ✓；
+`fixResumeSessionEqualsImpl:false`（无 fix-1）✗；stub token 0 ✓。tee 落盘的实现轮 claude stdout 里 `isReplay:true` 2 条（首帧 prompt + 插话一）、result 1 条。
+system raw 对照（不断言）：`informational|1,permission_denied|4,thinking_tokens|85`。
+
+**结论**：按 PRD「换措辞重跑至多一次，仍不过则标 draft 等人拍板、不得放宽断言」，AC-22 记为**未通过**，PR 保持 draft。两次合起来，
+插话功能要证明的每一段在真实运行上都出现过（新会话实时投递并被执行、`--resume` 的 fix-1 里实时投递、修复轮之间 queued → 开场补投、
+queued → 结算 failed + 原因、事件流两类污染为 0、fix-1 会话 ID 不变），但没有出现在同一次运行里，第 1 次又缺 diff 实物。
+**需要人拍板**：① fixture 怎么改才能同时满足「go test 看不见 → 一定出 fix-1」与「修复轮认为是本任务的问题 → 能修绿」
+（例如让 vet 问题由实现轮自己的改动引入，或修复轮插话里明确授权）；② 插话二 `no_replay_ack` 是否接受为 AC-22 的通过形态
+（§3.2 把它定义为 200 `delivered` 的成功形态，但 AC-22 断言写的是 `error IS NULL`）。
 
 ### 10.5 与并行线的接缝（本线先合入的情形）
 
@@ -1417,5 +1453,5 @@ stub 对「F01-SLEEP」回一个 `Bash sleep 8` 的 tool_use，之后的请求�
 - `Session.Deliver` 在写协程被大首帧占住时也遵守 2s 上限：排队超时的帧以 CAS 标记「调用方已放弃」，写协程跳过它，不会出现
   「已报背压、事后又被写进去」；半帧写超时则直接收尾会话（宁可走「下一轮补投 / 结算」，也不发出粘连的坏帧）。
 - `StreamInput=true` 且 `Prompt` 为空时 `Run` 直接报错：流式输入下 prompt 是 stdin 首帧，没有首帧 CLI 只会干等到看门狗。
-- 观察到的既有问题（不在本线范围，未修）：AC-22 第 0 步撞上的测试残留（见 10.4）；`make clean-test-db` 的 docker 分支忽略
+- 观察到的既有问题（不在本线范围，未修）：`lathe_f01` 的测试残留（e2e 因此改用独立空库 `lathe_f01e2e`）；`make clean-test-db` 的 docker 分支忽略
   `LATHE_TEST_DSN` 的库名；resume 降级只看 `err` 的既有行为（§2.2 第 10 条）。
