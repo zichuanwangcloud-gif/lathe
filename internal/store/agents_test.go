@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"testing"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
@@ -198,4 +200,58 @@ func TestSetAgentSummary(t *testing.T) {
 	if got.AgentNumTurns == nil || *got.AgentNumTurns != 12 {
 		t.Errorf("轮数未读回: %v", got.AgentNumTurns)
 	}
+}
+
+// AC-1（f04）：流水线会写的每一个 phase 都必须能落库。
+//
+// implement-reentry 来自 runner.PhaseImplementReentry（internal/runner/eventsink.go）；
+// 这里只能写字面量 —— runner 的非测试代码 import 了 store，store 测试再 import
+// runner 会成环。字面量与常量的绑定由 httpapi 的
+// TestEventsPhaseFilterAcceptsRunnerReentryPhase 负责。
+func TestInsertAgentEventsAcceptsEveryPipelinePhase(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	tag := "f04-ac1-" + randHex(t)
+	userID, taskID := agentEventFixture(t, st, tag+"@example.com")
+	// external_key 带随机量，清理按自己建的 task_id 删（agent_events 级联）
+	if _, err := st.pool.Exec(ctx, `UPDATE tasks SET external_key=$2 WHERE id=$1`, taskID, tag); err != nil {
+		t.Fatalf("改 external_key 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = st.pool.Exec(context.Background(), `DELETE FROM tasks WHERE id=$1`, taskID)
+	})
+
+	for _, phase := range []string{
+		"triage", "implement",
+		"implement-reentry", // = runner.PhaseImplementReentry
+		"verify", "push", "fix-1", "fix-12", "review",
+	} {
+		t.Run("给定 phase="+phase+" 断言可落库并读回", func(t *testing.T) {
+			_, last, err := st.AgentEventsAfter(ctx, taskID, userID, 0, 500)
+			if err != nil {
+				t.Fatalf("查询失败: %v", err)
+			}
+			body := "probe-" + phase
+			if err := st.InsertAgentEvents(ctx, taskID, phase, []agent.Entry{{Kind: agent.KindText, Body: body}}); err != nil {
+				t.Fatalf("落库失败: got err=%v, want nil", err)
+			}
+			got, _, err := st.AgentEventsAfter(ctx, taskID, userID, last, 500)
+			if err != nil {
+				t.Fatalf("读回失败: %v", err)
+			}
+			if len(got) != 1 || got[0].Phase != phase || got[0].Body != body {
+				t.Errorf("读回不符: got %+v, want 1 条 phase=%s body=%s", got, phase, body)
+			}
+		})
+	}
+}
+
+// randHex 给 fixture 标识加随机量（AGENTS.md §5.5）。
+func randHex(t *testing.T) string {
+	t.Helper()
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("取随机数失败: %v", err)
+	}
+	return hex.EncodeToString(b[:])
 }
