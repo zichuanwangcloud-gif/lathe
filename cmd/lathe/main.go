@@ -22,6 +22,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/creds"
 	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
 	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
+	"github.com/zichuanwangcloud-gif/lathe/internal/inbox"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/mail"
@@ -285,6 +286,16 @@ func serve(cfg config.Config) error {
 		ConfigStatus: configStatus(cfg),
 	}
 	apiSrv.Routes(mux)
+
+	// 收件箱（docs/features/inbox.md）：等人处理的事项从现有状态实时派生，
+	// 原因文本先过 runner 同一套两层脱敏再上界面。
+	inboxSvc, err := inbox.NewService(st, func(s string) string {
+		return runner.RedactText(s, cfg.KnownSecrets())
+	})
+	if err != nil {
+		return err
+	}
+	(&httpapi.InboxAPI{Service: inboxSvc, Auth: auth}).Routes(mux)
 
 	// 看板「同步 Linear」的只读接口。凭据与执行队列走同一条通路，
 	// 设置页里改完 Linear token 即刻生效，不用重启。
