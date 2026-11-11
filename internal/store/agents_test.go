@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
@@ -254,4 +255,46 @@ func randHex(t *testing.T) string {
 		t.Fatalf("取随机数失败: %v", err)
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// AC-4：回放新增的查询都必须走 (task_id, id) 索引 agent_events_task_id，
+// 不因 phase/kind/失败过滤退化成全表扫。先关 seqscan 排除小表统计的干扰。
+func TestEventsQueriesUseTaskIndex(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+
+	filter := EventFilter{Phases: []string{"implement", "fix-1"}, Kinds: []string{"tool_use"}}
+	beforeSQL, beforeArgs := agentEventsBeforeQuery(1, 1, 100, filter, 50)
+	failSQL, failArgs := agentEventsAfterQuery(1, 1, 0, EventFilter{FailuresOnly: true}, 50)
+
+	cases := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"给定 AgentEventsBefore 带 phase/kind 过滤", beforeSQL, beforeArgs},
+		{"给定 failures=1 的 after 查询", failSQL, failArgs},
+		{"给定 summary 的阶段聚合", summaryPhasesSQL, []any{int64(1)}},
+		{"给定 summary 的失败列表", summaryFailuresSQL, []any{int64(1), summaryFailuresMax + 1}},
+		{"给定 summary 的 lastFailure", summaryEdgeFailureSQL("DESC"), []any{int64(1)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name+" 断言计划里出现 agent_events_task_id", func(t *testing.T) {
+			tx, err := st.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+				t.Fatal(err)
+			}
+			var plan string
+			if err := tx.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+c.sql, c.args...).Scan(&plan); err != nil {
+				t.Fatalf("EXPLAIN 失败: %v", err)
+			}
+			if !strings.Contains(plan, `"agent_events_task_id"`) {
+				t.Errorf("计划未走 agent_events_task_id: got %s", plan)
+			}
+		})
+	}
 }

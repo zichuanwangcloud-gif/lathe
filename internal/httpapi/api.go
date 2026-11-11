@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -70,6 +71,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks", a.Auth.RequireFunc(a.listTasks))
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
+	mux.Handle("GET /api/tasks/{id}/events/summary", a.Auth.RequireFunc(a.taskEventsSummary))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
 	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
 	mux.Handle("GET /api/stats/metrics", a.Auth.RequireFunc(a.metricsStats))
@@ -136,20 +138,45 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, detail)
 }
 
+// ownedTask 是任务读接口共用的归属判定：不存在与不是自己的任务一律
+// 404「任务不存在」（不用 403 暴露存在性，AGENTS.md §7）。
+//
+// 抽成一处是为了团队可见性（f12）落地时只改这一个函数体。只给**读**接口用；
+// 调用方的 store 查询一律传 tk.UserID（任务属主），不传 CurrentUser(r).ID。
+func (a *API) ownedTask(w http.ResponseWriter, r *http.Request) (*task.Task, bool) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return nil, false
+	}
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return nil, false
+	}
+	return tk, true
+}
+
+// eventPhaseRe 是 /events?phase= 的白名单：流水线会写的全部阶段（与
+// agent_events_phase_check 同一集合，含 0041 的 implement-reentry）。
+var eventPhaseRe = regexp.MustCompile(`^(triage|implement|implement-reentry|verify|review|push|fix-[0-9]+)$`)
+
+// eventKinds 是 /events?kind= 的白名单（0014 的 kind CHECK 的 9 个值）。
+var eventKinds = map[string]bool{
+	"init": true, "text": true, "thinking": true, "tool_use": true, "tool_result": true,
+	"result": true, "verify_step": true, "raw": true, "agent_start": true,
+}
+
 // taskEvents 增量拉取 agent 执行事件（docs/04 §3.3）。
 //
 // 轮询协议：after 传上次的 last_id（首轮传 0），游标 id 严格单调，
 // 将来换 SSE + Last-Event-ID 时客户端协议不变，只是传输升级。
+//
+// 回放扩展（docs/features/run-replay.md §3.2.1）：paged/before/phase/kind/failures
+// 任一出现时响应多带 first_id/has_more；一个都不带时行为与响应和旧版**完全一致**
+// （顶层键恰为 {events, last_id}）—— 这是与旧客户端、f01 测试的兼容契约。
 func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	tk, ok := a.ownedTask(w, r)
 	if !ok {
-		return
-	}
-
-	// 权限与 taskDetail 同一原则：不是自己的任务按 404 处理
-	tk, err := a.Tasks.Get(r.Context(), id)
-	if err != nil || tk.UserID != CurrentUser(r).ID {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
 		return
 	}
 
@@ -157,12 +184,104 @@ func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
 	limit, _ := strconv.Atoi(q.Get("limit"))
 
-	events, lastID, err := a.Store.AgentEventsAfter(r.Context(), id, tk.UserID, after, limit)
+	extended := q.Has("paged") || q.Has("before") || q.Has("phase") || q.Has("kind") || q.Has("failures")
+	if !extended {
+		events, lastID, err := a.Store.AgentEventsAfter(r.Context(), tk.ID, tk.UserID, after, limit)
+		if err != nil {
+			serverError(w, "查询执行日志失败", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": events, "last_id": lastID})
+		return
+	}
+
+	bad := func(msg string) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+	}
+	if q.Has("paged") && q.Get("paged") != "1" {
+		bad("paged 参数只接受 1")
+		return
+	}
+	var f store.EventFilter
+	if q.Has("failures") {
+		if q.Get("failures") != "1" {
+			bad("failures 参数只接受 1")
+			return
+		}
+		f.FailuresOnly = true
+	}
+	if q.Has("phase") {
+		for _, p := range strings.Split(q.Get("phase"), ",") {
+			p = strings.TrimSpace(p)
+			if !eventPhaseRe.MatchString(p) {
+				bad(fmt.Sprintf("phase 参数含未知阶段 %q", p))
+				return
+			}
+			f.Phases = append(f.Phases, p)
+		}
+	}
+	if q.Has("kind") {
+		for _, k := range strings.Split(q.Get("kind"), ",") {
+			k = strings.TrimSpace(k)
+			if !eventKinds[k] {
+				bad(fmt.Sprintf("kind 参数含未知类别 %q", k))
+				return
+			}
+			f.Kinds = append(f.Kinds, k)
+		}
+	}
+
+	var (
+		events  []store.AgentEvent
+		hasMore bool
+		err     error
+		lastID  = after
+	)
+	if q.Has("before") {
+		if q.Has("after") {
+			bad("before 与 after 不能同时传")
+			return
+		}
+		before, perr := strconv.ParseInt(q.Get("before"), 10, 64)
+		if perr != nil || before <= 0 {
+			bad("before 参数须为正整数")
+			return
+		}
+		events, hasMore, err = a.Store.AgentEventsBefore(r.Context(), tk.ID, tk.UserID, before, f, limit)
+		lastID = 0
+	} else {
+		events, hasMore, err = a.Store.AgentEventsAfterFiltered(r.Context(), tk.ID, tk.UserID, after, f, limit)
+	}
 	if err != nil {
 		serverError(w, "查询执行日志失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": events, "last_id": lastID})
+
+	var firstID any // 本批为空时为 null
+	if len(events) > 0 {
+		firstID = events[0].ID
+		lastID = events[len(events)-1].ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"events": events, "last_id": lastID, "first_id": firstID, "has_more": hasMore,
+	})
+}
+
+// taskEventsSummary 汇总一个任务的全部事件（不受前端内存窗口影响）：
+// 各阶段条数/起止/失败数、失败列表（前 200）、首末失败。
+//
+// 与 costStats 同理独立成端点，不放进 5 秒轮询的 /api/tasks/{id}。
+func (a *API) taskEventsSummary(w http.ResponseWriter, r *http.Request) {
+	tk, ok := a.ownedTask(w, r)
+	if !ok {
+		return
+	}
+	sum, err := a.Store.AgentEventsSummary(r.Context(), tk.ID)
+	if err != nil {
+		serverError(w, "汇总执行日志失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
