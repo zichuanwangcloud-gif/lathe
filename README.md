@@ -1,6 +1,7 @@
 # Lathe
 
 > 绑定 Linear 账户后，指派给你的 issue 自动变成一个**已验证**的 PR。
+> 需求来源：Linear / 内置工单 / 阿里云云效（Projex）工作项。
 
 Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：bug 类任务必须先在改动前的代码上复现失败，才有权声称修复。
 
@@ -70,6 +71,10 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    - Linear Webhook 密钥：建 webhook 时 Linear 生成
 #    - GitHub Webhook 密钥（可选，PR 评论回流用）：建仓库 webhook 时自己填的 Secret
 #    - 邮件发送（SMTP）：用于「忘记密码」，保存时会真投一封测试邮件
+#    - 云效连接（可选，需求来源用阿里云云效 Projex 时）：接入点、组织 ID、个人访问令牌、
+#      webhook 密钥（≥16 位，自己定）、触发标签与可选的状态同步名。保存时用令牌取当前
+#      用户，「指派给我」判定用这个账号 ID。Region 版（专属实例）需管理员先在「系统设置」
+#      登记实例域名，否则保存会被拒（防止服务端被当成访问内网的跳板）
 #    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
 #    接单判定直接使用，无需手工填写。
 #
@@ -86,6 +91,12 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #
 # 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
 #    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
+#
+# 9.（可选）云效任务来源：「设置」页的云效卡片里有回调地址
+#    /webhooks/yunxiao/<同一个随机段>。在云效项目 → 设置 → 自动化规则用 Webhook 模板
+#    新建两条规则（触发「字段变更」与「状态变更」），Body 选【工作项数据】，
+#    Secret 填与卡片里「Webhook 密钥」相同的串。之后指派给你（或打上卡片里配的
+#    触发标签）的工作项就会接单；也可以在卡片里按工作项 ID 手动开跑。
 ```
 
 ### 账号
@@ -154,6 +165,9 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_NODE_NAME` | 节点名（事件 actor 前缀、管理界面运行时面板），默认主机名 |
 | `LATHE_PNPM_STORE` | 验证器跑前端步骤时共享的 pnpm store 目录，默认 `/opt/lathe/.pnpm-store` |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
+
+云效（Projex）任务来源**没有环境变量**：连接只能在「设置」页按人配置，Region 版实例域名
+允许列表只能由管理员在「系统设置」页登记（详见 [docs/features/tracker-yunxiao.md](docs/features/tracker-yunxiao.md)）。
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。
