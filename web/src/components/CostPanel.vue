@@ -426,6 +426,13 @@ const tooltipStyle = computed(() => {
     </template>
 
     <p v-else class="faint">加载中…</p>
+
+    <!-- f03：完整账本在 /usage。口径差异：本面板只统计执行事件流里的任务运行，
+         不含 PRD 规划 / 预览推荐，也会漏掉事件缓冲丢弃的行 -->
+    <p class="faint more">
+      <router-link to="/usage">按阶段 / 仓库 / 档位细看 →</router-link>
+      本面板只统计任务执行事件流；用量页是完整账本（含 PRD 规划、预览推荐、失败与被杀的运行），两者数字可能不同。
+    </p>
   </div>
 </template>
 
@@ -456,6 +463,7 @@ const tooltipStyle = computed(() => {
 .section { margin-top: 18px; }
 .bad-text { color: var(--bad); }
 .pad { padding: 24px 0; }
+.more { margin-top: 14px; }
 
 /* KPI：数字用比例figures，不用 tabular-nums（大字号下等宽数字显松散） */
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }

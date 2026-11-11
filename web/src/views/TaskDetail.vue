@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, computed, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
+import TaskUsage from '../components/TaskUsage.vue'
 import { confirmDialog } from '../confirm'
 import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
 
@@ -379,11 +380,14 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 交付摘要卡（docs/04 §3.5）：实现阶段终局自述 + 成本/耗时徽章 -->
+    <!-- 交付摘要卡（docs/04 §3.5）：实现阶段终局自述 + 最近一轮的成本/耗时徽章。
+         徽章读的 tasks.agent_* 是每轮覆盖的值（只留最后一轮 fix），所以标「最近一轮」；
+         全部运行的合计见下面的「用量」卡（f03）。 -->
     <div v-if="task.agentSummary" class="card summary-card">
       <div class="spread">
         <div class="label">交付摘要</div>
-        <div class="row badges">
+        <div class="row badges" title="最近一轮 agent 运行的轮数 / 耗时 / 花费（不是任务累计，累计见「用量」卡）">
+          <span class="faint">最近一轮</span>
           <span v-if="task.agentNumTurns != null" class="badge idle">{{ task.agentNumTurns }} 轮</span>
           <span v-if="task.agentDurationMs != null" class="badge idle">{{ formatDuration(task.agentDurationMs) }}</span>
           <span v-if="task.agentCostUsd != null" class="badge idle">${{ Number(task.agentCostUsd).toFixed(4) }}</span>
@@ -391,6 +395,8 @@ onUnmounted(() => {
       </div>
       <div class="md" v-html="md(task.agentSummary)"></div>
     </div>
+
+    <TaskUsage :task-id="id" class="usage-card" />
 
     <div class="grid">
       <div class="card">
@@ -531,6 +537,7 @@ h1 { margin: 0; font-size: 22px; }
 .retry-plan .reasons li { margin: 2px 0; }
 
 .summary-card { margin-bottom: 16px; }
+.usage-card { margin-bottom: 16px; }
 .badges { gap: 8px; flex-wrap: wrap; }
 
 .grid {

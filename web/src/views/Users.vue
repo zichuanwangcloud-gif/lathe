@@ -77,7 +77,11 @@ onMounted(load)
 </script>
 
 <template>
-  <h1>用户管理</h1>
+  <div class="spread">
+    <h1>用户管理</h1>
+    <!-- f03：管理员的全局用量入口（后端 /api/admin/usage 强制鉴权） -->
+    <RouterLink to="/usage?scope=all">全局用量 →</RouterLink>
+  </div>
 
   <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 

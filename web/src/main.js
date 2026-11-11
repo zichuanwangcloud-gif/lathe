@@ -13,6 +13,7 @@ import PRDConversation from './views/prd/PRDConversation.vue'
 import Issues from './views/Issues.vue'
 import IssueDetail from './views/IssueDetail.vue'
 import Repos from './views/Repos.vue'
+import Usage from './views/Usage.vue'
 import PersonalSettings from './views/PersonalSettings.vue'
 import SystemSettings from './views/SystemSettings.vue'
 import Users from './views/Users.vue'
@@ -52,6 +53,8 @@ const router = createRouter({
     { path: '/linear', name: 'linear', component: LinearIssues, meta: { linear: true } },
     { path: '/tasks/:id', name: 'task', component: TaskDetail, props: true },
     { path: '/repos', name: 'repos', component: Repos },
+    // 用量统计（f03）：所有人可用；?scope=all 的全局视图只对管理员生效，后端强制鉴权
+    { path: '/usage', name: 'usage', component: Usage },
     { path: '/settings', name: 'settings', component: PersonalSettings },
     { path: '/admin/settings', name: 'system-settings', component: SystemSettings, meta: { admin: true } },
     { path: '/users', name: 'users', component: Users, meta: { admin: true } },

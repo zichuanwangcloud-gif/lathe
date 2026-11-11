@@ -95,6 +95,8 @@ RFC 2606 保留域；默认干跑，`YES=1` 才真删）。
 6. ~~**模型路由**~~（已交付，B2-2）：`LATHE_TRIAGE_CHANNEL` / `LATHE_IMPLEMENT_CHANNEL` 配 cc-switch 通道名，pipeline 按阶段以 `LATHE_AGENT_CHANNEL` 注入子进程，wrapper（`scripts/claude-cc-switch`）从 `~/.cc-switch/config.json` 现取该通道的 BASE_URL/TOKEN/MODEL；通道不存在时告警回落激活通道。未配置则全局跟随 cc-switch 激活通道。
 7. ~~**分诊目录中立化**~~（已交付，B2-3）。
 
+已交付（f03）：`agent_runs` + `/usage` —— `agent_runs` 每次 agent 运行一行（含失败/被杀、PRD 规划、预览推荐，token 四项 + 费用 + 时长），`/usage` 按任务/仓库/验证档位/阶段/时间聚合，管理员有全局视图（docs/features/usage-stats.md）。
+
 ### 3.3 生命周期与现场管理
 
 8. ~~**worktree 收割机**~~（已交付，08 T6）：终态任务的现场按 TTL 回收（默认 72h）。

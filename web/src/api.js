@@ -92,6 +92,12 @@ export const api = {
   // 平台自度量（环节耗时分位数 + 失败分类直方图）。同样独立于 /api/stats，
   // 理由与 costStats 一样：那两个聚合都要扫 task_events，而看板 5 秒一轮。
   metricsStats: () => request('/api/stats/metrics'),
+  // 用量统计（f03，docs/features/usage-stats.md）。参数原样转成 query string：
+  // from / to / repo / tier / bucket / group / limit。管理员全局视图走独立端点，
+  // 后端强制鉴权（普通成员 403）。
+  usage: (params = {}) => request('/api/usage' + usageQuery(params)),
+  adminUsage: (params = {}) => request('/api/admin/usage' + usageQuery(params)),
+  taskUsage: (id) => request(`/api/tasks/${id}/usage`),
   repos: () => request('/api/repos'),
   config: () => request('/api/config'),
 
@@ -291,6 +297,16 @@ export function formatTime(iso) {
   if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
   if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
   return d.toLocaleString('zh-CN', { hour12: false })
+}
+
+// usageQuery 只带非空参数：空串让后端走默认值，而不是被当成非法值 400。
+function usageQuery(params) {
+  const q = new URLSearchParams()
+  for (const k of ['from', 'to', 'repo', 'tier', 'bucket', 'group', 'limit']) {
+    if (params[k] !== undefined && params[k] !== null && params[k] !== '') q.set(k, params[k])
+  }
+  const s = q.toString()
+  return s ? '?' + s : ''
 }
 
 export function formatDuration(ms) {
