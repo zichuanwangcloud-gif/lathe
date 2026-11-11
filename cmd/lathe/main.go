@@ -176,6 +176,10 @@ func serve(cfg config.Config) error {
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID, st)
+	// 云效任务来源（f08）：每用户一条连接，与 integrations 分开存、同一个
+	// Sealer 加密。云效没有环境变量兜底（只能在设置页配）。
+	yunxiaoConns := st.NewYunxiaoConnections(sealer)
+	factory.WithYunxiao(yunxiaoConns)
 
 	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory)
 	if err != nil {
@@ -276,6 +280,17 @@ func serve(cfg config.Config) error {
 		Deliveries: st,
 		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
 	})
+
+	// 云效工作项回调（f08）：/webhooks/yunxiao/{slug}，与 Linear/GitHub 共用
+	// 用户的随机段、按用户的云效 webhook 密钥验签。没有无 slug 的兜底路径
+	// （同 GitHub 新入口的立场）。
+	mux.Handle("POST /webhooks/yunxiao/{slug}", &httpapi.YunxiaoWebhook{
+		Resolver:   &httpapi.YunxiaoResolver{Users: users, Conns: yunxiaoConns, Store: st},
+		Deliveries: st,
+		Triggers:   yunxiaoConns,
+		Tasks:      q,
+	})
+	(&httpapi.YunxiaoAPI{Conns: yunxiaoConns, Store: st, Auth: auth, Tasks: q}).Routes(mux)
 
 	apiSrv := &httpapi.API{
 		Store:        st,
