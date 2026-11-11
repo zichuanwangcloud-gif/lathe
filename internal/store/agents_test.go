@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
@@ -197,5 +200,138 @@ func TestSetAgentSummary(t *testing.T) {
 	}
 	if got.AgentNumTurns == nil || *got.AgentNumTurns != 12 {
 		t.Errorf("轮数未读回: %v", got.AgentNumTurns)
+	}
+}
+
+// AC-1（f04）：流水线会写的每一个 phase 都必须能落库。
+//
+// implement-reentry 来自 runner.PhaseImplementReentry（internal/runner/eventsink.go）；
+// 这里只能写字面量 —— runner 的非测试代码 import 了 store，store 测试再 import
+// runner 会成环。字面量与常量的绑定由 httpapi 的
+// TestEventsPhaseFilterAcceptsRunnerReentryPhase 负责。
+func TestInsertAgentEventsAcceptsEveryPipelinePhase(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	tag := "f04-ac1-" + randHex(t)
+	userID, taskID := agentEventFixture(t, st, tag+"@example.com")
+	// external_key 带随机量，清理按自己建的 task_id 删（agent_events 级联）
+	if _, err := st.pool.Exec(ctx, `UPDATE tasks SET external_key=$2 WHERE id=$1`, taskID, tag); err != nil {
+		t.Fatalf("改 external_key 失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = st.pool.Exec(context.Background(), `DELETE FROM tasks WHERE id=$1`, taskID)
+	})
+
+	for _, phase := range []string{
+		"triage", "implement",
+		"implement-reentry", // = runner.PhaseImplementReentry
+		"verify", "push", "fix-1", "fix-12", "review",
+	} {
+		t.Run("给定 phase="+phase+" 断言可落库并读回", func(t *testing.T) {
+			_, last, err := st.AgentEventsAfter(ctx, taskID, userID, 0, 500)
+			if err != nil {
+				t.Fatalf("查询失败: %v", err)
+			}
+			body := "probe-" + phase
+			if err := st.InsertAgentEvents(ctx, taskID, phase, []agent.Entry{{Kind: agent.KindText, Body: body}}); err != nil {
+				t.Fatalf("落库失败: got err=%v, want nil", err)
+			}
+			got, _, err := st.AgentEventsAfter(ctx, taskID, userID, last, 500)
+			if err != nil {
+				t.Fatalf("读回失败: %v", err)
+			}
+			if len(got) != 1 || got[0].Phase != phase || got[0].Body != body {
+				t.Errorf("读回不符: got %+v, want 1 条 phase=%s body=%s", got, phase, body)
+			}
+		})
+	}
+}
+
+// randHex 给 fixture 标识加随机量（AGENTS.md §5.5）。
+func randHex(t *testing.T) string {
+	t.Helper()
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("取随机数失败: %v", err)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// AC-4：回放新增的查询都必须走 (task_id, id) 索引 agent_events_task_id，
+// 不因 phase/kind/失败过滤退化成全表扫。先关 seqscan 排除小表统计的干扰。
+func TestEventsQueriesUseTaskIndex(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	_, taskID := agentEventFixture(t, st, "f04-ac4-explain-"+randHex(t)+"@example.com")
+	t.Cleanup(func() {
+		_, _ = st.pool.Exec(context.Background(), `DELETE FROM tasks WHERE id=$1`, taskID)
+	})
+
+	type q struct {
+		name string
+		sql  string
+		args []any
+	}
+	// 参数取真实形态：本任务有事件、before = 本任务 max(id)+1（回放首页就是这么查的）。
+	// 用 before=100 这类远低于真实 id 的假参数时，主键范围看起来几乎为空，规划器
+	// 走主键反而便宜 —— 那测不出大表上「从全表最新事件往回翻」的问题。
+	build := func(before int64) []q {
+		filter := EventFilter{Phases: []string{"implement", "fix-1"}, Kinds: []string{"tool_use"}}
+		beforeSQL, beforeArgs := agentEventsBeforeQuery(taskID, 0, before, filter, 50)
+		plainSQL, plainArgs := agentEventsBeforeQuery(taskID, 0, before, EventFilter{}, 200)
+		failSQL, failArgs := agentEventsAfterQuery(taskID, 0, 0, EventFilter{FailuresOnly: true}, 50)
+		return []q{
+			{"给定 AgentEventsBefore 带 phase/kind 过滤", beforeSQL, beforeArgs},
+			{"给定 AgentEventsBefore 不带过滤（回放首页）", plainSQL, plainArgs},
+			{"给定 failures=1 的 after 查询", failSQL, failArgs},
+			{"给定 summary 的阶段聚合", summaryPhasesSQL, []any{taskID}},
+			{"给定 summary 的失败列表", summaryFailuresSQL, []any{taskID, summaryFailuresMax + 1}},
+			{"给定 summary 的 lastFailure", summaryEdgeFailureSQL("DESC"), []any{taskID}},
+		}
+	}
+
+	for _, c := range build(0) {
+		t.Run(c.name+" 断言计划里出现 agent_events_task_id", func(t *testing.T) {
+			tx, err := st.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			// 事务内造数据并 ANALYZE（回滚即消失）：本任务 300 行 + 另一批别的任务
+			// 的行，让统计信息反映「表里不止这一个任务」。
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO agent_events (task_id, phase, kind, body)
+				SELECT $1, 'implement', CASE WHEN g % 2 = 0 THEN 'tool_use' ELSE 'text' END, 'x'
+				FROM generate_series(1, 300) g`, taskID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO agent_events (task_id, phase, kind, body)
+				SELECT t.id, 'implement', 'text', 'y' FROM tasks t, generate_series(1, 50) LIMIT 3000`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `ANALYZE agent_events`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+				t.Fatal(err)
+			}
+			var maxID int64
+			if err := tx.QueryRow(ctx, `SELECT max(id) FROM agent_events WHERE task_id=$1`, taskID).Scan(&maxID); err != nil {
+				t.Fatal(err)
+			}
+			for _, real := range build(maxID + 1) {
+				if real.name != c.name {
+					continue
+				}
+				var plan string
+				if err := tx.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+real.sql, real.args...).Scan(&plan); err != nil {
+					t.Fatalf("EXPLAIN 失败: %v", err)
+				}
+				if !strings.Contains(plan, `"agent_events_task_id"`) {
+					t.Errorf("计划未走 agent_events_task_id: got %s", plan)
+				}
+			}
+		})
 	}
 }

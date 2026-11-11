@@ -476,6 +476,17 @@ func redactText(s string, registered []string, extraEnv map[string]string) strin
 	return s
 }
 
+// RedactForDisplay 是「读取侧」的脱敏入口：落盘的完整验证日志没有脱敏
+// （verifylog.go 只做了 0600），任务详情页按块读取时每块返回前都必须过它
+// （docs/features/run-replay.md §3.2.3，AGENTS.md §7）。
+//
+// 只是 redactText 的薄包装，走同样的权威层 + 形态兜底两层，不另写规则；
+// 读取时拿不到那一轮的 StackEnv，所以 extraEnv 为 nil —— 隔离栈临时口令
+// 只能靠形态层识别 user:pass@ DSN，这一边界写在 run-replay.md「已知边界」。
+func RedactForDisplay(s string, registered []string) string {
+	return redactText(s, registered, nil)
+}
+
 // redactSecrets 是 redactText 的「无登记值」入口（测试与兼容调用用）。
 func redactSecrets(s string, env map[string]string) string {
 	return redactText(s, nil, env)
