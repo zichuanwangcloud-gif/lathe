@@ -982,3 +982,26 @@ func firstN(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// f04：RedactForDisplay 是日志读取接口的脱敏入口，必须与写入侧的
+// redactText（无 StackEnv）逐字节一致 —— 不另写一套规则。
+func TestRedactForDisplayMatchesRedactText(t *testing.T) {
+	reg := []string{"postgres://lathe:f04RegisteredPw9@db.internal:5432/app"}
+	cases := []struct{ name, in string }{
+		{"给定登记的 DSN 断言与 redactText 一致", "dsn=postgres://lathe:f04RegisteredPw9@db.internal:5432/app ok"},
+		{"给定未登记的 DSN 断言形态层同样生效", "dial postgres://u:p4ssw0rdXYZ@h:5432/db failed"},
+		{"给定 kv 形态 断言一致", "API_KEY=abcdefghijklmnopqrstuvwxyz012345\n"},
+		{"给定跨行 kv 断言一致", "password:\n  hunter2hunter2\n"},
+		{"给定空串 断言为空", ""},
+		{"给定普通文本 断言原样", "go build ./... ok\n中文输出\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := RedactForDisplay(c.in, reg)
+			want := redactText(c.in, reg, nil)
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+}

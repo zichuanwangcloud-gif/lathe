@@ -115,6 +115,7 @@ func TestAPIRequiresAuth(t *testing.T) {
 		{"GET", "/api/tasks/1", ""},
 		{"GET", "/api/tasks/1/events", ""},
 		{"GET", "/api/tasks/1/events/summary", ""},
+		{"GET", "/api/tasks/1/verifications/1/log", ""},
 		{"GET", "/api/stats", ""},
 		{"GET", "/api/stats/cost", ""},
 		{"GET", "/api/stats/metrics", ""},

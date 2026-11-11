@@ -2,10 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // replay.go —— 任务详情页「运行回放」的只读查询（docs/features/run-replay.md）。
@@ -289,4 +292,20 @@ func (s *Store) AgentEventsSummary(ctx context.Context, taskID int64) (*EventsSu
 		}
 	}
 	return out, nil
+}
+
+// VerificationLogRef 取一条验证行的 log_ref 与落库时刻。
+//
+// 同时按 task_id 限定：vid 不属于该任务时与「不存在」不可区分（found=false）。
+// 归属判定（任务属主）由 API 层的 ownedTask 先做。
+func (s *Store) VerificationLogRef(ctx context.Context, taskID, vid int64) (ref *string, at time.Time, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT log_ref, at FROM verifications WHERE id = $1 AND task_id = $2`, vid, taskID).Scan(&ref, &at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, time.Time{}, false, nil
+	}
+	if err != nil {
+		return nil, time.Time{}, false, fmt.Errorf("store: 查询验证日志引用失败: %w", err)
+	}
+	return ref, at, true, nil
 }

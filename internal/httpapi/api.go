@@ -53,6 +53,14 @@ type API struct {
 
 	// ConfigStatus 返回凭据配置状态（不含 token 本身）。
 	ConfigStatus func() map[string]any
+
+	// LogDir 是完整验证日志的根（verifications.log_ref 相对它），与
+	// Pipeline.LogDir 同源（cfg.DataDir）。为空时日志接口一律 503。
+	LogDir string
+
+	// KnownSecrets 是脱敏权威层的登记值（cfg.KnownSecrets()），与
+	// Pipeline.KnownSecrets 同源。日志块返回前与安全切点检验都用它。
+	KnownSecrets []string
 }
 
 // Routes 把 API 注册到 mux。
@@ -72,6 +80,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
 	mux.Handle("GET /api/tasks/{id}/events/summary", a.Auth.RequireFunc(a.taskEventsSummary))
+	mux.Handle("GET /api/tasks/{id}/verifications/{vid}/log", a.Auth.RequireFunc(a.verificationLog))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
 	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
 	mux.Handle("GET /api/stats/metrics", a.Auth.RequireFunc(a.metricsStats))
