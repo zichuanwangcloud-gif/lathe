@@ -9,9 +9,9 @@
 -- 代码里统一按 COALESCE(agent_driver, 'claude') 读，只写在 taskColumns 一处；
 -- 不做存量回填，所以 down 能精确撤销。
 --
--- 为什么非事务 + NOT VALID/VALIDATE：tasks 是长期累积的表（每次尝试一行，从不删），
+-- 为什么非事务 + 先不校验再 VALIDATE：tasks 是长期累积的表（每次尝试一行，从不删），
 -- 直接 ADD CONSTRAINT … CHECK 会在 ACCESS EXCLUSIVE 下扫全表，期间派发、Transition、
--- 轮询全部阻塞。NOT VALID 只改目录、瞬间完成；VALIDATE 扫表时只拿
+-- 轮询全部阻塞。先加「不校验存量」的约束只改目录、瞬间完成；VALIDATE 扫表时只拿
 -- SHARE UPDATE EXCLUSIVE，不挡读写。两步必须在不同事务里才有意义（同一事务里
 -- 前一步的排他锁会持有到提交），所以首行打了非事务标记（先例 0018）。
 --
