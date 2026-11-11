@@ -234,6 +234,12 @@ export const api = {
       body: JSON.stringify({ password: password || '' }),
     }),
   deleteUser: (id) => request(`/api/admin/users/${id}`, { method: 'DELETE' }),
+
+  // 运行中插话（docs/features/interject.md）
+  interject: (taskId, message) =>
+    request(`/api/tasks/${taskId}/interject`, { method: 'POST', body: JSON.stringify({ message }) }),
+  interjections: (taskId, afterRev = 0) =>
+    request(`/api/tasks/${taskId}/interjections?after_rev=${afterRev}`),
 }
 
 // 状态的中文名与配色，全站统一。
