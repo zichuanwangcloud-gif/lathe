@@ -238,7 +238,7 @@ func (c *Client) doEnvelope(ctx context.Context, query string, vars map[string]a
 	if err != nil {
 		return nil, nil, fmt.Errorf("linear: 请求失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
