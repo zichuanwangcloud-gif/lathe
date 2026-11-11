@@ -110,6 +110,10 @@ type Service struct {
 	// 留成字段是为了单测能替换掉。
 	CloneURL func(providerRepo string) string
 
+	// Usage 落每次规划 / 复核 agent 运行的用量账本（f03，agent_runs）。为 nil 时
+	// 不记账；记账失败只告警，不影响规划轮。
+	Usage agent.UsageRecorder
+
 	// Now 可注入，便于测试。
 	Now func() time.Time
 
@@ -556,7 +560,7 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 
 	timeout := roundTimeout
 	for attempt := 0; ; attempt++ {
-		res, err := s.runOnce(budgetCtx, params, timeout)
+		res, err := s.runOnce(budgetCtx, spec, params, timeout)
 		if err != nil {
 			// 首跑超时不判死：同一个会话续跑，明确要求它立刻交 JSON。
 			// 实测拆分轮两次都撞在时间上限上 —— 模型在拼命读代码「求准」，
@@ -594,12 +598,23 @@ func (s *Service) runAgent(ctx context.Context, spec runSpec) (*agent.Result, st
 	}
 }
 
-// runOnce 跑一次 agent（首跑或修正），把各种失败形态统一成错误。
-func (s *Service) runOnce(ctx context.Context, p agent.RunParams, timeout time.Duration) (*agent.Result, error) {
+// runOnce 跑一次 agent（首跑、超时收尾或修正），把各种失败形态统一成错误。
+//
+// 用量记账（f03）必须在这里、Agent.Run 返回的那一刻做：下面会把
+// res.IsError || !res.Success 翻译成 err 并丢掉 res，在外层记账会把一次
+// 报了 error_max_turns、真花了钱的运行记成 res=nil。
+func (s *Service) runOnce(ctx context.Context, spec runSpec, p agent.RunParams, timeout time.Duration) (*agent.Result, error) {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	start := time.Now()
 	res, runErr := s.Agent.Run(runCtx, p)
+	agent.RecordRun(ctx, s.Usage, agent.RunRecord{
+		Kind: "prd", PRDID: spec.prdID, Phase: spec.phase,
+		SessionID: p.SessionID, Resume: p.Resume,
+		StartedAt: start, EndedAt: time.Now(),
+		Result: res, Err: runErr,
+	})
 	if runErr != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("prd: agent 超时（%s 内没有交出结果）: %w", timeout, runErr)

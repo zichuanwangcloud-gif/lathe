@@ -3,11 +3,15 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/testsupport"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
@@ -75,8 +80,11 @@ func (f *fakeGitHub) GetPRInfo(ctx context.Context, providerRepo string, number 
 type fakeAgent struct {
 	results []*agent.Result
 	errs    []error
-	mutate  []func(dir string) error
-	calls   []agent.RunParams
+	// both[i] 为真时第 i 次调用同时返回 results[i] 与 errs[i]（「判死但 result
+	// 已到」的形态，f03 用量记账要看到这种）；默认行为不变。
+	both   []bool
+	mutate []func(dir string) error
+	calls  []agent.RunParams
 }
 
 func (f *fakeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, error) {
@@ -89,6 +97,9 @@ func (f *fakeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, 
 		}
 	}
 	if i < len(f.errs) && f.errs[i] != nil {
+		if i < len(f.both) && f.both[i] && i < len(f.results) {
+			return f.results[i], f.errs[i]
+		}
 		return nil, f.errs[i]
 	}
 	if i < len(f.results) {
@@ -1263,5 +1274,396 @@ func TestPipelineNonManualGateModesUnchanged(t *testing.T) {
 				t.Errorf("gate_mode=%s 应正常开 PR，CreatePR 调用 %d 次", mode, len(gh.params))
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------- f03 用量账本
+
+// usageStore 连真实库给 Pipeline.Usage / UsageTier 用。
+func usageStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), dsnForTest())
+	if err != nil {
+		testsupport.SkipOrFail(t, "打开 store 失败: %v", err)
+	}
+	t.Cleanup(st.Close)
+	return st
+}
+
+type usageRow struct {
+	phase, bucket, kind, status string
+	review, resume              bool
+	user, repo                  int64
+	cost                        *float64
+	turns                       int
+	tokIn, tokOut, tokCR, tokCC int64
+	tokensKnown                 bool
+	models                      string
+	subtype                     *string
+	durationMS                  int64
+	tier                        *string
+	ordered                     bool // started_at <= ended_at
+}
+
+func usageRows(t *testing.T, pool *pgxpool.Pool, taskID int64) []usageRow {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT phase, bucket, run_kind, status, review_round, resume, user_id, repo_id, cost_usd::float8, num_turns,
+		       input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, tokens_known, models::text,
+		       subtype, duration_ms, verify_tier, started_at <= ended_at
+		  FROM agent_runs WHERE task_id = $1 ORDER BY started_at, id`, taskID)
+	if err != nil {
+		t.Fatalf("读 agent_runs 失败: %v", err)
+	}
+	defer rows.Close()
+	var out []usageRow
+	for rows.Next() {
+		var r usageRow
+		if err := rows.Scan(&r.phase, &r.bucket, &r.kind, &r.status, &r.review, &r.resume, &r.user, &r.repo, &r.cost, &r.turns,
+			&r.tokIn, &r.tokOut, &r.tokCR, &r.tokCC, &r.tokensKnown, &r.models, &r.subtype, &r.durationMS, &r.tier, &r.ordered); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func phasesOf(rs []usageRow) string {
+	var p []string
+	for _, r := range rs {
+		p = append(p, r.phase)
+	}
+	return strings.Join(p, ",")
+}
+
+func taskOwner(t *testing.T, pool *pgxpool.Pool, taskID int64) (int64, int64) {
+	t.Helper()
+	var u, r int64
+	if err := pool.QueryRow(context.Background(), `SELECT user_id, repo_id FROM tasks WHERE id=$1`, taskID).Scan(&u, &r); err != nil {
+		t.Fatal(err)
+	}
+	return u, r
+}
+
+const greetTest = "package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"
+
+// AC-2：分诊 + 实现 + fix-1 三次 Run，账本恰好三行，归属取自任务行。
+func TestPipelineRecordsAgentRunPerInvocation(t *testing.T) {
+	pool, m, taskID, repo, src := pipelineFixture(t)
+	st := usageStore(t)
+	ag := &fakeAgent{
+		results: []*agent.Result{
+			{Success: true, Subtype: "success", Text: `{"actionable":true,"kind":"fix","reason":"x","question":""}`, CostUSD: 0.01, CostKnown: true},
+			{Success: true, Subtype: "success", Text: "初版（答错了）", CostUSD: 0.4, CostKnown: true},
+			{Success: true, Subtype: "success", Text: "修好了", CostUSD: 0.09, CostKnown: true},
+		},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"), []byte(greetTest), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"), []byte("package main\n\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+			func(dir string) error {
+				return os.WriteFile(filepath.Join(dir, "fix.go"), []byte("package main\n\nfunc greet() string { return \"hello\" }\n"), 0o644)
+			},
+		},
+	}
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{pr: &github.PullRequest{Number: 43, URL: "https://x/pull/43"}}, ag, &fakeNotifier{})
+	p.MaxFixAttempts = 2
+	p.Usage, p.UsageTier = st, st
+
+	if err := p.Execute(context.Background(), ExecuteParams{TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777"}); err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+	rs := usageRows(t, pool, taskID)
+	if got := phasesOf(rs); got != "triage,implement,fix-1" {
+		t.Fatalf("phase 序列 got %s, want triage,implement,fix-1", got)
+	}
+	user, repoID := taskOwner(t, pool, taskID)
+	wantBuckets := []string{"triage", "implement", "implement"}
+	for i, r := range rs {
+		if r.bucket != wantBuckets[i] || r.kind != "task" || r.status != "success" || r.user != user || r.repo != repoID || !r.ordered {
+			t.Errorf("第 %d 行 got bucket=%s kind=%s status=%s user=%d repo=%d ordered=%v, want %s/task/success/%d/%d/true",
+				i, r.bucket, r.kind, r.status, r.user, r.repo, r.ordered, wantBuckets[i], user, repoID)
+		}
+	}
+	// fix-1 在定档之后，写入时就带档；triage/implement 由定档回补
+	for i, r := range rs {
+		if r.tier == nil || *r.tier != "heavy" {
+			t.Errorf("第 %d 行 verify_tier got %v, want heavy", i, r.tier)
+		}
+	}
+}
+
+// AC-2：实现那次 Run 没给 result / 被杀 / 超时 / 取消 / CLI 报失败，账本照样一行，任务照常失败。
+func TestPipelineRecordsRunWhenResultMissing(t *testing.T) {
+	triageOK := &agent.Result{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"x","question":""}`}
+	f := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name        string
+		res         *agent.Result
+		err         error
+		wantStatus  string
+		wantCost    *float64
+		wantTurns   int
+		wantSubtype string
+	}{
+		{"无 result", nil, fmt.Errorf("%w（退出错误: exit 1）", agent.ErrNoResultEvent), "no_result", nil, 0, ""},
+		{"静默判死", nil, fmt.Errorf("%w（10m 内没有任何输出）", agent.ErrIdle), "killed", nil, 0, ""},
+		{"总超时", nil, fmt.Errorf("agent: 执行超时（上限 1s），进程树已回收: %w", context.DeadlineExceeded), "killed", nil, 0, ""},
+		{"取消", nil, fmt.Errorf("agent: 执行被取消: %w", context.Canceled), "killed", nil, 0, ""},
+		{"判死但 result 已到", &agent.Result{CostUSD: 0.3, CostKnown: true, NumTurns: 7, Success: true, Subtype: "success"},
+			fmt.Errorf("%w（…）", agent.ErrIdle), "killed", f(0.3), 7, "success"},
+		{"CLI 报失败", &agent.Result{CostUSD: 0.2, CostKnown: true, NumTurns: 5, IsError: true, Subtype: "error_max_turns"},
+			nil, "error", f(0.2), 5, "error_max_turns"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, m, taskID, repo, src := pipelineFixture(t)
+			st := usageStore(t)
+			ag := &fakeAgent{results: []*agent.Result{triageOK, tc.res}, errs: []error{nil, tc.err}, both: []bool{false, tc.res != nil}}
+			p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, ag, &fakeNotifier{})
+			p.Usage, p.UsageTier = st, st
+
+			_ = p.Execute(context.Background(), ExecuteParams{TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777"})
+			final, _ := m.Get(context.Background(), taskID)
+			if final.State != task.StateFailed {
+				t.Errorf("任务终态 got %s, want failed（账本不改变流水线语义）", final.State)
+			}
+			rs := usageRows(t, pool, taskID)
+			if got := phasesOf(rs); got != "triage,implement" {
+				t.Fatalf("phase 序列 got %s, want triage,implement", got)
+			}
+			r := rs[1]
+			if r.status != tc.wantStatus {
+				t.Errorf("status got %s, want %s", r.status, tc.wantStatus)
+			}
+			if (r.cost == nil) != (tc.wantCost == nil) || (r.cost != nil && *r.cost != *tc.wantCost) || r.turns != tc.wantTurns {
+				t.Errorf("cost/turns got %v/%d, want %v/%d", r.cost, r.turns, tc.wantCost, tc.wantTurns)
+			}
+			if tc.res == nil {
+				if r.tokIn+r.tokOut+r.tokCR+r.tokCC != 0 || r.tokensKnown || r.models != "[]" || r.subtype != nil || r.durationMS < 0 {
+					t.Errorf("res==nil 行 got tokens=%d/%d/%d/%d known=%v models=%s subtype=%v dur=%d, want 0/false/[]/NULL/≥0",
+						r.tokIn, r.tokOut, r.tokCR, r.tokCC, r.tokensKnown, r.models, r.subtype, r.durationMS)
+				}
+			} else if r.subtype == nil || *r.subtype != tc.wantSubtype {
+				t.Errorf("subtype got %v, want %s", r.subtype, tc.wantSubtype)
+			}
+		})
+	}
+}
+
+// AC-2b：PR review 那一轮的 resume 失败 / 降级重入 / 修复回路都记成 review 桶。
+func TestPipelineRecordsReviewRoundRuns(t *testing.T) {
+	pool, m, taskID, repo, src := pipelineFixture(t)
+	st := usageStore(t)
+	gh := &fakeGitHub{pr: &github.PullRequest{URL: "https://x/pr/11", Number: reviewPR, Existing: true}}
+	ag := &fakeAgent{
+		results: []*agent.Result{nil, {Success: true, Text: "重入改完"}, {Success: true, Text: "修好编译"}},
+		errs:    []error{errors.New("resume 失败：会话数据不在本机"), nil, nil},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error { // 降级重入：写出编译不过的代码 → light 验证首轮失败
+				return os.WriteFile(filepath.Join(dir, "broken.go"), []byte("package main\n\nthis is not valid go\n"), 0o644)
+			},
+			func(dir string) error { // fix-1：修好
+				return os.WriteFile(filepath.Join(dir, "broken.go"), []byte("package main\n"), 0o644)
+			},
+		},
+	}
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, gh, ag, &fakeNotifier{})
+	p.MaxFixAttempts = 1
+	p.Usage, p.UsageTier = st, st
+	p.Clients = &fakeClients{lin: &fakeLinear{issue: demoIssue()}, gh: &feedbackGitHub{fakeGitHub: gh, fb: &github.ReviewFeedback{
+		PRAuthor: "lathe-bot",
+		Comments: []github.ReviewComment{{Key: "inline:21", Author: "alice", Body: "错误被吞掉了", Path: "README.md", Line: 3}},
+	}}}
+	prOpenTask(t, p, m, taskID, src, repo, true)
+	out, err := (&ReviewIntake{Tasks: m}).AcceptReview(context.Background(), ownerOf(t, m, taskID),
+		inlineEvent("inline:21", "alice", "错误被吞掉了"), "deliv-usage")
+	if err != nil || out.Status != ReviewQueued {
+		t.Fatalf("回流失败：%+v %v", out, err)
+	}
+	plan := reviewRoundPlan(t, p, m, taskID, repo)
+	if !plan.Review || !plan.ResumeSession || plan.Entry != EntryImplement {
+		t.Fatalf("派发计划应为 review 二轮 + resume，得到 %+v", plan)
+	}
+	if err := p.Execute(context.Background(), ExecuteParams{TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777", Retry: plan}); err != nil {
+		t.Fatalf("二轮执行失败: %v", err)
+	}
+	if len(ag.calls) != 3 {
+		t.Fatalf("agent 调用次数 got %d, want 3（resume 失败 → 重入 → fix-1）", len(ag.calls))
+	}
+	rs := usageRows(t, pool, taskID)
+	if got := phasesOf(rs); got != "implement,implement-reentry,fix-1" {
+		t.Fatalf("phase 序列 got %s, want implement,implement-reentry,fix-1", got)
+	}
+	for i, r := range rs {
+		if !r.review || r.bucket != "review" {
+			t.Errorf("第 %d 行 review_round/bucket got %v/%s, want true/review", i, r.review, r.bucket)
+		}
+	}
+	if !rs[0].resume || rs[0].status != "error" {
+		t.Errorf("第 1 行 resume/status got %v/%s, want true/error", rs[0].resume, rs[0].status)
+	}
+}
+
+// failingUsage 恒落库失败，验「记账失败不阻断任务」。
+type failingUsage struct{ calls int }
+
+func (f *failingUsage) RecordAgentRun(context.Context, agent.RunRecord) error {
+	f.calls++
+	return errors.New("boom")
+}
+
+// AC-3：记账失败只告警（日志 1 条 agent 用量落库失败），任务照常走到既定终态。
+func TestUsageRecorderFailureDoesNotFailTask(t *testing.T) {
+	_, m, taskID, repo, src := pipelineFixture(t)
+	var buf strings.Builder
+	var mu sync.Mutex
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(writerFunc(func(b []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(b)
+	}), &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	ag := &fakeAgent{results: []*agent.Result{
+		{Success: true, Text: `{"actionable":false,"kind":"fix","reason":"只有一句现象","question":"能补充复现步骤吗？"}`},
+	}}
+	rec := &failingUsage{}
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, ag, &fakeNotifier{})
+	p.Usage = rec
+	if err := p.Execute(context.Background(), ExecuteParams{TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777"}); err != nil {
+		t.Fatalf("Execute got err=%v, want nil（blocked_spec 是正常出口）", err)
+	}
+	final, _ := m.Get(context.Background(), taskID)
+	if final.State != task.StateBlockedSpec {
+		t.Errorf("终态 got %s, want blocked_spec（既定终态不受记账失败影响）", final.State)
+	}
+	mu.Lock()
+	n := strings.Count(buf.String(), "agent 用量落库失败")
+	mu.Unlock()
+	if rec.calls != 1 || n != 1 {
+		t.Errorf("记账调用/告警条数 got %d/%d, want 1/1", rec.calls, n)
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
+
+// AC-7b：Fresh 重跑在同一行上改档（heavy → light），group=tier 按运行时刻的档位分。
+func TestUsageTierFollowsAttemptAcrossFreshRetry(t *testing.T) {
+	pool, m, taskID, repo, src := pipelineFixture(t)
+	st := usageStore(t)
+	ctx := context.Background()
+	triage := func(cost float64) *agent.Result {
+		return &agent.Result{Success: true, Text: `{"actionable":true,"kind":"fix","reason":"x","question":""}`, CostUSD: cost, CostKnown: true}
+	}
+	done := func(cost float64) *agent.Result {
+		return &agent.Result{Success: true, Text: "改完", CostUSD: cost, CostKnown: true}
+	}
+
+	// 尝试 1（heavy，修复耗尽 → failed）
+	ag1 := &fakeAgent{
+		results: []*agent.Result{triage(0.01), done(0.20), done(0.10)},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				if err := os.WriteFile(filepath.Join(dir, "main_test.go"), []byte(greetTest), 0o644); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "fix.go"), []byte("package main\n\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+			func(dir string) error {
+				return os.WriteFile(filepath.Join(dir, "fix.go"), []byte("package main\n\n// 换个注释不算修\nfunc greet() string { return \"wrong\" }\n"), 0o644)
+			},
+		},
+	}
+	gh := &fakeGitHub{pr: &github.PullRequest{Number: 44, URL: "https://x/pull/44"}}
+	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, gh, ag1, &fakeNotifier{})
+	p.MaxFixAttempts = 1
+	p.Usage, p.UsageTier = st, st
+	if err := p.Execute(ctx, ExecuteParams{TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777"}); err == nil {
+		t.Fatal("尝试 1 应失败（修复耗尽）")
+	}
+	tk, _ := m.Get(ctx, taskID)
+	if tk.State != task.StateFailed || tk.VerifyTier == nil || *tk.VerifyTier != "heavy" || len(ag1.calls) != 3 {
+		t.Fatalf("尝试 1 前置 got state=%s tier=%v calls=%d, want failed/heavy/3（夹具没走到定档？）", tk.State, tk.VerifyTier, len(ag1.calls))
+	}
+
+	// 重派：真实重建路径 —— 回收现场 → queued → Fresh，同一个 taskID
+	reclaimWorktree(t, ctx, m, p, repo, tk)
+	if _, err := m.Transition(ctx, taskID, task.StateQueued, "user:1", nil); err != nil {
+		t.Fatalf("转回 queued 失败: %v", err)
+	}
+	var triageTierBeforeVerify *string
+	readTriageTier := false
+	ag2 := &fakeAgent{
+		results: []*agent.Result{triage(0.02), done(0.05)},
+		mutate: []func(string) error{
+			nil,
+			func(dir string) error {
+				// 实现调用开始时：尝试 2 的分诊行已写入，定档还没发生
+				if err := pool.QueryRow(ctx, `SELECT verify_tier FROM agent_runs
+					WHERE task_id=$1 AND phase='triage' ORDER BY started_at DESC LIMIT 1`, taskID).Scan(&triageTierBeforeVerify); err != nil {
+					return err
+				}
+				readTriageTier = true
+				if err := os.MkdirAll(filepath.Join(dir, "web"), 0o755); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(dir, "web", "App.vue"), []byte("<template><div/></template>\n"), 0o644)
+			},
+		},
+	}
+	p.Agent = ag2
+	if err := p.Execute(ctx, ExecuteParams{TaskID: taskID, Repo: repo, CloneURL: src, IssueRef: "uuid-777",
+		Retry: &RetryPlan{Fresh: true, Entry: EntryTriage, Reasons: []string{"测试指定重建"}}}); err != nil {
+		t.Fatalf("尝试 2 应成功: %v", err)
+	}
+	tk, _ = m.Get(ctx, taskID)
+	if tk.State != task.StatePROpen || tk.VerifyTier == nil || *tk.VerifyTier != "light" || len(ag2.calls) != 2 {
+		t.Fatalf("尝试 2 前置 got state=%s tier=%v calls=%d, want pr_open/light/2", tk.State, tk.VerifyTier, len(ag2.calls))
+	}
+	if !readTriageTier || triageTierBeforeVerify != nil {
+		t.Errorf("尝试 2 的分诊行在定档前 verify_tier got %v (read=%v), want NULL（不是上一次的 heavy）", triageTierBeforeVerify, readTriageTier)
+	}
+
+	q := store.UsageQuery{From: time.Now().Add(-time.Hour), To: time.Now().Add(time.Hour), Group: "tier"}
+	user, _ := taskOwner(t, pool, taskID)
+	us, err := st.UsageStats(ctx, user, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]struct {
+		runs int
+		cost float64
+	}{"heavy": {3, 0.31}, "light": {2, 0.07}}
+	got := map[string]store.UsageGroup{}
+	for _, g := range us.ByGroup {
+		got[g.Key] = g
+	}
+	for k, w := range want {
+		g, ok := got[k]
+		if !ok || g.Runs != w.runs || g.CostUSD == nil || math.Abs(*g.CostUSD-w.cost) > 1e-9 {
+			t.Errorf("tier %s got runs=%d cost=%v, want %d/%.2f", k, g.Runs, g.CostUSD, w.runs, w.cost)
+		}
+	}
+	if g, ok := got["none"]; ok && g.Runs != 0 {
+		t.Errorf("tier none got runs=%d, want 0", g.Runs)
+	}
+	rs := usageRows(t, pool, taskID)
+	if len(rs) != 5 {
+		t.Fatalf("行数 got %d, want 5", len(rs))
+	}
+	for i, r := range rs[:3] {
+		if r.tier == nil || *r.tier != "heavy" {
+			t.Errorf("尝试 1 第 %d 行 verify_tier got %v, want heavy（回补只补 NULL）", i, r.tier)
+		}
 	}
 }
