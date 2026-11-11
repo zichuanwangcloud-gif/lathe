@@ -202,7 +202,7 @@ func (a *API) verificationLog(w http.ResponseWriter, r *http.Request) {
 		notFound()
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	st, err := f.Stat()
 	if err != nil || !st.Mode().IsRegular() {
 		notFound()
