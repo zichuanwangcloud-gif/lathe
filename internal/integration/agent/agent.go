@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -97,6 +98,13 @@ type Result struct {
 	// 独立的失败模式，必须与"改不动代码"区分开来上报。
 	PermissionDenials []json.RawMessage
 	APIErrorStatus    json.RawMessage
+
+	// Usage 是这次运行的 token 用量（f03）。多条 result 时随末条覆盖，
+	// 与 CostUSD 同组，见 Usage 类型注释。
+	Usage Usage
+	// CostKnown 表示 CostUSD 是 CLI 报的真实账单。false = 未知（如 codex
+	// 不报费用），账本落 NULL 而不是 $0。零值即「未知」，未改的驱动默认安全。
+	CostKnown bool
 }
 
 // resultEvent 映射 type=result 事件里 Lathe 关心的字段。
@@ -112,6 +120,65 @@ type resultEvent struct {
 	TerminalReason    string            `json:"terminal_reason"`
 	PermissionDenials []json.RawMessage `json:"permission_denials"`
 	APIErrorStatus    json.RawMessage   `json:"api_error_status"`
+
+	// Usage 是主循环的量（单 turn），ModelUsage 是进程累计、含 subagent
+	// 的逐模型量。取 ModelUsage 为主，缺它才回落 Usage（f03）。
+	Usage      *claudeUsage                `json:"usage"`
+	ModelUsage map[string]claudeModelUsage `json:"modelUsage"`
+}
+
+// claudeUsage 是 result.usage（snake_case）。
+type claudeUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+// claudeModelUsage 是 result.modelUsage 的一项（camelCase）。
+type claudeModelUsage struct {
+	InputTokens              int64   `json:"inputTokens"`
+	OutputTokens             int64   `json:"outputTokens"`
+	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
+	CostUSD                  float64 `json:"costUSD"`
+}
+
+// usageOf 从**一条** result 事件取用量：有 modelUsage 用各模型之和（明细
+// 按 costUSD 降序、并列按模型名升序，结果确定），没有就回落该条的 usage，
+// 两个都没有则 Present=false。不看其他 result —— 跨 result 的取舍由调用方
+// 的覆盖赋值决定（末条整组胜出）。
+func usageOf(re *resultEvent) Usage {
+	var u Usage
+	if len(re.ModelUsage) > 0 {
+		u.Present = true
+		for name, m := range re.ModelUsage {
+			u.InputTokens += m.InputTokens
+			u.OutputTokens += m.OutputTokens
+			u.CacheReadTokens += m.CacheReadInputTokens
+			u.CacheCreationTokens += m.CacheCreationInputTokens
+			u.Models = append(u.Models, ModelUsage{
+				Model: name, InputTokens: m.InputTokens, OutputTokens: m.OutputTokens,
+				CacheReadTokens: m.CacheReadInputTokens, CacheCreationTokens: m.CacheCreationInputTokens,
+				CostUSD: m.CostUSD,
+			})
+		}
+		sort.Slice(u.Models, func(i, j int) bool {
+			if u.Models[i].CostUSD != u.Models[j].CostUSD {
+				return u.Models[i].CostUSD > u.Models[j].CostUSD
+			}
+			return u.Models[i].Model < u.Models[j].Model
+		})
+		return u
+	}
+	if re.Usage != nil {
+		u.Present = true
+		u.InputTokens = re.Usage.InputTokens
+		u.OutputTokens = re.Usage.OutputTokens
+		u.CacheReadTokens = re.Usage.CacheReadInputTokens
+		u.CacheCreationTokens = re.Usage.CacheCreationInputTokens
+	}
+	return u
 }
 
 // envelope 是所有事件的公共头部。
@@ -334,7 +401,8 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 			ErrIdle, d.idleTimeout(), stderr.String())
 	}
 	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
-		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", limit.Round(time.Second))
+		// %w 包 DeadlineExceeded：账本据此把总超时记成 killed（f03）。文案前缀不变。
+		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收: %w", limit.Round(time.Second), context.DeadlineExceeded)
 	} else if ctxErr != nil {
 		return result, fmt.Errorf("agent: 执行被取消: %w", ctxErr)
 	}
@@ -429,6 +497,10 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 			TerminalReason:    re.TerminalReason,
 			PermissionDenials: re.PermissionDenials,
 			APIErrorStatus:    re.APIErrorStatus,
+			// f03：Usage/CostKnown 与 CostUSD 同一组覆盖赋值 —— 末条胜出，
+			// 不跨 result 相加（modelUsage 与 total_cost_usd 都是进程累计）。
+			Usage:     usageOf(&re),
+			CostKnown: true,
 		}
 	}
 	if err := sc.Err(); err != nil {

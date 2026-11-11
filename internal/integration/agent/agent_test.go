@@ -420,6 +420,10 @@ sleep 120
 	if err == nil || !strings.Contains(err.Error(), "超时") {
 		t.Fatalf("应因超时报错，得到: %v", err)
 	}
+	// f03：总超时要能被 errors.Is 识别为 DeadlineExceeded（账本据此记 killed）
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) got false, want true；err=%v", err)
+	}
 	if elapsed > 10*time.Second {
 		t.Errorf("超时后应迅速返回，实际耗时 %v", elapsed)
 	}
@@ -582,5 +586,159 @@ exit 3
 		if !strings.Contains(msg, want) {
 			t.Errorf("错误信息应同时带上 stderr 的开头与结尾（缺 %s）", want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------- f03 用量解析
+
+// sampleResultLine 读真实样本（claude 2.1.322 一次 -p 运行的 result 事件，
+// 已脱 session id）并压成一行 NDJSON，可选地删掉若干顶层键。
+func sampleResultLine(t *testing.T, drop ...string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "claude-result-sample.json"))
+	if err != nil {
+		t.Fatalf("读样本失败: %v", err)
+	}
+	return compactJSON(t, raw, drop...)
+}
+
+func compactJSON(t *testing.T, raw []byte, drop ...string) string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("样本不是合法 JSON: %v", err)
+	}
+	for _, k := range drop {
+		delete(m, k)
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// replayResultLines 读 f01 的双 result fixture（同一进程两条 result，第 7、13 行），
+// 返回整份 NDJSON 的各行。
+func replayLines(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "replay-user.ndjson"))
+	if err != nil {
+		t.Fatalf("读 fixture 失败: %v", err)
+	}
+	return strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+}
+
+type usageQuad struct{ in, out, cr, cc int64 }
+
+func quadOf(u Usage) usageQuad {
+	return usageQuad{u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheCreationTokens}
+}
+
+// AC-1：单条 result 的 token 用量从 modelUsage 解析出来，费用标记为已知。
+func TestResultEventParsesUsage(t *testing.T) {
+	cases := []struct {
+		name        string
+		line        string
+		wantPresent bool
+		wantQuad    usageQuad
+		wantModels  int
+	}{
+		{"真实样本：modelUsage 各模型之和", sampleResultLine(t), true, usageQuad{2, 4, 0, 17039}, 1},
+		{"删掉 usage 与 modelUsage：Present=false 且四项 0", sampleResultLine(t, "usage", "modelUsage"), false, usageQuad{}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := parseStream(strings.NewReader(tc.line+"\n"), nil)
+			if err != nil || res == nil {
+				t.Fatalf("解析失败: res=%v err=%v", res, err)
+			}
+			if res.Usage.Present != tc.wantPresent {
+				t.Errorf("Present got %v, want %v", res.Usage.Present, tc.wantPresent)
+			}
+			if got := quadOf(res.Usage); got != tc.wantQuad {
+				t.Errorf("In/Out/CR/CC got %+v, want %+v", got, tc.wantQuad)
+			}
+			if got := len(res.Usage.Models); got != tc.wantModels {
+				t.Fatalf("len(Models) got %d, want %d", got, tc.wantModels)
+			}
+			if tc.wantModels == 1 {
+				m := res.Usage.Models[0]
+				if m.Model != "claude-opus-5-5" {
+					t.Errorf("Models[0].Model got %q, want claude-opus-5-5", m.Model)
+				}
+				if d := m.CostUSD - res.CostUSD; d > 1e-9 || d < -1e-9 {
+					t.Errorf("Models[0].CostUSD got %v, want %v（total_cost_usd）", m.CostUSD, res.CostUSD)
+				}
+			}
+			if !res.CostKnown {
+				t.Errorf("CostKnown got false, want true（result 事件到达即费用已知）")
+			}
+		})
+	}
+}
+
+// AC-1（与 f01 的接缝）：同一进程多条 result 时 Usage 随末条覆盖、不跨 result
+// 相加；末条缺 modelUsage 回落末条的 usage；末条两个键都没有则 Present=false。
+// 唯一的多 result Usage 测试，f01 rebase 后须一行不改仍绿。
+func TestResultEventUsageTakesLastResult(t *testing.T) {
+	lines := replayLines(t)
+	if len(lines) < 13 {
+		t.Fatalf("fixture 行数 got %d, want ≥13", len(lines))
+	}
+	// 第 7、13 行是两条 result（1-based）
+	mutate := func(dropFirst, dropSecond []string) string {
+		cp := append([]string(nil), lines...)
+		cp[6] = compactJSON(t, []byte(cp[6]), dropFirst...)
+		cp[12] = compactJSON(t, []byte(cp[12]), dropSecond...)
+		return strings.Join(cp, "\n") + "\n"
+	}
+	cases := []struct {
+		name        string
+		stream      string
+		wantPresent bool
+		wantQuad    usageQuad
+		wantModels  bool    // Models 是否非 nil
+		wantModel0  float64 // Models[0].CostUSD（wantModels 时）
+		wantCost    float64
+	}{
+		{"两条 result 都有 modelUsage：取末条，不相加",
+			mutate(nil, nil), true, usageQuad{6, 12, 12532, 18978}, true, 0.0976604, 0.0976604},
+		{"两条都只有 usage：回落也只取末条",
+			mutate([]string{"modelUsage"}, []string{"modelUsage"}), true, usageQuad{4, 6, 12532, 3232}, false, 0, 0.0976604},
+		{"第 1 条有 modelUsage、第 2 条两个键都没有：末条整组胜出",
+			mutate(nil, []string{"modelUsage", "usage"}), false, usageQuad{}, false, 0, 0.0976604},
+		{"单条 result（AC-1 样本）回归",
+			sampleResultLine(t) + "\n", true, usageQuad{2, 4, 0, 17039}, true, 0.085283, 0.085283},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := parseStream(strings.NewReader(tc.stream), nil)
+			if err != nil || res == nil {
+				t.Fatalf("解析失败: res=%v err=%v", res, err)
+			}
+			if got := quadOf(res.Usage); got != tc.wantQuad {
+				t.Errorf("In/Out/CR/CC got %+v, want %+v", got, tc.wantQuad)
+			}
+			if res.Usage.Present != tc.wantPresent {
+				t.Errorf("Present got %v, want %v", res.Usage.Present, tc.wantPresent)
+			}
+			if tc.wantModels {
+				if len(res.Usage.Models) == 0 {
+					t.Fatalf("Models got 空, want 非空")
+				}
+				if d := res.Usage.Models[0].CostUSD - tc.wantModel0; d > 1e-9 || d < -1e-9 {
+					t.Errorf("Models[0].CostUSD got %v, want %v", res.Usage.Models[0].CostUSD, tc.wantModel0)
+				}
+			} else if res.Usage.Models != nil {
+				t.Errorf("Models got %+v, want nil", res.Usage.Models)
+			}
+			if d := res.CostUSD - tc.wantCost; d > 1e-9 || d < -1e-9 {
+				t.Errorf("CostUSD got %v, want %v", res.CostUSD, tc.wantCost)
+			}
+			if !res.CostKnown {
+				t.Errorf("CostKnown got false, want true")
+			}
+		})
 	}
 }
