@@ -15,6 +15,13 @@ import (
 
 const apiTestToken = "test-admin-token"
 
+// taskReadRoutes 是每一个任务【读】接口的显式表（AC-54）。f04 合入后由后合入方补
+// GET /api/tasks/{id}/events/summary 与 GET /api/tasks/{id}/verifications/{vid}/log。
+var taskReadRoutes = []struct{ method, path string }{
+	{"GET", "/api/tasks/{id}"},
+	{"GET", "/api/tasks/{id}/events?after=0"},
+}
+
 func apiFixture(t *testing.T) (*API, *store.Store, *task.Machine, int64) {
 	t.Helper()
 

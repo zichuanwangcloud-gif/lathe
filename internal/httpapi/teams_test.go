@@ -130,6 +130,12 @@ func (e *teamEnv) server(uid int64) *httptest.Server {
 
 // raw 发请求，返回状态码与原始响应体；不调用 t.Fatal，可在 goroutine 里用。
 func (e *teamEnv) raw(uid int64, method, path, body string, hdr ...string) (int, []byte, error) {
+	code, b, _, err := e.rawResp(uid, method, path, body, hdr...)
+	return code, b, err
+}
+
+// rawResp 同 raw，另返回响应头（AC-45 要比对两种 404 的 Content-Type）。
+func (e *teamEnv) rawResp(uid int64, method, path, body string, hdr ...string) (int, []byte, http.Header, error) {
 	srv := e.server(uid)
 	var rd io.Reader
 	if body != "" {
@@ -137,7 +143,7 @@ func (e *teamEnv) raw(uid int64, method, path, body string, hdr ...string) (int,
 	}
 	r, err := http.NewRequest(method, srv.URL+path, rd)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	r.Header.Set("Authorization", "Bearer "+apiTestToken)
 	for i := 0; i+1 < len(hdr); i += 2 {
@@ -145,11 +151,11 @@ func (e *teamEnv) raw(uid int64, method, path, body string, hdr ...string) (int,
 	}
 	resp, err := srv.Client().Do(r)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, err := io.ReadAll(resp.Body)
-	return resp.StatusCode, b, err
+	return resp.StatusCode, b, resp.Header, err
 }
 
 func (e *teamEnv) call(uid int64, method, path, body string, hdr ...string) (int, map[string]any) {
@@ -228,13 +234,6 @@ func newSharedSetup(e *teamEnv) sharedSetup {
 	e.share(s.repo, s.team)
 	s.task = e.task(s.owner, s.repo)
 	return s
-}
-
-// taskReadRoutes 是每一个任务【读】接口的显式表（AC-54）。f04 合入后由后合入方补
-// GET /api/tasks/{id}/events/summary 与 GET /api/tasks/{id}/verifications/{vid}/log。
-var taskReadRoutes = []struct{ method, path string }{
-	{"GET", "/api/tasks/{id}"},
-	{"GET", "/api/tasks/{id}/events?after=0"},
 }
 
 // ---------------------------------------------------------------- 5.2 隔离与可见性
@@ -767,13 +766,23 @@ func TestRepoShareRequiresTeamMembership(t *testing.T) {
 	var maxID int64
 	_ = e.st.Pool().QueryRow(context.Background(), `SELECT COALESCE(max(id),0) FROM teams`).Scan(&maxID)
 
-	code1, b1, _ := e.raw(jia, "POST", p("/api/repos/%d/sharing", repo), p(`{"teamId":%d}`, other))
-	code2, b2, _ := e.raw(jia, "POST", p("/api/repos/%d/sharing", repo), p(`{"teamId":%d}`, maxID+1000))
+	code1, b1, h1, err1 := e.rawResp(jia, "POST", p("/api/repos/%d/sharing", repo), p(`{"teamId":%d}`, other))
+	code2, b2, h2, err2 := e.rawResp(jia, "POST", p("/api/repos/%d/sharing", repo), p(`{"teamId":%d}`, maxID+1000))
+	if err1 != nil || err2 != nil {
+		t.Fatalf("请求失败：%v / %v", err1, err2)
+	}
 	if code1 != 404 || code2 != 404 {
 		t.Errorf("非成员团队 got %d、不存在团队 got %d want 404/404", code1, code2)
 	}
 	if !bytes.Equal(b1, b2) {
 		t.Errorf("两种 404 的响应体不同：%s vs %s", b1, b2)
+	}
+	ct1, ct2 := h1.Get("Content-Type"), h2.Get("Content-Type")
+	if ct1 != ct2 {
+		t.Errorf("两种 404 的 Content-Type 不同：非成员团队 got %q、不存在团队 got %q want 相同", ct1, ct2)
+	}
+	if !strings.HasPrefix(ct1, "application/json") {
+		t.Errorf("Content-Type got %q want application/json", ct1)
 	}
 	if e.repoTeam(repo) != nil {
 		t.Errorf("repos.team_id 被改")
