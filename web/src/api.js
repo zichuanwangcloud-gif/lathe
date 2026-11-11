@@ -234,6 +234,18 @@ export const api = {
       body: JSON.stringify({ password: password || '' }),
     }),
   deleteUser: (id) => request(`/api/admin/users/${id}`, { method: 'DELETE' }),
+
+  // 云效任务来源（f08）
+  yunxiaoConnection: () => request('/api/yunxiao/connection'),
+  saveYunxiaoConnection: (body) =>
+    request('/api/yunxiao/connection', { method: 'PUT', body: JSON.stringify(body) }),
+  verifyYunxiaoConnection: () => request('/api/yunxiao/connection/verify', { method: 'POST' }),
+  deleteYunxiaoConnection: () => request('/api/yunxiao/connection', { method: 'DELETE' }),
+  runYunxiaoWorkitem: (id) =>
+    request(`/api/yunxiao/workitems/${encodeURIComponent(id)}/run`, { method: 'POST' }),
+  yunxiaoAllowedHosts: () => request('/api/admin/yunxiao/allowed-hosts'),
+  saveYunxiaoAllowedHosts: (hosts) =>
+    request('/api/admin/yunxiao/allowed-hosts', { method: 'PUT', body: JSON.stringify({ hosts }) }),
 }
 
 // 状态的中文名与配色，全站统一。
