@@ -39,12 +39,16 @@ func NewRepoLookup(pool *pgxpool.Pool) RepoLookup {
 			pattern       string
 			tierOverride  string
 			excludeDirs   []string
+			vcsProvider   string
+			vcsBaseURL    string
 		)
 		err := pool.QueryRow(ctx, `
 			SELECT provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
-			       COALESCE(verify_tier_override, ''), exclude_dirs
+			       COALESCE(verify_tier_override, ''), exclude_dirs,
+			       vcs_provider, COALESCE(vcs_base_url, '')
 			FROM repos WHERE id = $1`, repoID,
-		).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs)
+		).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs,
+			&vcsProvider, &vcsBaseURL)
 		if err != nil {
 			return cfg, fmt.Errorf("runner: 读取仓库配置失败（repo_id=%d）: %w", repoID, err)
 		}
@@ -56,6 +60,8 @@ func NewRepoLookup(pool *pgxpool.Pool) RepoLookup {
 			BranchPattern:      pattern,
 			ExcludeDirs:        excludeDirs,
 			VerifyTierOverride: tierOverride,
+			VCSProvider:        vcs.Provider(vcsProvider),
+			VCSBaseURL:         vcsBaseURL,
 		}
 		return cfg, nil
 	}

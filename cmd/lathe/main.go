@@ -431,6 +431,8 @@ func serve(cfg config.Config) error {
 			Channel:   cfg.ImplementChannel,
 			// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
 			SettingSources: cfg.SettingSources,
+			// GitLab/Gitea 仓库的规划检出按 PRD 属主取代码平台鉴权
+			GitAuth: prdGitAuth{f: factory},
 		},
 	}
 	prdAPI.Routes(mux)
