@@ -110,6 +110,12 @@ type Pipeline struct {
 	// （docs/04-agent-visibility.md）；为 nil 时整个可见性机制关闭。
 	AgentEvents AgentEventRecorder
 
+	// Usage 落每次 agent 运行的用量账本（f03，agent_runs）；UsageTier 是定档后的
+	// 档位回补。为 nil 时整个记账关闭（测试装配与老用法不受影响），与
+	// AgentEvents 同一立场。记账失败只告警，绝不影响流水线。
+	Usage     agent.UsageRecorder
+	UsageTier agent.TierBackfiller
+
 	// Memory 读写跨任务失败记忆（§3.6 第 16 条）：fail() 往里写，
 	// 分诊/实现提示词从里读。为 nil 时整个机制关闭（测试与老装配）。
 	//
@@ -547,6 +553,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	// 最该被知道的地方 —— 上次若因单子不明确 blocked_spec 过，这次分诊
 	// 直接看到那段历史，判定就有了上下文。分诊是新会话，提示词里没有
 	// 任何失败信息，所以不排除本任务的记录（alreadyInPrompt=false）。
+	triageStart := time.Now()
 	triageRes, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         p.withFailureMemory(rc.ctx, rc.scope, TriagePrompt(issue.Context()), false),
 		Dir:            triageDir,
@@ -558,6 +565,8 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	})
 	// 成功与失败路径都必须 drain：失败时缓冲里恰是排障最关键的现场
 	triageSink.Close()
+	// 用量记账在判错之前：失败/被杀的运行同样花了钱（f03）
+	p.recordRun(rc, "triage", triageSession, false, triageStart, triageRes, err)
 	if err != nil {
 		return p.fail(rc, StageTriageRun, err)
 	}
@@ -771,6 +780,7 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
 		channel = rc.profile.ModelChannel
 	}
+	start := time.Now()
 	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            rc.wt.Path,
@@ -782,7 +792,29 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 		OnEvent:        sink.OnEvent,
 	})
 	sink.Close()
+	p.recordRun(rc, phase, session, resume, start, res, err)
 	return res, err
+}
+
+// recordRun 落一次任务侧 agent 运行的用量账本（f03）。在调用方判 err 之前同步调用，
+// 所以任何失败分支都已记过账；落库失败只告警（agent.RecordRun）。
+//
+// 档位取本次 Execute 内存里的 rc.tier，**不读** tasks.verify_tier：Fresh 重跑时
+// 任务行上还挂着上一次尝试的旧档，读库会把这次的分诊/实现记成旧档。定档前写下
+// 的行由 stageVerify 里的回补补上。review_round 看 plan.Review（PR review 那一轮
+// 的 resume、降级重入与修复回路都归 review 桶）。
+func (p *Pipeline) recordRun(rc *runCtx, phase, session string, resume bool, start time.Time, res *agent.Result, err error) {
+	if p.Usage == nil {
+		return
+	}
+	agent.RecordRun(rc.ctx, p.Usage, agent.RunRecord{
+		Kind: "task", TaskID: rc.tk.ID, Phase: phase,
+		ReviewRound: rc.plan != nil && rc.plan.Review,
+		VerifyTier:  string(rc.tier),
+		SessionID:   session, Resume: resume,
+		StartedAt: start, EndedAt: time.Now(),
+		Result: res, Err: err,
+	})
 }
 
 // channelEnv 把 cc-switch 通道名编成注入 agent 子进程的环境变量；
@@ -941,6 +973,10 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		return err
 	}
 	rc.tk = tk
+	// f03：本次尝试的后续运行（fix-N）带上档位；定档前写下的用量行回补成这一档。
+	// rc.tier 唯一的读点是上面的定档入口，已在其后，赋值不改变任何既有行为。
+	rc.tier = tier
+	p.backfillUsageTier(rc, tier)
 
 	// F7.1：节点画像损坏或字段非法时，在这里（已进入 verifying、可以
 	// 合法转 failed 的状态）以可读原因失败——覆盖 stageImplement 没
@@ -1101,6 +1137,19 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 
 	rc.report = report
 	return nil
+}
+
+// backfillUsageTier 把本任务里此前没有档位的用量行补成刚定下的档（只补 NULL）。
+// 与 persistVerifications 同一立场：失败只告警，没补上的行下次定档再补。
+func (p *Pipeline) backfillUsageTier(rc *runCtx, tier VerifyTier) {
+	if p.UsageTier == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(rc.ctx), 3*time.Second)
+	defer cancel()
+	if err := p.UsageTier.SetAgentRunTier(ctx, rc.tk.ID, string(tier)); err != nil {
+		slog.Warn("用量档位回补失败", "task", rc.tk.ID, "tier", tier, "err", err)
+	}
 }
 
 // ---------------------------------------------------------------- 阶段：推送与开 PR

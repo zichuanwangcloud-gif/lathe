@@ -210,6 +210,8 @@ func serve(cfg config.Config) error {
 	// 与分诊同级走便宜通道；推荐只是预填，启动仍是人拍板。
 	previewMgr.SetRecommender(agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
 		cfg.TriageChannel, cfg.SettingSources)
+	// 用量账本（f03）：推荐也是一次真实的 agent 运行，归属由 store 从任务行取
+	previewMgr.Usage = st
 
 	// T6 worktree TTL 收割机。复用 pipeline 那一份 Worktrees ——
 	// 两边不能是两套配置（同 MergePoller 的注释）。
@@ -431,6 +433,8 @@ func serve(cfg config.Config) error {
 			Channel:   cfg.ImplementChannel,
 			// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
 			SettingSources: cfg.SettingSources,
+			// 用量账本（f03）：规划/复核的每次尝试各记一行
+			Usage: st,
 		},
 	}
 	prdAPI.Routes(mux)
@@ -581,7 +585,10 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		Verifications: st,
 		Stacks:        verifyStacks{pm},
 		AgentEvents:   st,
-		Memory:        st,
+		// 用量账本（f03）：每次 agent 运行一行 + 定档后的档位回补
+		Usage:     st,
+		UsageTier: st,
+		Memory:    st,
 		// 脱敏权威层的登记值：配置里的 DB 口令/集成 token（见 config.KnownSecrets）。
 		// 隔离栈连接串与进程环境由 runner 自己在脱敏时补上（它拿得到 StackEnv）。
 		KnownSecrets:     cfg.KnownSecrets(),

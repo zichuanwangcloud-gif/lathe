@@ -166,13 +166,20 @@ func (m *Manager) runRecommend(taskID int64, absWorktree, issueContext string, o
 	running := m.runningContainers(ctx)
 
 	prompt := recommendPrompt(issueContext, cands, profile, running)
+	sessionID := newUUID() // claude 要求 UUID 格式（实测非 UUID 直接拒跑）
+	start := time.Now()
 	res, err := m.agent.Run(ctx, agent.RunParams{
 		Prompt:         prompt,
 		Dir:            absWorktree,
-		SessionID:      newUUID(), // claude 要求 UUID 格式（实测非 UUID 直接拒跑）
-		PermissionMode: "plan",    // 只读分析，不许改 worktree
+		SessionID:      sessionID,
+		PermissionMode: "plan", // 只读分析，不许改 worktree
 		SettingSources: m.settingSources,
 		ExtraEnv:       channelEnv(m.agentChannel),
+	})
+	// 用量记账在判错之前：失败的推荐同样花了钱（f03）
+	agent.RecordRun(ctx, m.Usage, agent.RunRecord{
+		Kind: "preview", TaskID: taskID, Phase: "recommend", SessionID: sessionID,
+		StartedAt: start, EndedAt: time.Now(), Result: res, Err: err,
 	})
 	if err != nil {
 		fail(fmt.Errorf("agent 执行失败: %w", err))

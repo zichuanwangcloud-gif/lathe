@@ -64,15 +64,22 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/logout", a.Auth.Logout)
 	mux.HandleFunc("GET /api/me", a.Auth.Me)
 
-	// 读。全部按 CurrentUser 隔离（P1.5 第二步）：任何人只能看到
-	// 自己名下的任务与仓库配置，管理员也不例外 —— 跨用户读取的
-	// 后门宁可没有，排障走数据库。
+	// 读。除 /api/admin/* 的显式聚合外，读接口全部按 CurrentUser 隔离
+	// （P1.5 第二步）：任何人只能看到自己名下的任务与仓库配置，管理员也
+	// 不例外 —— 跨用户读取的后门宁可没有，排障走数据库。
+	//
+	// 唯一的例外是 f03 的 GET /api/admin/usage：需求要求管理员看全局用量，
+	// 所以显式开一个 RequireAdmin 的独立端点，只返回聚合与 user_id，不带
+	// email 与任何任务/PRD/仓库标签（docs/features/usage-stats.md §3.6）。
 	mux.Handle("GET /api/tasks", a.Auth.RequireFunc(a.listTasks))
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
 	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
 	mux.Handle("GET /api/stats/metrics", a.Auth.RequireFunc(a.metricsStats))
+	mux.Handle("GET /api/usage", a.Auth.RequireFunc(a.usage))
+	mux.Handle("GET /api/tasks/{id}/usage", a.Auth.RequireFunc(a.taskUsage))
+	mux.Handle("GET /api/admin/usage", a.Auth.RequireAdminFunc(a.adminUsage))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
 

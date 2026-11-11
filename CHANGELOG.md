@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **用量统计**（docs/features/usage-stats.md）：按任务、仓库、验证档位、阶段与时间范围
+  聚合 token、费用、时长；新增 `/usage` 页面、`GET /api/usage`、`GET /api/tasks/{id}/usage`、
+  管理员 `GET /api/admin/usage`（migration 0038–0040）。每次 agent 运行（分诊、实现、修复、
+  PR review 续跑、PRD 规划/复核、预览推荐，含失败/被杀/超时的运行）记一行 `agent_runs`，
+  历史 result 事件回填；费用未知（如 codex 不报费用、进程被杀前没给结果）记为「未知」，
+  不记成 $0。任务详情页的成本/耗时徽章改为标注「最近一轮」。外部数据库需 PostgreSQL ≥ 15。
+
 ### Changed
 
 - **模糊任务对话：少问、跑得完、报错能救**（docs/10 §1.3–§1.5）。实测一份 feature PRD

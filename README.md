@@ -110,6 +110,14 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 `Authorization: Bearer <token>` 的请求会被当作内置管理员，供 curl 直接调接口；
 同时它也是「SMTP 挂了且管理员把自己锁在门外」时唯一进得去的路。日常登录不用它。
 
+### 用量统计
+
+导航栏「用量」（`/usage`）按任务、仓库、验证档位、阶段与时间范围聚合每次 agent
+运行的 token、费用与时长（数据来自 `agent_runs` 账本：每次运行一行，含失败/被杀的
+运行、PRD 规划与预览推荐）；任务详情页有逐次运行的「用量」卡。管理员在「用户管理」
+页可进入全局用量（`/api/admin/usage`，只给聚合与用户 id）。费用取 CLI 自报，不报费用
+的驱动显示「未知」而不是 $0。本功能无新增环境变量。详见 docs/features/usage-stats.md。
+
 ### Docker 部署
 
 ```bash
@@ -118,12 +126,13 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 
 镜像不含 Postgres 与 `claude` CLI：用 `LATHE_DB_*` 指向外部数据库
 （容器内先跑 `lathe migrate up` 建表），agent 执行需另行挂载或安装 claude。
+外部数据库需 **PostgreSQL ≥ 15**（迁移 0038 用了 `UNIQUE NULLS NOT DISTINCT`）。
 
 | 环境变量 | 作用 |
 |---|---|
 | `LATHE_BASE_URL` | 对外地址，重置邮件里的链接前缀。不配则退回本机地址并告警 |
 | `LATHE_HTTP_ADDR` | 监听地址，默认 `:8200` |
-| `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres |
+| `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres（需 PostgreSQL ≥ 15，0038 用 `UNIQUE NULLS NOT DISTINCT`） |
 | `LATHE_ADMIN_EMAIL` | 内置管理员邮箱，默认 `admin@lathe.local` |
 | `LATHE_ADMIN_PASSWORD` | 内置管理员初始口令，不配则随机生成并打印一次 |
 | `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
