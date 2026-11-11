@@ -17,7 +17,8 @@ import (
 type Verifier struct{}
 
 // Verify 实现 httpapi.Verifier。
-func (Verifier) Verify(ctx context.Context, kind, token string) httpapi.VerifyResult {
+func (Verifier) Verify(ctx context.Context, req httpapi.VerifyRequest) httpapi.VerifyResult {
+	kind, token := req.Kind, req.Token
 	switch kind {
 	case store.KindLinear:
 		return verifyLinear(ctx, token)

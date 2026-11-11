@@ -17,6 +17,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // maxJSONBody 限制请求体大小。
@@ -568,7 +569,9 @@ func (a *API) previewRetry(ctx context.Context, tk *task.Task) (runner.RetryPlan
 			if berr != nil {
 				base = repos[0].DefaultBranch
 			}
-			wtState = a.Scenes.Inspect(ctx, repos[0].ProviderRepo, path, branch, base)
+			// 镜像键按仓库所在平台实例算（GitHub 即 providerRepo 本身，与此前相同）。
+			key := vcs.RepoKey(vcs.Provider(repos[0].VCSProvider), repos[0].VCSBaseURL, repos[0].ProviderRepo)
+			wtState = a.Scenes.Inspect(ctx, key, path, branch, base)
 		}
 	}
 
@@ -630,23 +633,65 @@ func (a *API) createRepo(w http.ResponseWriter, r *http.Request) {
 		ProviderRepo  string `json:"providerRepo"`
 		DefaultBranch string `json:"defaultBranch"`
 		HotfixBase    string `json:"hotfixBase"`
+		// VCSProvider 是代码平台：github（缺省）/ gitlab / gitea。
+		VCSProvider string `json:"vcsProvider"`
+		// VCSBaseURL 不接受：实例地址只有一个真相源（凭据），仓库只是登记
+		// 那一刻的快照。传了就 400，而不是静默忽略。
+		VCSBaseURL *json.RawMessage `json:"vcsBaseUrl"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
 		return
 	}
-	body.ProviderRepo = strings.TrimSpace(body.ProviderRepo)
-	if body.ProviderRepo == "" || !strings.Contains(body.ProviderRepo, "/") {
+	if body.VCSBaseURL != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "providerRepo 须为 owner/repo 形式，如 acme/demo",
+			"error": "实例地址不在这里填：登记时会自动取你在个人设置里为该平台配置的实例地址",
 		})
 		return
+	}
+	provider := vcs.Provider(strings.TrimSpace(body.VCSProvider))
+	if provider == "" {
+		provider = vcs.ProviderGitHub
+	}
+	if !provider.Valid() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "代码平台须为 github / gitlab / gitea 之一",
+		})
+		return
+	}
+	body.ProviderRepo = strings.TrimSpace(body.ProviderRepo)
+	if _, _, err := vcs.SplitRef(provider, body.ProviderRepo); err != nil {
+		msg := "providerRepo 须为 owner/repo 形式，如 acme/demo"
+		if provider != vcs.ProviderGitHub {
+			msg = "providerRepo 须为 group/repo 或 group/subgroup/repo 形式：" + err.Error()
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+		return
+	}
+
+	// 自建平台：实例地址从当前用户同平台凭据复制一份钉死（非密列，不解密）。
+	baseURL := ""
+	if provider != vcs.ProviderGitHub {
+		u, err := a.Store.IntegrationBaseURL(r.Context(), CurrentUser(r).ID, string(provider))
+		if err != nil {
+			if errors.Is(err, store.ErrIntegrationNotFound) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "请先在个人设置里配置 " + provider.DisplayName() + " 令牌与实例地址",
+				})
+				return
+			}
+			serverError(w, "读取凭据实例地址失败", err)
+			return
+		}
+		baseURL = u
 	}
 
 	repo, err := a.Store.CreateRepo(r.Context(), CurrentUser(r).ID, store.CreateRepoParams{
 		ProviderRepo:  body.ProviderRepo,
 		DefaultBranch: strings.TrimSpace(body.DefaultBranch),
 		HotfixBase:    strings.TrimSpace(body.HotfixBase),
+		VCSProvider:   string(provider),
+		VCSBaseURL:    baseURL,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRepoExists) {
@@ -680,9 +725,19 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		VerifyTierOverride *string `json:"verifyTierOverride"`
 		// 指针区分「未传」（不动）与「空串」（清空基线目录）
 		BaselineDir *string `json:"baselineDir"`
+		// 平台、实例与路径登记后不可改（只认存在与否）：迁移需要删除后重新登记。
+		VCSProvider  *json.RawMessage `json:"vcsProvider"`
+		VCSBaseURL   *json.RawMessage `json:"vcsBaseUrl"`
+		ProviderRepo *json.RawMessage `json:"providerRepo"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
+		return
+	}
+	if body.VCSProvider != nil || body.VCSBaseURL != nil || body.ProviderRepo != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "仓库的代码平台、实例地址与路径登记后不可修改；需要换平台或实例请删除后重新登记",
+		})
 		return
 	}
 

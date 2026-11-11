@@ -427,12 +427,12 @@ func (c Config) PublicURL() string {
 // 反而会让替换器多扫一遍。集成凭据（Linear/GitHub/webhook 密钥）全给 ——
 // 它们可能从未进过进程环境（从库里解出来直接用），形态表也认不出随机串。
 func (c Config) KnownSecrets() []string {
-	out := make([]string, 0, 5)
+	out := make([]string, 0, 6)
 	if c.Database.Password != "" {
 		out = append(out, c.Database.DSN())
 	}
 	for _, v := range []string{
-		c.LinearToken, c.LinearWebhookSecret, c.GitHubToken, c.AdminPassword,
+		c.LinearToken, c.LinearWebhookSecret, c.GitHubToken, c.GitHubWebhookSecret, c.AdminPassword,
 	} {
 		if strings.TrimSpace(v) != "" {
 			out = append(out, v)
