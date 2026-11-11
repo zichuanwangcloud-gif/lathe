@@ -221,9 +221,9 @@ func TestLeaseConstants(t *testing.T) {
 		t.Errorf("LeaseTTL−FenceMargin=%v 应 > LeaseHeartbeat=%v", LeaseTTL-FenceMargin, LeaseHeartbeat)
 	}
 	cases := []struct {
-		name          string
+		name           string
 		ttl, hb, fence time.Duration
-		wantErr       bool
+		wantErr        bool
 	}{
 		{"production_ok", LeaseTTL, LeaseHeartbeat, FenceMargin, false},
 		{"ttl_too_short_for_heartbeats", time.Minute, 20 * time.Second, 45 * time.Second, true},
