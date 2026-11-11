@@ -25,6 +25,9 @@ type accountFixture struct {
 	auth   *Auth
 	mail   *fakeMailer
 	st     *store.Store
+	// acct / admin 暴露出来，让「吊销失败」类测试能把 PATs 换成假件。
+	acct  *AccountAPI
+	admin *AdminAPI
 }
 
 // fakeMailer 记下发出的邮件，让忘记密码的链路能脱离 SMTP 测试。
@@ -54,7 +57,8 @@ func newAccountFixture(t *testing.T) *accountFixture {
 	users := st.NewUsers()
 	sessions := st.NewSessions()
 
-	a := NewAuth(apiTestToken).WithStore(users, sessions, nil, false)
+	a := NewAuth(apiTestToken).WithStore(users, sessions, nil, false).
+		WithPATs(st.NewPATs())
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/login", a.Login)
 	mux.HandleFunc("POST /api/logout", a.Logout)
@@ -65,15 +69,21 @@ func newAccountFixture(t *testing.T) *accountFixture {
 	mux.Handle("GET /api/admin-only", a.RequireAdminFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
+	// 个人 API 令牌：管理接口 + 单挂一条 GET /api/tasks 供「属主过滤」断言。
+	// 不挂整个 API.Routes：它自己也注册 login/logout/me，与上面同名模式冲突会 panic。
+	(&PATAPI{PATs: st.NewPATs(), Auth: a, Sessions: sessions}).Routes(mux)
+	mux.Handle("GET /api/tasks", a.RequireFunc((&API{Store: st, Auth: a}).listTasks))
 
 	mailer := newFakeMailer()
 	acct := &AccountAPI{
 		Users: users, Sessions: sessions, Resets: st.NewResets(),
 		Auth: a, Mail: mailer, BaseURL: "https://lathe.test",
+		PATs: st.NewPATs(),
 	}
 	acct.Routes(mux)
 
-	admin := &AdminAPI{Users: users, Sessions: sessions, Resets: st.NewResets(), Auth: a, Store: st}
+	admin := &AdminAPI{Users: users, Sessions: sessions, Resets: st.NewResets(), Auth: a, Store: st,
+		PATs: st.NewPATs()}
 	admin.Routes(mux)
 
 	srv := httptest.NewServer(mux)
@@ -87,6 +97,7 @@ func newAccountFixture(t *testing.T) *accountFixture {
 	return &accountFixture{
 		srv: srv, client: &http.Client{Jar: jar},
 		users: users, auth: a, mail: mailer, st: st,
+		acct: acct, admin: admin,
 	}
 }
 

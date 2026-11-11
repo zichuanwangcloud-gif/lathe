@@ -30,6 +30,9 @@ type AccountAPI struct {
 	Resets   *store.Resets
 	Auth     *Auth
 	Mail     Mailer
+	// PATs 在三条改口令路径上吊销该用户全部个人 API 令牌。
+	// 为 nil 时改口令直接 500，不静默跳过（安全动作不因漏接线而降级）。
+	PATs PATRevoker
 
 	// BaseURL 用于拼接重置链接，来自 config.PublicURL()。
 	BaseURL string
@@ -142,6 +145,11 @@ func (a *AccountAPI) changePassword(w http.ResponseWriter, r *http.Request) {
 	hash, err := auth.Hash(body.NewPassword)
 	if err != nil {
 		serverError(w, "生成密码哈希失败", err)
+		return
+	}
+	// 先吊销全部个人 API 令牌、成功后才改口令：任何一步失败都不会出现
+	// 「新口令 + 旧 PAT」的组合（PRD f05 §3.6 第 11b 项）。
+	if !revokePATsBeforePasswordChange(w, r, a.PATs, u.ID) {
 		return
 	}
 	if err := a.Users.SetPassword(r.Context(), u.ID, hash, false); err != nil {
@@ -315,6 +323,10 @@ func (a *AccountAPI) resetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 吊销失败时这封链接已被消费，用户需重新发起找回 —— 失败方向是安全的。
+	if !revokePATsBeforePasswordChange(w, r, a.PATs, userID) {
+		return
+	}
 	if err := a.Users.SetPassword(r.Context(), userID, hash, false); err != nil {
 		serverError(w, "更新密码失败", err)
 		return
@@ -348,4 +360,25 @@ func validEmail(email string) error {
 		return errors.New("邮箱含非法字符")
 	}
 	return nil
+}
+
+// revokePATsBeforePasswordChange 在改口令之前吊销该用户全部个人 API 令牌。
+//
+// 返回 false 时已写好 500，调用方必须中止、不改口令。不沿用清会话的 `_ =` 写法：
+// 会话 12 小时自然过期，PAT 可能永不过期，「口令已改、PAT 却还活着」正是要堵的状态。
+// revoker 为 nil（漏接线）同样 500 —— 安全动作绝不因为漏接线而静默降级。
+func revokePATsBeforePasswordChange(w http.ResponseWriter, r *http.Request, revoker PATRevoker, userID int64) bool {
+	if revoker == nil {
+		serverError(w, "吊销个人 API 令牌失败，密码未修改，请重试", errors.New("PAT 吊销未接线"))
+		return false
+	}
+	n, err := revoker.RevokeUser(r.Context(), userID)
+	if err != nil {
+		serverError(w, "吊销个人 API 令牌失败，密码未修改，请重试", err)
+		return false
+	}
+	if n > 0 {
+		slog.Info("改口令前吊销了个人 API 令牌", "user_id", userID, "count", n)
+	}
+	return true
 }

@@ -165,7 +165,8 @@ func serve(cfg config.Config) error {
 		return err
 	}
 
-	go gcSessions(ctx, sessions)
+	pats := st.NewPATs()
+	go gcAuthRows(ctx, sessions, pats)
 
 	// P1.5 第二步：凭据按用户隔离。环境变量兜底只给内置管理员 ——
 	// 那是部署者自己的账号，不该借给普通成员的任务用。
@@ -240,8 +241,10 @@ func serve(cfg config.Config) error {
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
 	// （脚本调用，同时是把自己锁在门外时的应急入口）
+	// 第三条：个人 API 令牌（Bearer lathe_pat_…），身份等于签发者本人。
 	auth := httpapi.NewAuth(os.Getenv("LATHE_ADMIN_TOKEN")).
-		WithStore(users, sessions, admin, cfg.SecureCookies())
+		WithStore(users, sessions, admin, cfg.SecureCookies()).
+		WithPATs(pats)
 	auth.TrustProxy = cfg.TrustedProxy
 	// 「Linear 任务」菜单的显隐依据：与执行队列同一条凭据通路，
 	// 管理员的 env 兜底自然被覆盖；只解密本地凭据，不访问 Linear。
@@ -302,10 +305,15 @@ func serve(cfg config.Config) error {
 		Resets:     st.NewResets(),
 		Auth:       auth,
 		Mail:       mail.NewSender(secrets.LoadSMTP),
+		PATs:       pats,
 		BaseURL:    cfg.PublicURL(),
 		TrustProxy: cfg.TrustedProxy,
 	}
 	accountAPI.Routes(mux)
+
+	// 个人 API 令牌的签发/列出/吊销：只接受会话 Cookie，签发需当前口令。
+	patAPI := &httpapi.PATAPI{PATs: pats, Auth: auth, Sessions: sessions}
+	patAPI.Routes(mux)
 
 	smtpAPI := &httpapi.SMTPAPI{
 		Secrets:  secrets,
@@ -319,6 +327,7 @@ func serve(cfg config.Config) error {
 		Sessions: sessions,
 		Resets:   st.NewResets(),
 		Auth:     auth,
+		PATs:     pats,
 		Store:    st,
 	}
 	adminAPI.Routes(mux)
@@ -806,8 +815,12 @@ func ensureSuperadmin(ctx context.Context, users *store.Users, cfg config.Config
 	return users.ByID(ctx, u.ID)
 }
 
-// gcSessions 定期清理过期会话与过期的密码重置令牌。
-func gcSessions(ctx context.Context, sessions *store.Sessions) {
+// gcAuthRows 定期清理过期会话、过期的密码重置令牌，以及吊销/过期满 30 天的
+// 个人 API 令牌。
+//
+// 同一个定时器、两次独立调用、两段独立日志：PAT 行数不混进会话的计数，
+// 免得运维看到删除数以为全是会话。
+func gcAuthRows(ctx context.Context, sessions *store.Sessions, pats *store.PersonalAccessTokens) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
 	for {
@@ -815,13 +828,15 @@ func gcSessions(ctx context.Context, sessions *store.Sessions) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := sessions.GC(ctx)
-			if err != nil {
+			if n, err := sessions.GC(ctx); err != nil {
 				slog.Warn("清理过期会话失败", "err", err)
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				slog.Info("已清理过期会话与重置令牌", "rows", n)
+			}
+			if n, err := pats.GC(ctx); err != nil {
+				slog.Warn("清理过期个人 API 令牌失败", "err", err)
+			} else if n > 0 {
+				slog.Info("已清理过期个人 API 令牌", "rows", n)
 			}
 		}
 	}

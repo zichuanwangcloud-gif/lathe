@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- **个人 API 令牌（PAT）**：个人设置页可签发/命名/吊销带过期时间的令牌，请求带
+  `Authorization: Bearer lathe_pat_…`，权限严格等于本人（管理员签的才是管理员权限）。
+  库里只存 SHA-256，明文只在创建时显示一次；记录最后使用时间；签发需输入当前密码；
+  账号停用、修改/找回/被重置密码后其全部令牌立即失效。令牌管理只能用浏览器登录态发起。
+  `LATHE_ADMIN_TOKEN` 行为不变。迁移 0044。详见 `docs/features/personal-api-token.md`。
+
 ### Changed
 
 - **模糊任务对话：少问、跑得完、报错能救**（docs/10 §1.3–§1.5）。实测一份 feature PRD
