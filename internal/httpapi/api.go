@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
@@ -52,6 +53,15 @@ type API struct {
 
 	// ConfigStatus 返回凭据配置状态（不含 token 本身）。
 	ConfigStatus func() map[string]any
+
+	// Interjector 是运行中插话（docs/features/interject.md）。为 nil 时两个
+	// 插话路由返回 503（不是 404，也不假装成功）。
+	Interjector Interjector
+	// InterjectLimits 是插话的长度与限流参数（LATHE_INTERJECT_*）。
+	InterjectLimits InterjectLimits
+
+	interjectMu  sync.Mutex
+	interjectLim *limiter
 }
 
 // Routes 把 API 注册到 mux。
@@ -83,6 +93,8 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("POST /api/tasks/{id}/cancel", a.Auth.RequireFunc(a.cancelTask))
 	mux.Handle("POST /api/tasks/{id}/approve", a.Auth.RequireFunc(a.approveTask))
 	mux.Handle("POST /api/tasks/{id}/review-retry", a.Auth.RequireFunc(a.reviewRetryTask))
+	mux.Handle("POST /api/tasks/{id}/interject", a.Auth.RequireFunc(a.interjectTask))
+	mux.Handle("GET /api/tasks/{id}/interjections", a.Auth.RequireFunc(a.listInterjections))
 	mux.Handle("POST /api/repos", a.Auth.RequireFunc(a.createRepo))
 	mux.Handle("PUT /api/repos/{id}", a.Auth.RequireFunc(a.updateRepo))
 	mux.Handle("GET /api/repos/{id}/baseline", a.Auth.RequireFunc(a.repoBaseline))

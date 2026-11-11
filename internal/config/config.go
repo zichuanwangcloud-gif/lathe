@@ -159,6 +159,17 @@ type Config struct {
 	LinearToken         string
 	LinearWebhookSecret string
 	GitHubToken         string
+	// InterjectMaxChars 是一条运行中插话的长度上限（按 rune 计，LATHE_INTERJECT_MAX_CHARS）。
+	// 消费方：internal/httpapi 的 POST /api/tasks/{id}/interject（超过 → 413，不落库）。
+	// 上限 16384 = task_interjections.body 的保底 CHECK（迁移 0032）—— 配得比它大
+	// 会让 API 放行、库拒绝，人看到的是 500 而不是 413。
+	InterjectMaxChars int
+	// InterjectRateLimit / InterjectWindow 是同一任务在窗口内允许的插话条数
+	// （LATHE_INTERJECT_RATE_LIMIT / LATHE_INTERJECT_WINDOW）。消费方：同一个
+	// handler 的限流器（超过 → 429，不落库）。挡的是「催」，不是持久化风控。
+	InterjectRateLimit int
+	InterjectWindow    time.Duration
+
 	// GitHubWebhookSecret 是 GitHub 仓库 webhook 签名密钥的兜底
 	// （LATHE_GITHUB_WEBHOOK_SECRET）。消费方：creds.Provider.GitHubWebhookSecret，
 	// 与其它环境变量凭据一样只对内置管理员生效（creds.Factory）。
@@ -202,6 +213,28 @@ const MinWorktreeTTL = time.Hour
 // 关掉整条能力没有对应的开关：永远是「多久算搁置」，不存在「不判搁置」。
 // 能单独关的是那封信（LATHE_PRD_STALL_NOTIFY）—— 关掉它判定照做。
 const MinPRDStallTimeout = time.Hour
+
+// 运行中插话三个配置项的合法范围（docs/features/interject.md §3.6）。
+const (
+	// MaxInterjectChars 等于 task_interjections.body 的保底 CHECK（16384）。
+	MaxInterjectChars     = 16384
+	MaxInterjectRateLimit = 100
+	MinInterjectWindow    = time.Second
+	MaxInterjectWindow    = time.Minute
+)
+
+// envIntStrict 同 envInt，但解析失败返回错误（点名变量与原值），不静默回落默认值。
+func envIntStrict(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q 不是整数: %w", key, v, err)
+	}
+	return n, nil
+}
 
 // validateBoolEnv 校验形如 `x == "true"` 的布尔环境变量。
 //
@@ -272,6 +305,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	interjectMax, err := envIntStrict("LATHE_INTERJECT_MAX_CHARS", 8192)
+	if err != nil {
+		return Config{}, err
+	}
+	interjectRate, err := envIntStrict("LATHE_INTERJECT_RATE_LIMIT", 5)
+	if err != nil {
+		return Config{}, err
+	}
+	interjectWindow, err := envDurationStrict("LATHE_INTERJECT_WINDOW", 10*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
 
 	c := Config{
 		HTTPAddr: env("LATHE_HTTP_ADDR", ":8200"),
@@ -311,11 +356,35 @@ func Load() (Config, error) {
 		LinearWebhookSecret:   env("LATHE_LINEAR_WEBHOOK_SECRET", ""),
 		GitHubToken:           env("LATHE_GITHUB_TOKEN", ""),
 		GitHubWebhookSecret:   env("LATHE_GITHUB_WEBHOOK_SECRET", ""),
+		InterjectMaxChars:     interjectMax,
+		InterjectRateLimit:    interjectRate,
+		InterjectWindow:       interjectWindow,
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err
 	}
+	if err := c.validateInterject(); err != nil {
+		return Config{}, err
+	}
 	return c, nil
+}
+
+// validateInterject 校验运行中插话的三个配置项（只在 Load 里做：它们只有
+// 环境变量一个来源，错误要点名变量名）。非法值启动即报错，不运行期静默降级。
+func (c Config) validateInterject() error {
+	if c.InterjectMaxChars <= 0 || c.InterjectMaxChars > MaxInterjectChars {
+		return fmt.Errorf("config: LATHE_INTERJECT_MAX_CHARS 必须是 1..%d 的整数（%d 是库表 body 列的硬上限），得到 %d",
+			MaxInterjectChars, MaxInterjectChars, c.InterjectMaxChars)
+	}
+	if c.InterjectRateLimit <= 0 || c.InterjectRateLimit > MaxInterjectRateLimit {
+		return fmt.Errorf("config: LATHE_INTERJECT_RATE_LIMIT 必须是 1..%d 的整数，得到 %d",
+			MaxInterjectRateLimit, c.InterjectRateLimit)
+	}
+	if c.InterjectWindow < MinInterjectWindow || c.InterjectWindow > MaxInterjectWindow {
+		return fmt.Errorf("config: LATHE_INTERJECT_WINDOW 必须在 %v..%v 之间，得到 %v",
+			MinInterjectWindow, MaxInterjectWindow, c.InterjectWindow)
+	}
+	return nil
 }
 
 // Validate 检查配置自身一致性。
