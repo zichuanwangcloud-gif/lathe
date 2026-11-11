@@ -309,3 +309,20 @@ func (s *Store) VerificationLogRef(ctx context.Context, taskID, vid int64) (ref 
 	}
 	return ref, at, true, nil
 }
+
+// VerificationLogClaimedLater 判定日志路径 ref 是否被同一任务里**更新**的验证行
+// 再次声明（重试复用任务行、日志写回同名文件，见 run-replay.md §3.2.3 规则 1）。
+//
+// 这是确定性的库内判定，不依赖时钟：有更新的行声明了同一个路径，文件就归它。
+func (s *Store) VerificationLogClaimedLater(ctx context.Context, taskID, vid int64, ref string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM verifications
+			WHERE task_id = $1 AND id > $2 AND log_ref IS NOT NULL
+			  AND $3 = ANY(string_to_array(log_ref, ' ')))`, taskID, vid, ref).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: 判定验证日志覆盖失败: %w", err)
+	}
+	return exists, nil
+}

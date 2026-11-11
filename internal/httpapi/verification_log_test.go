@@ -414,3 +414,85 @@ func TestVerificationLogOwnership(t *testing.T) {
 	})
 }
 
+// 重试复用任务行：后一次运行写回同名日志文件，旧 vid 不得读到新内容（铁律 1）。
+func TestVerificationLogRejectsLogOverwrittenByLaterRun(t *testing.T) {
+	isOverwritten := func(code int, body map[string]any) bool {
+		return code == http.StatusNotFound && body["code"] == "log_overwritten"
+	}
+
+	t.Run("给定后一次运行已插行 断言旧 vid 404 log_overwritten、新 vid 200", func(t *testing.T) {
+		f := newLogFixture(t)
+		ref := f.rel(0, "01-build.log")
+		f.write(t, ref, []byte("RUN-1"))
+		vid1, _ := insertVerification(t, f.api, f.tk.ID, "build", "passed", strp(ref))
+		f.write(t, ref, []byte("RUN-2"))
+		vid2, _ := insertVerification(t, f.api, f.tk.ID, "build", "passed", strp(ref))
+
+		code, body, raw := f.get(t, vid1, "")
+		if !isOverwritten(code, body) || strings.Contains(raw, "RUN-2") {
+			t.Errorf("vid1 got %d %s, want 404 log_overwritten 且不含 RUN-2", code, raw)
+		}
+		code, body, raw = f.get(t, vid2, "")
+		if code != http.StatusOK || body["text"] != "RUN-2" {
+			t.Errorf("vid2 got %d %s, want 200 RUN-2", code, raw)
+		}
+	})
+
+	mtimeCase := func(name string, delta time.Duration, wantOverwritten bool) {
+		t.Run(name, func(t *testing.T) {
+			f := newLogFixture(t)
+			ref := f.rel(0, "01-build.log")
+			f.write(t, ref, []byte("RUN-X"))
+			vid1, at := insertVerification(t, f.api, f.tk.ID, "build", "passed", strp(ref))
+			mt := at.Add(delta)
+			if err := os.Chtimes(filepath.Join(f.dir, ref), mt, mt); err != nil {
+				t.Fatal(err)
+			}
+			code, body, raw := f.get(t, vid1, "")
+			if got := isOverwritten(code, body); got != wantOverwritten {
+				t.Errorf("got %d %s, want overwritten=%v", code, raw, wantOverwritten)
+			}
+			if !wantOverwritten && body["text"] != "RUN-X" {
+				t.Errorf("容差内应正常读出: got %s", raw)
+			}
+		})
+	}
+	mtimeCase("给定文件 ModTime 晚于 at+10s（后一次运行正在写）断言 404 log_overwritten", 10*time.Second, true)
+	mtimeCase("给定文件 ModTime 在 at+2s 容差内 断言 200", 2*time.Second, false)
+
+	t.Run("给定复现多段只被覆盖其中一段 断言 part=0 404、part=1 200", func(t *testing.T) {
+		f := newLogFixture(t)
+		a, b := f.rel(0, "01-repro_fail.log"), f.rel(0, "02-repro_fail.log")
+		f.write(t, a, []byte("A"))
+		f.write(t, b, []byte("B"))
+		vid1, at := insertVerification(t, f.api, f.tk.ID, "repro_fail", "passed", strp(a+" "+b))
+		insertVerification(t, f.api, f.tk.ID, "repro_fail", "passed", strp(a))
+		mt := at.Add(-time.Second)
+		for _, p := range []string{a, b} {
+			if err := os.Chtimes(filepath.Join(f.dir, p), mt, mt); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if code, body, raw := f.get(t, vid1, "?part=0"); !isOverwritten(code, body) {
+			t.Errorf("part=0 got %d %s, want 404 log_overwritten", code, raw)
+		}
+		if code, body, raw := f.get(t, vid1, "?part=1"); code != http.StatusOK || body["text"] != "B" {
+			t.Errorf("part=1 got %d %s, want 200 B", code, raw)
+		}
+	})
+
+	t.Run("给定非属主请求被覆盖的 vid 断言只看到任务不存在", func(t *testing.T) {
+		f := newLogFixture(t)
+		ref := f.rel(0, "01-build.log")
+		f.write(t, ref, []byte("RUN-1"))
+		vid1, _ := insertVerification(t, f.api, f.tk.ID, "build", "passed", strp(ref))
+		f.write(t, ref, []byte("RUN-2"))
+		insertVerification(t, f.api, f.tk.ID, "build", "passed", strp(ref))
+		userB := mustUser(t, f.api.Store, "f04-ac5o-b-"+rhex(t)+"@example.com")
+		srvB := apiServer(t, &API{Store: f.api.Store, Tasks: f.m, Queue: &fakeEnqueuer{}, Auth: authAs(userB, "b@example.com"), LogDir: f.dir})
+		code, _, raw := getLog(t, srvB.URL, f.tk.ID, vid1, "")
+		if code != http.StatusNotFound || strings.TrimSpace(raw) != `{"error":"任务不存在"}` {
+			t.Errorf("got %d %s, want 404 {\"error\":\"任务不存在\"}", code, raw)
+		}
+	})
+}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 )
@@ -29,6 +30,8 @@ const (
 	redactContextMin = 16 << 10
 	// maxCutProbes 是每次请求最多检验的候选切点数（有界开销）。
 	maxCutProbes = 256
+	// logMtimeSkew 吸收 DB now() 与宿主机文件 mtime 的时钟偏差（覆盖判定规则 2）。
+	logMtimeSkew = 5 * time.Second
 )
 
 // redactContext 返回安全切点检验的窗口 W = max(16KiB, 2 × 最长登记凭据长度)，
@@ -173,7 +176,7 @@ func (a *API) verificationLog(w http.ResponseWriter, r *http.Request) {
 		limit = logChunkMax
 	}
 
-	ref, _, found, err := a.Store.VerificationLogRef(r.Context(), tk.ID, vid)
+	ref, vAt, found, err := a.Store.VerificationLogRef(r.Context(), tk.ID, vid)
 	if err != nil {
 		serverError(w, "查询验证日志失败", err)
 		return
@@ -205,6 +208,27 @@ func (a *API) verificationLog(w http.ResponseWriter, r *http.Request) {
 		notFound()
 		return
 	}
+	// 重试覆盖判定（铁律 1：证据不挂错运行）。重试复用任务行，新一次运行把日志
+	// 写回同一个 round-<n>/NN-<step>.log（O_TRUNC），旧行还在 —— 拿旧 vid 读到的
+	// 会是后一次运行的内容。任一命中即判已覆盖，返回 404 log_overwritten：
+	//   1. 库内：有 id 更大的行声明了同一段路径（确定性，不依赖时钟）；
+	//   2. 时间：文件 ModTime 晚于本行 at + 5s（后一次运行正在写、还没插行）——
+	//      本行自己的文件在插行前已关闭，ModTime ≤ at；偏差超限只会 fail-closed；
+	//   3. 读后复核：读完再 Stat，size/ModTime 变了，本次内容丢弃。
+	// 这条 404 只在 ownedTask 与 task_id 都通过后出现，对非属主不暴露任何信息。
+	overwritten := func() {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "日志已被后一次运行覆盖", "code": "log_overwritten"})
+	}
+	later, err := a.Store.VerificationLogClaimedLater(r.Context(), tk.ID, vid, parts[part])
+	if err != nil {
+		serverError(w, "查询验证日志失败", err)
+		return
+	}
+	if later || st.ModTime().After(vAt.Add(logMtimeSkew)) {
+		overwritten()
+		return
+	}
+
 	size := st.Size()
 	if offset > size {
 		bad("offset 超出日志长度")
@@ -219,6 +243,10 @@ func (a *API) verificationLog(w http.ResponseWriter, r *http.Request) {
 	buf := make([]byte, winTo-winFrom)
 	if _, err := io.ReadFull(io.NewSectionReader(f, winFrom, winTo-winFrom), buf); err != nil {
 		serverError(w, "读取验证日志失败", err)
+		return
+	}
+	if st2, err := f.Stat(); err != nil || st2.Size() != size || !st2.ModTime().Equal(st.ModTime()) {
+		overwritten()
 		return
 	}
 	cut := &cutter{buf: buf, base: winFrom, size: size, w: win, known: a.KnownSecrets}
