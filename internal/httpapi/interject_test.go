@@ -533,3 +533,83 @@ func TestSubmitSurvivesClientDisconnect(t *testing.T) {
 		})
 	}
 }
+
+// 迟到回显（AC-22 实测：CLI 只在当前步骤 —— 一次 API 往返或一次工具调用 —— 结束、
+// 把排队的输入并进对话时才回显，--resume 的修复轮里常常超过 2s）。
+// 给定：活会话写入成功但 2s 内不回显 → 200 delivered + no_replay_ack；
+// 断言：回显随后到达时 error 被清空且 rev 前进（界面轮询能拿到）；
+// 会话已注销后到达的回显不再改行。
+func TestInterjectLateReplayAckClearsError(t *testing.T) {
+	type row struct {
+		status, err, deliveryID string
+		rev                     int64
+	}
+	read := func(t *testing.T, api *API, taskID int64) row {
+		t.Helper()
+		var r row
+		if err := api.Store.Pool().QueryRow(context.Background(), `
+			SELECT status, coalesce(error,''), coalesce(delivery_id::text,''), rev
+			FROM task_interjections WHERE task_id=$1 ORDER BY id DESC LIMIT 1`, taskID).
+			Scan(&r.status, &r.err, &r.deliveryID, &r.rev); err != nil {
+			t.Fatalf("读插话行失败: %v", err)
+		}
+		return r
+	}
+	cases := []struct {
+		name         string
+		unregister   bool // 回显到达前会话已注销（进程已退出）
+		wantErrAfter string
+	}{
+		{name: "会话仍在_迟到回显清空no_replay_ack", wantErrAfter: ""},
+		{name: "会话已注销_迟到回显不改行", unregister: true, wantErrAfter: "no_replay_ack"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			api, st, m, repoID := apiFixture(t)
+			tk := ijTask(t, st, m, repoID, "implementing")
+			ij := wireInterjectorForOwnerTest(t, api)
+			ij.Register(tk.ID, &fakeLive{ij: ij}, "fix-1", "sess") // 不回显
+			srv := apiServer(t, api)
+
+			resp := do(t, srv, "POST", interjectPath(tk.ID), msgBody("迟到回显"), true)
+			body := decode(t, resp)
+			if resp.StatusCode != 200 || body["error"] != "no_replay_ack" {
+				t.Fatalf("got status=%d error=%v want 200 + no_replay_ack", resp.StatusCode, body["error"])
+			}
+			before := read(t, api, tk.ID)
+			if before.status != "delivered" || before.err != "no_replay_ack" || before.deliveryID == "" {
+				t.Fatalf("回显前 got=%+v want delivered/no_replay_ack/有 delivery_id", before)
+			}
+			if c.unregister {
+				ij.Unregister(tk.ID)
+			}
+			ij.Ack(before.deliveryID) // 迟到的 isReplay 回显（读协程上调用）
+
+			var after row
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				after = read(t, api, tk.ID)
+				if after.err == c.wantErrAfter && (c.wantErrAfter != "" || after.rev > before.rev) {
+					break
+				}
+				if time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if c.unregister {
+				time.Sleep(300 * time.Millisecond)
+				after = read(t, api, tk.ID)
+			}
+			if after.status != "delivered" || after.err != c.wantErrAfter {
+				t.Errorf("回显后 got=(%s,%q) want=(delivered,%q)", after.status, after.err, c.wantErrAfter)
+			}
+			if c.wantErrAfter == "" && after.rev <= before.rev {
+				t.Errorf("清空 error 后 rev 应前进：got=%d before=%d", after.rev, before.rev)
+			}
+			if c.wantErrAfter != "" && after.rev != before.rev {
+				t.Errorf("不改行时 rev 不应变：got=%d want=%d", after.rev, before.rev)
+			}
+		})
+	}
+}

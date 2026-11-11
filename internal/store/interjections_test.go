@@ -191,3 +191,56 @@ func TestStartupSweepInterjectionsStore(t *testing.T) {
 		t.Errorf("delivered 行不应被动过：before=%+v after=%+v", doneRow, after)
 	}
 }
+
+// 迟到回显的 store 侧：只有「delivered + no_replay_ack + delivery_id 对得上」的行
+// 被清空 error 并前进 rev；其它情形一律不动（返回 nil）。
+func TestMarkInterjectionReplayAcked(t *testing.T) {
+	const did = "22222222-2222-4222-8222-222222222222"
+	const other = "33333333-3333-4333-8333-333333333333"
+	open := func(string) string { return "" }
+	cases := []struct {
+		name      string
+		errText   string // MarkDelivered 时的 error；"-" = 停在 delivering
+		ackID     string
+		wantClear bool
+	}{
+		{name: "no_replay_ack_同一delivery_id_清空", errText: InterjectionNoReplayAck, ackID: did, wantClear: true},
+		{name: "no_replay_ack_别的delivery_id_不动", errText: InterjectionNoReplayAck, ackID: other},
+		{name: "已确认_不动", errText: "", ackID: did},
+		{name: "仍在delivering_不动", errText: "-", ackID: did},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := testStore(t)
+			ctx := context.Background()
+			userID, taskID := interjectionFixture(t, st, "implementing")
+			r, _, err := st.InsertInterjectionGated(ctx, taskID, userID, "x", open)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.MarkInterjectionDelivering(ctx, taskID, r.ID, did, "fix-1", "s"); err != nil {
+				t.Fatal(err)
+			}
+			if c.errText != "-" {
+				if _, err := st.MarkInterjectionDelivered(ctx, taskID, r.ID, c.errText); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, _ := st.GetInterjection(ctx, r.ID)
+			got, err := st.MarkInterjectionReplayAcked(ctx, taskID, r.ID, c.ackID)
+			if err != nil {
+				t.Fatalf("err got=%v want nil", err)
+			}
+			after, _ := st.GetInterjection(ctx, r.ID)
+			if c.wantClear {
+				if got == nil || after.Error != nil || after.Status != InterjectionDelivered || after.Rev <= before.Rev {
+					t.Errorf("got=%+v after=%+v want delivered、error=NULL、rev>%d", got, after, before.Rev)
+				}
+				return
+			}
+			if got != nil || after.Rev != before.Rev || after.Status != before.Status {
+				t.Errorf("不应改行：got=%+v before=%+v after=%+v", got, before, after)
+			}
+		})
+	}
+}

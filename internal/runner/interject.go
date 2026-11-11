@@ -83,6 +83,7 @@ type InterjectStore interface {
 	GetInterjection(ctx context.Context, id int64) (*store.Interjection, error)
 	MarkInterjectionDelivering(ctx context.Context, taskID, id int64, deliveryID, phase, sessionID string) (*store.Interjection, error)
 	MarkInterjectionDelivered(ctx context.Context, taskID, id int64, errText string) (*store.Interjection, error)
+	MarkInterjectionReplayAcked(ctx context.Context, taskID, id int64, deliveryID string) (*store.Interjection, error)
 	MarkInterjectionFailed(ctx context.Context, taskID, id int64, reason string) (*store.Interjection, error)
 	RevertInterjectionGated(ctx context.Context, taskID, id int64) (*store.Interjection, string, error)
 	ClaimPendingInterjections(ctx context.Context, taskID int64, phase, sessionID string) ([]store.Interjection, error)
@@ -163,6 +164,16 @@ type Interjections struct {
 	mu      sync.Mutex
 	live    map[int64]*liveEntry
 	waiters map[string]chan struct{}
+	// late 是 2s 内没等到回显、已按 no_replay_ack 收尾的投递（deliveryID →
+	// 行）。回显迟到时据此清空 error（lateAck）；所属会话注销时一并丢弃。
+	late map[string]lateAck
+}
+
+// lateAck 是一条等迟到回显的投递。entry 是投递时的活会话条目：会话注销
+// （进程已退出、不会再有回显）时按它清理。
+type lateAck struct {
+	taskID, rowID int64
+	entry         *liveEntry
 }
 
 func (i *Interjections) supported(tk *task.Task) bool {
@@ -193,6 +204,11 @@ func (i *Interjections) Unregister(taskID int64) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	delete(i.live, taskID)
+	for id, la := range i.late {
+		if la.taskID == taskID {
+			delete(i.late, id)
+		}
+	}
 }
 
 // lookup 返回某任务的活会话；已收尾（Closed）的条目视为没有。
@@ -225,17 +241,60 @@ func (i *Interjections) forget(deliveryID string) {
 }
 
 // Ack 是 agent 读协程上的 OnDelivery：纯内存、不阻塞、零 I/O。
+// 迟到的回显（已按 no_replay_ack 收尾）另起协程写库，读协程不等它。
 func (i *Interjections) Ack(deliveryID string) {
 	i.mu.Lock()
 	ch := i.waiters[deliveryID]
+	la, isLate := i.late[deliveryID]
+	if ch == nil && isLate {
+		delete(i.late, deliveryID)
+	}
 	i.mu.Unlock()
 	if ch == nil {
+		if isLate {
+			go i.recordLateAck(deliveryID, la)
+		}
 		return // 首帧 prompt 的回显、或已放弃等待的 id
 	}
 	select {
 	case ch <- struct{}{}:
 	default:
 	}
+}
+
+// awaitLateAck 在行已按 no_replay_ack 收尾之后调用：等待窗口与收尾之间
+// 到达的回显（落在容量 1 的 channel 里）直接算确认，返回 true；否则把这条
+// 投递登记为「等迟到回显」—— 前提是投递时的会话条目仍在（已注销说明进程
+// 已退出，不会再有回显）。
+func (i *Interjections) awaitLateAck(deliveryID string, ack chan struct{}, la lateAck) bool {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	delete(i.waiters, deliveryID)
+	select {
+	case <-ack:
+		return true
+	default:
+	}
+	if i.live[la.taskID] != la.entry {
+		return false
+	}
+	if i.late == nil {
+		i.late = map[string]lateAck{}
+	}
+	i.late[deliveryID] = la
+	return false
+}
+
+// recordLateAck 把迟到回显记进库：清空 no_replay_ack、前进 rev（界面轮询
+// 据此更新徽标）。不在读协程上运行。
+func (i *Interjections) recordLateAck(deliveryID string, la lateAck) {
+	row, err := writeRetry(context.Background(), la.rowID, func(c context.Context) (*store.Interjection, error) {
+		return i.Store.MarkInterjectionReplayAcked(c, la.taskID, la.rowID, deliveryID)
+	})
+	if err != nil {
+		return
+	}
+	slog.Info("插话迟到回显已确认", "task", la.taskID, "id", la.rowID, "cleared", row != nil)
 }
 
 // ---------------------------------------------------------------- 脱敏
@@ -382,6 +441,14 @@ func (i *Interjections) Submit(ctx context.Context, taskID, userID int64, body s
 		}
 		if done == nil {
 			return i.resultOf(dctx, row.ID)
+		}
+		if errText != "" && i.awaitLateAck(deliveryID, ack, lateAck{taskID: taskID, rowID: row.ID, entry: live}) {
+			// 回显恰好落在超时与收尾之间：当场清空 no_replay_ack。
+			if acked, err := writeRetry(dctx, row.ID, func(c context.Context) (*store.Interjection, error) {
+				return i.Store.MarkInterjectionReplayAcked(c, taskID, row.ID, deliveryID)
+			}); err == nil && acked != nil {
+				done = acked
+			}
 		}
 		return SubmitResult{Outcome: OutcomeDelivered, Row: done}, nil
 

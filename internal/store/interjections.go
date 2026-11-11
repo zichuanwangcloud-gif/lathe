@@ -213,6 +213,23 @@ func (s *Store) MarkInterjectionDelivered(ctx context.Context, taskID, id int64,
 	return it, nil
 }
 
+// MarkInterjectionReplayAcked 处理迟到的 isReplay 回显：行已按 2s 超时收尾为
+// delivered + no_replay_ack，之后 CLI 才回显（它只在当前步骤 —— 一次 API 往返
+// 或一次工具调用 —— 结束、把排队的输入并进对话时回显）。只清空 error 并前进
+// rev；status 不变。不是这条投递（delivery_id 不符）、不是 no_replay_ack、或
+// 还没收尾的行一律不动，返回 nil。
+func (s *Store) MarkInterjectionReplayAcked(ctx context.Context, taskID, id int64, deliveryID string) (*Interjection, error) {
+	it, err := s.updateLocked(ctx, taskID, `
+		UPDATE task_interjections
+		SET error=NULL, rev=nextval('task_interjections_rev_seq')
+		WHERE id=$1 AND status='delivered' AND error=$2 AND delivery_id::text=$3
+		RETURNING `+interjectionCols, id, InterjectionNoReplayAck, deliveryID)
+	if err != nil {
+		return nil, fmt.Errorf("store: 记迟到回显失败（id %d）: %w", id, err)
+	}
+	return it, nil
+}
+
 // MarkInterjectionFailed 把一条尚未终结（queued/delivering）的行判 failed。
 func (s *Store) MarkInterjectionFailed(ctx context.Context, taskID, id int64, reason string) (*Interjection, error) {
 	it, err := s.updateLocked(ctx, taskID, `
