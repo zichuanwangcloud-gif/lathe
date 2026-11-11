@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onUnmounted, inject } from 'vue'
+import { useRoute } from 'vue-router'
 import {
   api,
   UnauthorizedError,
@@ -13,6 +14,7 @@ import {
 import { confirmDialog } from '../../confirm'
 import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../../livelog'
 import {
+  SECTIONS,
   STAGE_LABEL,
   SECTION_TITLE,
   REVIEW_PHASE,
@@ -37,6 +39,7 @@ import PRDDocPanel from '../../components/prd/PRDDocPanel.vue'
 
 const props = defineProps({ id: { type: String, required: true } })
 const onUnauthorized = inject('onUnauthorized')
+const route = useRoute()
 const sidebar = inject('prdSidebar', null)
 
 const prd = ref(null)
@@ -654,6 +657,11 @@ onMounted(async () => {
   const pref = readPanelPref()
   panelOpen.value = wide() && (pref ?? rounds.value.length > 0)
   scrollToBottom(true)
+
+  // 从收件箱「待逐节确认」跳来：?section=<key> 打开文档面板并定位到该节。
+  // 只认 SECTIONS 里的固定 key，别的值一律忽略。
+  const sec = route.query.section
+  if (typeof sec === 'string' && SECTIONS.some((s) => s.key === sec)) gotoSection(sec)
 
   // 新建页带来的 autorun：发送即跑第一轮。读完即清，刷新页面不会重跑。
   const hs = window.history.state || {}

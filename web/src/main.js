@@ -3,6 +3,7 @@ import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
 import Board from './views/Board.vue'
+import Inbox from './views/Inbox.vue'
 import LinearIssues from './views/LinearIssues.vue'
 import TaskDetail from './views/TaskDetail.vue'
 import FlowList from './views/FlowList.vue'
@@ -30,6 +31,7 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'board', component: Board },
+    { path: '/inbox', name: 'inbox', component: Inbox },
     // 内置工单（docs/09）：不依赖 Linear 的手动需求入口，所有人可用
     { path: '/issues', name: 'issues', component: Issues },
     { path: '/issues/:id', name: 'issue', component: IssueDetail, props: true },

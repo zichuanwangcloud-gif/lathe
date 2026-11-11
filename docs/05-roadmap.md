@@ -46,6 +46,7 @@
 | ~~worktree 尸体阻塞同 issue 重试（失败保留现场但无回收策略）~~ —— 已修复：`Create` 回收同名尸体再建（目录/分支/普通残留三形态），重试端点 Fresh 计划先 `Discard` | #345、#466 各撞一次 |
 | ~~EventSink 落库 UTF-8 截断 bug~~ —— **已修复**：`truncate` 回退到 rune 边界再截（`internal/integration/agent/agent.go`，注释引 SQLSTATE 22021） | 54075f4 commit body 已记录 |
 | ~~agent 进程 env 泄漏~~ —— **已修复**：`sanitizedEnv` 改白名单制（`internal/integration/agent/agent.go`），只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程；确需追加走 `LATHE_AGENT_ENV_EXTRA` | 代码走查 |
+| `tasks.failure_reason` 写入侧未脱敏：`failWithExcerpt`（`internal/runner/pipeline.go`）、分诊 `verdict.Reason`、mergepoll 的 rebase 跟进原样落库，任务详情页（`TaskDetail.vue` 的失败卡片）与看板（`Board.vue` 的失败行）原样展示。失败记忆（`recordFailureMemoryFor`）和收件箱（`inbox.reasonText`）各自在读/写副本上脱敏，但主字段未修。治法候选：在 `Machine.Transition` 的 `FailureReason` 落库前统一过 `runner.RedactText`（需要把 `KnownSecrets` 注入 task 层）——属于 runner 失败落库路径，不在 f02 范围 | 代码走查（f02 评审 B2） |
 | 分诊工作目录污染：triage 未设 `Dir` → 继承 serve 的 cwd=`/opt/lathe` → `--setting-sources project` 把 Lathe 自己的 CLAUDE.md 灌进目标仓库的分诊上下文 | 代码走查 |
 
 ~~已修复~~（B2-3）：分诊改在中立目录执行（默认 `$TMPDIR/lathe-triage`，位于任何项目树之外，`Pipeline.TriageDir` 可覆盖）。
