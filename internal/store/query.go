@@ -18,8 +18,12 @@ var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
-	ID          int64  `json:"id"`
-	UserID      int64  `json:"userId"`
+	ID     int64 `json:"id"`
+	UserID int64 `json:"userId"`
+	// RepoID 只在团队视图（ListTasks TeamView=true）与 TaskDetailForViewer 里填充；
+	// 默认视图与属主版 TaskDetail 一律为 0（omitempty：响应与 f12 之前逐字节相同）。
+	// 新调用方要用它，必须走 viewer 版或自己查 tasks.repo_id（docs/features/team-roles.md §3.3）。
+	RepoID      int64  `json:"repoId,omitempty"`
 	ExternalKey string `json:"externalKey"`
 	// TrackerProvider 是需求来源平台（'linear' | 'internal'）；
 	// 前端据此把 key 渲染成 Linear 链接或内置工单页链接。
@@ -63,6 +67,9 @@ type ListTasksParams struct {
 	States []string
 	Limit  int
 	Offset int
+	// TeamView 为 true 时（GET /api/tasks?scope=team）额外包含「我所在团队的
+	// 共享仓库里别人的任务」，走 listTasksTeamSQL；false 时是 f12 之前那条 SQL，一字不改。
+	TeamView bool
 }
 
 // ListTasks 按更新时间倒序返回指定用户名下的任务列表。
@@ -151,6 +158,10 @@ type TaskDetail struct {
 	Task          TaskRow           `json:"task"`
 	Events        []EventRow        `json:"events"`
 	Verifications []VerificationRow `json:"verifications"`
+	// ViewerRole 是当前查看者对任务所属仓库的关系（owner / team_owner / team_admin /
+	// team_member），只由 TaskDetailForViewer 填充；属主版 TaskDetail 留空不序列化。
+	// 前端据此只做按钮显隐 —— 权限判定仍在服务端。
+	ViewerRole RepoRole `json:"viewerRole,omitempty"`
 }
 
 // TaskDetail 读取单个任务的完整信息。
@@ -484,3 +495,12 @@ func nilIfEmpty(s []string) any {
 	}
 	return s
 }
+
+// listTasksTeamSQL 是 scope=team 任务列表的 SQL（红阶段空壳：OR-IN 形状）。
+const listTasksTeamSQL = `
+SELECT t.id FROM tasks t
+WHERE (t.user_id = $1 OR t.repo_id IN (
+        SELECT r2.id FROM repos r2 JOIN team_members m ON m.team_id = r2.team_id AND m.user_id = $1))
+  AND ($2::text[] IS NULL OR t.state = ANY($2))
+ORDER BY t.updated_at DESC, t.id DESC
+LIMIT $3 OFFSET $4`

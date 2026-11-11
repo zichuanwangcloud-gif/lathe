@@ -292,7 +292,7 @@ func (a *AdminAPI) remove(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("删除用户后以下工作区目录需手工清理", "user", u.ID, "paths", paths)
 	}
 
-	if err := a.Users.Delete(r.Context(), u.ID); err != nil {
+	if err := a.Store.DeleteUserGuarded(r.Context(), u.ID); err != nil {
 		serverError(w, "删除用户失败", err)
 		return
 	}

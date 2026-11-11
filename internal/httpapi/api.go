@@ -110,8 +110,11 @@ func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
+	// scope=team：额外包含「我所在团队的共享仓库里别人的任务」（f12）。
+	// 不带 scope 时走 f12 之前那条 SQL，响应与今天逐字节相同。
 	rows, total, err := a.Store.ListTasks(r.Context(), store.ListTasksParams{
 		UserID: CurrentUser(r).ID, States: states, Limit: limit, Offset: offset,
+		TeamView: q.Get("scope") == "team",
 	})
 	if err != nil {
 		serverError(w, "查询任务列表失败", err)
@@ -127,7 +130,8 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	detail, err := a.Store.TaskDetail(r.Context(), id, CurrentUser(r).ID)
+	// 可见性 = 属主 ∪ 任务所属仓库共享到的团队的成员（f12）。不可见与不存在同等处理。
+	detail, err := a.Store.TaskDetailForViewer(r.Context(), id, CurrentUser(r).ID)
 	if err != nil {
 		// 别人的任务与不存在同等处理：对非属主隐瞒存在
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
@@ -141,17 +145,12 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 // 轮询协议：after 传上次的 last_id（首轮传 0），游标 id 严格单调，
 // 将来换 SSE + Last-Event-ID 时客户端协议不变，只是传输升级。
 func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	// 权限与 taskDetail 同一原则：不可读的任务按 404 处理
+	tk, ok := a.ownedTask(w, r)
 	if !ok {
 		return
 	}
-
-	// 权限与 taskDetail 同一原则：不是自己的任务按 404 处理
-	tk, err := a.Tasks.Get(r.Context(), id)
-	if err != nil || tk.UserID != CurrentUser(r).ID {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
-		return
-	}
+	id := tk.ID
 
 	q := r.URL.Query()
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
@@ -163,6 +162,26 @@ func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events, "last_id": lastID})
+}
+
+// ownedTask 解析路径里的任务 ID，判定当前用户【可读】该任务（与 f04 共用的唯一任务读归属 helper）。
+//
+// 名字里的 owned 是历史名，语义是「当前用户可读」——只给【读】接口用（events 等）。
+// 写接口（retry/cancel/approve/review-retry）与 retryPlan 继续内联
+// tk.UserID != CurrentUser(r).ID，千万别拿它做写接口的判定。
+// 调用方拿到 tk 后，store 查询一律传 tk.UserID（任务属主），保留 SQL 里的第二道隔离。
+// 不可读与不存在同一个 404「任务不存在」。
+func (a *API) ownedTask(w http.ResponseWriter, r *http.Request) (*task.Task, bool) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return nil, false
+	}
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return nil, false
+	}
+	return tk, true
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
@@ -224,6 +243,17 @@ func (a *API) costStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listRepos(w http.ResponseWriter, r *http.Request) {
+	// scope=team：我的 + 我所在团队共享给我的（只读），行上带 owned / teamId（f12）。
+	// 不带 scope 时仍调 ListRepos，响应与今天逐字节相同（不加 owned / teamId）。
+	if r.URL.Query().Get("scope") == "team" {
+		repos, err := a.Store.ListReposForViewer(r.Context(), CurrentUser(r).ID)
+		if err != nil {
+			serverError(w, "查询仓库失败", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"repos": repos})
+		return
+	}
 	repos, err := a.Store.ListRepos(r.Context(), CurrentUser(r).ID)
 	if err != nil {
 		serverError(w, "查询仓库失败", err)

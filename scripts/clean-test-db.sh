@@ -38,15 +38,28 @@ DSN="${LATHE_TEST_DSN:-postgres://lathe:lathe@127.0.0.1:55432/lathe?sslmode=disa
 APPLY=""
 [ "${1:-}" = "--yes" ] && APPLY=1
 
+# 库名从 DSN 里解析：docker 回退分支借容器里的 psql，只能按库名连，不能直接吃 DSN。
+# 解析不出就退出，不回落到任何默认库 —— 以前这里写死 -d lathe，LATHE_TEST_DSN
+# 指向别的库时（并行功能线各用各的测试库）脚本照样连共享库 lathe，越界（f12 AC-43）。
+DBNAME=$(printf '%s' "$DSN" | sed -nE 's#^postgres(ql)?://[^/]+/([A-Za-z0-9_]+)([?].*)?$#\2#p')
+if [ -z "$DBNAME" ]; then
+	echo "无法从 LATHE_TEST_DSN 解析出库名：$DSN" >&2
+	exit 1
+fi
+
 # psql 优先用宿主机的；没有就借开发容器里的（本仓常见情形：宿主无 psql）。
 if command -v psql >/dev/null 2>&1; then
 	run_sql() { psql "$DSN" -v ON_ERROR_STOP=1 "$@"; }
 elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -qx lathe-postgres-dev; then
-	run_sql() { docker exec -i lathe-postgres-dev psql -U lathe -d lathe -v ON_ERROR_STOP=1 "$@"; }
+	run_sql() { docker exec -i lathe-postgres-dev psql -U lathe -d "$DBNAME" -v ON_ERROR_STOP=1 "$@"; }
 else
 	echo "找不到 psql，也没有在跑的 lathe-postgres-dev 容器；先 make dev-infra" >&2
 	exit 1
 fi
+
+# 第一条输出永远是实际连上的库名，让人（和 AC-43 测试）看得见脚本动的是哪个库。
+run_sql -c "SELECT current_database();"
+echo
 
 echo "== 测试残留（email 以 @example.com 结尾的 fixture 用户）=="
 run_sql -c "
