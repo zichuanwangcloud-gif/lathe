@@ -3,6 +3,7 @@ import { ref, computed, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth, refresh } from '../auth'
 import { confirmDialog } from '../confirm'
+import NotifyChannels from '../components/NotifyChannels.vue'
 
 // 每个用户专属的 webhook 回调地址（P1.5 第二步）：
 // 事件按它路由到本人 —— 用谁的凭据验签、任务归谁的名下。
@@ -302,6 +303,9 @@ onMounted(load)
       >清除</button>
     </form>
   </div>
+
+  <!-- 站外通知渠道（Slack / 飞书）：webhook URL 本身即凭据，同样加密存储，只显示 https://<host>/… -->
+  <NotifyChannels />
 </template>
 
 <style scoped>
