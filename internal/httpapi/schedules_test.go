@@ -178,6 +178,9 @@ func TestSchedulesCRUD(t *testing.T) {
 	id := int64(sc["id"].(float64))
 
 	_, v = doReq(t, f.srv, "GET", "/api/schedules", "")
+	if v["triggerLabel"] != "lathe:go" {
+		t.Errorf("列表应带系统接单标签名供界面判断: got %v, want lathe:go", v["triggerLabel"])
+	}
 	if list := v["schedules"].([]any); len(list) != 1 || int64(list[0].(map[string]any)["id"].(float64)) != id {
 		t.Errorf("列表: got %v, want 只含 %d", list, id)
 	}

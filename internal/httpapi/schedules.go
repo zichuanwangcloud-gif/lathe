@@ -104,7 +104,12 @@ func (a *SchedulesAPI) list(w http.ResponseWriter, r *http.Request) {
 	for i := range rows {
 		out = append(out, viewOf(&rows[i]))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"schedules": out})
+	// triggerLabel 给界面判断「打接单标签」能不能选（标签名不是凭据，不敏感）
+	label := ""
+	if a.Preconditions != nil {
+		label = a.Preconditions.TriggerLabel(r.Context())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"schedules": out, "triggerLabel": label})
 }
 
 func (a *SchedulesAPI) get(w http.ResponseWriter, r *http.Request) {

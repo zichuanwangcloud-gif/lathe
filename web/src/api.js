@@ -174,6 +174,18 @@ export const api = {
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueKey }) }),
   linearIssues: () => request('/api/linear/issues'),
   linearIssue: (id) => request(`/api/linear/issues/${encodeURIComponent(id)}`),
+  linearTeams: () => request('/api/linear/teams'),
+
+  // 定时建单（docs/features/scheduled-issue.md）：到点只在 Linear 建单，之后走正常接单
+  schedules: () => request('/api/schedules'),
+  createSchedule: (body) => request('/api/schedules', { method: 'POST', body: JSON.stringify(body) }),
+  updateSchedule: (id, body) =>
+    request(`/api/schedules/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteSchedule: (id) => request(`/api/schedules/${id}`, { method: 'DELETE' }),
+  runSchedule: (id) => request(`/api/schedules/${id}/run`, { method: 'POST' }),
+  scheduleRuns: (id, limit = 50) => request(`/api/schedules/${id}/runs?limit=${limit}`),
+  previewSchedule: (body) =>
+    request('/api/schedules/preview', { method: 'POST', body: JSON.stringify(body) }),
   startIssue: (issueId, issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueId, issueKey }) }),
   retry: (id, mode = 'auto') =>
