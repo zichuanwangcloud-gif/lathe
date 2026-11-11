@@ -210,8 +210,12 @@ export const api = {
     }),
 
   integrations: () => request('/api/integrations'),
-  saveIntegration: (kind, token) =>
-    request(`/api/integrations/${kind}`, { method: 'PUT', body: JSON.stringify({ token }) }),
+  // baseUrl 只对自建平台（gitlab/gitea）传：其余种类传了会被后端 400 拒绝。
+  saveIntegration: (kind, token, baseUrl) =>
+    request(`/api/integrations/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(baseUrl ? { token, baseUrl } : { token }),
+    }),
   verifyIntegration: (kind) =>
     request(`/api/integrations/${kind}/verify`, { method: 'POST' }),
   deleteIntegration: (kind) =>

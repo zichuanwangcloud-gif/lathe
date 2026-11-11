@@ -15,6 +15,9 @@ function webhookFor(platform) {
 const webhookURL = computed(() => webhookFor('linear'))
 // PR 评论回流（review 意见 → 二轮修复）的回调地址。
 const githubWebhookURL = computed(() => webhookFor('github'))
+// GitLab / Gitea 同形：同一个随机段，各挂一个平台前缀。
+const gitlabWebhookURL = computed(() => webhookFor('gitlab'))
+const giteaWebhookURL = computed(() => webhookFor('gitea'))
 const copied = ref('')
 async function copyWebhook(which, url) {
   try {
@@ -30,6 +33,9 @@ const items = ref([])
 const error = ref('')
 const busy = ref('')
 const drafts = ref({})
+// 自建平台（gitlab/gitea）的实例地址草稿；与令牌一起提交。
+const baseDrafts = ref({})
+const NEEDS_BASE = new Set(['gitlab', 'gitea'])
 const results = ref({})
 const onUnauthorized = inject('onUnauthorized')
 
@@ -58,6 +64,30 @@ const META = {
     where: '目标仓库 → Settings → Webhooks，创建时自行填写的 Secret',
     env: 'LATHE_GITHUB_WEBHOOK_SECRET',
   },
+  gitlab: {
+    name: 'GitLab 令牌',
+    desc: '用于推分支、开 MR、读 review 意见与项目成员（信任判定）。支持自建实例：与实例地址一起保存，保存时会连到该实例验证令牌。',
+    where: 'GitLab → Preferences → Access Tokens（勾选 api 权限）',
+    env: '', // 无环境变量兜底：实例地址只在这里填
+  },
+  gitlab_webhook: {
+    name: 'GitLab Webhook 密钥',
+    desc: '校验 MR 评论事件的 X-Gitlab-Token。配好后 MR 上项目成员（≥ Reporter）的评论会回流成二轮修改。无法主动验证：在项目 webhook 设置里点 Test 返回 200 即配对成功。',
+    where: '目标项目 → Settings → Webhooks，创建时填写的 Secret token',
+    env: '',
+  },
+  gitea: {
+    name: 'Gitea 令牌',
+    desc: '用于推分支、开 PR、读 review 意见与协作者权限（信任判定）。支持自建实例：与实例地址一起保存，保存时会连到该实例验证令牌。',
+    where: 'Gitea → 设置 → 应用 → 管理访问令牌（仓库读写权限）',
+    env: '', // 无环境变量兜底：实例地址只在这里填
+  },
+  gitea_webhook: {
+    name: 'Gitea Webhook 密钥',
+    desc: '校验 PR 评论事件的 X-Gitea-Signature（HMAC-SHA256）。配好后 PR 对话里有写权限的协作者的评论会回流成二轮修改；review 本身不触发，但会在二轮时一并带给 agent。',
+    where: '目标仓库 → Settings → Webhooks，创建时填写的 Secret',
+    env: '',
+  },
 }
 
 async function load() {
@@ -81,13 +111,24 @@ async function afterCredentialChange() {
 async function save(kind) {
   const token = (drafts.value[kind] || '').trim()
   if (!token) return
+  let baseUrl = ''
+  if (NEEDS_BASE.has(kind)) {
+    // 替换令牌时沿用已保存的实例地址（地址框留空 = 不改）
+    const current = items.value.find((i) => i.kind === kind)?.baseUrl || ''
+    baseUrl = (baseDrafts.value[kind] || '').trim() || current
+    if (!baseUrl) {
+      error.value = '请填写实例地址，如 https://gitlab.example.com'
+      return
+    }
+  }
 
   busy.value = kind
   error.value = ''
   try {
-    const res = await api.saveIntegration(kind, token)
+    const res = await api.saveIntegration(kind, token, baseUrl)
     results.value[kind] = res.verify
     drafts.value[kind] = ''
+    baseDrafts.value[kind] = ''
     await afterCredentialChange()
   } catch (e) {
     error.value = e.message
@@ -203,6 +244,46 @@ onMounted(load)
     </p>
   </div>
 
+  <div v-if="gitlabWebhookURL" class="card cred">
+    <div class="spread">
+      <div>
+        <h2>你的 GitLab Webhook 地址（MR 评论回流）</h2>
+        <p class="faint desc">
+          在目标项目 → Settings → Webhooks 里新建 webhook：URL 填这个地址，Secret token 填一串随机值
+          （同时保存到下面的「GitLab Webhook 密钥」），触发器勾选 <em>Comments</em>（Note events）。
+          之后 MR 上项目成员（Reporter 及以上）留的评论会让任务回到原会话修改、重新验证并更新 MR。
+        </p>
+      </div>
+    </div>
+    <div class="row form">
+      <input readonly :value="gitlabWebhookURL" class="mono" @focus="$event.target.select()" />
+      <button @click.prevent="copyWebhook('gitlab', gitlabWebhookURL)">{{ copied === 'gitlab' ? '已复制 ✓' : '复制' }}</button>
+    </div>
+    <p class="faint hint">
+      成员关系用你的 GitLab 令牌查询；查不到（令牌权限不足、接口出错）时一律不回流 —— 安全的默认。
+    </p>
+  </div>
+
+  <div v-if="giteaWebhookURL" class="card cred">
+    <div class="spread">
+      <div>
+        <h2>你的 Gitea Webhook 地址（PR 评论回流）</h2>
+        <p class="faint desc">
+          在目标仓库 → Settings → Webhooks 里新建 Gitea webhook：目标 URL 填这个地址，内容类型选
+          <code class="mono">application/json</code>，密钥填一串随机值（同时保存到下面的「Gitea Webhook 密钥」），
+          触发条件选「自定义事件」并勾选 <em>Pull Request Comment</em>。
+        </p>
+      </div>
+    </div>
+    <div class="row form">
+      <input readonly :value="giteaWebhookURL" class="mono" @focus="$event.target.select()" />
+      <button @click.prevent="copyWebhook('gitea', giteaWebhookURL)">{{ copied === 'gitea' ? '已复制 ✓' : '复制' }}</button>
+    </div>
+    <p class="faint hint">
+      在 PR 对话里发评论即触发二轮；review（含行内评论）本身不触发，但会在二轮时一并带给 agent。
+    </p>
+  </div>
+
   <div v-for="item in items" :key="item.kind" class="card cred">
     <div class="spread">
       <div>
@@ -219,6 +300,7 @@ onMounted(load)
       <code class="mono">{{ item.masked }}</code>
       <span v-if="item.source === 'env'" class="badge idle">来自环境变量</span>
       <span v-if="item.accountName" class="dim">· 账号 {{ item.accountName }}</span>
+      <span v-if="item.baseUrl" class="dim">· 实例 <code class="mono">{{ item.baseUrl }}</code></span>
       <span v-if="item.verifiedAt" class="faint">· 验证于 {{ formatTime(item.verifiedAt) }}</span>
     </div>
 
@@ -234,6 +316,13 @@ onMounted(load)
     </div>
 
     <form class="row form" @submit.prevent="save(item.kind)">
+      <input
+        v-if="NEEDS_BASE.has(item.kind)"
+        v-model="baseDrafts[item.kind]"
+        type="url"
+        :placeholder="item.baseUrl ? `实例地址（留空沿用 ${item.baseUrl}）` : `实例地址，如 https://${item.kind}.example.com`"
+        autocomplete="off"
+      />
       <input
         v-model="drafts[item.kind]"
         type="password"
@@ -256,7 +345,7 @@ onMounted(load)
 
     <p class="faint hint">
       获取位置：{{ META[item.kind]?.where }}
-      <span v-if="auth.user?.role === 'admin'" class="sep">
+      <span v-if="auth.user?.role === 'admin' && META[item.kind]?.env" class="sep">
         · 也可用环境变量 <code class="mono">{{ META[item.kind]?.env }}</code>（仅对管理员兜底，优先级低于此处配置）
       </span>
     </p>
