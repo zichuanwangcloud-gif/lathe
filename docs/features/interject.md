@@ -263,7 +263,7 @@ CREATE TABLE task_interjections (
   --   delivered  已进入 agent 进程 —— 只代表「CLI 收到了」，不代表模型照做
   --   failed     不会进入模型；error 写明原因
   status      text        NOT NULL DEFAULT 'queued',
-  -- failed 时是人读原因（CHECK 强制非空）；delivered 时可为 'no_replay_ack'（写入成功但没等到回显）。
+  -- failed 时是人读原因（CHECK 强制非空）；delivered 时可为 'no_replay_ack'（写入成功但 2s 内没等到回显；回显迟到时被清空，§3.3 第 5 步）。
   error       text,
   -- 投递时归属的 agent 会话 ID：事后能对上「这句话进了哪一轮」。
   session_id  text,
@@ -622,6 +622,15 @@ type Interjector interface {
       - `ErrDeliverBackpressure` → `MarkFailed('投递通道拥塞…')`，返回 503；
       - 写成功 → 在 **Submit 协程**里等 ack channel 至多 2 秒：收到 → `MarkDelivered`；
         超时 → `MarkDelivered(error='no_replay_ack')`（**不**判 failed：写进管道且会话未关，P5 保证它会被吸收）；返回 200。
+        **迟到回显（实现期补，AC-22 实测驱动）**：CLI 只在**当前步骤**（一次 API 往返或一次工具调用）结束、把排队的输入并进对话时
+        才发 `isReplay` 回显（真实捕获：回显行的 `timestamp` 是收到时刻，但它在 stdout 上排在当时那次工具调用的 `tool_result` 之后，
+        `evidence/f01/e2e/run-20261111-182515/claude-stdout-*.jsonl`）。模型在长思考或跑 `go test` 时插话，2s 内就等不到回显——
+        这是结构性的，与 `--resume` 无关，调大等待只是换一个会被打破的数字，还会让 HTTP 请求跟着变慢。所以 2s 等待不变，
+        超时收尾后若投递时的会话条目仍在，就把这条投递登记为「等迟到回显」；回显到达时读协程只做内存查表、另起协程执行
+        `MarkInterjectionReplayAcked`（条件 `status='delivered' AND error='no_replay_ack' AND delivery_id=$3`，清空 `error`、
+        前进 `rev`，界面轮询据此把「未收到确认回显」去掉）。会话注销（进程退出、不会再有回显）时一并丢弃登记；
+        超时与收尾之间到达的回显落在容量 1 的 channel 里，收尾后当场确认。`no_replay_ack` 于是只剩一种含义：
+        **写进了管道、直到会话结束都没见到回显**。（`TestInterjectLateReplayAckClearsError`、`TestMarkInterjectionReplayAcked`）
 6. **终态写失败**（DB 不可用，`dctx` 下 5s 超时）：重试至多 3 次（退避 0.5s/1s/2s，总计 ≤ 25s），仍失败则 `slog.Error`
    （只记 `id`、`len`，不记正文）并返回 500。这是**唯一**会让行暂留 `delivering` 的情形，前提是 DB 整体不可用；
    由下一次启动清扫收尾（`delivering` → `failed`「进程重启，投递未完成」）。如实写进 `docs/features/interject.md`，
@@ -671,7 +680,8 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
   初稿 §3.4 代码里在 `onDelivery` 里同步 `MarkDelivered` 与后文矛盾，已删除。
   这张表原样写进 `interject.go` 的包注释；AC-6b 用「只让读协程可能碰到的写路径变慢」的假 store 守住读协程不被拖慢。
 - **注册表**：`internal/runner/interject.go` 新文件，`map[int64]*entry` + `sync.Mutex`，另有
-  `map[string]chan struct{}` 存 ack 等待者（`Expect` 放入、`Submit` 退出时删除，不泄漏）。
+  `map[string]chan struct{}` 存 ack 等待者（`Expect` 放入、`Submit` 退出时删除，不泄漏），以及「等迟到回显」的
+  `map[string]lateAck`（超时收尾后放入；回显到达或所属会话 `Unregister` 时删除，不泄漏）。
   条目 `{session *agent.Session, phase, sessionID string, startedAt time.Time}`；`Lookup` 对 `session.Closed()`
   为真的条目返回「无活会话」。一个任务同一时刻至多一个条目（实现轮与修复轮串行），`Register` 遇到已存在条目
   就覆盖并 `slog.Warn`。
@@ -1049,7 +1059,7 @@ f06 合入后改为 `CapabilitiesOf` 并把该测试改成表驱动（claude →
 |---|---|---|---|
 | `implementing` | 活会话 | `200 delivered` | `delivered`，`delivery_id` 非空 |
 | `verifying`（修复轮在跑） | 活会话 | `200 delivered` | `delivered` |
-| `implementing` | 活会话但回显 2s 内未到 | `200 delivered` | `delivered`，`error='no_replay_ack'` |
+| `implementing` | 活会话但回显 2s 内未到 | `200 delivered` | `delivered`，`error='no_replay_ack'`（回显迟到后清空，`TestInterjectLateReplayAckClearsError`） |
 | `implementing` | 无活会话 | `202 queued`（`reason:"no_live_session"`） | `queued` |
 | `implementing` | 会话已出 result（`Closed()`） | `202 queued` | `queued` |
 | `verifying` | 无活会话（正在跑 `go test`） | `202 queued` | `queued` |
@@ -1246,6 +1256,10 @@ ss -ltn | grep -c ':8401 '                                                      
 > ③ 内置管理员首次登录必须改口令（`mustChangePassword`），且 `LATHE_ADMIN_PASSWORD` 只给没有口令的账号设初值，所以每次运行用新的
 > `LATHE_ADMIN_EMAIL=f01e2e-<ts>@lathe.local`（只新增用户行），登录后先 `POST /api/password/change`；
 > ④ AC-15 截图用本机已装的 playwright（python）+ 无头 chromium（`e2e/shot.py`），插话一、二经界面发送（POST 响应原样落 `interject*.json`）。
+> ⑤ **第 3 次取证（通过）**：`lathe_f01e2e` 留着前两次的任务（#2 `awaiting_approval` 非终态，第 0 步不满足；不删不改），改用同样只跑了迁移的独立空库
+> **`lathe_f01e2e2`**（`run.sh` 的 `F01_DB` 可覆盖）；措辞 3 = issue 同措辞 1，修复轮之间那句插话明确授权「go vet 在 calc.go 报的问题属于本任务、必须修」；
+> 插话二的 `no_replay_ack` 由新增的迟到回显确认清空（§3.3 第 5 步）。AC-15 整套截图出自这同一次运行，每张附当刻的库快照（`ac15-*.db.txt`）。
+> 这是第 3 次尝试（超出「重跑至多一次」）且中间有设计改动，两点待人确认，PR 保持 draft。
 > 结果见 §10。
 
 ### 启动恢复
@@ -1376,8 +1390,8 @@ ss -ltn | grep -c ':8401 '                                                      
 | AC-19 queued 一定有结局 | 通过（管线 6 场景、两组竞态各 100 次、cancelTask / CancelForIssue / blocked_dep 级联 / 周期清扫 / 不误判）；机检：`internal/task/`、`queue.go` 无改动，`api.go` 三个 hunk 都不在 `cancelTask`（610–634）内 | `TestQueuedInterjectionsSettled*`、`TestInterjectRace*`、`TestInterjectSettledOnReadAfterCancel*`；`dev/22-…` |
 | AC-20 客户端断开 | 通过（三个子用例，handler ≤ 3s） | `TestSubmitSurvivesClientDisconnect` |
 | AC-14 驱动级真实证据 | **通过（12/12，真 claude 2.1.322 + 真 provider）**：a 段回显 uuid 一致、末条 result 含 MARK、首条 result 后 0.230s 退出非 `ErrIdle`、result 后 `Deliver` → `ErrSessionClosed` 且只有 1 条 result；c 段（`--resume` + 流式）回显一致、单 result、同时含第一段暗号与 MARK2、`session_id` 不变、0.229s 退出；仓库无改动；secret-scan 0 命中 | `run_real_cli.sh`、`real-cli/real-20261111-181627/` |
-| AC-15 UI | 机检通过（`TaskDetail.vue` numstat `2 0`、`AgentEventItem.vue` 无 diff、`v-html` 0、`InterjectPanel` 2 次）；`make ui && make build` 成功。**截图已做**（无头 chromium，在 AC-22 两次 :8401 运行上）：implementing 发一句 → 「已送达」；verifying 时输入框在且带提示；修复轮之间发的一句「已记录待投递」→ 被 fix-1 补投时「投递中」；awaiting_approval 后输入框消失、列表仍在、该句「未进入模型」+ 原因。缺一张：第 1 次运行终态截图因 `/api/login` 限流 429 没截到（已改为复用会话） | `e2e/run-20261111-182145/ac15-{1,2,3}-*.png`、`e2e/run-20261111-182515/ac15-{1,2,4}-*.png`、`*.panel.txt` |
-| AC-22 :8401 端到端 | **按 PRD 的严格断言未通过（两次运行都没有同时满足「出 fix-1」与「终态 awaiting_approval」）**；插话链路本身（实时投递、`--resume` 会话里投递、修复轮之间 queued → 开场补投、验证通过后 queued → 结算 failed + 原因）在真实运行上全部走通，详见 10.4 | `e2e/run.sh`、`e2e/run-20261111-182145/`、`e2e/run-20261111-182515/` |
+| AC-15 UI | 机检通过（`TaskDetail.vue` numstat `2 0`、`AgentEventItem.vue` 无 diff、`v-html` 0、`InterjectPanel` 2 次）；`make ui && make build` 成功。**整套截图出自同一次通过 AC-22 的运行**（第 3 次，任务 #1，无头 chromium），每张都附截图当刻库里的 `state` 与各行 `phase/status/error`（`ac15-*.db.txt`）：① implementing 发一句 →「已送达」（`implement\|delivered\|`）；② verifying、修复轮之间发一句 →「已记录待投递」（`queued`，截图时已被 fix-1 认领为 `delivering`）；③ fix-1 在跑时发一句 → 输入框在且带提示、该句「已送达 + 已写入 agent 进程，未收到确认回显」（`fix-1\|delivered\|no_replay_ack`）；③b 迟到回显到达后同一句只剩「已送达」（`fix-1\|delivered\|`）；④ awaiting_approval 后输入框消失、列表仍在、三句都「已送达」。前两次运行的截图保留作对照，不再计入 | `e2e/run-20261111-184526/ac15-{1,2,3,3b,4}-*.png`、`ac15-*.panel.txt`、`ac15-*.db.txt` |
+| AC-22 :8401 端到端 | **第 3 次运行按 PRD 的严格断言全部通过**（终态 `awaiting_approval`、`implement\|delivered\|t\|t` 与 `fix-1\|delivered\|t\|t`、fix-1 事件 95、失败验证 1、最后一次 `passed`、两个标记都在 `worktree.diff`、fix-1 会话 = 实现会话）。这是第 3 次尝试（PRD 写的是「换措辞重跑至多一次」），并且中间改了代码（迟到回显，§3.3 第 5 步），两点都需要人确认，详见 10.4 | `e2e/run.sh`、`e2e/run-20261111-184526/`（通过）；`e2e/run-20261111-182145/`、`e2e/run-20261111-182515/`（前两次，未通过） |
 
 ### 10.3 AC-14：真实 claude 2.1.322 + 真 provider（2026-11-11 18:16，通过）
 
@@ -1397,7 +1411,7 @@ ss -ltn | grep -c ':8401 '                                                      
 
 stub provider 的补充证据（`real-cli/real-cli-20261111-165750-*`，12/12）保留，可离线复现。
 
-### 10.4 AC-22：两次真实 :8401 运行（如实）
+### 10.4 AC-22：三次真实 :8401 运行（如实）
 
 环境：独立空库 **`lathe_f01e2e`**（为避开 `lathe_f01` 的 36 个测试残留，不删它们）、`127.0.0.1:8401`、隔离 HOME（cc-switch 通道）、
 本地 bare fixture + 预置 mirror、`LATHE_GITHUB_TOKEN=stub-not-a-token`、`gate_mode=manual`、`verifyTierOverride=light`、`LATHE_FIX_ATTEMPTS=1`。
@@ -1433,12 +1447,43 @@ fix-1 事件 0 ✗；失败验证 0 ✗；最后验证 `passed` ✓；`f01-mark-
 `fixResumeSessionEqualsImpl:false`（无 fix-1）✗；stub token 0 ✓。tee 落盘的实现轮 claude stdout 里 `isReplay:true` 2 条（首帧 prompt + 插话一）、result 1 条。
 system raw 对照（不断言）：`informational|1,permission_denied|4,thinking_tokens|85`。
 
-**结论**：按 PRD「换措辞重跑至多一次，仍不过则标 draft 等人拍板、不得放宽断言」，AC-22 记为**未通过**，PR 保持 draft。两次合起来，
-插话功能要证明的每一段在真实运行上都出现过（新会话实时投递并被执行、`--resume` 的 fix-1 里实时投递、修复轮之间 queued → 开场补投、
-queued → 结算 failed + 原因、事件流两类污染为 0、fix-1 会话 ID 不变），但没有出现在同一次运行里，第 1 次又缺 diff 实物。
-**需要人拍板**：① fixture 怎么改才能同时满足「go test 看不见 → 一定出 fix-1」与「修复轮认为是本任务的问题 → 能修绿」
-（例如让 vet 问题由实现轮自己的改动引入，或修复轮插话里明确授权）；② 插话二 `no_replay_ack` 是否接受为 AC-22 的通过形态
-（§3.2 把它定义为 200 `delivered` 的成功形态，但 AC-22 断言写的是 `error IS NULL`）。
+**前两次的结论（保留原文含义）**：按 PRD「换措辞重跑至多一次，仍不过则标 draft 等人拍板」，前两次合起来记为未通过。留下两个问题：
+① fixture 怎么同时满足「go test 看不见 → 一定出 fix-1」与「修复轮认为是本任务的问题 → 能修绿」；② 插话二的 `no_replay_ack`。第 3 次运行分别回答了这两个问题：
+
+**第 3 次（措辞 3，任务 #1，库 `lathe_f01e2e2`，`e2e/run-20261111-184526/`）—— 严格断言全部通过**
+
+改了两处，断言一条没动：
+- **措辞 3**：issue 正文同措辞 1（不提 Copy/vet，所以实现轮照旧没修 `Copy` → 一定出 fix-1）。验证期间、修复轮之间发的那句插话改为属主明确授权
+  「流水线 go vet 在 calc.go 里报出的问题属于本任务，修复轮必须把它修掉，不要当成无关的既有问题跳过」，这句经 fix-1 开场补投进 prompt。
+  这本身就是插话要支持的用法：人在两轮之间补一句判断。fix-1 的交付摘要原文：「上一轮我看到了 `Copy` 复制锁的问题，但判断它是仓库原有的……
+  你已经说明这个问题属于本任务，所以这一轮修掉了。」
+- **迟到回显（代码改动，§3.3 第 5 步）**：第 1 次插话二的 `no_replay_ack` 是结构性的。tee 落盘的 claude stdout 显示，插话二在 `18:46:53.398`
+  被 CLI 收到（回显行的 `timestamp`），回显却排在当时那次 API 往返（思考 7s，再并行调了 Read 和 Bash）的 `tool_result`（`18:46:58.058`）之后才输出，
+  比写入晚约 4.7s。2s 等待对模型正在思考或跑工具的时刻天然不够，调大等待只是换一个会被打破的数字。现在超时后照旧先落
+  `no_replay_ack` 并返回 200；回显迟到时清空 `error`、前进 `rev`。本次 serve.log：`18:46:58.075 插话迟到回显已确认 task=1 id=3 cleared=true`。
+
+另一处环境变化：`lathe_f01e2e` 里留着前两次的任务（#1 `failed`、#2 `awaiting_approval`），#2 不是终态，第 0 步前置检查不满足。按 AGENTS.md §4 不删、不改它们，
+第 3 次改用新建的独立空库 **`lathe_f01e2e2`**（只跑了迁移，`tasks=0`）。
+
+| 断言 | 期望 | 实际 |
+|---|---|---|
+| 终态 | `awaiting_approval` | `awaiting_approval` ✓ |
+| 插话行 | `implement\|delivered\|t\|t`、`fix-1\|delivered\|t\|t` | `implement\|delivered\|t\|t` ✓、插话二 `fix-1\|delivered\|t\|t` ✓（200 时 `no_replay_ack`，约 2.7s 后由迟到回显清空）；另有修复轮之间那句 `fix-1\|delivered\|t\|f`（202 queued → fix-1 开场补投；补投行按设计没有 `delivery_id`） |
+| fix-1 事件数 | ≥1 | 95 ✓ |
+| 失败验证数 | ≥1 | 1 ✓（第一轮 `lint` 即 `go vet` copylocks） |
+| 最后一次验证 | `passed` | `passed` ✓（`build passed / lint failed / build passed / lint passed`） |
+| worktree.diff 里的标记 | 两个都 ≥1 | `f01-mark-f6d1ea26` 1 ✓、`f01-mark-1d7112e1` 1 ✓（修复轮之间那句的 `f01-gap-6e856819` 也是 1） |
+| `command_lifecycle` raw | 0 | 0 ✓ |
+| user 回显冒充 text | 0 | 0 ✓ |
+| fix-1 会话 = 实现会话 | true | true ✓ |
+| stub token 出现在事件里 | 0 | 0 ✓ |
+| 生产二进制 / :8401 / secret-scan | 未变 / 已停 / 0 | untouched / 0 / 0 命中 ✓ |
+
+system raw 对照（不断言）：`informational|1,permission_denied|4,thinking_tokens|142`。顺带一条与插话无关的观察：fix-1 自述「这个环境里 `go vet` 和 `go test`
+都需要权限批准」（`permission_denied|4`），所以它自己没跑验证，转绿是 `stageVerify` 独立判定的。这正是 G5 想要的：判定不靠 agent 自己说。
+
+**需要人确认的两点**（所以 PR 仍保持 draft，等人拍板）：① 这是第 3 次尝试，超出了 PRD「换措辞重跑至多一次」的上限，措辞 3 是在前两次失败后按评审建议
+（「修复轮插话里明确授权」）定的；② 迟到回显是验收期才加的设计改动，没有经过 PRD 评审，需要评审认可它对 `no_replay_ack` 含义的收窄。
 
 ### 10.5 与并行线的接缝（本线先合入的情形）
 
