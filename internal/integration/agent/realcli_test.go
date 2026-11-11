@@ -46,6 +46,15 @@ var (
 	realMark = flag.String("real-mark", "", "AC-14：a 段注入的标记（包装脚本用 uuidgen 生成）；空 = 随机")
 )
 
+// isolatedCommand 起一个显式 Dir、白名单 env（PATH + 隔离 HOME + extra）的子进程，
+// 不继承测试进程的 cwd 与全量环境（AGENTS.md §9）。
+func isolatedCommand(dir, home string, extra []string, name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + home}, extra...)
+	return cmd
+}
+
 var markRe = regexp.MustCompile(`(?:ZEBRA|MARK1|MARK2)-[0-9a-f]{8}`)
 
 // stubProvider 是最小的 Anthropic Messages API 替身。
@@ -188,11 +197,9 @@ func TestRealCLIInterject(t *testing.T) {
 		repo = *realDir
 	}
 	git := func(args ...string) string {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = repo
-		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home,
+		cmd := isolatedCommand(repo, home, []string{
 			"GIT_AUTHOR_NAME=f01", "GIT_AUTHOR_EMAIL=f01@example.invalid",
-			"GIT_COMMITTER_NAME=f01", "GIT_COMMITTER_EMAIL=f01@example.invalid"}
+			"GIT_COMMITTER_NAME=f01", "GIT_COMMITTER_EMAIL=f01@example.invalid"}, "git", args...)
 		b, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, b)
@@ -346,7 +353,7 @@ func TestRealCLIInterject(t *testing.T) {
 		_ = os.WriteFile(filepath.Join(out, fmt.Sprintf("real-cli-%s-stub-requests.json", stamp)), stubLog, 0o644)
 	}
 	porcelain := strings.TrimSpace(git("status", "--porcelain"))
-	version, _ := exec.Command(*realBin, "--version").Output()
+	version, _ := isolatedCommand(repo, home, nil, *realBin, "--version").Output()
 
 	type check struct {
 		Name string `json:"name"`
