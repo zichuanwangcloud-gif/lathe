@@ -283,6 +283,10 @@ func serve(cfg config.Config) error {
 		Queue:        q,
 		Auth:         auth,
 		ConfigStatus: configStatus(cfg),
+		// 验证日志读取（f04）：与 Pipeline.LogDir / KnownSecrets 同源（buildPipeline 里的同名字段），
+		// 漏装时日志接口一律 503、静默不可用 —— TestServeWiresVerificationLogIntoAPI 守着。
+		LogDir:       cfg.DataDir,
+		KnownSecrets: cfg.KnownSecrets(),
 	}
 	apiSrv.Routes(mux)
 
