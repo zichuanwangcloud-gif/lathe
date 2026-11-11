@@ -54,7 +54,7 @@ func TestBuildPipelineReturnsStacksAlreadyWired(t *testing.T) {
 		HeavySlots:    1,
 	}
 
-	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 	// `go mergePoller.Run(...)` / `go sweeper.Run(...)` —— 那会绕过这个结构。
 	for _, g := range goStmts {
 		if strings.HasPrefix(g, "q.work") || strings.HasPrefix(g, "mergePoller.") ||
-			strings.HasPrefix(g, "sweeper.") {
+			strings.HasPrefix(g, "sweeper.") || strings.HasPrefix(g, "notifyWorker.") {
 			t.Errorf("serve 里不该直接 `go %s`：后台执行者只能由 startWorkers 启动，"+
 				"那是「装配完成后才启动」这条约束的唯一承载点", g)
 		}
@@ -202,7 +202,7 @@ func TestStartWorkersLaunchesAllLoops(t *testing.T) {
 		return true
 	})
 
-	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false}
+	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false, "notifyWorker.Run": false}
 	for _, g := range goStmts {
 		for k := range want {
 			if strings.HasPrefix(g, k) {
@@ -246,7 +246,7 @@ var _ runner.VerifyStackUp = verifyStacks{}
 func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 func TestVerifyStacksReturnsTrueNilWithoutInfra(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}

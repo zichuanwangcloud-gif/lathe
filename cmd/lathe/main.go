@@ -25,6 +25,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/mail"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
@@ -157,6 +158,9 @@ func serve(cfg config.Config) error {
 	slog.Info("凭据加密已就绪", "key_source", keySource)
 
 	secrets := st.NewSecrets(sealer)
+	// 站外通知渠道（Slack / 飞书，f09）：URL 与签名密钥同凭据一样加密入库。
+	// 白名单只此一处：保存时校验与发送时校验用的是同一份 notify.AllowedHosts。
+	notifyChannels := st.NewNotifyChannels(sealer, notify.AllowedHosts)
 	users := st.NewUsers()
 	sessions := st.NewSessions()
 
@@ -177,7 +181,7 @@ func serve(cfg config.Config) error {
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID, st)
 
-	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory)
+	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory, notifyChannels)
 	if err != nil {
 		return err
 	}
@@ -314,6 +318,14 @@ func serve(cfg config.Config) error {
 	}
 	smtpAPI.Routes(mux)
 
+	// 站外通知渠道的个人设置（f09）：保存即发测试消息，投递记录可查可重试。
+	notifyAPI := &httpapi.NotifyAPI{
+		Channels: notifyChannels,
+		Sender:   notify.NewProductionSender(),
+		Auth:     auth,
+	}
+	notifyAPI.Routes(mux)
+
 	adminAPI := &httpapi.AdminAPI{
 		Users:    users,
 		Sessions: sessions,
@@ -420,18 +432,9 @@ func serve(cfg config.Config) error {
 	// agent 驱动另起一个实例：Driver 无状态，与执行共用没有好处，分开
 	// 反而让规划超时将来能独立调。
 	prdAPI := &httpapi.PRDAPI{
-		Store: st,
-		Auth:  auth,
-		Planner: &prd.Service{
-			Store:     prd.NewStoreAdapter(st),
-			Agent:     agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
-			Worktrees: prdWorktrees{wm: pipeline.Worktrees},
-			Issues:    prdIssues{st: st},
-			Flows:     prdFlows{svc: flowSvc},
-			Channel:   cfg.ImplementChannel,
-			// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
-			SettingSources: cfg.SettingSources,
-		},
+		Store:   st,
+		Auth:    auth,
+		Planner: buildPRDService(cfg, st, pipeline.Worktrees, flowSvc, notifyChannels),
 	}
 	prdAPI.Routes(mux)
 
@@ -464,7 +467,7 @@ func serve(cfg config.Config) error {
 	// 更实的影响：那一段窗口里被领走的任务 p.Stacks == nil → 整个起栈
 	// 分支跳过 → 既不起栈也不留痕。而那个窗口恰恰是最热的时刻 ——
 	// 上面的 Reconcile 刚把所有在途任务重新入队。
-	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets)
+	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets, notifyChannels)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -496,7 +499,7 @@ func serve(cfg config.Config) error {
 // 而不是被硬杀。注意被取消的 ctx 会一路传进拆栈路径 —— 那正是
 // VerifyStack.Down 必须自己解绑取消的原因（见 preview/verifystack.go）。
 func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *store.Store,
-	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets) {
+	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets, nc *store.NotifyChannels) {
 	go q.work(ctx)
 
 	// F4.1 合并检测的轮询兜底 + F4.2 现场回收 + F4.3 后继链自动 rebase
@@ -542,6 +545,47 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 		slog.Warn("PRD 搁置提醒已关闭（LATHE_PRD_STALL_NOTIFY=false）：仍会判搁置，但不会通知属主")
 	}
 	go sweeper.Run(ctx)
+
+	// 站外通知 outbox 的投递者（f09）：每 notify.DrainInterval 一轮，逐行领取发送，
+	// 失败退避重试至多 notify.MaxAttempts 次。它只读写 notify_deliveries 这张旁路表，
+	// 与任务状态机没有任何交集 —— 它挂了、慢了，任务照样流转。
+	notifyWorker := notify.NewWorker(nc, notify.NewProductionSender(), cfg.PublicURL())
+	go notifyWorker.Run(ctx)
+}
+
+// buildPRDService 装配模糊任务规划服务（docs/10）。
+//
+// 从 serve 的字面量里提出来，是为了让装配测试能断言 ReviewNotifier 接的是
+// 同一个 *store.NotifyChannels（同 buildPipeline 的做法）。函数体保持键值字面量。
+func buildPRDService(cfg config.Config, st *store.Store, wm *runner.WorktreeManager, flowSvc *flow.Service, nc *store.NotifyChannels) *prd.Service {
+	return &prd.Service{
+		Store:     prd.NewStoreAdapter(st),
+		Agent:     agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		Worktrees: prdWorktrees{wm: wm},
+		Issues:    prdIssues{st: st},
+		Flows:     prdFlows{svc: flowSvc},
+		Channel:   cfg.ImplementChannel,
+		// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
+		SettingSources: cfg.SettingSources,
+		// PRD 进 ready_for_review 时推站外通知（f09）。nil NC 不能装进接口：
+		// 那会得到一个「非 nil 接口里的 nil 指针」，notifyReview 会在它上面调方法。
+		ReviewNotifier: reviewNotifierOf(nc),
+	}
+}
+
+// reviewNotifierOf / chatNotifierOf 让 nil NC 落成 nil 接口（关闭），而不是装了 nil 指针的接口。
+func reviewNotifierOf(nc *store.NotifyChannels) prd.ReviewNotifier {
+	if nc == nil {
+		return nil
+	}
+	return nc
+}
+
+func chatNotifierOf(nc *store.NotifyChannels) runner.ChatNotifier {
+	if nc == nil {
+		return nil
+	}
+	return nc
 }
 
 // buildPipeline 装配流水线。
@@ -553,7 +597,7 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 // 返回 preview.Manager 给调用方复用：验证隔离栈与预览环境用的是同一套
 // docker 能力与同一组资源阈值，另起一个实例等于两套配置，迟早不一致
 // （apiSrv.Baselines 复用它是同一个先例）。
-func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, factory runner.ClientFactory) (*runner.Pipeline, *preview.Manager, error) {
+func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, factory runner.ClientFactory, nc *store.NotifyChannels) (*runner.Pipeline, *preview.Manager, error) {
 	wm, err := runner.NewWorktreeManager(cfg.WorkspaceRoot)
 	if err != nil {
 		return nil, nil, err
@@ -576,6 +620,8 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		ClientFactory: factory,
 		Notifier:      logNotifier{},
 		Mail:          taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
+		// 站外渠道（Slack / 飞书，f09）：*store.NotifyChannels 直接满足 runner.ChatNotifier，不写适配器。
+		Chat:          chatNotifierOf(nc),
 		BaseURL:       cfg.PublicURL(),
 		LogDir:        cfg.DataDir,
 		Verifications: st,
