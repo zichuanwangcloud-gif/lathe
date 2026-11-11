@@ -103,6 +103,9 @@ func (s Stage) label() string {
 	case StageSkillMissing:
 		// 常量在 skills.go。
 		return "技能缺失"
+	case StageTeamSkillFailed:
+		// 常量在 teamskills.go（f11）。
+		return "团队技能物化失败"
 	}
 	return string(s)
 }

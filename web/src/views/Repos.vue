@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError } from '../api'
+import TeamSkillCard from '../components/TeamSkillCard.vue'
 
 const repos = ref([])
 const error = ref('')
@@ -298,6 +299,8 @@ onMounted(load)
     </div>
 
     <button class="primary" @click="save(repo)">保存</button>
+
+    <TeamSkillCard :repo-id="repo.id" />
   </div>
 </template>
 

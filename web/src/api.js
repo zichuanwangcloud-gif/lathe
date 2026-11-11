@@ -203,6 +203,26 @@ export const api = {
   createRepo: (body) =>
     request('/api/repos', { method: 'POST', body: JSON.stringify(body) }),
   repoBaseline: (id) => request(`/api/repos/${id}/baseline`),
+
+  // 团队自定义技能（f11，docs/features/team-skills.md）：按仓库登记，版本不可变
+  teamSkills: (repoId) => request(`/api/repos/${repoId}/team-skills`),
+  teamSkill: (repoId, sid) => request(`/api/repos/${repoId}/team-skills/${sid}`),
+  teamSkillVersion: (repoId, sid, v) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}/versions/${v}`),
+  createTeamSkill: (repoId, body) =>
+    request(`/api/repos/${repoId}/team-skills`, { method: 'POST', body: JSON.stringify(body) }),
+  appendTeamSkillVersion: (repoId, sid, body) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}/versions`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  restoreTeamSkillVersion: (repoId, sid, v) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}/versions/${v}/restore`, { method: 'POST' }),
+  updateTeamSkill: (repoId, sid, body) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  archiveTeamSkill: (repoId, sid) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}`, { method: 'DELETE' }),
+  taskTeamSkills: (taskId) => request(`/api/tasks/${taskId}/team-skills`),
   deployRepoBaseline: (id, composeFile) =>
     request(`/api/repos/${id}/baseline/deploy`, {
       method: 'POST',

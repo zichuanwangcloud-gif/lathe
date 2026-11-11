@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, computed, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
+import TaskTeamSkills from '../components/TaskTeamSkills.vue'
 import { confirmDialog } from '../confirm'
 import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
 
@@ -406,6 +407,7 @@ onUnmounted(() => {
           </dd>
           <dt>工作区</dt><dd class="mono break">{{ task.worktreePath || '—' }}</dd>
           <dt>会话</dt><dd class="mono break">{{ task.agentSessionId || '—' }}</dd>
+          <TaskTeamSkills :task-id="props.id" />
           <dt>创建</dt><dd>{{ formatTime(task.createdAt) }}</dd>
           <dt>更新</dt><dd>{{ formatTime(task.updatedAt) }}</dd>
         </dl>

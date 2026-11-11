@@ -251,6 +251,11 @@ webhook 密钥验签、任务记在各自名下、队列按属主解析各自的
 旧路径 `/webhooks/linear` 继续指向内置管理员，兼容既有部署；环境变量凭据只给
 内置管理员兜底，不会漏给普通成员。
 
+**团队自定义技能**：仓库配置页可为每个仓库登记团队自己的技能（`SKILL.md` + 少量
+附属文件，存库、版本不可变），任务实现阶段物化到工作区的 `.claude/skills/team-<名字>/`，
+与 Lathe 内置技能分命名空间、不进 PR；每个任务第一次物化时钉住版本，重跑用同一版
+（[docs/features/team-skills.md](docs/features/team-skills.md)）。
+
 后续见 [docs/02-design.md](docs/02-design.md) §8：P2 OAuth 绑定与配额 → P3 多节点。
 
 未完成：红绿测试进程的完整 compose 隔离（§8）、多节点。

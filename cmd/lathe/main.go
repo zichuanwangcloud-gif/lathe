@@ -391,6 +391,16 @@ func serve(cfg config.Config) error {
 	}
 	credAPI.Routes(mux)
 
+	// 团队自定义技能（f11，docs/features/team-skills.md）：按仓库登记、带版本、
+	// 物化进任务 worktree。凭据扫描的已知值 = 部署自身的凭据 + 用户的集成凭据。
+	teamSkillAPI := &httpapi.TeamSkillAPI{
+		Store:        st,
+		Secrets:      secrets,
+		KnownSecrets: cfg.KnownSecrets(),
+		Auth:         auth,
+	}
+	teamSkillAPI.Routes(mux)
+
 	// 编排图：一键批量入队（PRD 07 F1.4），与执行队列共用同一个
 	// task.Machine，不重开数据库连接。
 	flowSvc := &flow.Service{Pool: st.Pool(), Tasks: task.NewMachine(st.Pool()), Store: st}
@@ -582,6 +592,8 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		Stacks:        verifyStacks{pm},
 		AgentEvents:   st,
 		Memory:        st,
+		// 团队自定义技能（f11）：钉版本、物化、提交前复位；*store.Store 直接满足接口。
+		TeamSkills: st,
 		// 脱敏权威层的登记值：配置里的 DB 口令/集成 token（见 config.KnownSecrets）。
 		// 隔离栈连接串与进程环境由 runner 自己在脱敏时补上（它拿得到 StackEnv）。
 		KnownSecrets:     cfg.KnownSecrets(),
