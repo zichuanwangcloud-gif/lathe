@@ -1362,17 +1362,27 @@ ss -ltn | grep -c ':8401 '                                                      
 | AC-18 取消后不接受 | 通过 | `TestInterjectRejectedAfterCancelEvenWithLiveSession` |
 | AC-19 queued 一定有结局 | 通过（管线 6 场景、两组竞态各 100 次、cancelTask / CancelForIssue / blocked_dep 级联 / 周期清扫 / 不误判）；机检：`internal/task/`、`queue.go` 无改动，`api.go` 三个 hunk 都不在 `cancelTask`（610–634）内 | `TestQueuedInterjectionsSettled*`、`TestInterjectRace*`、`TestInterjectSettledOnReadAfterCancel*`；`dev/22-…` |
 | AC-20 客户端断开 | 通过（三个子用例，handler ≤ 3s） | `TestSubmitSurvivesClientDisconnect` |
-| AC-14 驱动级真实证据 | **通过**（见 10.3） | `real-cli/` |
+| AC-14 驱动级真实证据 | **未取证**（真凭据不可用，见 10.3）。驱动机制项在真实 claude 二进制上全部成立（stub provider 补充证据 12/12；真 provider 那次 8/12，失败的 4 项都是「未登录」导致模型没跑） | `run_real_cli.sh`、`real-cli/real-20261111-172800/`、`real-cli/`（stub） |
 | AC-15 UI | 机检通过（`TaskDetail.vue` numstat `2 0`、`AgentEventItem.vue` 无 diff、`v-html` 0、`InterjectPanel` 2 次）；`make ui && make build` 成功。**截图未做**：手测按 PRD 定义在 AC-22 那次 :8401 运行上做，见 10.4 | `dev/09-ui-build.txt` |
-| AC-22 :8401 端到端 | **未执行**，见 10.4 | `e2e/run.sh`、`e2e/run-attempt-1.txt` |
+| AC-22 :8401 端到端 | **未执行**，见 10.4（两个前置都不满足：库里残留、真凭据不可用） | `e2e/run.sh`、`e2e/run-attempt-1.txt` |
 
-### 10.3 AC-14：真实 claude 2.1.322 + 本机 stub provider
+### 10.3 AC-14：真实 claude 2.1.322（真 provider 未取证；stub provider 补充证据）
 
+**真 provider：未取证。** 包装脚本 `/opt/lathe-wt/evidence/f01/run_real_cli.sh` 按 PRD 形态建隔离 `HOME`、复制
+`~/.claude/.credentials.json`、建临时仓库、`uuidgen` 生成 `INTERJECT-MARK-…`，再以 `-real-home/-real-dir/-real-mark` 跑
+`TestRealCLIInterject`（给了 `-real-home` 就不注入 stub 的 `ANTHROPIC_BASE_URL`/假 token）。2026-11-11 17:28 那次两段的 result 都是
+`Not logged in · Please run /login`：本机凭据文件里只有 `mcpOAuth.*`（只看了键名），**没有 `claudeAiOauth`**，P7「复制即登录」的
+前提今天不成立。按 PRD 纪律，不拿 stub 结果顶替，也没有挪用当前 agent 会话环境里的 `ANTHROPIC_*`（那不是 PRD 规定的凭据来源）。
+那次仍然成立的机制项：首条 result 后 0.536s / 0.257s 退出、非 `ErrIdle`；result 后 `Deliver` → `ErrSessionClosed`；单条 result；
+`--resume` 参数形状；`session_id` 不变；仓库无改动（`real-cli/real-20261111-172800/`，含 `ATTEMPT.md`、完整 go test 输出、secret-scan 0 命中）。
+**需要人**：提供可复制的 Claude 登录凭据（或指定凭据来源）后重跑脚本；补齐前 PR 保持 draft。
+
+**补充证据（stub provider，可离线复现，不算 AC-14 通过）：**
 `TestRealCLIInterject`（默认跳过）用 Lathe 自己的 `Driver` 起真实 `claude` 二进制：显式 `Dir`（`t.TempDir()` 里的 git 仓库）、`sanitizedEnv` 白名单 + `ExtraEnv`
 （隔离 `HOME`/`CLAUDE_CONFIG_DIR`、`ANTHROPIC_BASE_URL` 指向测试进程内的 httptest stub、假 token），不用真凭据、不连外网。
 stub 对「F01-SLEEP」回一个 `Bash sleep 8` 的 tool_use，之后的请求里看到什么标记就回什么 —— 所以「result 含 MARK」证明的是**注入帧被
 真实 CLI 并进了同一个 turn 的下一次模型请求**，不是模型的理解能力（与 PRD 写的真凭据版本相比，这一档证据弱在「模型照做」那一层，
-强在完全可复现）。12 项自检全部通过：
+强在完全可复现）。12 项自检全部通过（`real-cli/real-cli-20261111-165750-*`）：
 
 - a 段（新会话）：注入帧 `isReplay` 回显 uuid 一致；末条 result `DONE ZEBRA-… MARK1-…`；**首条 result 后 0.228s 退出**、非 `ErrIdle`；
   result 之后 `Deliver` → `ErrSessionClosed`，stdout 只有 1 条 result。
@@ -1388,8 +1398,11 @@ stub 对「F01-SLEEP」回一个 `Bash sleep 8` 的 tool_use，之后的请求�
    `queued` 的 CR-777 与 `pr_open` 的 LT-xx）。serve 会领 queued 行、merge poller 会拿 stub token 轮询 pr_open 行，不能带着残留起实例；
    按 AGENTS.md §4「真删任何东西必须先问人」停下。另：`make clean-test-db` 在宿主无 psql 时走 docker 分支并写死 `-d lathe`，
    **清不到 `lathe_f01`**（只读查询，未改任何东西），清理方式需人决定。脚本 `e2e/run.sh` 已就绪，前置满足后可直接跑。
+   第 2 轮复查（17:30）残留仍在（10 行，id 197–1324），仍未获清理授权。此外 `run.sh` 用的也是复制 `~/.claude/.credentials.json`
+   的隔离 HOME，而本机该文件里没有 Claude 登录凭据（见 10.3），即使清掉残留，实例里的 claude 也会 `Not logged in`。
 2. **AC-15 截图**依赖 AC-22 的那次运行，同上未做。
-3. 因此按 §3.6 的约定，PR 在 AC-22 补齐前应保持 draft。
+3. **AC-14 真 provider 未取证**（见 10.3）。
+4. 因此按 §3.6 的约定（P10 + AC-14 + AC-22 缺一即 draft），PR 保持 draft，等人决定：① `lathe_f01` 残留怎么清；② 用哪份凭据。
 
 ### 10.5 与并行线的接缝（本线先合入的情形）
 

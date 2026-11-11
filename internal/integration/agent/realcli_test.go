@@ -26,15 +26,24 @@ import (
 //	go test ./internal/integration/agent -run TestRealCLIInterject -v -count=1 \
 //	  -args -real-bin "$(command -v claude)" -real-out /opt/lathe-wt/evidence/f01/real-cli
 //
-// 模型端是本测试进程里的 httptest stub provider（ANTHROPIC_BASE_URL 指向它，
-// 假 token），不用真凭据、不连外网。stub 按 Messages API 的 SSE 形状应答：
-// 首帧要求 sleep → 回一个 Bash tool_use；之后的请求里能看到什么标记就原样
+// 两种模型端：
+//   - 给了 -real-home（PRD AC-14 规定的形态，包装脚本
+//     /opt/lathe-wt/evidence/f01/run_real_cli.sh）：隔离 HOME 里放复制来的真凭据，
+//     走真实 provider，-real-dir 是脚本建的临时仓库，-real-mark 是 uuidgen 标记。
+//     这时「result 里有 MARK」证明的是模型真的吸收了运行中注入。
+//   - 不给（补充证据，可离线复现）：本测试进程里的 httptest stub provider
+//     （ANTHROPIC_BASE_URL 指向它，假 token），不用真凭据、不连外网。
+//
+// stub 按 Messages API 的 SSE 形状应答：首帧要求 sleep → 回一个 Bash tool_use；之后的请求里能看到什么标记就原样
 // 回什么 —— 于是「result 里有 MARK」证明的是：注入帧被真实 CLI 并进了**同一个
 // turn** 的下一次模型请求（CLI 收到 + 转给了模型），而不是模型的理解能力。
 // 子进程显式 Dir（mktemp 仓库）+ 白名单 env（sanitizedEnv）+ 隔离 HOME。
 var (
-	realBin = flag.String("real-bin", "", "AC-14：真实 claude 可执行文件路径（空 = 跳过）")
-	realOut = flag.String("real-out", "", "AC-14：证据输出目录")
+	realBin  = flag.String("real-bin", "", "AC-14：真实 claude 可执行文件路径（空 = 跳过）")
+	realOut  = flag.String("real-out", "", "AC-14：证据输出目录")
+	realHome = flag.String("real-home", "", "AC-14：隔离 HOME（内含复制来的真凭据）；空 = 用本机 stub provider")
+	realDir  = flag.String("real-dir", "", "AC-14：已 git init 的临时仓库；空 = 测试自建")
+	realMark = flag.String("real-mark", "", "AC-14：a 段注入的标记（包装脚本用 uuidgen 生成）；空 = 随机")
 )
 
 var markRe = regexp.MustCompile(`(?:ZEBRA|MARK1|MARK2)-[0-9a-f]{8}`)
@@ -166,12 +175,18 @@ func TestRealCLIInterject(t *testing.T) {
 	}
 	stamp := time.Now().Format("20060102-150405")
 
+	realProvider := *realHome != ""
 	stub := &stubProvider{}
 	srv := httptest.NewServer(stub)
 	defer srv.Close()
 
-	home := t.TempDir()
-	repo := t.TempDir()
+	home, repo := t.TempDir(), t.TempDir()
+	if realProvider {
+		home = *realHome
+	}
+	if *realDir != "" {
+		repo = *realDir
+	}
 	git := func(args ...string) string {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = repo
@@ -184,8 +199,10 @@ func TestRealCLIInterject(t *testing.T) {
 		}
 		return string(b)
 	}
-	git("init", "-q")
-	git("commit", "-q", "--allow-empty", "-m", "init")
+	if *realDir == "" {
+		git("init", "-q")
+		git("commit", "-q", "--allow-empty", "-m", "init")
+	}
 
 	// tee 包装：真实 claude 的 stdout 全量落盘（含被驱动过滤掉的 replay/lifecycle）
 	wrapper := filepath.Join(t.TempDir(), "claude-tee")
@@ -195,6 +212,14 @@ func TestRealCLIInterject(t *testing.T) {
 
 	short := func() string { return newFrameID()[:8] }
 	zebra, mark1, mark2 := "ZEBRA-"+short(), "MARK1-"+short(), "MARK2-"+short()
+	if *realMark != "" {
+		mark1, mark2 = *realMark, *realMark+"-2"
+	}
+	// 真模型要先想一下才发 Bash，注入晚一点，仍落在 sleep 8 的窗口里。
+	injectDelay := 4 * time.Second
+	if realProvider {
+		injectDelay = 7 * time.Second
+	}
 	sid := newFrameID()
 	d := &Driver{bin: wrapper, timeout: 3 * time.Minute, idle: 2 * time.Minute}
 
@@ -207,9 +232,12 @@ func TestRealCLIInterject(t *testing.T) {
 		p.SettingSources = "project"
 		p.ExtraEnv = []string{
 			"HOME=" + home, "CLAUDE_CONFIG_DIR=" + filepath.Join(home, ".claude"),
-			"ANTHROPIC_BASE_URL=" + srv.URL, "ANTHROPIC_AUTH_TOKEN=stub-not-a-token", "ANTHROPIC_API_KEY=",
 			"DISABLE_AUTOUPDATER=1", "DISABLE_TELEMETRY=1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 			"F01_REAL_BIN=" + *realBin, "F01_TEE_OUT=" + stdout,
+		}
+		if !realProvider {
+			p.ExtraEnv = append(p.ExtraEnv,
+				"ANTHROPIC_BASE_URL="+srv.URL, "ANTHROPIC_AUTH_TOKEN=stub-not-a-token", "ANTHROPIC_API_KEY=")
 		}
 		meta := segMeta{Segment: name, Args: d.buildArgs(p), SessionID: p.SessionID, StdoutFile: filepath.Base(stdout)}
 		var mu sync.Mutex
@@ -226,7 +254,7 @@ func TestRealCLIInterject(t *testing.T) {
 			}
 			meta.DeliveryID = deliveryID
 			go func() {
-				time.Sleep(4 * time.Second) // 落在 Bash sleep 8 的窗口里
+				time.Sleep(injectDelay) // 落在 Bash sleep 8 的窗口里
 				if err := s.Deliver(context.Background(), deliveryID, inject); err != nil {
 					mu.Lock()
 					meta.DeliverErr = err.Error()
@@ -313,8 +341,10 @@ func TestRealCLIInterject(t *testing.T) {
 		SessionID: sid, Resume: true,
 	}, "最终回答里还要原样包含 "+mark2)
 
-	stubLog, _ := json.MarshalIndent(stub.log, "", "  ")
-	_ = os.WriteFile(filepath.Join(out, fmt.Sprintf("real-cli-%s-stub-requests.json", stamp)), stubLog, 0o644)
+	if !realProvider {
+		stubLog, _ := json.MarshalIndent(stub.log, "", "  ")
+		_ = os.WriteFile(filepath.Join(out, fmt.Sprintf("real-cli-%s-stub-requests.json", stamp)), stubLog, 0o644)
+	}
 	porcelain := strings.TrimSpace(git("status", "--porcelain"))
 	version, _ := exec.Command(*realBin, "--version").Output()
 
@@ -325,7 +355,7 @@ func TestRealCLIInterject(t *testing.T) {
 	}
 	checks := []check{
 		{"1. a 段注入帧被 CLI 回显（isReplay，uuid 一致）", a.ReplayAcked && a.ReplayLine > 0, fmt.Sprintf("acked=%v line=%d", a.ReplayAcked, a.ReplayLine)},
-		{"2. a 段末条 result 含 MARK1（注入并进同一 turn 的模型请求）", strings.Contains(a.ResultText, mark1), a.ResultText},
+		{"2. a 段末条 result 含 MARK1（" + map[bool]string{true: "真模型吸收了注入", false: "stub：注入并进同一 turn 的模型请求"}[realProvider] + "）", strings.Contains(a.ResultText, mark1), a.ResultText},
 		{"3. a 段首条 result 后 ≤10s 退出且非 ErrIdle", a.ExitAfterResultS <= 10 && !a.IsIdle && a.RunErr == "", fmt.Sprintf("%.3fs err=%q", a.ExitAfterResultS, a.RunErr)},
 		{"4. result 之后 Deliver → ErrSessionClosed，stdout 只有 1 条 result", a.LateDeliverErr == ErrSessionClosed.Error() && a.ResultCount == 1, fmt.Sprintf("late=%q results=%d", a.LateDeliverErr, a.ResultCount)},
 		{"5a. c 段（--resume + 流式）注入帧回显 uuid 一致", c.ReplayAcked && c.ReplayLine > 0, fmt.Sprintf("acked=%v line=%d", c.ReplayAcked, c.ReplayLine)},
@@ -337,8 +367,12 @@ func TestRealCLIInterject(t *testing.T) {
 		{"6. 临时仓库 git status --porcelain 为空", porcelain == "", porcelain},
 		{"驱动交给 OnEvent 的事件里没有 user(replay)/command_lifecycle", !containsAny(a.FilteredEventTypes, "command_lifecycle") && !containsAny(c.FilteredEventTypes, "command_lifecycle"), strings.Join(append(a.FilteredEventTypes, c.FilteredEventTypes...), ",")},
 	}
+	provider := "httptest stub（127.0.0.1，假 token，不连外网）"
+	if realProvider {
+		provider = "real（隔离 HOME + 复制来的真凭据）"
+	}
 	summary := map[string]any{
-		"cliVersion": strings.TrimSpace(string(version)), "provider": "httptest stub（127.0.0.1，假 token，不连外网）",
+		"cliVersion": strings.TrimSpace(string(version)), "provider": provider,
 		"sessionId": sid, "zebra": zebra, "mark1": mark1, "mark2": mark2, "checks": checks,
 	}
 	b, _ := json.MarshalIndent(summary, "", "  ")
