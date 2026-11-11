@@ -46,6 +46,15 @@ func TestTaskEventsEndpoint(t *testing.T) {
 	if first["kind"] != "text" || first["phase"] != "implement" || first["body"] != "第一条" {
 		t.Errorf("首条事件不符: %v", first)
 	}
+	// f01：/events 的响应顶层键集合恰为 {events, last_id} —— 插话走独立的
+	// /interjections，不往 /events 里加字段（docs/features/interject.md）。
+	if len(body) != 2 || body["events"] == nil || body["last_id"] == nil {
+		keys := make([]string, 0, len(body))
+		for k := range body {
+			keys = append(keys, k)
+		}
+		t.Errorf("响应顶层键 got=%v want=[events last_id]", keys)
+	}
 	lastID := int64(body["last_id"].(float64))
 	if lastID <= 0 {
 		t.Fatalf("last_id 应为正数游标，得到 %d", lastID)

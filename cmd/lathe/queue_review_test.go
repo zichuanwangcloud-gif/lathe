@@ -86,3 +86,55 @@ func TestRunOneClaimedDispatchesReviewRound(t *testing.T) {
 		t.Errorf("应按 review 二轮决策（mode=review 回读成功、旧 interrupted_state 已被重置），实际理由：%s", reasons)
 	}
 }
+
+// f01 AC-16 搭配的 A 类红线：Reconcile 只动 triaging/implementing/verifying，
+// 终态与 pr_open 任务一个都不碰（启动清扫插在它之后，不能改变它的语义）。
+func TestReconcileDoesNotTouchTerminalTasks(t *testing.T) {
+	st := testStore(t)
+	userID, repoID := fixture(t, st)
+	ctx := context.Background()
+	q := testQueue(st, &fakePipeline{})
+
+	mk := func(path []task.State) *task.Task {
+		tk, err := q.tasks.Create(ctx, task.CreateParams{
+			UserID: userID, RepoID: repoID, ExternalKey: uniqueKey("Q-RECON"),
+		})
+		if err != nil {
+			t.Fatalf("Create 失败: %v", err)
+		}
+		for _, s := range path {
+			if _, err := q.tasks.Transition(ctx, tk.ID, s, "system", nil); err != nil {
+				t.Fatalf("转 %s 失败: %v", s, err)
+			}
+		}
+		return tk
+	}
+	cases := []struct {
+		name string
+		path []task.State
+		want task.State
+	}{
+		{"pr_open 不动", []task.State{task.StateTriaging, task.StateImplementing, task.StateVerifying, task.StatePROpen}, task.StatePROpen},
+		{"failed 不动", []task.State{task.StateTriaging, task.StateFailed}, task.StateFailed},
+		{"cancelled 不动", []task.State{task.StateCancelled}, task.StateCancelled},
+		{"implementing 转回 queued", []task.State{task.StateTriaging, task.StateImplementing}, task.StateQueued},
+	}
+	ids := make([]int64, len(cases))
+	for i, tc := range cases {
+		ids[i] = mk(tc.path).ID
+	}
+	if err := q.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := q.tasks.Get(ctx, ids[i])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.State != tc.want {
+				t.Errorf("state got=%s want=%s", got.State, tc.want)
+			}
+		})
+	}
+}
