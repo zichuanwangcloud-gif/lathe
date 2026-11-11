@@ -120,7 +120,7 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		case *ast.CallExpr:
 			switch name := callName(node.Fun); name {
 			case "buildPipeline", "newQueue", "startWorkers",
-				"q.Reconcile", "previewMgr.SweepVerifyStacks":
+				"q.Reconcile", "previewMgr.SweepVerifyStacks", "newScheduler":
 				hits = append(hits, hit{name, node.Pos()})
 			}
 		}
@@ -138,7 +138,7 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 
 	for _, name := range []string{
 		"buildPipeline", "newQueue", "q.Reconcile",
-		"previewMgr.SweepVerifyStacks", "startWorkers",
+		"previewMgr.SweepVerifyStacks", "startWorkers", "newScheduler",
 	} {
 		if idx(name) < 0 {
 			t.Fatalf("serve 里应调用 %s，实际调用序列：%v", name, hits)
@@ -154,6 +154,7 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		{"newQueue", "队列要先建出来"},
 		{"q.Reconcile", "启动恢复必须在 worker 启动前完成，避免同一任务被两边同时捡起"},
 		{"previewMgr.SweepVerifyStacks", "开机清扫要在 worker 起栈之前，否则可能删掉 worker 刚起的栈"},
+		{"newScheduler", "定时建单调度器要先构造好（路由与 startWorkers 共用同一个实例）再交给启动点"},
 	} {
 		if i := idx(before.name); i > start {
 			t.Errorf("%s 必须排在 startWorkers 之前（%s）；实际序列：%v", before.name, before.why, hits)
@@ -164,11 +165,45 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 	// `go mergePoller.Run(...)` / `go sweeper.Run(...)` —— 那会绕过这个结构。
 	for _, g := range goStmts {
 		if strings.HasPrefix(g, "q.work") || strings.HasPrefix(g, "mergePoller.") ||
-			strings.HasPrefix(g, "sweeper.") {
+			strings.HasPrefix(g, "sweeper.") || strings.HasPrefix(g, "scheduler.") {
 			t.Errorf("serve 里不该直接 `go %s`：后台执行者只能由 startWorkers 启动，"+
 				"那是「装配完成后才启动」这条约束的唯一承载点", g)
 		}
 	}
+
+	// startWorkers 的最后一个参数是 *schedule.Runner，serve 里的调用实参个数与之相等
+	var sw *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "startWorkers" {
+			sw = fd
+		}
+	}
+	if sw == nil {
+		t.Fatal("main.go 里找不到 startWorkers 函数")
+	}
+	params := 0
+	var lastType string
+	for _, fld := range sw.Type.Params.List {
+		n := len(fld.Names)
+		if n == 0 {
+			n = 1
+		}
+		params += n
+		if star, ok := fld.Type.(*ast.StarExpr); ok {
+			lastType = "*" + callName(star.X)
+		} else {
+			lastType = callName(fld.Type)
+		}
+	}
+	if lastType != "*schedule.Runner" {
+		t.Errorf("startWorkers 的最后一个参数类型应是 *schedule.Runner，got %q", lastType)
+	}
+	ast.Inspect(serve.Body, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok && callName(c.Fun) == "startWorkers" && len(c.Args) != params {
+			t.Errorf("serve 里调用 startWorkers 的实参个数 got %d, want %d（与签名一致）", len(c.Args), params)
+		}
+		return true
+	})
 }
 
 // startWorkers 必须真的把三条后台循环都起起来 —— 只起 worker 不起
@@ -202,7 +237,7 @@ func TestStartWorkersLaunchesAllLoops(t *testing.T) {
 		return true
 	})
 
-	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false}
+	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false, "scheduler.Run": false}
 	for _, g := range goStmts {
 		for k := range want {
 			if strings.HasPrefix(g, k) {

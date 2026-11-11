@@ -22,6 +22,7 @@ import ForgotPassword from './views/ForgotPassword.vue'
 import ResetPassword from './views/ResetPassword.vue'
 import ChangePassword from './views/ChangePassword.vue'
 import NotFound from './views/NotFound.vue'
+import Schedules from './views/Schedules.vue'
 import { auth, refresh, isAdmin, mustChangePassword, hasLinearToken } from './auth'
 import { setPasswordChangeHandler } from './api'
 import './style.css'
@@ -50,6 +51,8 @@ const router = createRouter({
     },
     // 「Linear 任务」只有绑定了 Linear API 令牌的人可见（菜单与守卫同一依据）
     { path: '/linear', name: 'linear', component: LinearIssues, meta: { linear: true } },
+    // 定时建单：到点用你的 Linear 令牌建单，同样只对绑了令牌的人可见
+    { path: '/schedules', name: 'schedules', component: Schedules, meta: { linear: true } },
     { path: '/tasks/:id', name: 'task', component: TaskDetail, props: true },
     { path: '/repos', name: 'repos', component: Repos },
     { path: '/settings', name: 'settings', component: PersonalSettings },

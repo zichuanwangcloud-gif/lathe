@@ -43,6 +43,10 @@
 
 **Runner 是纯执行体**，不持久化业务状态，崩溃后任务由租约超时重新派发。
 
+**定时建单调度器（`internal/schedule`）：只往 Linear 建单，不进入执行管线。** 到点用属主
+的 Linear 凭据建一张单，之后那张单经 Webhook Ingress 回来，与人手工建的单走同一条路；
+调度器不写 tasks、不 import runner/task。详见 [features/scheduled-issue.md](features/scheduled-issue.md)。
+
 ---
 
 ## 3. 任务状态机

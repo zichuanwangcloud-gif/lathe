@@ -163,6 +163,16 @@ type Config struct {
 	// （LATHE_GITHUB_WEBHOOK_SECRET）。消费方：creds.Provider.GitHubWebhookSecret，
 	// 与其它环境变量凭据一样只对内置管理员生效（creds.Factory）。
 	GitHubWebhookSecret string
+
+	// SchedulerSwitch 是定时建单调度器总开关（LATHE_SCHEDULER_ENABLED，默认开）。
+	// 消费方：cmd/lathe 的 startWorkers —— false 时不启动 schedule.Runner；
+	// 规则 API 照常可用，「立即运行」返回 503。读它请用 SchedulerEnabled()。
+	// 用字符串而不是 bool 的理由同 ReapEnabled：「未设置」与「false」必须能区分。
+	SchedulerSwitch string
+	// ScheduleCatchUpWindow 是定时建单的补偿窗口（LATHE_SCHEDULE_CATCHUP_WINDOW，默认 6h）。
+	// 消费方：schedule.Runner.CatchUpWindow —— 认领时迟到超过准点宽限（2·tick）的
+	// 那次，迟到 ≤ 窗口就补一次，否则记 skipped。0 = 只准点触发。范围 0–168h。
+	ScheduleCatchUpWindow time.Duration
 }
 
 // Database 是 Postgres 连接配置。
@@ -272,6 +282,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	scheduleCatchUpWindow, err := envDurationStrict("LATHE_SCHEDULE_CATCHUP_WINDOW", 6*time.Hour)
+	if err != nil {
+		return Config{}, err
+	}
 
 	c := Config{
 		HTTPAddr: env("LATHE_HTTP_ADDR", ":8200"),
@@ -311,6 +325,8 @@ func Load() (Config, error) {
 		LinearWebhookSecret:   env("LATHE_LINEAR_WEBHOOK_SECRET", ""),
 		GitHubToken:           env("LATHE_GITHUB_TOKEN", ""),
 		GitHubWebhookSecret:   env("LATHE_GITHUB_WEBHOOK_SECRET", ""),
+		SchedulerSwitch:       env("LATHE_SCHEDULER_ENABLED", "true"),
+		ScheduleCatchUpWindow: scheduleCatchUpWindow,
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err
@@ -395,6 +411,14 @@ func (c Config) Validate() error {
 	}
 	if c.CookieSecure != "" && c.CookieSecure != "true" && c.CookieSecure != "false" {
 		return fmt.Errorf("config: LATHE_COOKIE_SECURE 只能是 true 或 false，得到 %q", c.CookieSecure)
+	}
+	if err := validateBoolEnv("LATHE_SCHEDULER_ENABLED", c.SchedulerSwitch); err != nil {
+		return err
+	}
+	if c.ScheduleCatchUpWindow < 0 || c.ScheduleCatchUpWindow > MaxScheduleCatchUpWindow {
+		return fmt.Errorf("config: LATHE_SCHEDULE_CATCHUP_WINDOW 必须在 0 到 %v 之间，得到 %v"+
+			"（0 表示只准点触发；Go 的时长解析不支持 d 单位，写 168h 而不是 7d）",
+			MaxScheduleCatchUpWindow, c.ScheduleCatchUpWindow)
 	}
 	return nil
 }
@@ -525,3 +549,10 @@ func hostnameOr(def string) string {
 	}
 	return def
 }
+
+// MaxScheduleCatchUpWindow 是定时建单补偿窗口的上限（7 天）：停机超过一周，
+// 「这个周期该做的事」早已过时，补一张单只会制造噪声。
+const MaxScheduleCatchUpWindow = 168 * time.Hour
+
+// SchedulerEnabled 报告是否启动定时建单调度器（LATHE_SCHEDULER_ENABLED，默认开）。
+func (c Config) SchedulerEnabled() bool { return c.SchedulerSwitch != "false" }
