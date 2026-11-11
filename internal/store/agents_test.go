@@ -262,38 +262,75 @@ func randHex(t *testing.T) string {
 func TestEventsQueriesUseTaskIndex(t *testing.T) {
 	st := testStore(t)
 	ctx := context.Background()
+	_, taskID := agentEventFixture(t, st, "f04-ac4-explain-"+randHex(t)+"@example.com")
+	t.Cleanup(func() {
+		_, _ = st.pool.Exec(context.Background(), `DELETE FROM tasks WHERE id=$1`, taskID)
+	})
 
-	filter := EventFilter{Phases: []string{"implement", "fix-1"}, Kinds: []string{"tool_use"}}
-	beforeSQL, beforeArgs := agentEventsBeforeQuery(1, 1, 100, filter, 50)
-	failSQL, failArgs := agentEventsAfterQuery(1, 1, 0, EventFilter{FailuresOnly: true}, 50)
-
-	cases := []struct {
+	type q struct {
 		name string
 		sql  string
 		args []any
-	}{
-		{"给定 AgentEventsBefore 带 phase/kind 过滤", beforeSQL, beforeArgs},
-		{"给定 failures=1 的 after 查询", failSQL, failArgs},
-		{"给定 summary 的阶段聚合", summaryPhasesSQL, []any{int64(1)}},
-		{"给定 summary 的失败列表", summaryFailuresSQL, []any{int64(1), summaryFailuresMax + 1}},
-		{"给定 summary 的 lastFailure", summaryEdgeFailureSQL("DESC"), []any{int64(1)}},
 	}
-	for _, c := range cases {
+	// 参数取真实形态：本任务有事件、before = 本任务 max(id)+1（回放首页就是这么查的）。
+	// 用 before=100 这类远低于真实 id 的假参数时，主键范围看起来几乎为空，规划器
+	// 走主键反而便宜 —— 那测不出大表上「从全表最新事件往回翻」的问题。
+	build := func(before int64) []q {
+		filter := EventFilter{Phases: []string{"implement", "fix-1"}, Kinds: []string{"tool_use"}}
+		beforeSQL, beforeArgs := agentEventsBeforeQuery(taskID, 0, before, filter, 50)
+		plainSQL, plainArgs := agentEventsBeforeQuery(taskID, 0, before, EventFilter{}, 200)
+		failSQL, failArgs := agentEventsAfterQuery(taskID, 0, 0, EventFilter{FailuresOnly: true}, 50)
+		return []q{
+			{"给定 AgentEventsBefore 带 phase/kind 过滤", beforeSQL, beforeArgs},
+			{"给定 AgentEventsBefore 不带过滤（回放首页）", plainSQL, plainArgs},
+			{"给定 failures=1 的 after 查询", failSQL, failArgs},
+			{"给定 summary 的阶段聚合", summaryPhasesSQL, []any{taskID}},
+			{"给定 summary 的失败列表", summaryFailuresSQL, []any{taskID, summaryFailuresMax + 1}},
+			{"给定 summary 的 lastFailure", summaryEdgeFailureSQL("DESC"), []any{taskID}},
+		}
+	}
+
+	for _, c := range build(0) {
 		t.Run(c.name+" 断言计划里出现 agent_events_task_id", func(t *testing.T) {
 			tx, err := st.pool.Begin(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = tx.Rollback(ctx) }()
+			// 事务内造数据并 ANALYZE（回滚即消失）：本任务 300 行 + 另一批别的任务
+			// 的行，让统计信息反映「表里不止这一个任务」。
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO agent_events (task_id, phase, kind, body)
+				SELECT $1, 'implement', CASE WHEN g % 2 = 0 THEN 'tool_use' ELSE 'text' END, 'x'
+				FROM generate_series(1, 300) g`, taskID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO agent_events (task_id, phase, kind, body)
+				SELECT t.id, 'implement', 'text', 'y' FROM tasks t, generate_series(1, 50) LIMIT 3000`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `ANALYZE agent_events`); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
 				t.Fatal(err)
 			}
-			var plan string
-			if err := tx.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+c.sql, c.args...).Scan(&plan); err != nil {
-				t.Fatalf("EXPLAIN 失败: %v", err)
+			var maxID int64
+			if err := tx.QueryRow(ctx, `SELECT max(id) FROM agent_events WHERE task_id=$1`, taskID).Scan(&maxID); err != nil {
+				t.Fatal(err)
 			}
-			if !strings.Contains(plan, `"agent_events_task_id"`) {
-				t.Errorf("计划未走 agent_events_task_id: got %s", plan)
+			for _, real := range build(maxID + 1) {
+				if real.name != c.name {
+					continue
+				}
+				var plan string
+				if err := tx.QueryRow(ctx, `EXPLAIN (FORMAT JSON) `+real.sql, real.args...).Scan(&plan); err != nil {
+					t.Fatalf("EXPLAIN 失败: %v", err)
+				}
+				if !strings.Contains(plan, `"agent_events_task_id"`) {
+					t.Errorf("计划未走 agent_events_task_id: got %s", plan)
+				}
 			}
 		})
 	}

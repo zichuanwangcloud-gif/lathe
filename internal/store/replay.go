@@ -13,9 +13,15 @@ import (
 
 // replay.go —— 任务详情页「运行回放」的只读查询（docs/features/run-replay.md）。
 //
-// 全部是 WHERE task_id = $1 ... ORDER BY id 的形状，走 0005 的 (task_id, id)
+// 全部是 WHERE task_id = $1 ... ORDER BY task_id, id 的形状，走 0005 的 (task_id, id)
 // 索引 agent_events_task_id 后在单任务范围内过滤（单任务事件量百到千级）；
 // TestEventsQueriesUseTaskIndex 用 EXPLAIN 钉住。不加索引、不写回。
+//
+// 游标条件写成行比较 (task_id, id) < ($1, $before)，ORDER BY 写成 (task_id, id)：
+// task_id 已被等值固定，语义与 `id < $before ORDER BY id` 完全相同，但只有复合索引
+// 能承接这个行比较。只写 `id < $before ORDER BY id DESC LIMIT n` 时，规划器会选
+// 主键倒序范围扫描再按 task_id 过滤（全量 make test 下实测），大表上等于从全表
+// 最新的事件往回翻、把别的任务的事件全扫一遍。
 
 // FailurePredicateSQL 是「失败事件」的唯一判定（error 与 overflow 警告）。
 //
@@ -83,8 +89,8 @@ func agentEventsAfterQuery(taskID, userID, after int64, f EventFilter, limit int
 	return `SELECT ` + eventColumns + `
 		FROM agent_events a
 		JOIN tasks t ON t.id = a.task_id
-		WHERE a.task_id = $1 AND t.user_id = $2 AND a.id > $3` + extra + `
-		ORDER BY a.id
+		WHERE a.task_id = $1 AND t.user_id = $2 AND (a.task_id, a.id) > ($1, $3)` + extra + `
+		ORDER BY a.task_id, a.id
 		LIMIT $` + strconv.Itoa(len(args)), args
 }
 
@@ -96,8 +102,8 @@ func agentEventsBeforeQuery(taskID, userID, before int64, f EventFilter, limit i
 	return `SELECT ` + eventColumns + `
 		FROM agent_events a
 		JOIN tasks t ON t.id = a.task_id
-		WHERE a.task_id = $1 AND t.user_id = $2 AND a.id < $3` + extra + `
-		ORDER BY a.id DESC
+		WHERE a.task_id = $1 AND t.user_id = $2 AND (a.task_id, a.id) < ($1, $3)` + extra + `
+		ORDER BY a.task_id DESC, a.id DESC
 		LIMIT $` + strconv.Itoa(len(args)), args
 }
 
@@ -207,7 +213,7 @@ const summaryFailuresSQL = `
 	SELECT a.id, a.phase, a.kind, a.at, ` + severityColumnSQL + `
 	FROM agent_events a
 	WHERE a.task_id = $1 AND ` + FailurePredicateSQL + `
-	ORDER BY a.id
+	ORDER BY a.task_id, a.id
 	LIMIT $2`
 
 // summaryEdgeFailureSQL 取 id 最小（ASC）或最大（DESC）的那条 error，
@@ -220,7 +226,7 @@ func summaryEdgeFailureSQL(dir string) string {
 	SELECT a.id, a.phase, a.kind, a.at, 'error'
 	FROM agent_events a
 	WHERE a.task_id = $1 AND ` + failureErrorSQL + `
-	ORDER BY a.id ` + dir + `
+	ORDER BY a.task_id ` + dir + `, a.id ` + dir + `
 	LIMIT 1`
 }
 
