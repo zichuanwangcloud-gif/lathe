@@ -341,6 +341,46 @@ func TestPipelineTeamSkillsAgentDeletesSentinelStillNotCommitted(t *testing.T) {
 	}
 }
 
+// AC-10（r5）的流水线层：agent 在实现阶段把 dest 换成指向 worktree 外的链接 →
+// stageCommit 里的 hideTeamSkills 拒绝跟随链接写哨兵，走 p.fail(StageTeamSkillFailed)：
+// 没有提交、没有开 PR，外部目录里没有 .gitignore。
+func TestPipelineHideTeamSkillsRefusesSymlinkPlantedByAgent(t *testing.T) {
+	st := tsStore(t)
+	e := newTSEnv(t, st, "", nil)
+	e.src = goSourceRepo(t)
+	e.addSkill(t, "acme-testing", "x")
+	outside := t.TempDir()
+	gh := okGH()
+	p := e.pipeline(t, gh, scriptedAgent(func(dir string) error {
+		if err := writeFix(dir); err != nil {
+			return err
+		}
+		dest := filepath.Join(dir, ".claude/skills/team-acme-testing")
+		if err := os.RemoveAll(dest); err != nil {
+			return err
+		}
+		return os.Symlink(outside, dest)
+	}), nil)
+
+	if err := e.exec(t, p, nil); err == nil {
+		t.Fatal("dest 被换成链接，任务应失败")
+	}
+	tk := e.final(t)
+	if tk.State != task.StateFailed || deref(tk.FailureStage) != string(StageTeamSkillFailed) {
+		t.Fatalf("got %s/%s, want failed/%s", tk.State, deref(tk.FailureStage), StageTeamSkillFailed)
+	}
+	if len(gh.params) != 0 {
+		t.Errorf("不应开 PR，got %d 次 CreatePR", len(gh.params))
+	}
+	wt := e.wtPath(t)
+	if got := strings.TrimSpace(tsGit(t, wt, "log", "--format=%H", MirrorBaseRef("dev")+"..HEAD")); got != "" {
+		t.Errorf("不应有提交，<base>..HEAD got:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(outside, ".gitignore")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree 外的目录被写入了哨兵（err=%v）", err)
+	}
+}
+
 // AC-11c：画像声明的产品技能与团队技能并存，互不覆盖。
 func TestPipelineTeamSkillsCoexistWithProductSkills(t *testing.T) {
 	st := tsStore(t)
@@ -499,19 +539,23 @@ func TestFreshRebuildRepinsLatest(t *testing.T) {
 	e.src = goSourceRepo(t)
 	ctx := context.Background()
 	sid := e.addSkill(t, "acme-testing", "第一版")
-	// 前置：任务已钉 v1（与「首次物化钉 v1」同一行内容，直接用生产代码的 ListEnabled + PinsSave 写入）。
-	// 不先真跑一轮再 Fresh 重跑：重跑时任务行仍记着旧 worktree_path 且处于 queued，
-	// ClaimedWorktreePaths 会把它自己的路径当成「在途任务占用」—— 那是 f11 之外的既有行为，
-	// 这里只证 PinsClear 在 PinsLoad 之前生效。
-	v1, err := st.ListEnabledTeamSkills(ctx, e.repoID, e.userID)
-	if err != nil || len(v1) != 1 || v1[0].Version != 1 {
-		t.Fatalf("前置 ListEnabled got %+v %v", v1, err)
-	}
-	if err := st.TeamSkillPinsSave(ctx, e.taskID, e.userID, e.repoID, v1); err != nil {
-		t.Fatal(err)
+	// 同样的前置：真跑一轮，任务首次物化钉 v1。
+	p, wtPath := runUntilImplementFails(t, e)
+	if pins, _ := e.pinned(t); len(pins) != 1 || pins[0].Version != 1 {
+		t.Fatalf("前置：第一轮应钉 v1，got %+v", pins)
 	}
 	v2 := e.addVersion(t, sid, "acme-testing", "第二版")
-	p := e.pipeline(t, okGH(), implFixAgent(), nil)
+
+	// 按生产的重建路径回收旧现场：Discard 删盘 + 收割机落账（ClaimForReap 置空
+	// worktree_path）。只 Discard 不落账时，重建会被 ClaimedWorktreePaths 把本任务
+	// 自己算作认领者而拒绝接管（既有行为，见 memory_test.go 的 reclaimWorktree）。
+	tk := e.final(t)
+	if deref(tk.WorktreePath) != wtPath {
+		t.Fatalf("前置：worktree_path got %q, want %q", deref(tk.WorktreePath), wtPath)
+	}
+	reclaimWorktree(t, ctx, e.m, p, e.repo, tk)
+	requeue(t, e)
+	p.Agent = implFixAgent()
 	if err := e.exec(t, p, &RetryPlan{Fresh: true, Entry: EntryTriage}); err != nil {
 		t.Fatalf("重建 Execute 失败: %v", err)
 	}

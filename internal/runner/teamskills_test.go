@@ -20,7 +20,8 @@ import (
 // ---------------------------------------------------------------- 假件与夹具
 
 // memTeamSkills 是内存版 TeamSkillSource：AC-10 的单元测试只测物化与隐藏，
-// 不需要数据库（钉版本与库交互由 pipeline_teamskills_test.go 端到端覆盖）。
+// 技能内容不走数据库（钉版本与库交互由 pipeline_teamskills_test.go 端到端覆盖）。
+// 例外是 prepareOnRealTask：失败阶段要经真实 p.fail 落到任务行上才能断言。
 type memTeamSkills struct {
 	versions map[int64]map[int][]teamskills.File // skillID -> version -> files
 	pins     map[int64][]store.TeamSkillPin
@@ -298,12 +299,20 @@ func TestTeamSkillMaterialize_RefusesSymlinkedPath(t *testing.T) {
 			outsideBefore, _ := os.ReadDir(outside)
 
 			pin := mem.put(1, "acme-testing", 1, acmeFiles())
-			err := p.materializeTeamSkills(context.Background(), 1, wt, []store.TeamSkillPin{pin})
+			// 走生产入口 prepareTeamSkills + 真实 p.fail，断言错误落成的失败阶段。
+			tk, err := prepareOnRealTask(t, p, mem, wt, []store.TeamSkillPin{pin})
 			if c.wantErr && err == nil {
 				t.Fatalf("应拒绝物化，实际成功；完整 status:\n%s", statusAll(t, wt))
 			}
 			if !c.wantErr && err != nil {
 				t.Fatalf("对照格应成功（防误拦），got %v", err)
+			}
+			if c.wantErr {
+				if tk.State != task.StateFailed || deref(tk.FailureStage) != string(StageTeamSkillFailed) {
+					t.Errorf("流水线应落 failed/%s，got %s/%s", StageTeamSkillFailed, tk.State, deref(tk.FailureStage))
+				}
+			} else if tk.State != task.StateImplementing || tk.FailureStage != nil {
+				t.Errorf("对照格任务应仍在 implementing、无失败阶段，got %s/%s", tk.State, deref(tk.FailureStage))
 			}
 			if c.link != "" {
 				if got, _ := os.Readlink(filepath.Join(wt.Path, c.link)); got != linkBefore {
@@ -327,6 +336,23 @@ func TestTeamSkillMaterialize_RefusesSymlinkedPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// prepareOnRealTask 让 prepareTeamSkills 跑在一条真实任务行上（真实 Machine，
+// 任务处于 implementing —— 生产里物化发生的状态），返回调用结果与落库后的任务行。
+// 失败路径走的是真实的 p.fail，所以返回的 FailureStage 就是流水线会落的阶段。
+func prepareOnRealTask(t *testing.T, p *Pipeline, mem *memTeamSkills, wt *Worktree, pins []store.TeamSkillPin) (*task.Task, error) {
+	t.Helper()
+	e := newTSEnv(t, tsStore(t), "", nil)
+	tk, err := e.m.Transition(context.Background(), e.taskID, task.StateImplementing, "test", nil)
+	if err != nil {
+		t.Fatalf("前置：queued -> implementing 失败: %v", err)
+	}
+	mem.enabled = pins
+	p.Tasks = e.m
+	rc := &runCtx{ctx: context.Background(), actor: "test", tk: tk, wt: wt}
+	perr := p.prepareTeamSkills(rc)
+	return e.final(t), perr
 }
 
 func mustSymlink(t *testing.T, target, link string) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/teamskills"
 )
 
 // ---------------------------------------------------------------- 夹具
@@ -68,8 +70,13 @@ func (e *tsAPIEnv) repo(t *testing.T, userID int64, provider string) int64 {
 	return id
 }
 
+// skillMD 是测试里 SKILL.md 的统一模板（请求体与期望 sha 共用，不会漂移）。
+func skillMD(slug, body string) string {
+	return "---\nname: " + slug + "\ndescription: 团队规范\n---\n\n" + body + "\n"
+}
+
 func skillJSON(slug, body string) string {
-	md := "---\nname: " + slug + "\ndescription: 团队规范\n---\n\n" + body + "\n"
+	md := skillMD(slug, body)
 	b, _ := json.Marshal(map[string]any{
 		"slug": slug, "title": "", "files": []map[string]string{{"path": "SKILL.md", "content": md}},
 	})
@@ -77,7 +84,7 @@ func skillJSON(slug, body string) string {
 }
 
 func versionJSON(slug, body string) string {
-	md := "---\nname: " + slug + "\ndescription: 团队规范\n---\n\n" + body + "\n"
+	md := skillMD(slug, body)
 	b, _ := json.Marshal(map[string]any{"files": []map[string]string{{"path": "SKILL.md", "content": md}}})
 	return string(b)
 }
@@ -400,9 +407,36 @@ func TestVersionConcurrentAppend(t *testing.T) {
 				if rows != c.wantRows {
 					t.Fatalf("第 %d 轮库里版本 got %s, want %s", round, rows, c.wantRows)
 				}
+				// v1 之后各版本的 content_sha256 集合 = 两次请求内容的 sha 去重集合：
+				// 不同内容格 = {sha(C1), sha(C2)}；同内容格 = {sha(C1)}（即 v2 = sha(C1)）。
+				var gotSHAs []string
+				if err := e.st.Pool().QueryRow(context.Background(),
+					`SELECT array_agg(content_sha256 ORDER BY content_sha256) FROM team_skill_versions
+					 WHERE skill_id=$1 AND version>1`, sid).Scan(&gotSHAs); err != nil {
+					t.Fatal(err)
+				}
+				if got, want := strings.Join(gotSHAs, ","), wantSHASet(c.bodies[:]); got != want {
+					t.Fatalf("第 %d 轮 v2+ 的 content_sha256 集合 got {%s}, want {%s}", round, got, want)
+				}
 			}
 		})
 	}
+}
+
+// wantSHASet 是 versionJSON 发出去的那些内容的 content_sha256 去重、排序后的集合，
+// 与 handler 落库用同一个 teamskills.ContentSHA256。
+func wantSHASet(bodies []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, b := range bodies {
+		sha := teamskills.ContentSHA256([]teamskills.File{{Path: "SKILL.md", Content: skillMD("acme-testing", b)}})
+		if !seen[sha] {
+			seen[sha] = true
+			out = append(out, sha)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ",")
 }
 
 // ---------------------------------------------------------------- AC-9

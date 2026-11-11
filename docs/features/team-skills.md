@@ -166,7 +166,7 @@ materializeTeamSkills：
 | R13（既有，非本功能引入） | 产品技能的 `StageSkillMissing` 不在 `stageOrder` 里，review 二轮有提交时会被 `default` 送去 `EntryVerify`。建议另开 `fix/skill-missing-retry` |
 | R14（既有，非本功能引入） | 产品技能路径的 `excludeSkillsDir` 把 `.claude/skills/` 写进 mirror 共享的 `info/exclude`：同 provider 仓库的所有 worktree（跨用户、永久）里 agent 新增的 `.claude/skills/**` 都不进 PR。f11 不调用、不修改它；`TestPipelineTeamSkillsNoCrossUserResidue/ProductSkillResidueIsPreexisting` 把现状固化成可观察事实。建议另开 `fix/skill-exclude-scope` 改用哨兵方案 |
 | 迁移号 | 0062–0064 是编排方分配的并行开发号段，与 dev 当前最大号 0031 之间跳号，**违反** AGENTS.md §6.6；合入 dev 时按 dev 当时最大号 +1 连续重编号，只改文件名，不改迁移内容 |
-| 重建路径 | `TestFreshRebuildRepinsLatest` 以「已钉 v1 的任务做一次 Fresh 执行」验证清钉。没有用「真跑一轮 → 原样 Fresh 重跑」：重跑时任务行仍记着旧 `worktree_path` 且处于 queued，`ClaimedWorktreePaths` 会把它自己的路径当成在途占用 —— 生产派发侧（`cmd/lathe/queue.go`）先 `Discard` 再执行，与 f11 无关 |
+| 重建路径 | `TestFreshRebuildRepinsLatest` 真跑一轮（首次物化钉 v1）→ 保存 v2 → 按生产的回收路径（`Discard` 删盘 + 收割机 `ClaimForReap` 置空 `worktree_path`，与 `memory_test.go` 的 `reclaimWorktree` 同一夹具）→ 重入队 → Fresh 执行。只 `Discard` 不落账时，重建会被 `ClaimedWorktreePaths` 把本任务自己的旧路径算作在途占用而拒绝接管 —— 那是既有行为，与 f11 无关 |
 
 ## 7. 验收结果
 
@@ -182,14 +182,14 @@ materializeTeamSkills：
 | AC-5 | 凭据：形态 + PEM 第 3 行、PEM 不改脱敏、已知值、产品文本不误判、保存路径 400 不回显、用户集成凭据 | `red-ac5-findcredential.txt`（只走 redactText 时三个 PEM 用例 `ok=false`）；`red-api.txt` | `make test` |
 | AC-6 | 第 21 个 400；`pinnedTaskCount` = 2 / 0；走属主索引 | `red-ac6-ac9-store.txt`（漏属主谓词时 S1 得 4） | `make test` |
 | AC-7 | 非属主 404；任务钉技能 404；同名 409（顺序 + 并发 {201,409}，不透出约束名） | `red-ac7-409.txt`（无映射时 500） | `make test` |
-| AC-8 | 版本递增、同内容 200 不 bump、恢复产生新版本、并发不同内容 {2,3} / 同内容 {201,200} 且都是 v2（各 20 轮） | `red-ac8-concurrent.txt`（sha 在锁外时得 {201,201}） | `make test` |
+| AC-8 | 版本递增、同内容 200 不 bump、恢复产生新版本、并发不同内容 {2,3} 且 v2/v3 的 sha 集合 = {sha(C1),sha(C2)} / 同内容 {201,200} 且都是 v2、v2 的 sha = sha(C1)（各 20 轮） | `red-ac8-concurrent.txt`（sha 在锁外时得 {201,201}）；`red-r6-gap3-concurrent-sha.txt`（v2+ 写错 sha 时集合断言红） | `make test` |
 | AC-9 | 归档出列表/出钉集合、归档释放名字、停用不钉（store + API + 端到端）、已钉任务停用/归档后续跑仍物化 | `red-ac6-ac9-store.txt`（漏 enabled 时停用无效）；`red-runner-pipeline-unwired.txt` | `make test` |
-| AC-10 | 不碰产品技能、改写 name、清掉旧文件、拒绝被跟踪路径、拒绝符号链接（3 格 + 2 对照）、快照兜底与哨兵自检的故障注入、哨兵不写共享 exclude、agent 新增技能仍可见、根否定捞不回、复位、agent 植入链接、空钉不写、无 `$HOME` | `red-ac10-symlink.txt`（r4 体检变异：①③红；② 在该变异下仍被拦，原因已在证据里如实说明）；`red-ac14b.txt`（r3 实现：sha/可见性两格红）；`red-ac11d-hide.txt` | `make test` |
+| AC-10 | 不碰产品技能、改写 name、清掉旧文件、拒绝被跟踪路径、拒绝符号链接（3 格 + 2 对照，每格经 `prepareTeamSkills` + 真实 `p.fail` 断言落 `team_skill_failed`）、快照兜底与哨兵自检的故障注入、哨兵不写共享 exclude、agent 新增技能仍可见、根否定捞不回、复位、agent 植入链接（单测 + 流水线端到端：`team_skill_failed`、无提交、无 PR、外部无哨兵）、空钉不写、无 `$HOME` | `red-ac10-symlink.txt`（r4 体检变异：①③红；② 在该变异下仍被拦，原因已在证据里如实说明）；`red-ac14b.txt`（r3 实现：sha/可见性两格红）；`red-ac11d-hide.txt`；`red-r6-gap1-hide-symlink-e2e.txt`（stageCommit 吞掉复位错误时跑到 pr_open）；`red-r6-gap2-symlink-stage.txt`（物化错误落错阶段时 ①②③ 红） | `make test` |
 | AC-11a | 空画像 + 团队技能：pr_open、物化且改写 name、无 go-testing、共享 exclude 不含规则、status/提交/ChangedFiles 不含 `.claude`、钉行属主正确、无伪转移 | `red-runner-pipeline-unwired.txt` | `make test` |
 | AC-11b | agent 不改文件 → `implement_no_changes`、无 PR、无验证落库 | `red-ac11b.txt`（不写哨兵时任务继续推进） | `make test` |
 | AC-11c | 与产品技能并存 | `red-runner-pipeline-unwired.txt` | `make test` |
 | AC-11d | agent 删哨兵：写代码那格 pr_open 且技能不进提交、哨兵已复位；只删哨兵那格仍判死 | `red-ac11d-hide.txt`（无复位时技能进提交 / 跑到 pr_open） | `make test` |
-| AC-12 | 续跑仍是 v1；Fresh 重钉 v2 且钉行只有 v2 | `red-ac12-fresh.txt`（不清钉时仍是 v1） | `make test` |
+| AC-12 | 续跑仍是 v1；Fresh 重钉 v2 且钉行只有 v2 | `red-ac12-fresh.txt`（不清钉时仍是 v1）；`red-r6-gap4-fresh-real-round.txt`（真跑首轮的前置下，不清钉时仍是 v1） | `make test` |
 | AC-13 | 版本行被删 → `team_skill_failed`、点名 slug@version、agent 未驱动；PinsSave/PinsLoad/ListEnabled 出错同样失败；PlanRetry 五格；default 回归锁；review 二轮端到端（Inspect 证实有提交，重试仍回实现、不再推送） | `red-ac13-pinsave.txt`；`red-runner-pipeline-unwired.txt`（PlanRetry 第 2、3 格得 verify / commit） | `make test` |
 | AC-14 | 功能关闭零副作用 | —（本条只证「关掉等于没有」） | `make test` |
 | AC-14b | 共用 mirror 的用户 B 新增 `.claude/skills/b-new` 照常进 PR、共享 exclude 不含规则；对照格锁住既有残留 | `red-ac14b.txt` | `make test` |
