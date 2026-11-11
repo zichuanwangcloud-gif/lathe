@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
@@ -72,22 +73,11 @@ func terminalMail(baseURL string, tk *task.Task, detail string) (subject, body s
 }
 
 // stateSubject 把状态翻译成邮件主题里那半句人话。
+//
+// 表搬到了叶子包 notify（StateLabel）：邮件主题、Slack/飞书正文、设置页
+// 三处只有一份字面量。输出与搬家前逐字相同（TestStateSubjectMatchesNotifyLabel）。
 func stateSubject(s task.State) string {
-	switch s {
-	case task.StateFailed:
-		return "处理失败"
-	case task.StatePROpen:
-		return "已开 PR，待你评审"
-	case task.StateAwaitingApproval:
-		return "验证已通过，等你放行"
-	case task.StateMerged:
-		return "已合并"
-	case task.StateCancelled:
-		return "已取消"
-	case task.StateBlockedSpec:
-		return "需求不明确，已回帖提问"
-	}
-	return string(s)
+	return notify.StateLabel(string(s))
 }
 
 // notifyTimeout 是一封终态通知的发信总预算。
@@ -147,6 +137,65 @@ func (p *Pipeline) mailTerminal(ctx context.Context, tk *task.Task, detail strin
 		if err := mailer.SendTaskMail(sendCtx, taskID, subject, body); err != nil {
 			slog.Warn("终态通知发信失败（不影响任务状态）",
 				"task", taskID, "state", state, "err", err)
+		}
+	}()
+}
+
+// ChatNotifier 把一次任务事件写进站外渠道（Slack / 飞书）的 outbox。
+// 实现是 *store.NotifyChannels（cmd/lathe 直接赋值，不写适配器）。
+//
+// 与 TaskMail 的同形约束：调用方（chatTerminal）不把 error 往上传、不阻塞、nil 即关闭。
+//
+// **入参是转移那一刻的快照**：实现在异步 goroutine 里执行，那时任务可能已被放行、
+// updated_at 已前进；所以 notify.TaskEvent 带齐 payload 需要的全部字段，实现不查 tasks 表。
+type ChatNotifier interface {
+	EnqueueTaskEvent(ctx context.Context, ev notify.TaskEvent) (int, error)
+}
+
+// notifyReasonBudget 是站外通知里失败原因**含截断后缀**的字节上界（约 800 个汉字）。
+const notifyReasonBudget = 2400
+
+// chatEnqueueTimeout：入队只是一条 INSERT … ON CONFLICT DO NOTHING，
+// 超时说明库有问题，记日志走人 —— 绝不把等待转嫁给任务。
+const chatEnqueueTimeout = 3 * time.Second
+
+// chatTerminal 与 mailTerminal 同形：不返回 error、不阻塞、独立预算、panic 兜底。
+//
+// 快照在 go 语句之前取完：goroutine 里只碰值拷贝 ev，绝不碰 tk 指针，也不回读库。
+// 失败原因在这里脱敏（redactText + KnownSecrets 只在 runner 内可达），
+// 库里的 payload 从此只有脱敏后的文本。
+func (p *Pipeline) chatTerminal(ctx context.Context, tk *task.Task, kind string) {
+	if p.Chat == nil || tk == nil {
+		return
+	}
+	ev := notify.TaskEvent{
+		TaskID: tk.ID, UserID: tk.UserID, ExternalKey: tk.ExternalKey,
+		ToState: string(tk.State), EventType: kind, At: tk.UpdatedAt,
+	}
+	if kind == notify.EventFailed || kind == notify.EventBlockedSpec {
+		if tk.FailureStage != nil {
+			ev.FailureStage = *tk.FailureStage
+		}
+		if tk.FailureReason != nil {
+			// truncate 截断时会追加 truncatedSuffix，预算先扣掉它，总长才 ≤ notifyReasonBudget。
+			ev.Reason = truncate(redactText(*tk.FailureReason, p.KnownSecrets, nil), notifyReasonBudget-len(truncatedSuffix))
+		}
+	}
+	if kind == notify.EventPROpen && tk.PRURL != nil {
+		ev.PRURL = *tk.PRURL
+	}
+	n := p.Chat
+	bg := context.WithoutCancel(ctx)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("站外通知 goroutine panic（已在边界兜住）", "task", ev.TaskID, "event", ev.EventType, "panic", r)
+			}
+		}()
+		c, cancel := context.WithTimeout(bg, chatEnqueueTimeout)
+		defer cancel()
+		if _, err := n.EnqueueTaskEvent(c, ev); err != nil {
+			slog.Warn("站外通知入队失败（不影响任务状态）", "task", ev.TaskID, "event", ev.EventType, "err", err)
 		}
 	}()
 }

@@ -31,6 +31,10 @@ Go 1.25 · pgx + sqlc · PostgreSQL · Vue 3 SPA（`go:embed`）· `claude` CLI 
 
 交付物是**单个静态二进制**（含内嵌 UI），新增节点 = 拷一个文件。
 
+任务失败、等人补需求、等人放行、PR 已开、模糊任务待签字这五类「等人出手」的事件，
+除终态邮件外还可按个人设置推送到 Slack incoming webhook 或飞书自定义机器人，
+可按事件类型开关（[docs/features/notify-channels.md](docs/features/notify-channels.md)）。
+
 ## 开发
 
 ```bash
@@ -161,6 +165,9 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 凭据以 AES-256-GCM 加密后入库，主密钥保存在数据库之外（`LATHE_SECRET_KEY`
 环境变量，或 `$LATHE_DATA_DIR/secret.key`，首次运行自动生成、权限 0600），
 因此拿到数据库转储也解不出凭据。
+
+通知渠道的 webhook URL 本身即凭据，按同一套 AES-GCM 加密存储，界面只显示
+`https://<host>/…`，不显示路径的任何部分（末 4 位也不显示 —— 那是 token）。
 
 也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等，见上表），优先级低于设置页，
 且**只对内置管理员生效**（`internal/creds` 的 `Factory.ProviderFor`：环境兜底只发给

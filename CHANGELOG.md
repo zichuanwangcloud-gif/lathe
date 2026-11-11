@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Slack / 飞书通知渠道：任务失败、阻塞提问、等待放行、PR 已开、PRD 待签字可按事件开关
+  推送到个人配置的 Slack incoming webhook 或飞书自定义机器人（含签名校验）；webhook URL
+  与密钥 AES-256-GCM 加密入库、保存时发测试消息；失败重试至多 5 次且不影响任务状态机。
+  新增迁移 0056（`notify_channels`）、0057（`notify_deliveries`），不新增环境变量。
+
 ### Changed
 
 - **模糊任务对话：少问、跑得完、报错能救**（docs/10 §1.3–§1.5）。实测一份 feature PRD

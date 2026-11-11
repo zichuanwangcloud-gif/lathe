@@ -217,6 +217,18 @@ export const api = {
   deleteIntegration: (kind) =>
     request(`/api/integrations/${kind}`, { method: 'DELETE' }),
 
+  // 站外通知渠道（Slack / 飞书，f09）
+  notifyChannels: () => request('/api/notify/channels'),
+  saveNotifyChannel: (kind, body) =>
+    request(`/api/notify/channels/${kind}`, { method: 'PUT', body: JSON.stringify(body) }),
+  testNotifyChannel: (kind) =>
+    request(`/api/notify/channels/${kind}/test`, { method: 'POST' }),
+  deleteNotifyChannel: (kind) =>
+    request(`/api/notify/channels/${kind}`, { method: 'DELETE' }),
+  notifyDeliveries: (limit = 10) => request(`/api/notify/deliveries?limit=${limit}`),
+  retryDelivery: (id) =>
+    request(`/api/notify/deliveries/${id}/retry`, { method: 'POST' }),
+
   smtp: () => request('/api/smtp'),
   saveSmtp: (body) => request('/api/smtp', { method: 'PUT', body: JSON.stringify(body) }),
   verifySmtp: (testTo) =>

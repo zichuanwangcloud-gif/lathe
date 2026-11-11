@@ -998,5 +998,9 @@ func truncate(s string, n int) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + "…(已截断)"
+	return s[:cut] + truncatedSuffix
 }
+
+// truncatedSuffix 是 truncate 截断时追加的后缀（14 字节）。提成常量是为了让
+// 按字节预算截断的调用方（chatTerminal）能把它算进总长，而不是再抄一份字面量。
+const truncatedSuffix = "…(已截断)"

@@ -13,6 +13,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
@@ -403,7 +404,26 @@ func writeSharedFile(content string) func(string) error {
 //   - taskC 完全没被动过（没有级联到更深层）：状态、base_ref、分支历史
 //     都和 taskB 失败之前一样——因为 taskB 这一级没有完成，F4.3-AC5
 //     要求 3 不该被碰。
-func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
+//
+// rebaseConflictScenario 搭好「三任务栈 A←B←C、dev 上独立改同一行」的冲突现场，
+// 停在 mp.rebaseFollowup 调用之前。chat 注入 Pipeline.Chat（nil 即关闭）：
+// 原测试以 nil 调用（断言一字不改），AC-21b 传真 NC。
+type rebaseConflict struct {
+	m                       *task.Machine
+	userID                  int64
+	repo                    RepoConfig
+	taskA, taskB, taskC     *task.Task
+	lin                     *rebaseFollowupLinear
+	mem                     *fakeMemory
+	notifier                *fakeNotifier
+	mp                      *MergePoller
+	taskABranch, taskATip   string
+	taskBBranch             string
+	taskCHeadBefore, devTip string
+}
+
+func rebaseConflictScenario(t *testing.T, chat ChatNotifier) *rebaseConflict {
+	t.Helper()
 	_, m, userID, repoID, repo, src := rebaseFollowupFixture(t)
 	ctx := context.Background()
 
@@ -460,7 +480,7 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 		Tasks: m, Worktrees: wm, Verifier: NewVerifier(3*time.Minute, ""),
 		Agent: ag, Clients: &fakeClients{lin: lin, gh: gh}, Notifier: &fakeNotifier{},
 		Verifications: &fakeVerifications{}, PermissionMode: "acceptEdits", SettingSources: "project",
-		Memory: mem,
+		Memory: mem, Chat: chat,
 	}
 
 	if err := pipe.Execute(ctx, ExecuteParams{
@@ -524,6 +544,24 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 		ClientFactory: fixedClientFactory{clients: &fakeClients{lin: lin, gh: gh}},
 		RepoLookup:    repoLookupFixed(repo),
 	}
+
+	_ = taskCWorktreeBefore
+	return &rebaseConflict{
+		m: m, userID: userID, repo: repo, taskA: taskA, taskB: taskB, taskC: taskC,
+		lin: lin, mem: mem, notifier: notifier, mp: mp,
+		taskABranch: taskABranch, taskATip: taskATip, taskBBranch: taskBBranch,
+		taskCHeadBefore: taskCHeadBefore, devTip: devTip,
+	}
+}
+
+func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
+	sc := rebaseConflictScenario(t, nil)
+	ctx := context.Background()
+	m, repo, taskA, taskB, taskC := sc.m, sc.repo, sc.taskA, sc.taskB, sc.taskC
+	lin, mem, notifier, mp := sc.lin, sc.mem, sc.notifier, sc.mp
+	taskABranch, taskATip, taskBBranch := sc.taskABranch, sc.taskATip, sc.taskBBranch
+	taskCHeadBefore, devTip := sc.taskCHeadBefore, sc.devTip
+	_ = taskA
 
 	// ---- 顶层入口：等价于 taskA 合并触发的那一次调用 ----
 	if err := mp.rebaseFollowup(ctx, taskABranch, taskATip, repo.DefaultBranch); err != nil {
@@ -617,6 +655,40 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 	}
 	if _, ok := mem.stored[wantKey]; !ok {
 		t.Errorf("记忆应按 taskB 的定位键写入，实际键集合：%v", memoryKeys(mem))
+	}
+}
+
+// AC-21b：自动 rebase 撞冲突转 failed 这条路径不经 p.fail（没有 runCtx），
+// 必须在 failRebaseFollowup 里单独接 chatTerminal —— 漏接时 failed 行数为 0。
+func TestRebaseConflictEmitsFailedChatEvent(t *testing.T) {
+	nc := realNC(t)
+	sc := rebaseConflictScenario(t, nc)
+	ctx := context.Background()
+	addSlack(t, nc, sc.userID)
+
+	if err := sc.mp.rebaseFollowup(ctx, sc.taskABranch, sc.taskATip, sc.repo.DefaultBranch); err != nil {
+		t.Fatalf("rebaseFollowup: %v", err)
+	}
+	tB, err := sc.m.Get(ctx, sc.taskB.ID)
+	if err != nil || tB.State != task.StateFailed {
+		t.Fatalf("taskB 应转 failed，got %v %v", tB, err)
+	}
+	rows := waitDeliveries(t, testPoolForPipeline(t), sc.userID, notify.EventFailed, 1)
+	if len(rows) != 1 {
+		t.Fatalf("failed 投递行 got %d, want 1", len(rows))
+	}
+	r := rows[0]
+	if r.Payload.TaskID != sc.taskB.ID {
+		t.Errorf("payload.task_id got %d, want taskB=%d（taskC 不级联）", r.Payload.TaskID, sc.taskB.ID)
+	}
+	if r.Payload.FailureStage != string(StageRebaseConflict) {
+		t.Errorf("payload.failure_stage got %q, want %q", r.Payload.FailureStage, StageRebaseConflict)
+	}
+	if r.Payload.Reason == "" {
+		t.Error("payload.reason 不应为空")
+	}
+	if prefix := fmt.Sprintf("task:%d:failed:", sc.taskB.ID); !strings.HasPrefix(r.EventKey, prefix) {
+		t.Errorf("event_key got %q, want 前缀 %q", r.EventKey, prefix)
 	}
 }
 

@@ -88,6 +88,8 @@ func (f *fakeStore) TransitionPRD(_ context.Context, _, _ int64, p store.Transit
 		return nil, store.ErrPRDStateChanged
 	}
 	f.row.State = p.To
+	// updated_at 由库里的触发器维护；这里给确定值，供站外通知的去重键比对（f09 AC-22）。
+	f.row.UpdatedAt = time.Unix(1700000000, 0)
 	// 忠实模拟 COALESCE 语义：只有带上图号时才写，nil 保留原值。
 	if p.GeneratedFlowID != nil {
 		f.row.GeneratedFlowID = p.GeneratedFlowID
