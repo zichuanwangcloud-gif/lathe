@@ -138,7 +138,7 @@ func (s *Sender) send(ctx context.Context, ch Channel, msg Message) Result {
 	if err != nil {
 		return Result{Retryable: true, Reason: transportErrClass(err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if rerr != nil {
 		return Result{

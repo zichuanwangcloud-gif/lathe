@@ -37,10 +37,10 @@ var (
 // ErrChannelNotFound 表示该用户没有配置这种渠道。
 var ErrChannelNotFound = errors.New("store: 通知渠道未配置")
 
-// ErrDeliveryNotFound：投递不存在或不属于当前用户（httpapi 一律 404，不暴露存在性）。
+// ErrDeliveryNotFound 表示投递不存在或不属于当前用户（httpapi 一律 404，不暴露存在性）。
 var ErrDeliveryNotFound = errors.New("store: 投递记录不存在")
 
-// ErrNotRetryable：投递存在但不能人工重试（httpapi 409）。
+// ErrNotRetryable 表示投递存在但不能人工重试（httpapi 409）。
 var ErrNotRetryable = errors.New("store: 只有放弃（gave_up）的投递能重试")
 
 // ErrTestNotRetryable 是 ErrNotRetryable 的特例：测试消息走「重发测试」。
