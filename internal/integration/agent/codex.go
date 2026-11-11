@@ -62,7 +62,7 @@ func (d *CodexDriver) idleTimeout() time.Duration {
 // 这里表态，测试当场红 —— 不靠「后合入的一方记得处理」。
 //
 // SettingSources 列为「消费」：codex 下它被有意忽略（隔离靠专用 CODEX_HOME，
-// 不用 --ignore-user-config，见 docs/features/multi-cli.md §隔离），忽略也是
+// 不加「不读 $CODEX_HOME/config.toml」的那个 exec 参数，见 docs/features/multi-cli.md §7），忽略也是
 // 一种明确的处理。
 var (
 	codexConsumes = []string{
@@ -183,7 +183,7 @@ func envKey(kv string) string {
 
 // codexBuildArgs 构造 codex 的参数。prompt 永远不进 argv（走 stdin，P12）。
 //
-// 永不加 --ignore-user-config：它只是不读 $CODEX_HOME/config.toml（P11），
+// 永不加「不读用户配置」的那个 exec 参数（help 原文 Do not load $CODEX_HOME/config.toml，P11）：
 // 对技能、hook 的发现毫无作用，却会让运维在专用 home 里配的 provider/模型失效。
 func codexBuildArgs(p RunParams) ([]string, error) {
 	if p.FromPR != "" {
