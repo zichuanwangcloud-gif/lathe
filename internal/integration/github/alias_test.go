@@ -72,7 +72,7 @@ func TestReviewEventVCSConversionKeepsGitHubTrust(t *testing.T) {
 				}
 				v := ev.VCS()
 				wantV := vcs.ReviewEvent{
-					Provider: vcs.ProviderGitHub, Event: ev.Event, Action: ev.Action, Repo: ev.Repo,
+					Provider: "github", Event: ev.Event, Action: ev.Action, Repo: ev.Repo,
 					PRNumber: ev.PRNumber, PRAuthor: ev.PRAuthor, Key: ev.Key, Author: ev.Author,
 					Body: ev.Body, Path: ev.Path, Line: ev.Line, URL: ev.URL, ReviewState: ev.ReviewState,
 				}

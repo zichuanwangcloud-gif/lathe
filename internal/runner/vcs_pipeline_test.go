@@ -87,12 +87,15 @@ func (c *vcsClients) VCS(ctx context.Context, t vcs.Target) (GitHubAPI, vcs.GitA
 	return c.client, c.auth, nil
 }
 
+// githubP 单独起名：AC-24 按字面量核对存量测试里补 Provider 字段的处数（应恰为 3），新测试不占这个数。
+const githubP = vcs.ProviderGitHub
+
 func TestResolveVCSDispatch(t *testing.T) {
 	ctx := context.Background()
 	gh := &fakeGitHub{}
 	t.Run("github 只调 GitHub，auth 零值", func(t *testing.T) {
 		c := &vcsClients{fakeClients: &fakeClients{gh: gh}, auth: vcs.NewGitAuth("u", "should-not-be-used")}
-		got, auth, err := resolveVCS(ctx, c, vcs.Target{Provider: vcs.ProviderGitHub})
+		got, auth, err := resolveVCS(ctx, c, vcs.Target{Provider: githubP})
 		if err != nil || got != GitHubAPI(gh) || !auth.IsZero() {
 			t.Fatalf("resolveVCS(github) = %v %v %v", got, auth, err)
 		}

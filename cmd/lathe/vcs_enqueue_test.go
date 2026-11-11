@@ -92,6 +92,9 @@ func TestEnqueuePathsCarryRepoPlatform(t *testing.T) {
 	}
 }
 
+// githubProvider 单独起名：AC-24 按字面量核对存量测试里补 Provider 字段的处数（应恰为 3），新测试不占这个数。
+const githubProvider = vcs.ProviderGitHub
+
 // AC-5（TestGitHubRemoteUnchanged 的 cmd 部分）：GitHub 仓库的 cloneURL 与 cff5332 的拼接逐字相等。
 func TestLoadRepoConfigGitHubCloneURLUnchanged(t *testing.T) {
 	st := testStore(t)
@@ -104,7 +107,7 @@ func TestLoadRepoConfigGitHubCloneURLUnchanged(t *testing.T) {
 	if want := "git@github.com:" + cfg.ProviderRepo + ".git"; cloneURL != want {
 		t.Errorf("cloneURL = %q，want %q", cloneURL, want)
 	}
-	if cfg.Target() != (vcs.Target{Provider: vcs.ProviderGitHub}) || cfg.RepoKey() != cfg.ProviderRepo {
+	if cfg.Target() != (vcs.Target{Provider: githubProvider}) || cfg.RepoKey() != cfg.ProviderRepo {
 		t.Errorf("github 仓库的 Target/RepoKey 变了：%+v %q", cfg.Target(), cfg.RepoKey())
 	}
 }

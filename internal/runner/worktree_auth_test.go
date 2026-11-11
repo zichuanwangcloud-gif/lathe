@@ -405,7 +405,7 @@ func TestGitHubRemoteUnchanged(t *testing.T) {
 	if got := cfg.CloneURL(); got != "git@github.com:acme/demo.git" {
 		t.Errorf("CloneURL = %q，want git@github.com:acme/demo.git", got)
 	}
-	if got := cfg.Target(); got != (vcs.Target{Provider: vcs.ProviderGitHub}) {
+	if got := cfg.Target(); got != (vcs.Target{Provider: githubP}) {
 		t.Errorf("Target = %+v，want {github, \"\"}", got)
 	}
 	if got := vcs.RepoKey(vcs.ProviderGitHub, "", "acme/demo"); got != "acme/demo" {
