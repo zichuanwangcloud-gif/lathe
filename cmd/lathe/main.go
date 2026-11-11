@@ -28,6 +28,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/schedule"
 	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
@@ -296,6 +297,18 @@ func serve(cfg config.Config) error {
 	}
 	linearAPI.Routes(mux)
 
+	// 定时建单（docs/features/scheduled-issue.md）：到点只在 Linear 上建一张单，
+	// 之后走上面那条 webhook 接单路径。Runner 在这里构造（纯构造、无副作用），
+	// 「立即运行」与 startWorkers 里的后台循环共用同一个实例。
+	scheduler := newScheduler(cfg, st, factory)
+	(&httpapi.SchedulesAPI{
+		Store:            st,
+		Auth:             auth,
+		Fire:             scheduler,
+		SchedulerEnabled: cfg.SchedulerEnabled(),
+		Preconditions:    scheduleIntake{factory: factory, settings: st},
+	}).Routes(mux)
+
 	accountAPI := &httpapi.AccountAPI{
 		Users:      users,
 		Sessions:   sessions,
@@ -464,7 +477,7 @@ func serve(cfg config.Config) error {
 	// 更实的影响：那一段窗口里被领走的任务 p.Stacks == nil → 整个起栈
 	// 分支跳过 → 既不起栈也不留痕。而那个窗口恰恰是最热的时刻 ——
 	// 上面的 Reconcile 刚把所有在途任务重新入队。
-	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets)
+	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets, scheduler)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -486,7 +499,7 @@ func serve(cfg config.Config) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
-// startWorkers 启动后台执行者：任务队列 worker、合并检测轮询与 PRD 搁置扫描。
+// startWorkers 启动后台执行者：任务队列 worker、合并检测轮询、PRD 搁置扫描与定时建单调度器。
 //
 // 抽成函数是为了让「装配完成后才启动」成为一条【结构性】约束：本函数
 // 是唯一的启动点，只要它被放在装配之后调用，就不可能出现「worker 先
@@ -496,7 +509,7 @@ func serve(cfg config.Config) error {
 // 而不是被硬杀。注意被取消的 ctx 会一路传进拆栈路径 —— 那正是
 // VerifyStack.Down 必须自己解绑取消的原因（见 preview/verifystack.go）。
 func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *store.Store,
-	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets) {
+	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets, scheduler *schedule.Runner) {
 	go q.work(ctx)
 
 	// F4.1 合并检测的轮询兜底 + F4.2 现场回收 + F4.3 后继链自动 rebase
@@ -542,6 +555,15 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 		slog.Warn("PRD 搁置提醒已关闭（LATHE_PRD_STALL_NOTIFY=false）：仍会判搁置，但不会通知属主")
 	}
 	go sweeper.Run(ctx)
+
+	// 定时建单调度器（docs/features/scheduled-issue.md）：只往 Linear 建单，不进入执行管线。
+	// Runner 已在 serve 里构造（「立即运行」要用同一个实例），这里只负责启动。
+	// 关掉时 API 照常可用（可以先配规则），「立即运行」返回 503。
+	if cfg.SchedulerEnabled() {
+		go scheduler.Run(ctx)
+	} else {
+		slog.Warn("定时建单调度器已被 LATHE_SCHEDULER_ENABLED=false 关闭：规则不会到点建单")
+	}
 }
 
 // buildPipeline 装配流水线。
