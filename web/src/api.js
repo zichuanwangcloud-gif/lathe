@@ -217,6 +217,11 @@ export const api = {
   deleteIntegration: (kind) =>
     request(`/api/integrations/${kind}`, { method: 'DELETE' }),
 
+  // 个人 API 令牌（PAT）。签发需带 currentPassword；明文只在 createPAT 的响应里出现一次。
+  pats: () => request('/api/pat'),
+  createPAT: (body) => request('/api/pat', { method: 'POST', body: JSON.stringify(body) }),
+  revokePAT: (id) => request(`/api/pat/${id}`, { method: 'DELETE' }),
+
   smtp: () => request('/api/smtp'),
   saveSmtp: (body) => request('/api/smtp', { method: 'PUT', body: JSON.stringify(body) }),
   verifySmtp: (testTo) =>

@@ -24,6 +24,7 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
 | [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
 | [docs/11-branching-release.md](docs/11-branching-release.md) | 分支管理与发版规范（贡献者必读） |
+| [docs/features/personal-api-token.md](docs/features/personal-api-token.md) | 个人 API 令牌（PAT）：设计、接口、安全边界与验收结果 |
 
 ## 技术栈
 
@@ -96,6 +97,12 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 
 忘记密码需要先配好 SMTP。没配的话，管理员可以在用户管理页代为重置。
 
+脚本与 CI 用「个人设置 → 个人 API 令牌」签发 PAT，请求带
+`Authorization: Bearer lathe_pat_…`，**权限与你本人完全相同**（管理员签的才是管理员权限）。
+明文只在创建时显示一次，签发时需输入当前密码；可设过期、可随时吊销。
+**停用账号、修改密码、找回或被管理员重置密码，都会吊销你的全部令牌。**
+`LATHE_ADMIN_TOKEN` 仍保留为部署级应急通道，两者互不影响。
+
 ### 任务预览环境
 
 看板上有工作区的任务可以一键「预览」：扫描 worktree 里的 Dockerfile 与
@@ -126,7 +133,7 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres |
 | `LATHE_ADMIN_EMAIL` | 内置管理员邮箱，默认 `admin@lathe.local` |
 | `LATHE_ADMIN_PASSWORD` | 内置管理员初始口令，不配则随机生成并打印一次 |
-| `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
+| `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配。日常脚本请用个人 API 令牌，见 [docs/features/personal-api-token.md](docs/features/personal-api-token.md) |
 | `LATHE_LINEAR_TOKEN` | Linear API 令牌的兜底值。**只对内置管理员生效**，且优先级低于设置页（界面里配了就以界面为准，改完即刻生效） |
 | `LATHE_LINEAR_WEBHOOK_SECRET` | Linear webhook 签名密钥的兜底值。**只对内置管理员生效**、优先级低于设置页 |
 | `LATHE_LINEAR_USER_ID` | 「指派给我了吗」接单判定用的 Linear 用户 ID。**只对内置管理员生效**；设置页配 Linear 令牌时会自动取到账号 ID，正常情况不用手工填 |
