@@ -28,7 +28,7 @@ func digestCounts(t *testing.T, path string) (counts map[string]int, events []Ev
 	if err != nil {
 		t.Fatalf("打开 fixture 失败: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	counts = map[string]int{}
 	res, err = parseStream(f, func(e Event) {
 		events = append(events, e)

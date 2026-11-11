@@ -107,9 +107,3 @@ func (s *ackSession) Closed() bool {
 	defer s.mu.Unlock()
 	return s.closed
 }
-
-func (s *ackSession) delivered() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]string(nil), s.bodies...)
-}

@@ -133,6 +133,25 @@ GET /api/tasks/{id}/events?after=<id>&limit=<n>
 
 ---
 
+## 3.6 运行中插话（docs/features/interject.md）
+
+- **数据来源是 `task_interjections`，不是 `agent_events`**。插话记的是「人要求什么」，
+  它有自己的投递状态机（queued → delivering → delivered/failed），状态会在事后变化；
+  `agent_events` 是 stdout 的 append-only 提炼，游标是 `id`。两种数据不挂同一个游标，
+  `GET /events` 因此一个字段都没加；插话走 `GET /api/tasks/{id}/interjections?after_rev=R`。
+- **流式输入下两类 stdout 行被驱动过滤**（`parseStreamWith`，过滤在喂看门狗之后）：
+  - `type=user` 且 `isReplay=true`：`--replay-user-messages` 对我们写进 stdin 的帧的回显。
+    它的 `content` 是 text 块，`Digest` 会把它记成 `KindText` —— 人插的话就会以
+    **agent 自己说的正文**出现在事件流里，审计上张冠李戴。回显只用于投递确认（uuid 对上）。
+  - `type=command_lifecycle`：`--input-format stream-json` 的命令排队/开始/完成通知，
+    CLI 的连接性噪声，不是 agent 产出；不丢的话会退化成 `raw`。
+  - `system/<非 init>`（`thinking_tokens`、`api_retry`…）**照旧**落 `raw`，不过滤。
+- **一次运行多条 result**（result 前一刻写进管道的插话被 CLI 当成新 turn）：
+  `num_turns`、`duration_ms` 是单 turn 量 → 各条求和；`total_cost_usd`（进程累计）与
+  文本、成败等终局字段取最后一条。终局摘要四列据此落库。
+
+---
+
 ## 4. 明确不做（及原因）
 
 | 不做 | 原因 |

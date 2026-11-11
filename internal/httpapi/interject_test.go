@@ -273,7 +273,7 @@ func getList(t *testing.T, srvURL string, client *http.Client, id int64, after s
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var lr listResp
 	if resp.StatusCode == http.StatusOK {
 		if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
@@ -504,7 +504,7 @@ func TestSubmitSurvivesClientDisconnect(t *testing.T) {
 			go func() {
 				resp, err := srv.srv.Client().Do(req)
 				if err == nil {
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			}()
 			select {
@@ -517,7 +517,7 @@ func TestSubmitSurvivesClientDisconnect(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("handler 5s 内没返回")
 			}
-			if el := time.Since(start); el > 3500*time.Millisecond {
+			if el := time.Since(start); el > 3*time.Second {
 				t.Errorf("handler 耗时 got=%v want≤3s（ack 超时 2s + 写库）", el)
 			}
 			if n := countInterjections(t, st, tk.ID); n != c.wantRows {

@@ -88,7 +88,7 @@ func (s *stubProvider) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fl, _ := w.(http.Flusher)
 	ev := func(name string, data any) {
 		b, _ := json.Marshal(data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
+		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, b)
 		if fl != nil {
 			fl.Flush()
 		}
@@ -295,7 +295,7 @@ func TestRealCLIInterject(t *testing.T) {
 					meta.ReplayLine = n
 				}
 			}
-			f.Close()
+			_ = f.Close()
 		}
 		b, _ := json.MarshalIndent(meta, "", "  ")
 		_ = os.WriteFile(filepath.Join(out, fmt.Sprintf("real-cli-%s-%s.meta.json", stamp, name)), b, 0o644)
