@@ -228,6 +228,10 @@ node.limits = { light: f(cpu), heavy: f(mem_free, disk_free) }
 
 派发即写 `node_id + lease_expires_at`，Runner 定期续租。节点崩溃 → 租约到期 → 任务回到 `queued` 重新派发。`implementing` 中断的任务重派时凭 `agent_session_id` 续跑。
 
+> 跨节点插话不支持：运行中插话的投递通道是同进程内存注册表，「某任务正在哪个进程跑」
+> 在 DB 里没有权威记录；查不到活会话的插话留在 `queued`，由下一轮补投或结算收尾。
+> 演进注记见 [features/interject.md](./features/interject.md)。
+
 ### 6.5 智能重试：断点续跑而非从头重跑
 
 失败任务的重试不是无条件丢弃现场重建。流水线视为阶段链

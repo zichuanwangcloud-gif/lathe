@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, computed, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
+import InterjectPanel from '../components/InterjectPanel.vue'
 import { confirmDialog } from '../confirm'
 import { appendCapped, createMarkdown, createPoller, MAX_LIVE_EVENTS } from '../livelog'
 
@@ -426,6 +427,7 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <InterjectPanel :task-id="task.id" :state="task.state" />
     <!-- 执行日志面板（docs/04 §3.4）：按阶段分节，当前阶段置顶展开 -->
     <div class="card">
       <div class="spread">

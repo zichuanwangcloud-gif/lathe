@@ -166,6 +166,12 @@ type Pipeline struct {
 	// 成实际的 BASE_URL/TOKEN；为空则跟随 cc-switch 当前激活通道。
 	TriageChannel    string
 	ImplementChannel string
+
+	// Interjections 是运行中插话（docs/features/interject.md）：实现与修复轮的
+	// agent 以流式输入启动并登记活会话，queued 插话在下一次 runAgent 开场补投，
+	// Execute 收尾时结算。为 nil 时整个机制关闭，agent 启动方式与引入本字段
+	// 之前逐行一致（测试与老装配）。生产装配永远接（没有开关）。
+	Interjections *Interjections
 }
 
 // ExecuteParams 描述一次流水线执行。
@@ -295,6 +301,13 @@ func (rc *runCtx) takeRetryPayload() map[string]any {
 // 实现与验证。任一步失败都会走 fail()：回帖说明原因 + 保留 worktree
 // 现场 + 推送通知，且不自动重试（D4）。
 func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
+	// 插话收尾结算（T1）：放在 setup 之前，setup 失败也覆盖。本次执行把任务
+	// 带到不会再跑 agent 的状态（pr_open/awaiting_approval/failed/blocked_spec，
+	// 或执行期间被取消）时，没进入模型的 queued 插话以人读原因判 failed。
+	// 只读 tasks.state，不做任何状态转移。
+	if p.Interjections != nil {
+		defer p.Interjections.SettleTask(ctx, params.TaskID)
+	}
 	rc, entry, err := p.setup(ctx, params)
 	if err != nil {
 		return err
@@ -765,13 +778,19 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 // 的 p.ImplementChannel（既有行为，F7.1-AC4 的回归保证）。
 func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
 	prompt = p.injectFailureMemory(rc, phase, prompt, resume)
+	// 开场补投（运行中插话）：在失败记忆之后，所以最终 prompt 恒为
+	// base + [失败记忆段] + [插话段] —— 插话段永远是最后一段。无插话时原样返回。
+	var pf *prefilled
+	if p.Interjections != nil {
+		prompt, pf = p.Interjections.prefillInterjections(rc.ctx, rc.tk.ID, phase, session, prompt)
+	}
 	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
 	defer sink.Close() // 兜底，同 stageTriage
 	channel := p.ImplementChannel
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
 		channel = rc.profile.ModelChannel
 	}
-	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
+	params := agent.RunParams{
 		Prompt:         prompt,
 		Dir:            rc.wt.Path,
 		SessionID:      session,
@@ -780,7 +799,19 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 		SettingSources: p.SettingSources,
 		ExtraEnv:       channelEnv(channel),
 		OnEvent:        sink.OnEvent,
-	})
+	}
+	if ij := p.Interjections; ij != nil && ij.supported(rc.tk) {
+		taskID := rc.tk.ID
+		params.StreamInput = true
+		params.OnReady = func(s *agent.Session) { ij.Register(taskID, s, phase, session) }
+		// 读协程上：只发内存信号，零 I/O（interject.go 的线程模型）
+		params.OnDelivery = ij.Ack
+	}
+	res, err := p.Agent.Run(rc.ctx, params)
+	if p.Interjections != nil {
+		p.Interjections.Unregister(rc.tk.ID)
+		p.Interjections.finishPrefill(rc.ctx, pf, res)
+	}
 	sink.Close()
 	return res, err
 }

@@ -191,6 +191,20 @@ type RunParams struct {
 	// OnEvent 每解析出一条事件就回调一次（可为 nil）。
 	// 回调在读取协程里同步执行，实现应尽量轻量。
 	OnEvent func(Event)
+
+	// StreamInput 为真时以 --input-format stream-json --replay-user-messages 启动，
+	// prompt 作为 stdin 的第一帧写入（运行中插话，docs/features/interject.md）。
+	// stdin 的生命周期见 session.go 的包注释：首条 result / ctx 结束或看门狗 /
+	// Wait 返回，三者任一先到即关。默认 false（走位置参数，与引入本字段之前
+	// 逐行一致）—— 分诊、PRD 规划、预览推荐都不打开它。
+	StreamInput bool
+	// OnReady 在进程起来、stdin 可写后回调一次，交出可投递句柄。
+	// 仅 StreamInput 时生效；为 nil 时插话机制整体消失。
+	OnReady func(*Session)
+	// OnDelivery 是注入帧的投递回显（--replay-user-messages 的 isReplay 事件）。
+	// 在**读协程**里同步调用，契约：只许做内存操作（非阻塞发信号），
+	// 禁止任何 I/O —— 尤其是 DB 写。读协程被拖慢会让看门狗与事件流一起变慢。
+	OnDelivery func(deliveryID string)
 }
 
 // ErrNoResultEvent 表示 CLI 退出了但没给出终局 result 事件。
@@ -208,6 +222,10 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	}
 	if p.Resume && p.SessionID == "" {
 		return nil, fmt.Errorf("agent: Resume 需要 SessionID")
+	}
+	if p.StreamInput && p.Prompt == "" {
+		// 流式输入下 prompt 是 stdin 首帧；没有首帧 CLI 只会干等。
+		return nil, fmt.Errorf("agent: StreamInput 需要非空 Prompt（作为 stdin 首帧）")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, d.timeout)
@@ -248,20 +266,59 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	defer func() { _ = errR.Close() }()
 	cmd.Stdout, cmd.Stderr = outW, errW
 
+	// StreamInput：stdin 必须是 *os.File（os.Pipe 读端）。cmd.Stdin 不是
+	// *os.File 时 exec 会起一条拷贝协程，cmd.Wait 要等它结束 —— 写端不关就
+	// 永不返回，进程被杀之后也不返回（io.Pipe 实测 Wait 卡死）。也不用
+	// cmd.StdinPipe()：它把 Close 时机交给 exec，而这里要由解析侧按 result 主动关。
+	var stdinR, stdinW *os.File
+	if p.StreamInput {
+		stdinR, stdinW, err = os.Pipe()
+		if err != nil {
+			_ = outW.Close()
+			_ = errW.Close()
+			return nil, fmt.Errorf("agent: 建 stdin 管道失败: %w", err)
+		}
+		cmd.Stdin = stdinR
+	}
+
 	startErr := cmd.Start()
 	// 父进程必须关掉自己的写端，否则读端永远等不到 EOF
 	_ = outW.Close()
 	_ = errW.Close()
+	if stdinR != nil {
+		_ = stdinR.Close() // 读端归子进程；父进程留着它，子进程永远读不到 EOF
+	}
 	if startErr != nil {
+		if stdinW != nil {
+			_ = stdinW.Close()
+		}
 		return nil, fmt.Errorf("agent: 启动 %s 失败: %w", d.bin, startErr)
 	}
 	pgid := cmd.Process.Pid
 
-	// 监听取消：一旦 ctx 结束就杀整个进程组
+	var sess *Session
+	closeStdin := func() {}
+	if p.StreamInput {
+		sess = newSession(stdinW)
+		closeStdin = sess.closeStdin
+		// 兜底关闭点（第 3 个时机）：正常情况下此时早已关过
+		defer sess.closeStdin()
+		first, ferr := userFrame(newFrameID(), p.Prompt)
+		if ferr != nil {
+			sess.closeStdin()
+			killProcessGroup(pgid)
+			_ = cmd.Wait()
+			return nil, ferr
+		}
+		sess.writeFirst(first)
+	}
+
+	// 监听取消：一旦 ctx 结束就杀整个进程组（杀之前先关 stdin）
 	killed := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
+			closeStdin()
 			killProcessGroup(pgid)
 		case <-killed:
 		}
@@ -275,10 +332,15 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	go func() {
 		select {
 		case <-idle.fired:
+			closeStdin()
 			killProcessGroup(pgid)
 		case <-killed:
 		}
 	}()
+
+	if sess != nil && p.OnReady != nil {
+		p.OnReady(sess)
+	}
 
 	// 事件在后台读，OnEvent 因此在这个协程里回调（RunParams.OnEvent 的
 	// 契约本来就是「在读取协程里同步执行」，调用方的实现须并发安全）。
@@ -289,11 +351,14 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	var out parsed
 	parseDone := make(chan struct{})
 	go func() {
-		out.result, out.err = parseStream(outR, func(e Event) {
-			idle.touch()
-			if p.OnEvent != nil {
-				p.OnEvent(e)
-			}
+		// Touch 每一条可解析的 JSON 行都调、且在过滤之前：被丢弃的
+		// command_lifecycle / replay 回显照样证明进程活着。
+		out.result, out.err = parseStreamWith(outR, streamHooks{
+			Touch:      idle.touch,
+			OnEvent:    p.OnEvent,
+			OnDelivery: p.OnDelivery,
+			OnResult:   closeStdin,
+			Whitelist:  p.StreamInput,
 		})
 		close(parseDone)
 	}()
@@ -306,6 +371,7 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	}()
 
 	waitErr := cmd.Wait()
+	closeStdin()
 	// 兜底：即使正常退出也再扫一遍进程组，杀掉可能残留的孙子进程。
 	// 同组的遗留后台进程死了，它们持有的写端随之关闭，读端拿到 EOF。
 	killProcessGroup(pgid)
@@ -376,14 +442,62 @@ func (d *Driver) buildArgs(p RunParams) []string {
 	}
 	args = append(args, p.ExtraArgs...)
 
+	if p.StreamInput {
+		// prompt 不作位置参数：它是 stdin 的第一帧（Run 写入）。
+		return append(args, "--input-format", "stream-json", "--replay-user-messages")
+	}
 	if p.Prompt != "" {
 		args = append(args, p.Prompt)
 	}
 	return args
 }
 
+// streamHooks 是 parseStreamWith 的回调集合（均可为 nil）。
+type streamHooks struct {
+	// Touch 每一条可解析的 JSON 行都调，**过滤之前** —— 喂看门狗。
+	Touch func()
+	// OnEvent 只收放行的事件。
+	OnEvent func(Event)
+	// OnDelivery 收 isReplay 回显的 uuid（读协程上同步调用，只许做内存操作）。
+	OnDelivery func(id string)
+	// OnResult 在第一条 result 到达时调一次（StreamInput 用来关 stdin）。
+	OnResult func()
+	// Whitelist 为真时（StreamInput 模式）只放行 system/assistant/user/result。
+	Whitelist bool
+}
+
+// replayProbe 只取回显判定需要的两个字段。
+type replayProbe struct {
+	IsReplay bool   `json:"isReplay"`
+	UUID     string `json:"uuid"`
+}
+
 // parseStream 逐行解析 NDJSON 事件，返回终局 result。
 func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
+	return parseStreamWith(r, streamHooks{OnEvent: onEvent})
+}
+
+// parseStreamWith 是 parseStream 的完整实现。过滤规则（按顺序）：
+//
+//  0. 每一条 JSON 行先 Touch() —— 过滤在喂看门狗之后，被丢弃的事件照样证明进程活着
+//  1. type=user 且 isReplay=true → OnDelivery(uuid)，不交给 OnEvent【所有模式】
+//     这是 --replay-user-messages 对我们写进 stdin 的帧的回显：它的 content
+//     是 text 块，Digest 会把它记成 KindText —— 人插的话就会以 **agent 自己说的
+//     正文** 出现在事件流里，审计上张冠李戴。
+//  2. type=command_lifecycle → 丢弃【所有模式】
+//     --input-format stream-json 的命令排队/开始/完成通知，是 CLI 的连接性噪声，
+//     不是 agent 产出；不丢的话 Digest 的 default 分支会把它退化成 raw。
+//  3. Whitelist 为真时：type ∉ {system, assistant, user, result} → 丢弃【仅 StreamInput】
+//  4. 其余照旧交给 OnEvent（含非 replay 的 user = 真·工具结果回灌）
+//
+// 1、2 两种形状只会由流式输入产生，非流式模式下它们根本不出现，过滤是 no-op。
+// 3 只在 StreamInput 开：非流式下未知类型仍按 docs/04「提炼不出结构时保底 raw」。
+// system/<非 init>（thinking_tokens、api_retry…）一律放行，Digest 照旧记 raw。
+//
+// 一次运行出现多条 result（result 前一刻写进管道的插话被 CLI 当成新 turn）时：
+// NumTurns、DurationMS 是单 turn 量 → 各条求和；其余字段（含进程累计的
+// total_cost_usd）取最后一条 —— 会话的终局状态就是最后一个 turn 之后的样子。
+func parseStreamWith(r io.Reader, h streamHooks) (*Result, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 
@@ -398,11 +512,29 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 		if err := json.Unmarshal(line, &env); err != nil {
 			continue // 单行解析失败不应终止整次执行
 		}
+		if h.Touch != nil {
+			h.Touch()
+		}
 
-		if onEvent != nil {
+		switch t := EventType(env.Type); {
+		case t == EventUser:
+			var rp replayProbe
+			if err := json.Unmarshal(line, &rp); err == nil && rp.IsReplay {
+				if h.OnDelivery != nil {
+					h.OnDelivery(rp.UUID)
+				}
+				continue
+			}
+		case t == "command_lifecycle":
+			continue
+		case h.Whitelist && t != EventSystem && t != EventAssistant && t != EventResult:
+			continue
+		}
+
+		if h.OnEvent != nil {
 			raw := make(json.RawMessage, len(line))
 			copy(raw, line)
-			onEvent(Event{
+			h.OnEvent(Event{
 				Type:      EventType(env.Type),
 				Subtype:   env.Subtype,
 				SessionID: env.SessionID,
@@ -417,7 +549,8 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 		if err := json.Unmarshal(line, &re); err != nil {
 			return nil, fmt.Errorf("agent: 解析 result 事件失败: %w", err)
 		}
-		result = &Result{
+		first := result == nil
+		next := &Result{
 			SessionID:         re.SessionID,
 			Success:           re.Subtype == "success" && !re.IsError,
 			IsError:           re.IsError,
@@ -429,6 +562,14 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 			TerminalReason:    re.TerminalReason,
 			PermissionDenials: re.PermissionDenials,
 			APIErrorStatus:    re.APIErrorStatus,
+		}
+		if !first {
+			next.NumTurns += result.NumTurns
+			next.DurationMS += result.DurationMS
+		}
+		result = next
+		if first && h.OnResult != nil {
+			h.OnResult()
 		}
 	}
 	if err := sc.Err(); err != nil {

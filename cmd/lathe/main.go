@@ -193,6 +193,14 @@ func serve(cfg config.Config) error {
 		slog.Error("启动恢复失败（继续运行，残留任务可人工重试）", "err", err)
 	}
 
+	// 插话启动清扫（docs/features/interject.md §3.4 T4）：进程重启后不可能
+	// 还有投递持有者，遗留 delivering → failed；任务已不会再跑 agent 的
+	// queued 插话按人读原因结算。Reconcile 转回 queued 的任务，其 queued
+	// 插话保留给下一次 agent 轮次补投。必须在 q.Reconcile 之后、worker 之前。
+	if err := pipeline.Interjections.StartupSweep(ctx); err != nil {
+		slog.Warn("插话启动清扫失败（周期清扫会兜底）", "err", err)
+	}
+
 	// 验证隔离栈的开机清扫（T8-AC6）。摆在 worker 启动之前：此刻不可能
 	// 有本进程起的栈，全清是安全的；而清扫之后才让 worker 取任务，
 	// 就不存在「worker 正要对某个任务起栈，清扫刚把它的栈删了」的窗口。
@@ -283,6 +291,12 @@ func serve(cfg config.Config) error {
 		Queue:        q,
 		Auth:         auth,
 		ConfigStatus: configStatus(cfg),
+		Interjector:  pipeline.Interjections,
+		InterjectLimits: httpapi.InterjectLimits{
+			MaxChars:  cfg.InterjectMaxChars,
+			RateLimit: cfg.InterjectRateLimit,
+			Window:    cfg.InterjectWindow,
+		},
 	}
 	apiSrv.Routes(mux)
 
@@ -542,6 +556,30 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 		slog.Warn("PRD 搁置提醒已关闭（LATHE_PRD_STALL_NOTIFY=false）：仍会判搁置，但不会通知属主")
 	}
 	go sweeper.Run(ctx)
+
+	// 插话周期结算（docs/features/interject.md §3.4 T3）：任务在 Execute 之外
+	// 离开可运行状态（取消、blocked_dep 级联）而没人打开详情页时，queued
+	// 插话也要在有界时间内落到终态。
+	go sweepInterjections(ctx, pipeline.Interjections, runner.InterjectSweepInterval)
+}
+
+// sweepInterjections 每 interval 调一次 SweepOnce；形状照 gcSessions。
+func sweepInterjections(ctx context.Context, ij *runner.Interjections, interval time.Duration) {
+	if ij == nil {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if _, err := ij.SweepOnce(ctx); err != nil {
+				slog.Warn("插话周期结算失败", "err", err)
+			}
+		}
+	}
 }
 
 // buildPipeline 装配流水线。
@@ -568,7 +606,18 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 	// Memory 接 *store.Store 本身：它直接满足 runner.FailureMemory
 	// （方法签名一对一同形），不需要适配器 —— 与 Verifications /
 	// AgentEvents 的接线方式一致。
+	// 运行中插话（docs/features/interject.md）：同一个实例同时挂在 Pipeline
+	// （实现/修复轮登记活会话、开场补投、收尾结算）与 API（POST /interject、
+	// GET /interjections）上 —— 两边必须是同一份内存注册表，否则 API 永远
+	// 查不到活会话。没有开关：生产装配永远接。
+	interjections := &runner.Interjections{
+		Store:        st,
+		Tasks:        task.NewMachine(st.Pool()),
+		KnownSecrets: cfg.KnownSecrets(),
+	}
+
 	return &runner.Pipeline{
+		Interjections: interjections,
 		Tasks:         task.NewMachine(st.Pool()),
 		Worktrees:     wm,
 		Verifier:      runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
