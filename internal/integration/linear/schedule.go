@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -102,6 +103,9 @@ func (c *Client) Teams(ctx context.Context) ([]Team, error) {
 	return resp.Teams.Nodes, nil
 }
 
+// ErrLabelNotFound 表示团队与工作区里都没有这个名字的标签（调用方据此区分「配置错」与「网络错」）。
+var ErrLabelNotFound = errors.New("linear: 找不到标签")
+
 const labelsByNameQuery = `query($name: String!) {
   issueLabels(first: 50, filter: { name: { eqIgnoreCase: $name } }) { nodes { id name team { id } } }
 }`
@@ -138,7 +142,7 @@ func (c *Client) LabelIDByName(ctx context.Context, teamID, name string) (string
 	if workspace != "" {
 		return workspace, nil
 	}
-	return "", fmt.Errorf("linear: 团队与工作区里都找不到标签 %q", name)
+	return "", fmt.Errorf("%w %q（团队与工作区里都没有）", ErrLabelNotFound, name)
 }
 
 const issueByIDQuery = `query($id: String!) { issue(id: $id) { id identifier url } }`
