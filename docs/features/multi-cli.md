@@ -178,6 +178,43 @@ nil，逐字节同改动前；codex 传 `strings.Reader`）；`*os.File` 作 std
 
 ## 8. 实现与验收结果
 
-见 §8.1（由验收运行回填）。
+证据目录 `/opt/lathe-wt/evidence/f06/`；合入顺序判定：f01、f03 都尚未合入 dev → AC-24、AC-26 均为**情形 A（f06 先合入）**，
+`TestCodexResultUsage` 留给 f03 rebase 时加（§2「与 f03 的接缝」）。
 
-### 8.1 验收结果
+| AC | 结果 | 证据 |
+|---|---|---|
+| AC-0 先红后绿 | 清单 36 个测试 `ok 36 / MISSING 0`；红证全部是基线导出目录里「缺符号」的 `[build failed]`；分支上每个提交单独导出 build+vet+gofmt `BROKEN 0`。清单外新增的 `TestDriverHelpers` / `TestCheckCodexHomeNotInTempDir` / `TestStripShellWrapper` 同格式留证 | `red-green/{check.txt,check-extra.txt,commits.txt,*.red.txt,*.green.txt,red.sh}` |
+| AC-1 基线 | `LATHE_TEST_REQUIRE_DB=1 make lint && make test` 退出 0；`make test-race` 退出 0；未入库 `.go` 的 gofmt 为空；golangci-lint（new-from-rev=origin/dev）0 issues | `gates/` |
+| AC-2 归一化 | `TestCodexParseStream`、`TestDigestCodex` 通过（样本取自 probe 原始行，`testdata/`） | 绿证 |
+| AC-3 claude 零回归 | 既有 agent 测试全绿；`agent_test.go`/`digest_test.go` 删改行数 0 | `gates/acceptance-static.txt` |
+| AC-4 runner 只依赖抽象 | runner 生产代码直接调 `ProjectsRoot/SubagentDir` 0 处；两个 EventSink 测试通过 | 同上 |
+| AC-5 参数构造 | `TestCodexBuildArgs` 通过；生产代码出现被禁参数名 0 处 | 同上 |
+| AC-6 env/Dir | `TestCodexRunEnvAndDir` 通过（含 TMPDIR 复查的两个子用例） | 绿证 |
+| AC-7 进程监管 | 7 个 `TestCodexRun*` 通过 | 绿证 |
+| AC-8 / AC-9 / AC-21 / AC-25 会话 | `019a-thread` 落库、fix-1 resume；fixResume=false 采纳 `019b-new`（库与 fix-2 都是）；review 续跑与降级 `019c-reentry`；节点无 codex 时 failed/implement_run、会话不变、只 Run 1 次；rebase 跟进 fix-1 收到 codex | 绿证 |
+| AC-10 驱动钉在任务上 | `TestCreatePinsRepoAgentDriver`、`TestPipelineDriverFromTaskRow` 通过；两条静态检查都是 0 | 绿证、`acceptance-static.txt` |
+| AC-11 默认 claude | `TestPipelineDefaultDriverIsClaude` 通过（经 Router 的 claude argv 与改动前逐项相同） | 绿证 |
+| AC-12 API | `TestUpdateRepoAgentDriver`、`TestAgentDriversEndpoint` 通过（别人的仓库 404） | 绿证 |
+| AC-13 验证体系与状态机 | 列出的 10 个文件 `git diff --stat` 无输出 | `acceptance-static.txt` |
+| AC-14 配置校验 | `TestLoadCodexConfig` 通过（含 6 个临时目录子用例） | 绿证 |
+| AC-15 技能物化 | `TestMaterializeSkillsForCodex` 通过；`skills/` 无改动 | 绿证 |
+| AC-16 迁移 | 首行非事务标记、`NOT VALID`/`VALIDATE CONSTRAINT` 各 1；`convalidated=t`；非法值 23514；0048 up 重跑两遍 rc=0；循环 down `steps=2 bad=0`、列与约束清零、up 后 `restored`；历史迁移无改动 | `gates/ac16.txt` |
+| AC-17 不引入新依赖 | `git diff --exit-code` go.mod/go.sum/package.json/pnpm-lock rc=0 | `acceptance-static.txt` |
+| AC-18 真实 CLI | 真实 codex 两轮（thread_id 一致、resume 请求带第一轮标记、`f06.txt=F06`、`command_execution`=2 行）+ 真实 claude 一轮成功；请求里 worktree 技能计数 6、个人技能 0；专用 home 已清理 | `summary.json`、`codex-run1.ndjson`、`codex-run2-resume.ndjson`、`claude-run.ndjson` |
+| AC-19 UI | `make ui && make build` rc=0；产物含 `agentDriver` 与 `agent-drivers`；生产二进制指纹未变。手测改为 :8406 上的 API 路径记录（本机无可免新依赖驱动登录态 SPA 的浏览器，未截图）：启用 codex 时 PUT codex 后列表为 codex；不设 `LATHE_CODEX_HOME` 重启后 `/api/agent-drivers` 的 codex `enabled=false`、PUT codex 400 且提示原因 | `gates/ui.txt`、`e2e/repo.json`、`e2e/ui-no-codex-home.txt` |
+| AC-20 文档 | 本文件、README 两行、CHANGELOG、docs/03 与 docs/04 补记 | `acceptance-static.txt` |
+| AC-22 HOME 隔离 | 真实 codex：worktree 技能可见、个人两类技能不可见；阳性对照两者都可见；strace 文件访问里伪 HOME 0 次（「strace 断言已执行」） | `red-green/TestCodexHomeIsolationRealCLI.green.txt` |
+| AC-23 端到端 | :8406 上 分诊→实现→验证 全走 codex，停在 `awaiting_approval|codex`；`agent_session_id` = 实现轮的 thread_id；工具 `exitCode=0`；light 档 build/lint 两步 passed；/tmp 下的 codex home 让 serve 启动即失败且不监听；stub 令牌未进事件流；serve/stub 按 PID 停止 | `e2e/{run.sh,run.log,summary.json,checks.txt,agent_events.ndjson,verifications.tsv,task.json}` |
+| AC-24 / AC-26 接缝 | 情形 A：`supervise.go` 的 `parse func(r io.Reader, h parseHooks)` 与 `BeforeKill func()` 各 1；`UsageFromCodex` 0、`Result` 无 `Usage/CostKnown`、`TestCodexResultUsage` 0；S1/S2/超时测试全绿 | `acceptance-static.txt`、绿证 |
+
+**与 PRD 的偏差（如实记录）**
+
+1. AC-23 第 0 步：`lathe_f06` 里有 8 个非终态任务，是既有测试 `TestPipelineInternalIssueHappyPath` /
+   `TestPipelineInternalBlockedSpecRoundTrip` 每轮 `make test` 留下的残留（不是 f06 引入，用户清理没能删掉它们）。
+   没有删除或改动它们；脚本改为证明本轮 serve 碰不到它们——queued 的都在长租约里且到期晚于本轮上限，
+   其余的属主没有任何集成凭据——并在结束时对比前后快照，`residueUntouched=true`。残留的根因建议另开 `fix/` 处理。
+2. `TestPipelineCodexFixLoopAdoptsReportedSession` 放在新文件 `pipeline_driver_test.go`（与 `pipeline_internal_test.go`
+   同属 `package runner`）；`rc.implSession` 通过 fix-2 收到的 `SessionID`（取自 `rc.implSession`）断言。
+3. `TestMaterializeSkillsForCodex` 的 `git status --porcelain` 限定在 `.codex`/`.claude` 路径：验证阶段 `go build`
+   在 worktree 里产出的未跟踪二进制与本断言无关（既有 claude 用例同样只看 `.claude` 路径），另用 `git check-ignore` 断言已排除。
+4. codex 的 `Bash` 工具条目 body 与 claude 同形（`Bash <命令>`），外壳已去掉。
