@@ -276,7 +276,9 @@ func (a *AdminAPI) resetPassword(w http.ResponseWriter, r *http.Request) {
 
 // remove 删除账号及其名下全部数据。
 //
-// 任务、仓库配置、凭据、会话、重置令牌都由外键 ON DELETE CASCADE 带走。
+// 任务、仓库配置、凭据、会话、重置令牌、团队成员关系都由外键 ON DELETE CASCADE 带走。
+// 团队守卫（f12）：此人是某个仍有其他成员的团队的 owner → 409（先转让）；
+// 此人是团队唯一成员 → 团队同一事务内一起删除。
 // 唯一带不走的是 worktree 占的磁盘目录 —— 先把路径打进日志，让人能手工
 // 回收；自动回收留到第二步（那时任务归属清晰）。
 func (a *AdminAPI) remove(w http.ResponseWriter, r *http.Request) {
@@ -287,12 +289,27 @@ func (a *AdminAPI) remove(w http.ResponseWriter, r *http.Request) {
 	if !a.guardLastAdmin(w, r, u) {
 		return
 	}
+	// 删账号必须过团队守卫（f12：不留无主团队）。Store 未装配时 fail-closed，
+	// 【不回落】到 Users.Delete —— 回落等于静默绕过「最后一个 owner」守卫。
+	if a.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "团队守卫未装配，拒绝删除账号"})
+		return
+	}
 
 	if paths, err := a.Users.WorktreePaths(r.Context(), u.ID); err == nil && len(paths) > 0 {
 		slog.Warn("删除用户后以下工作区目录需手工清理", "user", u.ID, "paths", paths)
 	}
 
-	if err := a.Users.Delete(r.Context(), u.ID); err != nil {
+	if err := a.Store.DeleteUserGuarded(r.Context(), u.ID); err != nil {
+		var owns *store.UserOwnsTeamError
+		if errors.As(err, &owns) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": strings.TrimPrefix(owns.Error(), "store: ")})
+			return
+		}
+		if errors.Is(err, store.ErrTeamBusy) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "团队数据正忙，请重试"})
+			return
+		}
 		serverError(w, "删除用户失败", err)
 		return
 	}

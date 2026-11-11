@@ -17,6 +17,9 @@ const retryPlan = ref(null)
 let detailPoller = null
 
 const task = computed(() => detail.value?.task)
+// 团队可见性（f12）：队友创建的任务只读 —— 写按钮不渲染（服务端对非属主写一律 404，
+// 这里只是事先显隐，不是防线）。viewerRole 缺省时按属主处理（兼容旧响应）。
+const canAct = computed(() => !detail.value?.viewerRole || detail.value.viewerRole === 'owner')
 const isTerminal = computed(() =>
   ['merged', 'failed', 'cancelled'].includes(task.value?.state)
 )
@@ -35,7 +38,8 @@ async function load() {
     detail.value = await api.task(props.id)
     error.value = ''
     // 失败任务、以及停在 review_feedback 的任务都拉重试预览：体检现场 + 决策理由
-    if (detail.value.task.state === 'failed' || detail.value.task.state === 'review_feedback') {
+    const mine = !detail.value.viewerRole || detail.value.viewerRole === 'owner'
+    if (mine && (detail.value.task.state === 'failed' || detail.value.task.state === 'review_feedback')) {
       try {
         retryPlan.value = await api.retryPlan(props.id)
       } catch {
@@ -275,6 +279,7 @@ onUnmounted(() => {
         <div class="row">
           <h1 class="mono">{{ task.externalKey }}</h1>
           <span class="badge" :class="stateTone(task.state)">{{ stateLabel(task.state) }}</span>
+          <span v-if="!canAct" class="badge" title="团队共享仓库里队友创建的任务：你只能查看">队友创建</span>
         </div>
         <div class="faint mono">
           {{ task.providerRepo }} · 任务 #{{ task.id }}
@@ -285,6 +290,7 @@ onUnmounted(() => {
       </div>
       <div class="wrap">
         <button @click="router.push('/')">返回</button>
+        <template v-if="canAct">
         <!-- 人工闸门放行：只在任务真的停在闸门上时出现 -->
         <button
           v-if="task.state === 'awaiting_approval'"
@@ -321,6 +327,7 @@ onUnmounted(() => {
           :disabled="acting"
           @click="act(api.cancel, '确认取消这个任务？')"
         >取消</button>
+        </template>
       </div>
     </div>
 

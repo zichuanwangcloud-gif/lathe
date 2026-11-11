@@ -18,8 +18,12 @@ var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
-	ID          int64  `json:"id"`
-	UserID      int64  `json:"userId"`
+	ID     int64 `json:"id"`
+	UserID int64 `json:"userId"`
+	// RepoID 只在团队视图（ListTasks TeamView=true）与 TaskDetailForViewer 里填充；
+	// 默认视图与属主版 TaskDetail 一律为 0（omitempty：响应与 f12 之前逐字节相同）。
+	// 新调用方要用它，必须走 viewer 版或自己查 tasks.repo_id（docs/features/team-roles.md §3.3）。
+	RepoID      int64  `json:"repoId,omitempty"`
 	ExternalKey string `json:"externalKey"`
 	// TrackerProvider 是需求来源平台（'linear' | 'internal'）；
 	// 前端据此把 key 渲染成 Linear 链接或内置工单页链接。
@@ -63,6 +67,9 @@ type ListTasksParams struct {
 	States []string
 	Limit  int
 	Offset int
+	// TeamView 为 true 时（GET /api/tasks?scope=team）额外包含「我所在团队的
+	// 共享仓库里别人的任务」，走 listTasksTeamSQL；false 时是 f12 之前那条 SQL，一字不改。
+	TeamView bool
 }
 
 // ListTasks 按更新时间倒序返回指定用户名下的任务列表。
@@ -78,6 +85,10 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 	var states any
 	if len(p.States) > 0 {
 		states = p.States
+	}
+
+	if p.TeamView {
+		return s.listTasksTeam(ctx, p, states)
 	}
 
 	var total int
@@ -151,6 +162,10 @@ type TaskDetail struct {
 	Task          TaskRow           `json:"task"`
 	Events        []EventRow        `json:"events"`
 	Verifications []VerificationRow `json:"verifications"`
+	// ViewerRole 是当前查看者对任务所属仓库的关系（owner / team_owner / team_admin /
+	// team_member），只由 TaskDetailForViewer 填充；属主版 TaskDetail 留空不序列化。
+	// 前端据此只做按钮显隐 —— 权限判定仍在服务端。
+	ViewerRole RepoRole `json:"viewerRole,omitempty"`
 }
 
 // TaskDetail 读取单个任务的完整信息。
@@ -483,4 +498,81 @@ func nilIfEmpty(s []string) any {
 		return nil
 	}
 	return s
+}
+
+// listTasksTeamSQL 是 scope=team 任务列表的 SQL（f12；ListTasks 与 AC-28 的 EXPLAIN
+// 引用同一个常量，测的就是跑的）。参数：$1 viewer，$2 状态过滤（NULL=不过滤），
+// $3 limit，$4 offset。
+//
+// 两臂 UNION ALL，每臂各自按索引取前 limit+offset 条，外层归并后再 LIMIT/OFFSET：
+//
+//	臂 1  我自己的任务                         → tasks_user_updated 上 Index Cond (user_id = $1)
+//	臂 2  我所在团队共享仓库里【别人】的任务   → tasks_repo_updated 上 Index Cond (repo_id = r2.id)
+//
+// t.user_id <> $1 让两臂不相交，UNION ALL 不需要去重。不用
+// `user_id = $1 OR repo_id IN (…)`：那种写法只能得到整表扫描 + Filter（PRD §10.2 B4 实测）。
+//
+// 【列清单副本】外层 SELECT 与 Scan 复制了 ListTasks 默认 SQL 的列（多一列 t.repo_id）。
+// 谁往默认 SQL 加列，必须同步加到这里；TestListTasksTeamViewRowsMatchDefaultView 会抓住漏改。
+const listTasksTeamSQL = `
+SELECT t.id, t.user_id, t.external_key, t.tracker_provider, t.state, t.task_kind, t.verify_tier,
+       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
+       r.provider_repo, t.created_at, t.updated_at,
+       t.agent_session_id, t.lease_expires_at,
+       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns,
+       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END,
+       t.repo_id
+FROM (
+  (SELECT t.* FROM tasks t
+    WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
+    ORDER BY t.updated_at DESC, t.id DESC LIMIT $3::int + $4::int)
+  UNION ALL
+  (SELECT t.* FROM tasks t
+     JOIN repos r2 ON r2.id = t.repo_id
+     JOIN team_members m ON m.team_id = r2.team_id AND m.user_id = $1
+    WHERE t.user_id <> $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
+    ORDER BY t.updated_at DESC, t.id DESC LIMIT $3::int + $4::int)
+) t
+JOIN repos r ON r.id = t.repo_id
+LEFT JOIN issues i ON t.tracker_provider = 'internal'
+       AND i.user_id = t.user_id AND i.key = t.external_key
+ORDER BY t.updated_at DESC, t.id DESC
+LIMIT $3::int OFFSET $4::int`
+
+// listTasksTeamCountSQL 与 listTasksTeamSQL 同形的两臂计数，total 才与列表一致。
+const listTasksTeamCountSQL = `
+SELECT (SELECT count(*) FROM tasks t
+         WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2)))
+     + (SELECT count(*) FROM tasks t
+          JOIN repos r2 ON r2.id = t.repo_id
+          JOIN team_members m ON m.team_id = r2.team_id AND m.user_id = $1
+         WHERE t.user_id <> $1 AND ($2::text[] IS NULL OR t.state = ANY($2)))`
+
+// listTasksTeam 是 ListTasks 的团队视图分支（参数已规整）。
+func (s *Store) listTasksTeam(ctx context.Context, p ListTasksParams, states any) ([]TaskRow, int, error) {
+	var total int
+	if err := s.pool.QueryRow(ctx, listTasksTeamCountSQL, p.UserID, states).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: 统计团队任务数失败: %w", err)
+	}
+	rows, err := s.pool.Query(ctx, listTasksTeamSQL, p.UserID, states, p.Limit, p.Offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: 查询团队任务列表失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]TaskRow, 0, p.Limit)
+	for rows.Next() {
+		var t TaskRow
+		if err := rows.Scan(
+			&t.ID, &t.UserID, &t.ExternalKey, &t.TrackerProvider, &t.State, &t.TaskKind, &t.VerifyTier,
+			&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
+			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
+			&t.AgentSessionID, &t.LeaseExpiresAt,
+			&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
+			&t.IssueID, &t.RepoID,
+		); err != nil {
+			return nil, 0, fmt.Errorf("store: 读取团队任务行失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, total, rows.Err()
 }

@@ -3,6 +3,9 @@ import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError } from '../api'
 
 const repos = ref([])
+// 我加入的团队（共享下拉的候选；f12）
+const teams = ref([])
+const sharing = ref(null) // 正在提交共享变更的 repo.id
 const error = ref('')
 const saved = ref(null)
 const onUnauthorized = inject('onUnauthorized')
@@ -47,10 +50,13 @@ async function add() {
 
 async function load() {
   try {
-    const r = await api.repos()
+    // scope=team：我的 + 团队共享给我的。owned=false 的行只读（配置只有属主能改）
+    const [r, t] = await Promise.all([api.reposWithTeam(), api.teams()])
+    teams.value = t.teams || []
     // 编辑态与服务端数据分开，避免输入过程中被自动刷新覆盖
     repos.value = (r.repos || []).map((x) => ({
       ...x,
+      shareTeam: x.teamId ?? '',
       protectedText: (x.protectedBranches || []).join(', '),
       excludeText: (x.excludeDirs || []).join(', '),
       infraText: (x.verifyInfra || []).join(', '),
@@ -135,6 +141,24 @@ async function deployBaseline(repo, composeFile) {
   }
 }
 
+function teamName(id) {
+  return teams.value.find((t) => t.id === id)?.name || `团队 #${id}`
+}
+
+// 共享 / 取消共享：只有仓库属主能做；共享的是任务可见性，不是配置编辑权与凭据。
+async function applyShare(repo) {
+  sharing.value = repo.id
+  error.value = ''
+  try {
+    await api.shareRepo(repo.id, repo.shareTeam === '' ? null : Number(repo.shareTeam))
+    await load()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    sharing.value = null
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -166,10 +190,45 @@ onMounted(load)
     你名下还没有仓库 —— 在上方登记一个，issue 才会被路由到这里。
   </div>
 
-  <div v-for="repo in repos" :key="repo.id" class="card repo">
+  <!-- 团队共享给我的仓库：只读视图。配置编辑表单只对 owned 渲染（权限判定仍在服务端） -->
+  <div v-for="repo in repos.filter((r) => r.owned === false)" :key="'s' + repo.id" class="card repo">
+    <div class="spread">
+      <h2 class="mono">{{ repo.providerRepo }}</h2>
+      <span class="badge">共享自「{{ teamName(repo.teamId) }}」· 只读</span>
+    </div>
+    <dl class="readonly">
+      <dt>默认基线分支</dt><dd class="mono">{{ repo.defaultBranch }}</dd>
+      <dt>hotfix 基线分支</dt><dd class="mono">{{ repo.hotfixBase }}</dd>
+      <dt>受保护分支</dt><dd class="mono">{{ (repo.protectedBranches || []).join(', ') }}</dd>
+      <dt>准入档位</dt><dd class="mono">{{ repo.gateMode }}</dd>
+      <dt>验证档位</dt><dd class="mono">{{ repo.verifyTierOverride || '自动' }}</dd>
+      <dt>验证依赖隔离</dt><dd class="mono">{{ (repo.verifyInfra || []).join(', ') || '无' }}</dd>
+    </dl>
+    <small class="faint">
+      任务由仓库属主用他自己的凭据执行；你能看任务与验证证据，不能改配置、不能操作他的任务。
+    </small>
+  </div>
+
+  <div v-for="repo in repos.filter((r) => r.owned !== false)" :key="repo.id" class="card repo">
     <div class="spread">
       <h2 class="mono">{{ repo.providerRepo }}</h2>
       <span v-if="saved === repo.id" class="badge ok">已保存</span>
+    </div>
+
+    <div class="row share" style="display: flex; gap: 8px; align-items: center; margin-top: 10px">
+      <span class="dim">共享到团队</span>
+      <select v-model="repo.shareTeam" :disabled="sharing === repo.id">
+        <option value="">不共享（私有）</option>
+        <option v-for="t in teams" :key="t.id" :value="t.id">{{ t.name }}</option>
+      </select>
+      <button
+        type="button"
+        :disabled="sharing === repo.id || String(repo.shareTeam) === String(repo.teamId ?? '')"
+        @click="applyShare(repo)"
+      >
+        {{ sharing === repo.id ? '提交中…' : '应用' }}
+      </button>
+      <small class="faint">共享后团队成员可以只读查看这个仓库下的任务与验证证据；凭据永不共享。</small>
     </div>
 
     <div class="fields">
@@ -318,6 +377,10 @@ label > span { font-size: 13px; color: var(--text-dim); }
 label small { font-size: 12px; }
 .full { grid-column: 1 / -1; }
 
+.readonly { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 14px 0; }
+.readonly dt { font-size: 13px; color: var(--text-dim); }
+.readonly dd { margin: 0; }
+.share { flex-wrap: wrap; }
 .baseline-status { margin: -6px 0 14px; }
 .baseline-services { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
 .baseline-services li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

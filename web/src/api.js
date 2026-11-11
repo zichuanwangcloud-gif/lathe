@@ -78,6 +78,8 @@ export const api = {
     if (params.state) q.set('state', params.state)
     if (params.limit) q.set('limit', params.limit)
     if (params.offset) q.set('offset', params.offset)
+    // scope=team：含「我所在团队共享仓库里别人的任务」（f12）；不传 = 只看自己的
+    if (params.scope) q.set('scope', params.scope)
     const qs = q.toString()
     return request(`/api/tasks${qs ? '?' + qs : ''}`)
   },
@@ -93,6 +95,28 @@ export const api = {
   // 理由与 costStats 一样：那两个聚合都要扫 task_events，而看板 5 秒一轮。
   metricsStats: () => request('/api/stats/metrics'),
   repos: () => request('/api/repos'),
+  // 团队视图：我的 + 团队共享给我的（行上带 owned / teamId；非 owned 只读）
+  reposWithTeam: () => request('/api/repos?scope=team'),
+  shareRepo: (id, teamId) =>
+    request(`/api/repos/${id}/sharing`, { method: 'POST', body: JSON.stringify({ teamId }) }),
+
+  // 团队与角色（f12）：团队共享的是任务可见性，不是凭据或仓库配置的编辑权
+  teams: () => request('/api/teams'),
+  team: (id) => request(`/api/teams/${id}`),
+  createTeam: (name) => request('/api/teams', { method: 'POST', body: JSON.stringify({ name }) }),
+  renameTeam: (id, name) => request(`/api/teams/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+  deleteTeam: (id) => request(`/api/teams/${id}`, { method: 'DELETE' }),
+  teamInvitations: (id) => request(`/api/teams/${id}/invitations`),
+  createInvitation: (id, body) =>
+    request(`/api/teams/${id}/invitations`, { method: 'POST', body: JSON.stringify(body) }),
+  revokeInvitation: (id, iid) => request(`/api/teams/${id}/invitations/${iid}`, { method: 'DELETE' }),
+  acceptInvitation: (code) =>
+    request('/api/team-invitations/accept', { method: 'POST', body: JSON.stringify({ code }) }),
+  setMemberRole: (id, uid, role) =>
+    request(`/api/teams/${id}/members/${uid}`, { method: 'PATCH', body: JSON.stringify({ role }) }),
+  removeMember: (id, uid) => request(`/api/teams/${id}/members/${uid}`, { method: 'DELETE' }),
+  transferTeam: (id, userId) =>
+    request(`/api/teams/${id}/transfer`, { method: 'POST', body: JSON.stringify({ userId }) }),
   config: () => request('/api/config'),
 
   // 编排流程图（PRD 07）：批量建图、查图、列出我建过的图
