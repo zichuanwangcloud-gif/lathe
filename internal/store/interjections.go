@@ -34,7 +34,9 @@ const (
 
 // InterjectionNoReplayAck 是「写进了 stdin 但 2 秒内没等到 CLI 回显」的
 // delivered 行的 error 值：写进管道且会话未关，CLI 会吸收它（实测 P5），
-// 只是这次没拿到确认。不判 failed。
+// 只是这次没拿到确认。不判 failed。含义是「未见到确认回显」而非「永远没有
+// 回显」：投递时的会话仍在时，迟到的回显会经 MarkInterjectionReplayAcked
+// 把它清空（error 置 NULL、rev 前进）；会话结束或那次写库失败则一直留着。
 const InterjectionNoReplayAck = "no_replay_ack"
 
 // ReasonRestartUndelivered 是启动清扫给遗留 delivering 行的原因。

@@ -9,7 +9,9 @@ package runner
 //
 //	| 协程                              | 允许碰 DB 吗 | 做什么                                               |
 //	|-----------------------------------|--------------|------------------------------------------------------|
-//	| agent 读协程（parseStreamWith）    | 否           | OnDelivery = Ack(id)：持锁查 map、非阻塞发信号、放锁 |
+//	| agent 读协程（parseStreamWith）    | 否           | OnDelivery = Ack(id)：持锁查 map、非阻塞发信号、放锁；|
+//	|                                   |              | 命中迟到登记时起一个短生命周期的写库协程，不等它     |
+//	| 迟到回显写库协程（recordLateAck）   | 是           | 清空 no_replay_ack（Background ctx，最坏重试 ~23.5s）|
 //	| HTTP 请求协程（Submit）            | 是           | 事务 A 用请求 ctx；行落库之后的写用 WithoutCancel+5s |
 //	| 管线协程（runAgent / Execute defer）| 是          | 开场补投、补投结局、结算 T1（WithoutCancel+5s）      |
 //	| HTTP 请求协程（ListSince）          | 是           | 结算 T2 + 取行（同一事务）                           |
@@ -286,9 +288,14 @@ func (i *Interjections) awaitLateAck(deliveryID string, ack chan struct{}, la la
 }
 
 // recordLateAck 把迟到回显记进库：清空 no_replay_ack、前进 rev（界面轮询
-// 据此更新徽标）。不在读协程上运行。
+// 据此更新徽标）。不在读协程上运行（Ack 用 go 起它，读协程不等）。
+//
+// 用 context.Background：没有请求或任务 ctx 可挂靠（发起这次投递的 HTTP
+// 请求早已返回），也不该因任务收尾而中断这一次小写。代价是这个协程的寿命
+// 由 writeRetry 封顶：最坏 4 次 × 5s 超时 + 0.5s/1s/2s 退避 ≈ 23.5s。全部失败
+// 时行仍是 delivered + no_replay_ack，只是徽标不会清掉，不影响投递结局。
 func (i *Interjections) recordLateAck(deliveryID string, la lateAck) {
-	row, err := writeRetry(context.Background(), la.rowID, func(c context.Context) (*store.Interjection, error) {
+	row, err := writeRetryMsg(context.Background(), la.rowID, lateAckFailMsg, func(c context.Context) (*store.Interjection, error) {
 		return i.Store.MarkInterjectionReplayAcked(c, la.taskID, la.rowID, deliveryID)
 	})
 	if err != nil {
@@ -331,6 +338,16 @@ func driverUnsupportedMessage(tk *task.Task) string {
 // writeRetry 在脱离请求的 ctx 上执行一次终态写：每次 5s 超时，失败按
 // 0.5s/1s/2s 退避至多重试 3 次。全部失败时行暂留 delivering，由启动清扫收尾。
 func writeRetry[T any](dctx context.Context, id int64, fn func(ctx context.Context) (T, error)) (T, error) {
+	return writeRetryMsg(dctx, id, "插话终态写库失败（行暂留 delivering，等启动清扫收尾）", fn)
+}
+
+// lateAckFailMsg 是「清空 no_replay_ack」写失败时的日志：此时行早已是
+// delivered，不会暂留 delivering，也没有任何清扫会回头清它。
+const lateAckFailMsg = "插话确认回显写库失败（行已是 delivered，error 停留在 no_replay_ack，不会再被清空；不影响投递结局）"
+
+// writeRetryMsg 同 writeRetry，全部失败时按 failMsg 打日志（各路径失败后
+// 行停在哪里不同，日志必须如实说）。
+func writeRetryMsg[T any](dctx context.Context, id int64, failMsg string, fn func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
 	var lastErr error
 	for attempt := 0; attempt <= len(interjectRetryBackoff); attempt++ {
@@ -345,7 +362,7 @@ func writeRetry[T any](dctx context.Context, id int64, fn func(ctx context.Conte
 		}
 		lastErr = err
 	}
-	slog.Error("插话终态写库失败（行暂留 delivering，等启动清扫收尾）", "id", id, "err", lastErr)
+	slog.Error(failMsg, "id", id, "err", lastErr)
 	return zero, lastErr
 }
 
@@ -444,7 +461,7 @@ func (i *Interjections) Submit(ctx context.Context, taskID, userID int64, body s
 		}
 		if errText != "" && i.awaitLateAck(deliveryID, ack, lateAck{taskID: taskID, rowID: row.ID, entry: live}) {
 			// 回显恰好落在超时与收尾之间：当场清空 no_replay_ack。
-			if acked, err := writeRetry(dctx, row.ID, func(c context.Context) (*store.Interjection, error) {
+			if acked, err := writeRetryMsg(dctx, row.ID, lateAckFailMsg, func(c context.Context) (*store.Interjection, error) {
 				return i.Store.MarkInterjectionReplayAcked(c, taskID, row.ID, deliveryID)
 			}); err == nil && acked != nil {
 				done = acked

@@ -12,6 +12,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 )
 
@@ -611,5 +612,96 @@ func TestInterjectLateReplayAckClearsError(t *testing.T) {
 				t.Errorf("不改行时 rev 不应变：got=%d want=%d", after.rev, before.rev)
 			}
 		})
+	}
+}
+
+// ackDuringDeliveredStore 包住真 store：MarkInterjectionDelivered 在按
+// no_replay_ack 收尾时先注入那条投递的回显、再慢一拍才真写 —— 模拟回显恰好
+// 落在 2s 超时之后、收尾写完成之前。MarkInterjectionReplayAcked 计次。
+type ackDuringDeliveredStore struct {
+	*store.Store
+	ij *runner.Interjections
+
+	mu         sync.Mutex
+	deliveryID string
+	acked      int
+}
+
+func (s *ackDuringDeliveredStore) MarkInterjectionDelivering(ctx context.Context, taskID, id int64, deliveryID, phase, sessionID string) (*store.Interjection, error) {
+	s.mu.Lock()
+	s.deliveryID = deliveryID
+	s.mu.Unlock()
+	return s.Store.MarkInterjectionDelivering(ctx, taskID, id, deliveryID, phase, sessionID)
+}
+
+func (s *ackDuringDeliveredStore) MarkInterjectionDelivered(ctx context.Context, taskID, id int64, errText string) (*store.Interjection, error) {
+	if errText == store.InterjectionNoReplayAck {
+		s.mu.Lock()
+		d := s.deliveryID
+		s.mu.Unlock()
+		s.ij.Ack(d) // 读协程上的回显，落在超时之后、收尾之前
+		time.Sleep(200 * time.Millisecond)
+	}
+	return s.Store.MarkInterjectionDelivered(ctx, taskID, id, errText)
+}
+
+func (s *ackDuringDeliveredStore) MarkInterjectionReplayAcked(ctx context.Context, taskID, id int64, deliveryID string) (*store.Interjection, error) {
+	s.mu.Lock()
+	s.acked++
+	s.mu.Unlock()
+	return s.Store.MarkInterjectionReplayAcked(ctx, taskID, id, deliveryID)
+}
+
+func (s *ackDuringDeliveredStore) ackedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acked
+}
+
+// 给定：活会话写入成功、2s 内不回显，回显在慢的 MarkInterjectionDelivered 里
+// 到达（超时之后、收尾之前）。断言：200 响应体里 error 已是 null（当场确认，
+// 不必等界面下一次轮询）；只写一次「清空 no_replay_ack」；之后同一 deliveryID
+// 的重复回显不再起迟到写入（没有登记进 late 表）。
+func TestInterjectAckDuringSlowMarkDelivered(t *testing.T) {
+	api, st, m, repoID := apiFixture(t)
+	tk := ijTask(t, st, m, repoID, "implementing")
+	wrapped := &ackDuringDeliveredStore{Store: st}
+	ij := &runner.Interjections{Store: wrapped, Tasks: api.Tasks}
+	wrapped.ij = ij
+	api.Interjector = ij
+	ij.Register(tk.ID, &fakeLive{ij: ij}, "fix-1", "sess") // 不回显
+	defer ij.Unregister(tk.ID)
+	srv := apiServer(t, api)
+
+	resp := do(t, srv, "POST", interjectPath(tk.ID), msgBody("收尾途中的回显"), true)
+	body := decode(t, resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("got status=%d want 200（body=%v）", resp.StatusCode, body)
+	}
+	if v, ok := body["error"]; !ok || v != nil {
+		t.Errorf("响应体 error got=%v（存在=%v）want=null", v, ok)
+	}
+	if body["status"] != "delivered" {
+		t.Errorf("响应体 status got=%v want=delivered", body["status"])
+	}
+	if got := wrapped.ackedCount(); got != 1 {
+		t.Errorf("响应返回时清空写 got=%d 次 want=1", got)
+	}
+
+	wrapped.mu.Lock()
+	d := wrapped.deliveryID
+	wrapped.mu.Unlock()
+	ij.Ack(d) // 重复回显：若登记进了 late 表，这里会再起一次迟到写
+	time.Sleep(300 * time.Millisecond)
+	if got := wrapped.ackedCount(); got != 1 {
+		t.Errorf("重复回显后清空写 got=%d 次 want=1（不应再起迟到写入）", got)
+	}
+	var errCol *string
+	if err := st.Pool().QueryRow(context.Background(),
+		`SELECT error FROM task_interjections WHERE task_id=$1 ORDER BY id DESC LIMIT 1`, tk.ID).Scan(&errCol); err != nil {
+		t.Fatalf("读插话行失败: %v", err)
+	}
+	if errCol != nil {
+		t.Errorf("库里 error got=%q want=NULL", *errCol)
 	}
 }

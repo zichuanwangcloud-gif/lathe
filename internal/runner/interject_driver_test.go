@@ -80,6 +80,22 @@ func (s *slowStore) MarkInterjectionDelivered(ctx context.Context, taskID, id in
 	return &cp, nil
 }
 
+// MarkInterjectionReplayAcked 是迟到回显的写（CI 慢到 2s 内没等到回显时，
+// 「立即确认」分支或 recordLateAck 会调到）。语义同 store：只清
+// delivered + no_replay_ack 的行，其余返回 nil。
+func (s *slowStore) MarkInterjectionReplayAcked(ctx context.Context, taskID, id int64, deliveryID string) (*store.Interjection, error) {
+	s.checkGoroutine("replay_acked")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.rows[id]
+	if r == nil || r.Status != store.InterjectionDelivered || r.Error == nil || *r.Error != store.InterjectionNoReplayAck {
+		return nil, nil
+	}
+	r.Error = nil
+	cp := *r
+	return &cp, nil
+}
+
 // fakeStreamCLI 写一个假 claude：读首帧；之后每读到一帧注入就按
 // --replay-user-messages 的形状回显；读满 n 帧注入后输出 50 行 assistant、
 // 一条 result，然后一直等 EOF。可选把收到的帧原文追加到 framesOut。
@@ -273,4 +289,99 @@ func TestInterjectRedactsAtSingleSubmitPoint(t *testing.T) {
 			t.Errorf("夹具没走到 Submit 的日志（slog 输出：%q）", out)
 		}
 	})
+}
+
+// ackCountStore 只实现迟到回显那一步写，按行计数（其它方法不该被调到）。
+type ackCountStore struct {
+	InterjectStore
+	mu     sync.Mutex
+	writes map[int64]int
+}
+
+func (s *ackCountStore) MarkInterjectionReplayAcked(ctx context.Context, taskID, id int64, deliveryID string) (*store.Interjection, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writes[id]++
+	return &store.Interjection{ID: id, TaskID: taskID, Status: store.InterjectionDelivered}, nil
+}
+
+func (s *ackCountStore) count(id int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writes[id]
+}
+
+// 迟到回显的内存表在并发下的不变式（-race 下跑）。给定 N 组已登记「等迟到
+// 回显」的投递：一半组只有 3 个并发 Ack（同一 deliveryID 重复回显），另一半
+// 组 3 个 Ack 与 1 个 Unregister 并发。断言：结束后 late 表为空；同一行的
+// 迟到写至多一次；只有 Ack 的组恰好写一次（登记没被弄丢）。
+func TestInterjectLateAckConcurrentUnregister(t *testing.T) {
+	const groups = 64
+	const acksPerGroup = 3
+	st := &ackCountStore{writes: map[int64]int{}}
+	ij := &Interjections{Store: st}
+
+	type group struct {
+		taskID, rowID int64
+		deliveryID    string
+		unregister    bool
+	}
+	gs := make([]group, groups)
+	for k := range gs {
+		g := group{taskID: int64(k + 1), rowID: int64(1000 + k), deliveryID: fmt.Sprintf("late-%d", k), unregister: k%2 == 1}
+		gs[k] = g
+		ij.Register(g.taskID, &ackSession{}, "fix-1", "s")
+		ij.mu.Lock()
+		entry := ij.live[g.taskID]
+		ij.mu.Unlock()
+		if ij.awaitLateAck(g.deliveryID, make(chan struct{}, 1), lateAck{taskID: g.taskID, rowID: g.rowID, entry: entry}) {
+			t.Fatalf("第 %d 组：空 channel 不该当场确认", k)
+		}
+	}
+	ij.mu.Lock()
+	if n := len(ij.late); n != groups {
+		ij.mu.Unlock()
+		t.Fatalf("登记后 late 表 got=%d want=%d", n, groups)
+	}
+	ij.mu.Unlock()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, g := range gs {
+		for a := 0; a < acksPerGroup; a++ {
+			wg.Add(1)
+			go func(id string) { defer wg.Done(); <-start; ij.Ack(id) }(g.deliveryID)
+		}
+		if g.unregister {
+			wg.Add(1)
+			go func(taskID int64) { defer wg.Done(); <-start; ij.Unregister(taskID) }(g.taskID)
+		}
+	}
+	close(start)
+	wg.Wait()
+
+	ij.mu.Lock()
+	left := len(ij.late)
+	ij.mu.Unlock()
+	if left != 0 {
+		t.Errorf("并发 Ack/Unregister 之后 late 表 got=%d want=0", left)
+	}
+
+	// 写库在 Ack 起的协程里：等只有 Ack 的组都写到，再多等一会儿让多余的写（若有）现形。
+	deadline := time.Now().Add(5 * time.Second)
+	for _, g := range gs {
+		for !g.unregister && st.count(g.rowID) == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	for k, g := range gs {
+		got := st.count(g.rowID)
+		if got > 1 {
+			t.Errorf("第 %d 组（unregister=%v）同一行迟到写 got=%d want≤1", k, g.unregister, got)
+		}
+		if !g.unregister && got != 1 {
+			t.Errorf("第 %d 组（只有 Ack）迟到写 got=%d want=1", k, got)
+		}
+	}
 }

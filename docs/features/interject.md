@@ -629,8 +629,10 @@ type Interjector interface {
         超时收尾后若投递时的会话条目仍在，就把这条投递登记为「等迟到回显」；回显到达时读协程只做内存查表、另起协程执行
         `MarkInterjectionReplayAcked`（条件 `status='delivered' AND error='no_replay_ack' AND delivery_id=$3`，清空 `error`、
         前进 `rev`，界面轮询据此把「未收到确认回显」去掉）。会话注销（进程退出、不会再有回显）时一并丢弃登记；
-        超时与收尾之间到达的回显落在容量 1 的 channel 里，收尾后当场确认。`no_replay_ack` 于是只剩一种含义：
-        **写进了管道、直到会话结束都没见到回显**。（`TestInterjectLateReplayAckClearsError`、`TestMarkInterjectionReplayAcked`）
+        超时与收尾之间到达的回显落在容量 1 的 channel 里，收尾后当场确认。`no_replay_ack` 的含义是**未见到确认回显**：
+        写进了管道、到目前为止没见到回显；它可能被之后的迟到回显清空，会话结束（或迟到写库失败）时没清空的就一直留着。
+        （`TestInterjectLateReplayAckClearsError`、`TestInterjectAckDuringSlowMarkDelivered`、`TestInterjectLateAckConcurrentUnregister`、
+        `TestMarkInterjectionReplayAcked`）
 6. **终态写失败**（DB 不可用，`dctx` 下 5s 超时）：重试至多 3 次（退避 0.5s/1s/2s，总计 ≤ 25s），仍失败则 `slog.Error`
    （只记 `id`、`len`，不记正文）并返回 500。这是**唯一**会让行暂留 `delivering` 的情形，前提是 DB 整体不可用；
    由下一次启动清扫收尾（`delivering` → `failed`「进程重启，投递未完成」）。如实写进 `docs/features/interject.md`，
