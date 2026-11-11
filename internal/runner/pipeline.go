@@ -15,6 +15,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 下面这些窄接口让流水线可被完整单测，无需真实的 Linear/GitHub/claude。
@@ -210,6 +211,9 @@ type runCtx struct {
 	clients Clients // 失败传播按每个后继自己的 provider 分派 tracker 用
 	tracker tracker.Tracker
 	gh      GitHubAPI
+	// auth 是本任务属主对仓库所在平台实例的 git 鉴权（GitLab/Gitea）；GitHub
+	// 恒为零值（走宿主 SSH）。setup 里经 resolveVCS 解出，随 runCtx 生命周期结束。
+	auth vcs.GitAuth
 
 	tk   *task.Task // 任务行（每次转移后刷新）
 	plan *RetryPlan // 非空表示断点续跑
@@ -477,7 +481,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 		Path:       deref(tk.WorktreePath),
 		Branch:     deref(tk.BranchName),
 		BaseBranch: base,
-		Mirror:     p.Worktrees.MirrorPath(params.Repo.ProviderRepo),
+		Mirror:     p.Worktrees.MirrorPath(params.Repo.RepoKey()),
 	}
 	if tk.AgentSessionID != nil {
 		rc.implSession = *tk.AgentSessionID
@@ -503,7 +507,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 
 	// 提交/验证入口的 diff 与基线工作区都解析自 mirror 命名空间，先刷新。
 	if entry == EntryCommit || entry == EntryVerify {
-		if _, err := p.Worktrees.EnsureMirror(ctx, params.Repo.ProviderRepo, params.CloneURL); err != nil {
+		if _, err := p.Worktrees.EnsureMirror(ctx, params.Repo.RepoKey(), params.CloneURL, rc.auth); err != nil {
 			return nil, "", fmt.Errorf("续跑前刷新 mirror 失败: %w", err)
 		}
 	}
@@ -617,7 +621,7 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		wt, err := p.Worktrees.Create(rc.ctx, CreateParams{
 			Repo: rc.params.Repo, CloneURL: rc.params.CloneURL,
 			Kind: rc.kind, IssueKey: rc.issue.Identifier, Title: rc.issue.Title,
-			TaskID: rc.tk.ID, ClaimedPaths: claimed,
+			TaskID: rc.tk.ID, ClaimedPaths: claimed, Auth: rc.auth,
 		})
 		if err != nil {
 			return p.fail(rc, StageCreateWorktree, err)
@@ -671,11 +675,11 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	// 失败即 fail 而不退回重建 —— 悄悄重建正是这个模式要避免的事，
 	// 理由如实写进失败原因，让人在事件流里看得见为什么。
 	if rc.plan != nil && rc.plan.Rebuild {
-		if _, err := p.Worktrees.EnsureMirror(rc.ctx, rc.params.Repo.ProviderRepo, rc.params.CloneURL); err != nil {
+		if _, err := p.Worktrees.EnsureMirror(rc.ctx, rc.params.Repo.RepoKey(), rc.params.CloneURL, rc.auth); err != nil {
 			return p.fail(rc, StageCreateWorktree, fmt.Errorf(
 				"从 review_feedback 重新发起一轮 review，但仓库镜像不可用，无法重挂现场: %w", err))
 		}
-		if err := p.Worktrees.Reattach(rc.ctx, rc.params.Repo.ProviderRepo, rc.wt.Path, rc.wt.Branch); err != nil {
+		if err := p.Worktrees.Reattach(rc.ctx, rc.params.Repo.RepoKey(), rc.wt.Path, rc.wt.Branch, rc.params.CloneURL, rc.auth); err != nil {
 			return p.fail(rc, StageCreateWorktree, fmt.Errorf(
 				"从 review_feedback 重新发起一轮 review，但工作区现场无法重挂: %w", err))
 		}
@@ -971,7 +975,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	runVerify := func(round int) (Report, error) {
 		logs := p.stepLogger(rc.tk.ID, round)
 		if tier == TierHeavy {
-			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps,
+			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.RepoKey(), rc.wt, steps,
 				changedFiles, rc.params.Repo.ExcludeDirs, rc.params.Repo.VerifyInfra, logs)
 		}
 		// light 档设计上「不起栈」（verify.go 的 TierLight 注释）：
@@ -1121,7 +1125,7 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		rc.tk = tk
 	}
 
-	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo, func(prog PushProgress) {
+	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo, rc.auth, func(prog PushProgress) {
 		p.pushProgress(rc, prog)
 	}); err != nil {
 		return p.fail(rc, StagePush, err)
@@ -1241,8 +1245,8 @@ func mergedExcludeDirs(global, repo []string) []string {
 	return append(out, repo...)
 }
 
-func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string, logs StepLogger) (Report, error) {
-	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, repoKey string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string, logs StepLogger) (Report, error) {
+	base, err := p.Worktrees.CreateDetached(ctx, repoKey, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
 	if err != nil {
 		return Report{}, err
 	}

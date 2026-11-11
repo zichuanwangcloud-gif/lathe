@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // heavyStackFixture 建好 mirror 与任务工作区，返回可直接喂 runHeavy 的料。
@@ -25,7 +27,7 @@ func heavyStackFixture(t *testing.T) (*Pipeline, int64, string, *Worktree) {
 
 	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, &fakeAgent{}, &fakeNotifier{})
 	ctx := context.Background()
-	if _, err := p.Worktrees.EnsureMirror(ctx, repo.ProviderRepo, src); err != nil {
+	if _, err := p.Worktrees.EnsureMirror(ctx, repo.ProviderRepo, src, vcs.GitAuth{}); err != nil {
 		t.Fatalf("建 mirror 失败: %v", err)
 	}
 	wt, err := p.Worktrees.Create(ctx, CreateParams{

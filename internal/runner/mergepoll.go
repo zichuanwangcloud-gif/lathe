@@ -12,6 +12,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // RepoLookup 按 repoID 查询该仓库的分支策略配置。
@@ -323,7 +324,7 @@ func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task) error {
 	wt := &Worktree{
 		Path:   *merged.WorktreePath,
 		Branch: *merged.BranchName,
-		Mirror: p.Worktrees.MirrorPath(repoCfg.ProviderRepo),
+		Mirror: p.Worktrees.MirrorPath(repoCfg.RepoKey()),
 	}
 	if err := p.Worktrees.Remove(ctx, wt, true); err != nil {
 		return fmt.Errorf("回收工作区失败: %w", err)
@@ -339,8 +340,7 @@ func (p *MergePoller) onMerged(ctx context.Context, merged *task.Task) error {
 // 解析，避免与 refs/heads/* 下可能存在的同名残留分支产生歧义——
 // 与 ChangedFiles/HasCommitsAhead 解析基线的立场一致。
 func (p *MergePoller) resolveMirrorTip(ctx context.Context, repoCfg RepoConfig, branch string) (string, error) {
-	cloneURL := cloneURLFor(repoCfg.ProviderRepo)
-	mirror, err := p.Worktrees.EnsureMirror(ctx, repoCfg.ProviderRepo, cloneURL)
+	mirror, err := p.Worktrees.EnsureMirror(ctx, repoCfg.RepoKey(), cloneURLFor(repoCfg), vcs.GitAuth{})
 	if err != nil {
 		return "", fmt.Errorf("刷新 mirror 失败: %w", err)
 	}
@@ -351,12 +351,11 @@ func (p *MergePoller) resolveMirrorTip(ctx context.Context, repoCfg RepoConfig, 
 	return strings.TrimSpace(out), nil
 }
 
-// cloneURLFor 按 provider repo 拼 SSH clone URL，与 cmd/lathe/queue.go
-// 的 loadRepoConfig 用的是同一套约定（"git@github.com:<repo>.git"）；
-// runner 包不能反向依赖 cmd/lathe，因此这里单独拼一份，跟 RepoLookup
-// 的 NewRepoLookup 是同一类"各自维护一份等价实现"的理由。
-func cloneURLFor(providerRepo string) string {
-	return "git@github.com:" + providerRepo + ".git"
+// cloneURLFor 是仓库的 git 远端地址：单一真相源 RepoConfig.CloneURL()
+// （GitHub 仍是 "git@github.com:<repo>.git"，与 cmd/lathe/queue.go 的
+// loadRepoConfig 同一个实现，不再各拼一份）。
+func cloneURLFor(repo RepoConfig) string {
+	return repo.CloneURL()
 }
 
 // rebaseFollowup 是 F4.3 后继链自动跟进的统一入口，处理一次"分支历史
@@ -414,7 +413,7 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 		Path:       *succ.WorktreePath,
 		Branch:     *succ.BranchName,
 		BaseBranch: newBaseBranch,
-		Mirror:     p.Worktrees.MirrorPath(repoCfg.ProviderRepo),
+		Mirror:     p.Worktrees.MirrorPath(repoCfg.RepoKey()),
 	}
 
 	// 必须在做任何改动之前捕获：这是下一级递归要用的 oldBaseTip——
@@ -426,12 +425,12 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 	}
 	succThisOldTip := strings.TrimSpace(tipOut)
 
-	if err := p.Worktrees.RebaseOnto(ctx, wt, oldBaseTip, newBaseBranch); err != nil {
+	if err := p.Worktrees.RebaseOnto(ctx, wt, oldBaseTip, newBaseBranch, cloneURLFor(repoCfg), vcs.GitAuth{}); err != nil {
 		p.failRebaseFollowup(ctx, succ, "自动 rebase", err)
 		return
 	}
 
-	if err := p.Worktrees.ForcePush(ctx, wt, repoCfg, nil); err != nil {
+	if err := p.Worktrees.ForcePush(ctx, wt, repoCfg, vcs.GitAuth{}, nil); err != nil {
 		p.failRebaseFollowup(ctx, succ, "推送改写后的分支（force-with-lease）", err)
 		return
 	}
@@ -474,7 +473,7 @@ func (p *MergePoller) rebaseFollowupOne(ctx context.Context, succ *task.Task, ol
 	if err := p.Pipeline.Execute(ctx, ExecuteParams{
 		TaskID:   succ.ID,
 		Repo:     execRepo,
-		CloneURL: cloneURLFor(repoCfg.ProviderRepo),
+		CloneURL: cloneURLFor(repoCfg),
 		IssueRef: IssueRefOf(succ),
 		Actor:    "system:rebase-followup",
 		Retry:    &RetryPlan{Fresh: false, Entry: EntryVerify},

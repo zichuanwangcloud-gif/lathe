@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // sourceRepo 造一个带 dev/main 两条分支的本地仓库，充当远端。
@@ -57,7 +59,7 @@ func TestEnsureMirrorCloneThenFetch(t *testing.T) {
 	m := newManager(t)
 	ctx := context.Background()
 
-	mirror, err := m.EnsureMirror(ctx, "acme/demo", src)
+	mirror, err := m.EnsureMirror(ctx, "acme/demo", src, vcs.GitAuth{})
 	if err != nil {
 		t.Fatalf("首次 EnsureMirror 失败: %v", err)
 	}
@@ -66,7 +68,7 @@ func TestEnsureMirrorCloneThenFetch(t *testing.T) {
 	}
 
 	// 再次调用应走 fetch 分支且不报错（幂等）
-	mirror2, err := m.EnsureMirror(ctx, "acme/demo", src)
+	mirror2, err := m.EnsureMirror(ctx, "acme/demo", src, vcs.GitAuth{})
 	if err != nil {
 		t.Fatalf("二次 EnsureMirror 失败: %v", err)
 	}
@@ -74,7 +76,7 @@ func TestEnsureMirrorCloneThenFetch(t *testing.T) {
 		t.Errorf("mirror 路径应稳定: %q vs %q", mirror, mirror2)
 	}
 
-	if _, err := m.EnsureMirror(ctx, "acme/demo", ""); err == nil {
+	if _, err := m.EnsureMirror(ctx, "acme/demo", "", vcs.GitAuth{}); err == nil {
 		t.Error("空 clone URL 应报错")
 	}
 
@@ -103,7 +105,7 @@ func TestEnsureMirrorFetchPruneKeepsInflightTaskBranch(t *testing.T) {
 	}
 
 	// 模拟第二个任务在同一仓库上启动：EnsureMirror 会 fetch --prune
-	if _, err := m.EnsureMirror(ctx, "acme/demo", src); err != nil {
+	if _, err := m.EnsureMirror(ctx, "acme/demo", src, vcs.GitAuth{}); err != nil {
 		t.Fatalf("并发 EnsureMirror 失败: %v", err)
 	}
 

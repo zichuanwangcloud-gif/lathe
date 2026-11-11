@@ -687,7 +687,7 @@ func TestPipelineReviewRetryRebuildsWorkspaceAndDispatchesReview(t *testing.T) {
 	// 第一轮：开出 PR，第一轮的提交已推到远端。
 	wt := prOpenTask(t, p, m, taskID, src, repo, true)
 	firstRound := gitOut(t, wt.Path, "rev-parse", "HEAD")
-	if err := p.Worktrees.Push(ctx, wt, repo, nil); err != nil {
+	if err := p.Worktrees.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("推进远端失败: %v", err)
 	}
 	// 远端确实有第一轮的分支
@@ -827,7 +827,7 @@ func TestWorktreeReattachRequiresRemoteBranch(t *testing.T) {
 	if err := os.RemoveAll(wt.Path); err != nil {
 		t.Fatalf("清理现场失败: %v", err)
 	}
-	if err := p.Worktrees.Reattach(context.Background(), repo.ProviderRepo, wt.Path, wt.Branch); err == nil {
+	if err := p.Worktrees.Reattach(context.Background(), repo.ProviderRepo, wt.Path, wt.Branch, src, vcs.GitAuth{}); err == nil {
 		t.Error("远端没有该分支时重挂应报错（而不是悄悄重建）")
 	}
 }
@@ -843,7 +843,7 @@ func TestWorktreeReattachMirrorsRemoteTip(t *testing.T) {
 
 	wt := prOpenTask(t, p, m, taskID, src, repo, true)
 	firstRound := gitOut(t, wt.Path, "rev-parse", "HEAD")
-	if err := p.Worktrees.Push(ctx, wt, repo, nil); err != nil {
+	if err := p.Worktrees.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("推进远端失败: %v", err)
 	}
 	remoteTip := gitOut(t, src, "rev-parse", "refs/heads/"+wt.Branch)
@@ -855,7 +855,7 @@ func TestWorktreeReattachMirrorsRemoteTip(t *testing.T) {
 	if err := os.RemoveAll(wt.Path); err != nil {
 		t.Fatalf("清理现场失败: %v", err)
 	}
-	if err := p.Worktrees.Reattach(ctx, repo.ProviderRepo, wt.Path, wt.Branch); err != nil {
+	if err := p.Worktrees.Reattach(ctx, repo.ProviderRepo, wt.Path, wt.Branch, src, vcs.GitAuth{}); err != nil {
 		t.Fatalf("重挂失败: %v", err)
 	}
 
@@ -898,7 +898,7 @@ func TestWorktreeReattachClearsStaleRegistrationFirst(t *testing.T) {
 	p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, &fakeAgent{}, &fakeNotifier{})
 
 	wt := prOpenTask(t, p, m, taskID, src, repo, true)
-	if err := p.Worktrees.Push(ctx, wt, repo, nil); err != nil {
+	if err := p.Worktrees.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("推进远端失败: %v", err)
 	}
 
@@ -921,7 +921,7 @@ func TestWorktreeReattachClearsStaleRegistrationFirst(t *testing.T) {
 		t.Fatalf("夹具应留下失效的 worktree 注册（目录 %s），实际列表:\n%s", wt.Path, listOut)
 	}
 
-	if err := p.Worktrees.Reattach(ctx, repo.ProviderRepo, wt.Path, wt.Branch); err != nil {
+	if err := p.Worktrees.Reattach(ctx, repo.ProviderRepo, wt.Path, wt.Branch, src, vcs.GitAuth{}); err != nil {
 		t.Fatalf("重挂应成功（先清注册再物化分支）: %v", err)
 	}
 

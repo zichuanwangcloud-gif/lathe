@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // gitTimeout 是单条 git 命令的上限。clone 大仓可能较慢，故给得宽松。
@@ -59,8 +63,12 @@ func NewWorktreeManager(root string) (*WorktreeManager, error) {
 func (m *WorktreeManager) Root() string { return m.root }
 
 // MirrorPath 返回某仓库的 bare mirror 路径。
-func (m *WorktreeManager) MirrorPath(providerRepo string) string {
-	safe := strings.ReplaceAll(providerRepo, "/", "-")
+//
+// 参数是镜像键（RepoConfig.RepoKey()）：GitHub 即 providerRepo 本身（与引入
+// 代码平台之前逐字节相同），GitLab/Gitea 带实例主机，两个实例上的同名仓库
+// 不会撞到同一个 mirror。
+func (m *WorktreeManager) MirrorPath(key string) string {
+	safe := strings.ReplaceAll(key, "/", "-")
 	safe = strings.ReplaceAll(safe, string(filepath.Separator), "-")
 	return filepath.Join(m.root, ".mirrors", safe+".git")
 }
@@ -86,23 +94,35 @@ func MirrorBaseRef(base string) string {
 // EnsureMirror 确保 bare mirror 存在且是最新的。
 //
 // 首次调用会 clone --mirror；之后只做 fetch --prune。
-func (m *WorktreeManager) EnsureMirror(ctx context.Context, providerRepo, cloneURL string) (string, error) {
+//
+// key 是镜像键（RepoConfig.RepoKey()），cloneURL 是这次用的远端。auth 为零值
+// （GitHub 走宿主 SSH、测试注入本地路径）时执行序列与引入代码平台之前完全
+// 一致；非零时（GitLab/Gitea 的 HTTPS + token）一切联网操作都在 Lathe 私有的
+// transport 里进行，见 fetchAuthed。
+func (m *WorktreeManager) EnsureMirror(ctx context.Context, key, cloneURL string, auth vcs.GitAuth) (string, error) {
 	if cloneURL == "" {
-		return "", fmt.Errorf("runner: 仓库 %s 缺少 clone URL", providerRepo)
+		return "", fmt.Errorf("runner: 仓库 %s 缺少 clone URL", key)
 	}
-	mirror := m.MirrorPath(providerRepo)
+	mirror := m.MirrorPath(key)
 
 	// clone/fetch 都会写 mirror 的 ref 空间，与 worktree 注册一样
 	// 属于要串行化的管理操作。锁粒度是单个 mirror，不同仓库互不阻塞。
 	unlock := m.lockMirror(mirror)
 	defer unlock()
 
+	if !auth.IsZero() {
+		if err := m.ensureMirrorAuthed(ctx, key, mirror, cloneURL, auth); err != nil {
+			return "", err
+		}
+		return mirror, nil
+	}
+
 	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err != nil {
 		if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
 			return "", fmt.Errorf("runner: 创建 mirror 目录失败: %w", err)
 		}
 		if _, err := m.git(ctx, "", "clone", "--mirror", "--quiet", cloneURL, mirror); err != nil {
-			return "", fmt.Errorf("runner: 克隆 mirror %s 失败: %w", providerRepo, err)
+			return "", fmt.Errorf("runner: 克隆 mirror %s 失败: %w", key, err)
 		}
 
 		// ★安全：clone --mirror 会设 remote.origin.mirror=true，此时 git push
@@ -119,9 +139,35 @@ func (m *WorktreeManager) EnsureMirror(ctx context.Context, providerRepo, cloneU
 		return "", fmt.Errorf("runner: 设置 fetch refspec 失败: %w", err)
 	}
 	if _, err := m.git(ctx, mirror, "fetch", "--prune", "--quiet", "origin"); err != nil {
-		return "", fmt.Errorf("runner: 更新 mirror %s 失败: %w", providerRepo, err)
+		return "", fmt.Errorf("runner: 更新 mirror %s 失败: %w", key, err)
 	}
 	return mirror, nil
+}
+
+// ensureMirrorAuthed 是 EnsureMirror 的带鉴权分支（调用方已持 mirror 锁）。
+//
+// 首次：Lathe 自己 git init --bare，写 remote.origin.url/fetch —— 不设
+// remote.origin.mirror，所以 clone --mirror 之后那一步 --unset-all 在这条路径
+// 上天然不需要。随后与刷新一样走 fetchAuthed。
+func (m *WorktreeManager) ensureMirrorAuthed(ctx context.Context, key, mirror, cloneURL string, auth vcs.GitAuth) error {
+	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err != nil {
+		if err := os.MkdirAll(filepath.Dir(mirror), 0o755); err != nil {
+			return fmt.Errorf("runner: 创建 mirror 目录失败: %w", err)
+		}
+		if _, err := m.git(ctx, "", "init", "--bare", "--quiet", mirror); err != nil {
+			return fmt.Errorf("runner: 初始化 mirror %s 失败: %w", key, err)
+		}
+		if _, err := m.git(ctx, mirror, "config", "remote.origin.url", cloneURL); err != nil {
+			return fmt.Errorf("runner: 设置 mirror 远端失败: %w", err)
+		}
+	}
+	if _, err := m.git(ctx, mirror, "config", "--replace-all", "remote.origin.fetch", mirrorFetchRefspec); err != nil {
+		return fmt.Errorf("runner: 设置 fetch refspec 失败: %w", err)
+	}
+	if err := m.fetchAuthed(ctx, mirror, cloneURL, auth); err != nil {
+		return fmt.Errorf("runner: 更新 mirror %s 失败: %w", key, err)
+	}
+	return nil
 }
 
 // HasChanges 报告工作区是否有未提交的改动。
@@ -169,7 +215,10 @@ func (m *WorktreeManager) Commit(ctx context.Context, wt *Worktree, message stri
 // onProgress 可为 nil；非 nil 时在每次退避重试前与「重试后成功」时各
 // 回调一次，调用方（pipeline）据此把重试过程写进任务事件流 —— 重试
 // 不该是黑盒，详情页要看得见。
-func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfig, onProgress func(PushProgress)) error {
+//
+// auth 非零（GitLab/Gitea）时推送在 transport 里进行（pushAuthed）；受保护
+// 分支闸门在选择 transport 或原路径【之前】，三个平台走同一段代码。
+func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfig, auth vcs.GitAuth, onProgress func(PushProgress)) error {
 	if wt == nil {
 		return fmt.Errorf("runner: 工作区为空")
 	}
@@ -179,6 +228,11 @@ func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfi
 	// 基线分支同样不能成为推送目标（防止配置错误把任务分支命名成 dev）
 	if base, err := repo.BaseBranch(KindFix); err == nil && wt.Branch == base {
 		return ErrProtectedBranch{Branch: wt.Branch, Repo: repo.ProviderRepo}
+	}
+
+	if !auth.IsZero() {
+		push := func() error { return m.pushAuthed(ctx, wt, repo.CloneURL(), auth, false) }
+		return pushWithRetry(ctx, wt.Branch, push, pushBackoff, onProgress)
 	}
 
 	refspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", wt.Branch, wt.Branch)
@@ -205,13 +259,21 @@ func (m *WorktreeManager) Push(ctx context.Context, wt *Worktree, repo RepoConfi
 // rebase 冲突（或任何其它非零退出）原样返回，不吞不重试——冲突需要人
 // 来看，自动重试或悄悄吞掉都会把冲突留在一个半改写的工作区里，比明确
 // 报错更危险。
-func (m *WorktreeManager) RebaseOnto(ctx context.Context, wt *Worktree, oldBaseTip, newBaseBranch string) error {
+//
+// cloneURL 与 auth 只在 auth 非零（GitLab/Gitea）时使用：刷新走 transport，
+// 远端地址显式取自仓库行而不是 mirror 里 agent 可写的 remote.origin.url。
+func (m *WorktreeManager) RebaseOnto(ctx context.Context, wt *Worktree, oldBaseTip, newBaseBranch, cloneURL string, auth vcs.GitAuth) error {
 	if wt == nil {
 		return fmt.Errorf("runner: 工作区为空")
 	}
 
 	unlock := m.lockMirror(wt.Mirror)
-	_, err := m.git(ctx, wt.Mirror, "fetch", "--prune", "--quiet", "origin")
+	var err error
+	if auth.IsZero() {
+		_, err = m.git(ctx, wt.Mirror, "fetch", "--prune", "--quiet", "origin")
+	} else {
+		err = m.fetchAuthed(ctx, wt.Mirror, cloneURL, auth)
+	}
 	unlock()
 	if err != nil {
 		return fmt.Errorf("runner: 刷新 mirror 失败: %w", err)
@@ -237,7 +299,7 @@ func (m *WorktreeManager) RebaseOnto(ctx context.Context, wt *Worktree, oldBaseT
 // 结构照抄 Push：先校验推送目标不是受保护分支，再拼完整显式 refspec，
 // 复用同一套 pushWithRetry 退避重试——网络抖动不该让 rebase 跟进这一步
 // 比普通推送更脆弱。
-func (m *WorktreeManager) ForcePush(ctx context.Context, wt *Worktree, repo RepoConfig, onProgress func(PushProgress)) error {
+func (m *WorktreeManager) ForcePush(ctx context.Context, wt *Worktree, repo RepoConfig, auth vcs.GitAuth, onProgress func(PushProgress)) error {
 	if wt == nil {
 		return fmt.Errorf("runner: 工作区为空")
 	}
@@ -246,6 +308,11 @@ func (m *WorktreeManager) ForcePush(ctx context.Context, wt *Worktree, repo Repo
 	}
 	if base, err := repo.BaseBranch(KindFix); err == nil && wt.Branch == base {
 		return ErrProtectedBranch{Branch: wt.Branch, Repo: repo.ProviderRepo}
+	}
+
+	if !auth.IsZero() {
+		push := func() error { return m.pushAuthed(ctx, wt, repo.CloneURL(), auth, true) }
+		return pushWithRetry(ctx, wt.Branch, push, pushBackoff, onProgress)
 	}
 
 	refspec := fmt.Sprintf("refs/heads/%s:refs/heads/%s", wt.Branch, wt.Branch)
@@ -420,6 +487,13 @@ type CreateParams struct {
 	// 用它判断目标目录是否仍属于在途任务 —— 是则拒绝，而不是把别人
 	// 正在跑的工作区当尸体回收。为空表示不做这道检查（测试与单次调用）。
 	ClaimedPaths []string
+	// Auth 是首次建/刷新 mirror 的 git 鉴权（GitLab/Gitea）。零值 = 原无鉴权
+	// 路径（GitHub 走宿主 SSH、测试注入本地路径）。
+	//
+	// 为什么进 CreateParams 却不进 RepoConfig：CreateParams 是 Create 一次调用
+	// 的入参，不保存、不返回（Worktree 不含它）、不进日志；RepoConfig 被到处
+	// 复制与打印。vcs.GitAuth 自带全格式脱敏，嵌在这里被打印也不出明文。
+	Auth vcs.GitAuth
 }
 
 // Create 建立任务工作区：更新 mirror → 计算基线与分支名 → 新建 worktree。
@@ -433,7 +507,7 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 		return nil, err
 	}
 
-	mirror, err := m.EnsureMirror(ctx, p.Repo.ProviderRepo, p.CloneURL)
+	mirror, err := m.EnsureMirror(ctx, p.Repo.RepoKey(), p.CloneURL, p.Auth)
 	if err != nil {
 		return nil, err
 	}
@@ -536,14 +610,17 @@ func (m *WorktreeManager) Create(ctx context.Context, p CreateParams) (*Worktree
 // 与 Create 的区别：Create 开新分支（-b）、会回收同名现场、并做活任务
 // 认领检查；Reattach 只认已有的远端分支，不新建任何历史。两者共用
 // 同一个 mirror 锁，互不并发。
-func (m *WorktreeManager) Reattach(ctx context.Context, providerRepo, path, branch string) error {
+//
+// key 是镜像键（RepoConfig.RepoKey()）；cloneURL 与 auth 只在 auth 非零
+// （GitLab/Gitea）时使用，刷新走 transport。
+func (m *WorktreeManager) Reattach(ctx context.Context, key, path, branch, cloneURL string, auth vcs.GitAuth) error {
 	if path == "" || branch == "" {
 		return fmt.Errorf("runner: 重挂现场缺少工作区路径或分支名")
 	}
 
-	mirror := m.MirrorPath(providerRepo)
+	mirror := m.MirrorPath(key)
 	if _, err := os.Stat(filepath.Join(mirror, "HEAD")); err != nil {
-		return fmt.Errorf("runner: 仓库 %s 尚无 mirror，无法重挂现场", providerRepo)
+		return fmt.Errorf("runner: 仓库 %s 尚无 mirror，无法重挂现场", key)
 	}
 
 	unlock := m.lockMirror(mirror)
@@ -553,7 +630,11 @@ func (m *WorktreeManager) Reattach(ctx context.Context, providerRepo, path, bran
 	// 重挂的语义是「以远端为权威」，所以这一步必须在物化本地分支之前 ——
 	// 晚于它的话，本地会查出停车前那个已经过期的 tip，二轮又是在旧内容
 	// 上改，推送仍会被拒。
-	if _, err := m.git(ctx, mirror, "fetch", "--prune", "--quiet", "origin"); err != nil {
+	if auth.IsZero() {
+		if _, err := m.git(ctx, mirror, "fetch", "--prune", "--quiet", "origin"); err != nil {
+			return fmt.Errorf("runner: 刷新 mirror 失败: %w", err)
+		}
+	} else if err := m.fetchAuthed(ctx, mirror, cloneURL, auth); err != nil {
 		return fmt.Errorf("runner: 刷新 mirror 失败: %w", err)
 	}
 
@@ -999,4 +1080,341 @@ func truncate(s string, n int) string {
 		cut--
 	}
 	return s[:cut] + "…(已截断)"
+}
+
+// ---------------------------------------------------------------- 带鉴权的 git（transport）
+//
+// GitLab/Gitea 用 token 走 HTTPS。威胁模型（docs/features/vcs-gitlab-gitea.md
+// §3.3.2）：worktree 的 .git 指向 mirror，mirror 的 config/hooks/info 对 agent
+// 全部可写。http.<最具体 URL>.proxy/sslVerify、include.path、url.*.insteadOf、
+// 新版 git 的 http.curloptResolve……「在 mirror 上跑 git、再用环境注入的配置去
+// 盖」挡不住任何一条（按 URL 匹配时更具体者胜出，与来源无关）。
+//
+// 所以带 token 的调用根本不读 agent 可写的任何 config：在 Lathe 私有、每次新建、
+// 没有 config 文件也没有 hooks 的 transport GIT_DIR 里跑，对象经
+// GIT_OBJECT_DIRECTORY 直接读写 mirror 的对象库（内容寻址，agent 塞进去的只能是
+// 「多几个对象」），环境从零构造、配置来源只有 Lathe 的 GIT_CONFIG_COUNT，
+// token 只经继承的管道 fd 交给主机限定的 credential helper，远端地址显式取自
+// repos 行。ref 回写 mirror 是本地 update-ref（无 token、无网络）。
+//
+// GitHub 不走这里：它用宿主 SSH，git 子进程里没有 Lathe 的 token（零值 GitAuth）。
+
+// transportExtraConfig 是【仅供测试】的注入口：transport 构造 GIT_CONFIG_COUNT 时
+// 排在 Lathe 固定键之前（同名单值键以后出现的为准，固定键永远压过它）。生产恒为
+// nil，不由任何配置项、环境变量或 API 设置。只允许 transportExtraKeys 里的键，
+// 其余直接 panic —— credential.* 这类多值键不靠「后者胜出」，靠白名单挡住。
+var transportExtraConfig [][2]string
+
+// transportBeforeRemove 是【仅供测试】的回调：transport 目录删除之前调用（nil 跳过），
+// 让测试检查 transport 里有没有 gc 的痕迹（packed-refs / gc.pid）。
+var transportBeforeRemove func(dir string)
+
+var transportExtraKeys = map[string]bool{"fetch.unpackLimit": true, "gc.autoPackLimit": true, "gc.autoDetach": true}
+
+// transport 是一次带鉴权操作用的私有 GIT_DIR。
+type transport struct {
+	dir    string // 系统临时目录下的 lathe-git-transport-*（0700），不在 WorkspaceRoot 之下
+	mirror string
+	auth   vcs.GitAuth
+	scheme string // 只放行这个协议（https；loopback 联调为 http）
+	origin string // scheme://host[:port]，credential helper 只对它给口令
+}
+
+// openTransport 建私有 transport 目录：只有 HEAD、refs/ 与空的 home/，
+// 不写 config 文件、没有 hooks 目录。用完必须 close。
+func (m *WorktreeManager) openTransport(mirror, remoteURL string, auth vcs.GitAuth) (*transport, error) {
+	if auth.IsZero() {
+		return nil, fmt.Errorf("runner: transport 只用于带鉴权的调用")
+	}
+	u, err := url.Parse(remoteURL)
+	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, fmt.Errorf("runner: 带鉴权的远端必须是 http(s) 地址，得到 %q", remoteURL)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("runner: 远端地址不能内嵌用户名或口令")
+	}
+	dir, err := os.MkdirTemp("", "lathe-git-transport-*")
+	if err != nil {
+		return nil, fmt.Errorf("runner: 创建 transport 目录失败: %w", err)
+	}
+	t := &transport{dir: dir, mirror: mirror, auth: auth, scheme: u.Scheme, origin: u.Scheme + "://" + u.Host}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.close()
+		return nil, err
+	}
+	for _, d := range []string{"refs", "home"} {
+		if err := os.Mkdir(filepath.Join(dir, d), 0o700); err != nil {
+			t.close()
+			return nil, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "HEAD"), []byte("ref: refs/heads/lathe-transport\n"), 0o600); err != nil {
+		t.close()
+		return nil, err
+	}
+	return t, nil
+}
+
+func (t *transport) close() {
+	if transportBeforeRemove != nil {
+		transportBeforeRemove(t.dir)
+	}
+	_ = os.RemoveAll(t.dir)
+}
+
+// config 是 transport 的全部配置（GIT_CONFIG_COUNT 的键值，按顺序）。
+func (t *transport) config() [][2]string {
+	var kv [][2]string
+	for _, e := range transportExtraConfig {
+		if !transportExtraKeys[e[0]] {
+			panic("runner: transportExtraConfig 只允许测试加速键，得到 " + e[0])
+		}
+		kv = append(kv, e)
+	}
+	user, _ := t.auth.Credential()
+	// helper 只在 get 时从 fd 3 读一行口令；用户名不是秘密。
+	helper := `!f() { test "$1" = get || exit 0; read -r p <&3 || exit 0; echo username=` + user + `; echo "password=$p"; }; f`
+	return append(kv,
+		[2]string{"core.hooksPath", "/dev/null"},
+		[2]string{"credential.helper", ""}, // 清空 helper 列表
+		[2]string{"credential." + t.origin + ".helper", helper},
+		[2]string{"credential.useHttpPath", "false"},
+		[2]string{"protocol.allow", "never"},
+		[2]string{"protocol." + t.scheme + ".allow", "always"},
+		[2]string{"core.fsmonitor", "false"},
+		// transport 的 GIT_DIR 只有自己的 ref，对象库却是 mirror 的：在这里跑的
+		// gc --auto 看不到任务分支与 worktree HEAD，会删掉在途提交。mirror 的
+		// 维护改在 importRefs 之后、mirror 语境下做。
+		[2]string{"gc.auto", "0"},
+		[2]string{"maintenance.auto", "false"},
+	)
+}
+
+// command 构造一条 transport 里的 git 命令。withToken 为真时把口令写进管道、
+// 读端作为 fd 3（ExtraFiles[0]）交给 git；token 不进任何环境变量与 argv。
+// 返回的 cleanup 关闭管道，调用方在命令结束后调用。
+func (t *transport) command(ctx context.Context, withToken bool, stdin string, args ...string) (*exec.Cmd, func(), error) {
+	if len(args) > 0 && args[0] == "fetch" {
+		// 与 gc.auto/maintenance.auto 冗余互保：键管住所有子命令，argv 管住
+		// 「某个版本的 fetch 不按配置判断」这一类意外。
+		args = append([]string{"fetch", "--no-auto-maintenance"}, args[1:]...)
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = t.dir
+	cfg := t.config()
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + filepath.Join(t.dir, "home"),
+		"GIT_DIR=" + t.dir,
+		"GIT_OBJECT_DIRECTORY=" + filepath.Join(t.mirror, "objects"),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"GIT_PROTOCOL_FROM_USER=0",
+		fmt.Sprintf("GIT_CONFIG_COUNT=%d", len(cfg)),
+	}
+	for i, kv := range cfg {
+		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
+	}
+	cmd.Env = env
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	cleanup := func() {}
+	if withToken {
+		r, w, err := os.Pipe()
+		if err != nil {
+			return nil, nil, fmt.Errorf("runner: 创建凭据管道失败: %w", err)
+		}
+		_, pass := t.auth.Credential()
+		// 写两行：helper 在同一进程树里被问第二次时仍有值可读。口令远小于管道缓冲，
+		// 同步写完即关写端，不会阻塞。
+		_, werr := io.WriteString(w, pass+"\n"+pass+"\n")
+		_ = w.Close()
+		if werr != nil {
+			_ = r.Close()
+			return nil, nil, fmt.Errorf("runner: 写凭据管道失败: %w", werr)
+		}
+		cmd.ExtraFiles = []*os.File{r}
+		cleanup = func() { _ = r.Close() }
+	}
+	return cmd, cleanup, nil
+}
+
+// run 执行一条 transport 命令并返回标准输出。错误文案只带截断后的 stderr，
+// 且再经 token 精确替换（远端回显也不会把口令带进失败原因）。
+func (t *transport) run(ctx context.Context, withToken bool, stdin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+	defer cancel()
+	cmd, cleanup, err := t.command(ctx, withToken, stdin, args...)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		msg := truncate(stderr.String(), 600)
+		for _, v := range t.auth.RedactValues() {
+			msg = strings.ReplaceAll(msg, v, "[REDACTED]")
+		}
+		return stdout.String(), fmt.Errorf("git %s（transport）: %w（%s）", strings.Join(args, " "), err, msg)
+	}
+	return stdout.String(), nil
+}
+
+// fetchAuthed 用 transport 刷新 mirror 的 refs/remotes/origin/*（调用方持 mirror 锁）：
+// 种 have → 带 token fetch → 本地导入（含 prune）→ mirror 语境 gc --auto。
+// 语义与原 fetch --prune origin 相同，命名空间只动 refs/remotes/origin/*（任务 #494）。
+func (m *WorktreeManager) fetchAuthed(ctx context.Context, mirror, remoteURL string, auth vcs.GitAuth) error {
+	t, err := m.openTransport(mirror, remoteURL, auth)
+	if err != nil {
+		return err
+	}
+	defer t.close()
+	if err := m.seedHaves(ctx, mirror, t); err != nil {
+		return err
+	}
+	if _, err := t.run(ctx, true, "", "fetch", "--quiet", remoteURL, mirrorFetchRefspec); err != nil {
+		return err
+	}
+	return m.importRefs(ctx, mirror, t)
+}
+
+// seedHaves 把 mirror 的 refs/remotes/origin/* 种进 transport 的 refs/lathe-have/*：
+// 没有 ref 的 transport 协商发不出 have，服务端只能回全量 pack。本地、无 token、
+// 不联网（对象本来就在共享对象库里，只是补上 ref）。放在独立命名空间而不是
+// refs/remotes/origin/*：后者会被 fetch 原地更新，上游删掉的分支在 transport 里
+// 仍留着种进去的旧值，importRefs 的 prune 就失效了。不种任务分支 refs/heads/*：
+// 没必要把未推送提交的 sha 当 have 发给远端。
+func (m *WorktreeManager) seedHaves(ctx context.Context, mirror string, t *transport) error {
+	out, err := m.git(ctx, mirror, "for-each-ref",
+		"--format=create refs/lathe-have/%(refname:lstrip=3) %(objectname)", "refs/remotes/origin/")
+	if err != nil {
+		return fmt.Errorf("runner: 读取 mirror 远端分支失败: %w", err)
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil
+	}
+	if _, err := t.run(ctx, false, out, "update-ref", "--stdin"); err != nil {
+		return fmt.Errorf("runner: 种 have 失败: %w", err)
+	}
+	return nil
+}
+
+// importRefs 把 transport 拿到的 refs/remotes/origin/* 经本地 update-ref --stdin
+// 写回 mirror（含 prune：mirror 有而 transport 没有的删除），随后在 mirror 语境
+// 下跑 gc --auto —— 本地、无 token、无网络、仍在 mirror 锁内，可达性根（全部
+// ref、worktree HEAD/index）与原路径 fetch 顺带的那次 gc 一致。
+func (m *WorktreeManager) importRefs(ctx context.Context, mirror string, t *transport) error {
+	const format = "--format=%(objectname) %(refname)"
+	got, err := t.run(ctx, false, "", "for-each-ref", format, "refs/remotes/origin/")
+	if err != nil {
+		return fmt.Errorf("runner: 读取 transport 远端分支失败: %w", err)
+	}
+	have, err := m.git(ctx, mirror, "for-each-ref", format, "refs/remotes/origin/")
+	if err != nil {
+		return fmt.Errorf("runner: 读取 mirror 远端分支失败: %w", err)
+	}
+	fresh := map[string]bool{}
+	var b strings.Builder
+	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
+		sha, ref, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || !strings.HasPrefix(ref, "refs/remotes/origin/") {
+			continue
+		}
+		fresh[ref] = true
+		fmt.Fprintf(&b, "update %s %s\n", ref, sha)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(have), "\n") {
+		_, ref, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && !fresh[ref] {
+			fmt.Fprintf(&b, "delete %s\n", ref)
+		}
+	}
+	if b.Len() > 0 {
+		if _, err := m.gitInput(ctx, mirror, b.String(), "-c", "core.hooksPath=/dev/null", "update-ref", "--stdin"); err != nil {
+			return fmt.Errorf("runner: 导入远端分支到 mirror 失败: %w", err)
+		}
+	}
+	if _, err := m.git(ctx, mirror, "-c", "core.hooksPath=/dev/null", "gc", "--auto", "--quiet"); err != nil {
+		return fmt.Errorf("runner: mirror 维护（gc --auto）失败: %w", err)
+	}
+	return nil
+}
+
+// pushAuthed 在 transport 里推任务分支（调用方已过受保护分支闸门）：
+// sha 由 Lathe 在 worktree 里 rev-parse 得到，refspec 显式写全、不带 +。
+// force 时 --force-with-lease 带显式期望值（transport 里没有 remote-tracking
+// ref 可隐式取）—— 期望值就是原实现隐式使用的那个：mirror 记录的
+// refs/remotes/origin/<b>。成功后本地记 tracking 与 upstream（等价于原
+// --set-upstream 的可观察状态）。
+func (m *WorktreeManager) pushAuthed(ctx context.Context, wt *Worktree, remoteURL string, auth vcs.GitAuth, force bool) error {
+	out, err := m.git(ctx, wt.Path, "rev-parse", "--verify", "--quiet", "refs/heads/"+wt.Branch+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("runner: 解析任务分支 %s 失败: %w", wt.Branch, err)
+	}
+	sha := strings.TrimSpace(out)
+	tracking := "refs/remotes/origin/" + wt.Branch
+
+	unlock := m.lockMirror(wt.Mirror)
+	defer unlock()
+
+	args := []string{"push", "--quiet"}
+	if force {
+		lease := ""
+		if cur, err := m.git(ctx, wt.Mirror, "rev-parse", "--verify", "--quiet", tracking+"^{commit}"); err == nil {
+			lease = strings.TrimSpace(cur)
+		}
+		args = append(args, "--force-with-lease=refs/heads/"+wt.Branch+":"+lease)
+	}
+	args = append(args, remoteURL, sha+":refs/heads/"+wt.Branch)
+
+	t, err := m.openTransport(wt.Mirror, remoteURL, auth)
+	if err != nil {
+		return err
+	}
+	defer t.close()
+	if _, err := t.run(ctx, true, "", args...); err != nil {
+		return err
+	}
+
+	if _, err := m.git(ctx, wt.Mirror, "-c", "core.hooksPath=/dev/null", "update-ref", tracking, sha); err != nil {
+		return fmt.Errorf("runner: 记录远端分支失败: %w", err)
+	}
+	for _, kv := range [][2]string{{"branch." + wt.Branch + ".remote", "origin"}, {"branch." + wt.Branch + ".merge", "refs/heads/" + wt.Branch}} {
+		if _, err := m.git(ctx, wt.Mirror, "config", kv[0], kv[1]); err != nil {
+			return fmt.Errorf("runner: 设置上游分支失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// gitInput 是带标准输入的 git（本地、无鉴权调用，环境与 git() 相同）。
+func (m *WorktreeManager) gitInput(ctx context.Context, dir, stdin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"GCM_INTERACTIVE=never",
+		"GIT_AUTHOR_NAME="+commitIdentityName,
+		"GIT_AUTHOR_EMAIL="+commitIdentityEmail,
+		"GIT_COMMITTER_NAME="+commitIdentityName,
+		"GIT_COMMITTER_EMAIL="+commitIdentityEmail,
+	)
+	cmd.Stdin = strings.NewReader(stdin)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return stdout.String(), fmt.Errorf("git %s: %w（%s）",
+			strings.Join(args, " "), err, truncate(stderr.String(), 600))
+	}
+	return stdout.String(), nil
 }

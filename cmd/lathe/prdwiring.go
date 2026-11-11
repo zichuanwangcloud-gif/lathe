@@ -7,6 +7,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 规划管线的装配（docs/10）。放在 cmd 层而不是 internal/prd 里，是为了让
@@ -23,7 +24,7 @@ type prdWorktrees struct {
 }
 
 func (p prdWorktrees) EnsureMirror(ctx context.Context, providerRepo, cloneURL string) (string, error) {
-	return p.wm.EnsureMirror(ctx, providerRepo, cloneURL)
+	return p.wm.EnsureMirror(ctx, providerRepo, cloneURL, vcs.GitAuth{})
 }
 
 func (p prdWorktrees) CreateDetached(ctx context.Context, providerRepo, base, name string) (*prd.Checkout, error) {

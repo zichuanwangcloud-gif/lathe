@@ -477,7 +477,7 @@ func (q *queue) runOneClaimed(ctx context.Context, tk *task.Task) {
 		if tk.BranchName != nil {
 			branch = *tk.BranchName
 		}
-		q.worktrees.Discard(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch)
+		q.worktrees.Discard(ctx, repoCfg.RepoKey(), *tk.WorktreePath, branch)
 	}
 	slog.Info("重试决策", "task", tk.ID, "plan", plan.String(), "reasons", plan.Reasons)
 
@@ -628,7 +628,7 @@ func (q *queue) inspectTask(ctx context.Context, tk *task.Task, repoCfg runner.R
 	if err != nil {
 		base = repoCfg.DefaultBranch
 	}
-	return q.worktrees.Inspect(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch, base)
+	return q.worktrees.Inspect(ctx, repoCfg.RepoKey(), *tk.WorktreePath, branch, base)
 }
 
 // resolveRepo 查出属主名下要用的仓库：第一条配置。
