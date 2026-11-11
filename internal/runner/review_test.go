@@ -12,6 +12,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // review_test.go 覆盖 PR 评论回流（docs/02-design.md §7，A2）：
@@ -70,9 +71,10 @@ func ownerOf(t *testing.T, m *task.Machine, taskID int64) int64 {
 	return tk.UserID
 }
 
-func inlineEvent(key, author, body string) *github.ReviewEvent {
-	return &github.ReviewEvent{
-		Event: github.EventReviewComment, Action: "created",
+func inlineEvent(key, author, body string) *vcs.ReviewEvent {
+	return &vcs.ReviewEvent{
+		Provider: vcs.ProviderGitHub,
+		Event:    github.EventReviewComment, Action: "created",
 		Repo: "acme/demo", PRNumber: reviewPR, PRAuthor: "lathe-bot",
 		Key: key, Author: author, Body: body, Path: "README.md", Line: 3,
 	}

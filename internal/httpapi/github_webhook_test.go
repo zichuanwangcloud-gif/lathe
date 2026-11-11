@@ -14,6 +14,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 const ghSecretA, ghSecretB = "gh-secret-user-a", "gh-secret-user-b"
@@ -33,7 +34,7 @@ func (fakeGitHubResolver) ResolveGitHub(ctx context.Context, slug string) (*GitH
 
 type acceptCall struct {
 	owner    int64
-	ev       github.ReviewEvent
+	ev       vcs.ReviewEvent
 	delivery string
 }
 
@@ -43,7 +44,7 @@ type fakeReviewIntake struct {
 	err   error
 }
 
-func (f *fakeReviewIntake) AcceptReview(ctx context.Context, owner int64, ev *github.ReviewEvent, delivery string) (runner.ReviewOutcome, error) {
+func (f *fakeReviewIntake) AcceptReview(ctx context.Context, owner int64, ev *vcs.ReviewEvent, delivery string) (runner.ReviewOutcome, error) {
 	f.calls = append(f.calls, acceptCall{owner, *ev, delivery})
 	if f.err != nil {
 		return runner.ReviewOutcome{}, f.err

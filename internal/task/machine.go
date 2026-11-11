@@ -486,13 +486,23 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 // 不按状态过滤：调用方需要看到终态任务，才能如实回报「任务已合并/已取消，
 // 忽略」，而不是笼统的「找不到」。
 func (m *Machine) TasksByPR(ctx context.Context, userID int64, providerRepo string, prNumber int) ([]*Task, error) {
+	return m.TasksByVCSPR(ctx, userID, "github", providerRepo, prNumber)
+}
+
+// TasksByVCSPR 是 TasksByPR 加一道代码平台过滤（repos.vcs_provider）。
+//
+// 唯一约束 (user_id, provider_repo) 保证同一用户一个路径只在一个平台上，所以
+// 平台过滤挡的是「GitHub webhook 带着一个 GitLab 仓库的路径与编号投进来」这类
+// 跨平台串扰，而不是同名仓库消歧。两处属主过滤原样保留（见 TasksByPR）。
+func (m *Machine) TasksByVCSPR(ctx context.Context, userID int64, provider, providerRepo string, prNumber int) ([]*Task, error) {
 	rows, err := m.pool.Query(ctx, `
 		SELECT `+taskColumnsQualified+`
 		FROM tasks JOIN repos r ON r.id = tasks.repo_id
 		WHERE tasks.user_id = $1 AND r.user_id = $1
 		  AND lower(r.provider_repo) = lower($2)
 		  AND tasks.pr_number = $3
-		ORDER BY tasks.id DESC`, userID, providerRepo, prNumber)
+		  AND r.vcs_provider = $4
+		ORDER BY tasks.id DESC`, userID, providerRepo, prNumber, provider)
 	if err != nil {
 		return nil, fmt.Errorf("task: 按 PR 查询任务失败: %w", err)
 	}

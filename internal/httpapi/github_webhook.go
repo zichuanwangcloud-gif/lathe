@@ -10,6 +10,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // GitHubWebhookTarget 是 GitHub 回调地址里的 slug 解析出的投递目标。
@@ -30,8 +31,11 @@ type GitHubTargetResolver interface {
 }
 
 // ReviewIntake 把一条 review 意见接进任务状态机（runner.ReviewIntake 实现）。
+//
+// 入参是平台中立的 vcs.ReviewEvent：各平台 handler 先在自己的平台包里做完
+// 信任判定，通过之后才构造它（GitHub 经 ev.VCS()）。
 type ReviewIntake interface {
-	AcceptReview(ctx context.Context, ownerID int64, ev *github.ReviewEvent, deliveryID string) (runner.ReviewOutcome, error)
+	AcceptReview(ctx context.Context, ownerID int64, ev *vcs.ReviewEvent, deliveryID string) (runner.ReviewOutcome, error)
 }
 
 // GitHubWebhook 处理来自 GitHub 仓库 webhook 的 PR review 事件
@@ -125,7 +129,7 @@ func (h *GitHubWebhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, err := h.Reviews.AcceptReview(ctx, target.OwnerID, ev, deliveryID)
+	out, err := h.Reviews.AcceptReview(ctx, target.OwnerID, ev.VCS(), deliveryID)
 	if err != nil {
 		slog.Error("PR review 回流失败", "repo", ev.Repo, "pr", ev.PRNumber, "owner", target.OwnerID, "err", err)
 		_ = h.Deliveries.FinishDelivery(ctx, key, err.Error())
