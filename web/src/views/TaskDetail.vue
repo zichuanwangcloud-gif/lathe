@@ -69,14 +69,14 @@ async function act(fn, confirmText) {
 
 // 内存里只留最近 MAX_LIVE_EVENTS 条（见 livelog.js），裁掉的条数如实展示
 const evWindow = createEventWindow({
-  fetchPage: ({ after }) => api.taskEvents(props.id, after),
+  fetchPage: ({ after, limit = 200, ...opts }) => api.taskEvents(props.id, after, limit, opts),
   max: MAX_LIVE_EVENTS,
   isTerminal: () => isTerminal.value,
-  state: reactive({ events: [], lastId: 0, dropped: 0, error: '' }),
+  state: reactive({}),
 })
 const events = computed(() => evWindow.state.events)
 const eventsError = computed(() => evWindow.state.error)
-const droppedEvents = computed(() => evWindow.state.dropped)
+const olderAvailable = computed(() => evWindow.state.olderAvailable)
 let evPoller = null
 
 async function loadEvents() {
@@ -172,7 +172,8 @@ onMounted(() => {
   }, 5000)
   evPoller = createPoller(async () => {
     await loadEvents()
-    // 终态后这一轮就是收尾：终态转移前 sink 已 drain，事件不会再多
+    // 终态后这一轮就是收尾：终态转移前 sink 已 drain，事件不会再多；
+    // 历史部分由「加载更早」按需翻页（createEventWindow 的回放模式）
     return !isTerminal.value
   }, 2000)
   detailPoller.start()
@@ -352,8 +353,9 @@ onUnmounted(() => {
         <span v-if="!isTerminal" class="faint live">● 实时</span>
       </div>
       <div v-if="eventsError" class="faint" style="margin-bottom: 8px">日志拉取失败：{{ eventsError }}</div>
-      <div v-if="droppedEvents" class="faint" style="margin-bottom: 8px">
-        只显示最近 {{ MAX_LIVE_EVENTS }} 条，更早的 {{ droppedEvents }} 条已省略（完整记录在库里）。
+      <div v-if="olderAvailable" class="faint" style="margin-bottom: 8px">
+        还有更早的事件未加载（完整记录在库里）。
+        <button @click="evWindow.loadOlder()">加载更早的 200 条</button>
       </div>
 
       <template v-if="orderedGroups.length">
