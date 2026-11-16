@@ -1,6 +1,7 @@
 # Lathe
 
 > 绑定 Linear 账户后，指派给你的 issue 自动变成一个**已验证**的 PR。
+> 需求来源：Linear / 内置工单 / 阿里云云效（Projex）工作项。
 
 Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：bug 类任务必须先在改动前的代码上复现失败，才有权声称修复。
 
@@ -24,12 +25,19 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
 | [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
 | [docs/11-branching-release.md](docs/11-branching-release.md) | 分支管理与发版规范（贡献者必读） |
+| [docs/features/scheduled-issue.md](docs/features/scheduled-issue.md) | 定时建单：到点在 Linear 建单，之后走正常接单流程 |
+| [docs/features/personal-api-token.md](docs/features/personal-api-token.md) | 个人 API 令牌（PAT）：设计、接口、安全边界与验收结果 |
+| [docs/features/inbox.md](docs/features/inbox.md) | 收件箱：待人处理事项聚合 |
 
 ## 技术栈
 
 Go 1.25 · pgx + sqlc · PostgreSQL · Vue 3 SPA（`go:embed`）· `claude` CLI (`--output-format stream-json`)
 
 交付物是**单个静态二进制**（含内嵌 UI），新增节点 = 拷一个文件。
+
+任务失败、等人补需求、等人放行、PR 已开、模糊任务待签字这五类「等人出手」的事件，
+除终态邮件外还可按个人设置推送到 Slack incoming webhook 或飞书自定义机器人，
+可按事件类型开关（[docs/features/notify-channels.md](docs/features/notify-channels.md)）。
 
 ## 开发
 
@@ -69,13 +77,22 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    - GitHub 令牌：GitHub → Settings → Developer settings → Personal access tokens
 #    - Linear Webhook 密钥：建 webhook 时 Linear 生成
 #    - GitHub Webhook 密钥（可选，PR 评论回流用）：建仓库 webhook 时自己填的 Secret
+#    - GitLab / Gitea 令牌（仓库在 GitLab / Gitea 上时，含自建实例）：与「实例地址」
+#      一起填（如 https://gitlab.example.com；仅 localhost/127.0.0.1 允许 http）。
+#      实例地址只在设置页填，不走环境变量；登记仓库时会把它固定到仓库上
+#    - GitLab / Gitea Webhook 密钥（可选，PR/MR 评论回流用）
 #    - 邮件发送（SMTP）：用于「忘记密码」，保存时会真投一封测试邮件
+#    - 云效连接（可选，需求来源用阿里云云效 Projex 时）：接入点、组织 ID、个人访问令牌、
+#      webhook 密钥（≥16 位，自己定）、触发标签与可选的状态同步名。保存时用令牌取当前
+#      用户，「指派给我」判定用这个账号 ID。Region 版（专属实例）需管理员先在「系统设置」
+#      登记实例域名，否则保存会被拒（防止服务端被当成访问内网的跳板）
 #    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
 #    接单判定直接使用，无需手工填写。
 #
 # 6. 「设置」页顶部有你的专属 Linear webhook 地址（/webhooks/linear/<你的随机段>），
 #    在 Linear → Settings → API → Webhooks 里指过去，勾选 Issue 事件
-# 7. 在「仓库配置」页登记目标仓库（owner/repo）并设置分支策略
+# 7. 在「仓库配置」页登记目标仓库（owner/repo；GitLab 可为 group/subgroup/repo）、
+#    选代码平台（GitHub / GitLab / Gitea，登记后不可改）并设置分支策略
 #
 # 7.5（可选）PR 评论回流：「设置」页还有一个 GitHub webhook 地址
 #    （/webhooks/github/<同一个随机段>）。在目标仓库 → Settings → Webhooks 新建：
@@ -83,9 +100,26 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    事件勾 Pull request reviews 与 Pull request review comments。
 #    之后他人在 Lathe 开的 PR 上留 review 意见 → 任务 resume 原会话修改 →
 #    完整重新验证 → 更新同一个 PR。PR 作者本人的评论与 approve 不触发。
+#    GitLab：项目 Settings → Webhooks，URL 填 /webhooks/gitlab/<同一个随机段>，
+#      勾 Comments（Note events），Secret token 与「GitLab Webhook 密钥」一致；
+#      项目成员（Reporter 及以上）的 MR 评论触发二轮。
+#    Gitea：仓库 Settings → Webhooks，URL 填 /webhooks/gitea/<同一个随机段>，
+#      选「自定义事件」勾 Pull Request Comment（Gitea 以 X-Gitea-Event: issue_comment
+#      + is_pull 发出，Lathe 按此识别），Secret 与「Gitea Webhook 密钥」一致；
+#      在 PR 对话里发评论触发二轮。Gitea 的 review（含行内评论）本身不触发，
+#      但会在二轮时一并带给 agent。
 #
 # 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
 #    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
+#
+# 9.（可选）在「定时建单」页配置每日 / 每周 / 每 N 小时的规则：到点用你的
+#    Linear 令牌在 Linear 上建一张单（指派给你或打接单标签），之后走正常的
+#    接单 → 分诊 → 验证 → PR。前提是第 5–7 步的 Linear 令牌、webhook 与仓库都已配好。
+# 9.（可选）云效任务来源：「设置」页的云效卡片里有回调地址
+#    /webhooks/yunxiao/<同一个随机段>。在云效项目 → 设置 → 自动化规则用 Webhook 模板
+#    新建两条规则（触发「字段变更」与「状态变更」），Body 选【工作项数据】，
+#    Secret 填与卡片里「Webhook 密钥」相同的串。之后指派给你（或打上卡片里配的
+#    触发标签）的工作项就会接单；也可以在卡片里按工作项 ID 手动开跑。
 ```
 
 ### 账号
@@ -95,6 +129,12 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 代重置密码、删除账号及其数据。
 
 忘记密码需要先配好 SMTP。没配的话，管理员可以在用户管理页代为重置。
+
+脚本与 CI 用「个人设置 → 个人 API 令牌」签发 PAT，请求带
+`Authorization: Bearer lathe_pat_…`，**权限与你本人完全相同**（管理员签的才是管理员权限）。
+明文只在创建时显示一次，签发时需输入当前密码；可设过期、可随时吊销。
+**停用账号、修改密码、找回或被管理员重置密码，都会吊销你的全部令牌。**
+`LATHE_ADMIN_TOKEN` 仍保留为部署级应急通道，两者互不影响。
 
 ### 团队与角色
 
@@ -124,23 +164,32 @@ compose 编排文件，人选要起哪几个。Dockerfile 单镜像可勾选附�
 `Authorization: Bearer <token>` 的请求会被当作内置管理员，供 curl 直接调接口；
 同时它也是「SMTP 挂了且管理员把自己锁在门外」时唯一进得去的路。日常登录不用它。
 
+### 用量统计
+
+导航栏「用量」（`/usage`）按任务、仓库、验证档位、阶段与时间范围聚合每次 agent
+运行的 token、费用与时长（数据来自 `agent_runs` 账本：每次运行一行，含失败/被杀的
+运行、PRD 规划与预览推荐）；任务详情页有逐次运行的「用量」卡。管理员在「用户管理」
+页可进入全局用量（`/api/admin/usage`，只给聚合与用户 id）。费用取 CLI 自报，不报费用
+的驱动显示「未知」而不是 $0。本功能无新增环境变量。详见 docs/features/usage-stats.md。
+
 ### Docker 部署
 
 ```bash
 docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 ```
 
-镜像不含 Postgres 与 `claude` CLI：用 `LATHE_DB_*` 指向外部数据库
-（容器内先跑 `lathe migrate up` 建表），agent 执行需另行挂载或安装 claude。
+镜像不含 Postgres 与 `claude` / `codex` CLI：用 `LATHE_DB_*` 指向外部数据库
+（容器内先跑 `lathe migrate up` 建表），agent 执行需另行挂载或安装 claude（以及按需安装 codex）。
+外部数据库需 **PostgreSQL ≥ 15**（迁移 0038 用了 `UNIQUE NULLS NOT DISTINCT`）。
 
 | 环境变量 | 作用 |
 |---|---|
 | `LATHE_BASE_URL` | 对外地址，重置邮件里的链接前缀。不配则退回本机地址并告警 |
 | `LATHE_HTTP_ADDR` | 监听地址，默认 `:8200` |
-| `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres |
+| `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres（需 PostgreSQL ≥ 15，0038 用 `UNIQUE NULLS NOT DISTINCT`） |
 | `LATHE_ADMIN_EMAIL` | 内置管理员邮箱，默认 `admin@lathe.local` |
 | `LATHE_ADMIN_PASSWORD` | 内置管理员初始口令，不配则随机生成并打印一次 |
-| `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
+| `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配。日常脚本请用个人 API 令牌，见 [docs/features/personal-api-token.md](docs/features/personal-api-token.md) |
 | `LATHE_LINEAR_TOKEN` | Linear API 令牌的兜底值。**只对内置管理员生效**，且优先级低于设置页（界面里配了就以界面为准，改完即刻生效） |
 | `LATHE_LINEAR_WEBHOOK_SECRET` | Linear webhook 签名密钥的兜底值。**只对内置管理员生效**、优先级低于设置页 |
 | `LATHE_LINEAR_USER_ID` | 「指派给我了吗」接单判定用的 Linear 用户 ID。**只对内置管理员生效**；设置页配 Linear 令牌时会自动取到账号 ID，正常情况不用手工填 |
@@ -165,9 +214,16 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_AGENT_TIMEOUT` | agent 单次执行超时，默认 `45m` |
 | `LATHE_AGENT_ENV_EXTRA` | agent 子进程环境白名单的显式开口（逗号分隔变量名）。默认白名单只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程 |
 | `LATHE_CLAUDE_BIN` | claude 二进制名或路径，默认 `claude`（从 PATH 解析） |
+| `LATHE_CODEX_HOME` | codex 驱动的**专用** `CODEX_HOME`；不配 = codex 不启用（仓库页不能选 codex，默认部署行为不变）。子进程的 `CODEX_HOME` 指向它、`HOME` 换成 `<它>/home`（个人 `~/.codex` 与 `~/.agents/skills` 都进不来）。必须是已存在的绝对路径目录，**不得是个人 `~/.codex`**，**不得放在系统临时目录（`TMPDIR`，默认 `/tmp`）下**——codex 会拒绝在那里执行任何命令且不报错；违反任一条启动直接报错。启用步骤：`mkdir` 专用目录 → `CODEX_HOME=<dir> codex login --with-api-key` → 在 `<dir>/config.toml` 写模型/provider → 设本变量。详见 `docs/features/multi-cli.md` |
+| `LATHE_CODEX_BIN` | codex 二进制名或路径，默认 `codex`。只在配了 `LATHE_CODEX_HOME` 时校验（找不到启动报错） |
 | `LATHE_NODE_NAME` | 节点名（事件 actor 前缀、管理界面运行时面板），默认主机名 |
 | `LATHE_PNPM_STORE` | 验证器跑前端步骤时共享的 pnpm store 目录，默认 `/opt/lathe/.pnpm-store` |
+| `LATHE_SCHEDULER_ENABLED` | 定时建单调度器总开关，默认 `true`，只认 `true` / `false`（写成 `yes` 等启动直接报错）。设 `false` 时调度器不启动、规则不会到点建单；规则 API 照常可用，「立即运行」返回 503 |
+| `LATHE_SCHEDULE_CATCHUP_WINDOW` | 定时建单的补偿窗口，默认 `6h`，范围 `0`–`168h`（越界或非法时长启动直接报错；同样**不支持 `d`**，写 `168h` 不能写 `7d`）。认领时迟到超过准点宽限（2 个 tick，60s）的那次：迟到 ≤ 窗口就补建一次（停机期间错过的多次合并成一次），否则记一条「跳过」。`0` 表示只准点触发 |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
+
+云效（Projex）任务来源**没有环境变量**：连接只能在「设置」页按人配置，Region 版实例域名
+允许列表只能由管理员在「系统设置」页登记（详见 [docs/features/tracker-yunxiao.md](docs/features/tracker-yunxiao.md)）。
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。
@@ -175,6 +231,9 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 凭据以 AES-256-GCM 加密后入库，主密钥保存在数据库之外（`LATHE_SECRET_KEY`
 环境变量，或 `$LATHE_DATA_DIR/secret.key`，首次运行自动生成、权限 0600），
 因此拿到数据库转储也解不出凭据。
+
+通知渠道的 webhook URL 本身即凭据，按同一套 AES-GCM 加密存储，界面只显示
+`https://<host>/…`，不显示路径的任何部分（末 4 位也不显示 —— 那是 token）。
 
 也可继续用环境变量配置凭据（`LATHE_LINEAR_TOKEN` 等，见上表），优先级低于设置页，
 且**只对内置管理员生效**（`internal/creds` 的 `Factory.ProviderFor`：环境兜底只发给
@@ -264,6 +323,11 @@ webhook 密钥验签、任务记在各自名下、队列按属主解析各自的
 任务、仓库、凭据、统计互不可见（对非属主一律 404，不用 403 暴露存在）。
 旧路径 `/webhooks/linear` 继续指向内置管理员，兼容既有部署；环境变量凭据只给
 内置管理员兜底，不会漏给普通成员。
+
+**团队自定义技能**：仓库配置页可为每个仓库登记团队自己的技能（`SKILL.md` + 少量
+附属文件，存库、版本不可变），任务实现阶段物化到工作区的 `.claude/skills/team-<名字>/`，
+与 Lathe 内置技能分命名空间、不进 PR；每个任务第一次物化时钉住版本，重跑用同一版
+（[docs/features/team-skills.md](docs/features/team-skills.md)）。
 
 后续见 [docs/02-design.md](docs/02-design.md) §8：P2 OAuth 绑定与配额 → P3 多节点。
 

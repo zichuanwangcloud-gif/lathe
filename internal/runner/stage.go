@@ -90,6 +90,9 @@ func (s Stage) label() string {
 		return "推送分支失败"
 	case StageCreatePR:
 		return "创建 PR 失败"
+	case StageVCSCredential:
+		// 常量在 vcs.go（GitLab/Gitea 凭据缺失或实例不一致）。
+		return "代码平台凭据不可用"
 	case StageRebaseConflict:
 		// 这条常量定义在 pipeline.go（它的触发路径是 MergePoller 而不是
 		// Pipeline.Execute，见那里的注释）。**在这里补上标签**是因为它现在
@@ -103,6 +106,9 @@ func (s Stage) label() string {
 	case StageSkillMissing:
 		// 常量在 skills.go。
 		return "技能缺失"
+	case StageTeamSkillFailed:
+		// 常量在 teamskills.go（f11）。
+		return "团队技能物化失败"
 	}
 	return string(s)
 }

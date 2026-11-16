@@ -93,7 +93,7 @@ func TestCleanTestDBTargetsDSNDatabase(t *testing.T) {
 
 	t.Run("库不存在 → 非零退出，不回落", func(t *testing.T) {
 		u, _ := url.Parse(dsn)
-		u.Path = "/lathe_f12_nonexistent_" + randSuffix()
+		u.Path = "/lathe_f12_nonexistent_" + f12Suffix()
 		out, _, err := runCleanScript(t, u.String())
 		if err == nil {
 			t.Errorf("连不存在的库 got exit 0 want 非零\n%s", out)
@@ -153,7 +153,7 @@ func TestCleanTestDBDeleteSQLInRollback(t *testing.T) {
 	}
 	func() {
 		defer func() { _ = tx.Rollback(ctx) }()
-		sfx := randSuffix()
+		sfx := f12Suffix()
 		var fixtureUser, realUser, fixtureTeam, realTeam int64
 		mk := func(q string, dst *int64, args ...any) {
 			if err := tx.QueryRow(ctx, q, args...).Scan(dst); err != nil {

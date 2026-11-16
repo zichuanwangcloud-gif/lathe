@@ -94,6 +94,7 @@ package runner
 //     下面的 tail。
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"regexp"
@@ -387,6 +388,10 @@ var tokenShapes = []tokenShape{
 	{re: regexp.MustCompile(`\b(?:gh[pousr]|github_pat)_([A-Za-z0-9_]{16,})\b`), group: 1},
 	// Linear API key（同上，前缀保留）。
 	{re: regexp.MustCompile(`\blin_api_([A-Za-z0-9]{16,})\b`), group: 1},
+	// Lathe 自己签发的个人 API 令牌（lathe_pat_ + 43 个 base64url）。它不来自
+	// 环境变量，层 1 抓不到。整段抹掉、不保留前缀 —— 固定前缀没有额外排障价值。
+	// 尾部不加 \b：base64url 末位可能是 `-`，加了会回溯把它留在原文里。
+	{re: regexp.MustCompile(`\b(lathe_pat_[A-Za-z0-9_\-]{32,})`), group: 1},
 	// Anthropic / OpenAI 风格的 sk- 密钥（前缀保留）。
 	{re: regexp.MustCompile(`\b(sk-[A-Za-z0-9\-_]{16,})\b`), group: 1},
 	// Slack bot/app/user token（前缀保留）。
@@ -476,6 +481,17 @@ func redactText(s string, registered []string, extraEnv map[string]string) strin
 	return s
 }
 
+// RedactForDisplay 是「读取侧」的脱敏入口：落盘的完整验证日志没有脱敏
+// （verifylog.go 只做了 0600），任务详情页按块读取时每块返回前都必须过它
+// （docs/features/run-replay.md §3.2.3，AGENTS.md §7）。
+//
+// 只是 redactText 的薄包装，走同样的权威层 + 形态兜底两层，不另写规则；
+// 读取时拿不到那一轮的 StackEnv，所以 extraEnv 为 nil —— 隔离栈临时口令
+// 只能靠形态层识别 user:pass@ DSN，这一边界写在 run-replay.md「已知边界」。
+func RedactForDisplay(s string, registered []string) string {
+	return redactText(s, registered, nil)
+}
+
 // redactSecrets 是 redactText 的「无登记值」入口（测试与兼容调用用）。
 func redactSecrets(s string, env map[string]string) string {
 	return redactText(s, nil, env)
@@ -538,6 +554,17 @@ func tail(s string, n int) string {
 // 返回值一定是脱敏过的（权威层用本流水线登记的已知凭据 + 这一步的隔离栈
 // 连接串）—— 它只往库里和提示词里去。
 func (p *Pipeline) failureExcerpt(report Report) string {
+	return p.failureExcerptWith(nil, report)
+}
+
+// failureExcerptFor 是带本任务运行期凭据的版本：替换表 = 装配期登记的
+// Pipeline.KnownSecrets + 本任务属主解出的 vcs token（rc.secrets）。新切片，
+// 不改共享的 KnownSecrets —— 并发任务互不可见、无锁、无界增长也不会发生。
+func (p *Pipeline) failureExcerptFor(rc *runCtx, report Report) string {
+	return p.failureExcerptWith(rc.secrets, report)
+}
+
+func (p *Pipeline) failureExcerptWith(extra []string, report Report) string {
 	f := report.FirstFailure()
 	if f == nil {
 		return ""
@@ -556,5 +583,65 @@ func (p *Pipeline) failureExcerpt(report Report) string {
 		b.WriteString("\n输出尾部：\n" + tail(out, maxStepOutput))
 	}
 
-	return tail(redactText(b.String(), p.KnownSecrets, f.Step.StackEnv), maxDigestStoredExcerpt)
+	return tail(redactText(b.String(), p.registeredSecrets(extra), f.Step.StackEnv), maxDigestStoredExcerpt)
+}
+
+// registeredSecrets 返回 KnownSecrets 与 extra 的并集（总是新切片）。
+func (p *Pipeline) registeredSecrets(extra []string) []string {
+	if len(extra) == 0 {
+		return p.KnownSecrets
+	}
+	out := make([]string, 0, len(p.KnownSecrets)+len(extra))
+	out = append(out, p.KnownSecrets...)
+	return append(out, extra...)
+}
+
+// ---------------------------------------------------------------- 检出入口（f11）
+
+// pemPrivateKeyHeader 只供 FindCredential 用，**不加入 tokenShapes**：脱敏
+// （替换）语义保持不变 —— 文件头「已知接受的边界」里写明了 PEM 私钥块不在
+// 层 2 覆盖范围内，那是刻意的取舍，不是疏漏。
+//
+// 检出侧需要它：团队技能（docs/features/team-skills.md）保存时要拦住被贴进
+// 技能内容的私钥，而形态表认不出 `-----BEGIN … PRIVATE KEY-----`（kv 词根
+// private[_-]?key 要求后面跟 `:`/`=`）。两处规则没有重叠项，所以不存在
+// 「同一种凭据两份正则会漂移」的问题。将来若决定让脱敏也覆盖 PEM，
+// TestFindCredential_PEMDoesNotChangeRedaction 会先红：届时把这条合并进
+// tokenShapes、删掉这里的重复。
+//
+// 只认 BEGIN 头而不认整块：技能里贴半截私钥也要拦。
+var pemPrivateKeyHeader = regexp.MustCompile(`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----`)
+
+// FindCredential 报告 s 里第一个像凭据的位置（行号，1 起）；没有则 ok=false。
+//
+// 只返回行号不返回值 —— 调用方的错误信息会进界面与日志，绝不能把发现的凭据
+// 回显出去。registered 是已知凭据值（装配侧 KnownSecrets + 调用方解密出的
+// 用户集成凭据），走层 1 的精确比对。
+//
+// 两步：
+//  1. 复用脱敏总入口 redactText（同一张 tokenShapes 表，不复制第二份正则）：
+//     脱敏结果与原串不同，第一处差异所在的行就是命中行；
+//  2. 逐行匹配 pemPrivateKeyHeader。
+//
+// 两步都命中时取较小的行号。
+func FindCredential(s string, registered []string) (line int, ok bool) {
+	if r := redactText(s, registered, nil); r != s {
+		i := 0
+		for i < len(s) && i < len(r) && s[i] == r[i] {
+			i++
+		}
+		line, ok = strings.Count(s[:i], "\n")+1, true
+	}
+	if loc := pemPrivateKeyHeader.FindStringIndex(s); loc != nil {
+		if pl := strings.Count(s[:loc[0]], "\n") + 1; !ok || pl < line {
+			line, ok = pl, true
+		}
+	}
+	return line, ok
+}
+
+// CredentialRejectMessage 是凭据命中时给人看的拒绝原因：带文件与行号，不带内容。
+func CredentialRejectMessage(path string, line int) string {
+	return fmt.Sprintf("%s 第 %d 行像一段凭据（已拦下，不回显）。技能内容会物化进每个任务的工作区，"+
+		"不能放凭据；请改用环境变量或设置页的凭据配置。", path, line)
 }

@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +37,9 @@ type teamEnv struct {
 	lim   *limiter
 	clock func() time.Time
 	proxy bool
+	// logDir 是验证日志的根（AC-54 的读路由表里有 GET .../verifications/{vid}/log，
+	// 没有它就一律 503，成员读路由这条断言测不到归属）。
+	logDir string
 }
 
 func newTeamEnv(t *testing.T) *teamEnv {
@@ -44,6 +49,7 @@ func newTeamEnv(t *testing.T) *teamEnv {
 		t: t, st: st, m: task.NewMachine(st.Pool()),
 		srvs: map[int64]*httptest.Server{}, apis: map[int64]*TeamAPI{},
 		lim: newLimiter(), clock: time.Now,
+		logDir: t.TempDir(),
 	}
 }
 
@@ -118,7 +124,7 @@ func (e *teamEnv) server(uid int64) *httptest.Server {
 	}
 	a := authAs(uid, fmt.Sprintf("u%d@example.com", uid))
 	mux := http.NewServeMux()
-	(&API{Store: e.st, Tasks: e.m, Queue: &fakeEnqueuer{}, Auth: a}).Routes(mux)
+	(&API{Store: e.st, Tasks: e.m, Queue: &fakeEnqueuer{}, Auth: a, LogDir: e.logDir}).Routes(mux)
 	ta := &TeamAPI{Store: e.st, Auth: a, TrustProxy: e.proxy, limiter: e.lim, now: func() time.Time { return e.clock() }}
 	ta.Routes(mux)
 	(&PreviewAPI{Store: e.st, Auth: a, Previews: &fakePreviews{}}).Routes(mux)
@@ -220,10 +226,19 @@ func (e *teamEnv) invite(teamID int64, role string) (string, int64) {
 
 func p(format string, args ...any) string { return fmt.Sprintf(format, args...) }
 
+// taskReadPath 把 taskReadRoutes 里的占位符换成真实 ID。
+func taskReadPath(tpl string, taskID, vid int64) string {
+	path := strings.Replace(tpl, "{id}", itoa(taskID), 1)
+	return strings.Replace(path, "{vid}", itoa(vid), 1)
+}
+
 // sharedSetup：属主 owner 的仓库共享到团队 T（owner 是 T 的 member，mate 是 T 的 member），
 // 外加一个与团队无关的 stranger。返回各 id 与属主的一条任务。
 type sharedSetup struct {
 	owner, mate, stranger, team, repo, task int64
+	// vid 是 s.task 上一条带日志的验证行 ID，供 AC-54 读路由表里的
+	// GET /api/tasks/{id}/verifications/{vid}/log 用。
+	vid int64
 }
 
 func newSharedSetup(e *teamEnv) sharedSetup {
@@ -233,7 +248,30 @@ func newSharedSetup(e *teamEnv) sharedSetup {
 	s.repo = e.repo(s.owner)
 	e.share(s.repo, s.team)
 	s.task = e.task(s.owner, s.repo)
+	s.vid = e.verifyLog(s.task)
 	return s
+}
+
+// verifyLog 给任务插一条带日志文件的验证行，返回验证行 ID。
+// 路径格式与 runner 的 fileStepLogger 一致（resolveLogPath 按这个前缀校验）。
+func (e *teamEnv) verifyLog(taskID int64) int64 {
+	e.t.Helper()
+	rel := fmt.Sprintf("verify-logs/task-%d/round-1/01-build.log", taskID)
+	full := filepath.Join(e.logDir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+		e.t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("ok\n"), 0o600); err != nil {
+		e.t.Fatal(err)
+	}
+	var vid int64
+	if err := e.st.Pool().QueryRow(context.Background(),
+		`INSERT INTO verifications (task_id, tier, step, status, duration_ms, log_ref)
+		 VALUES ($1, 'heavy', 'build', 'passed', 1, $2) RETURNING id`,
+		taskID, rel).Scan(&vid); err != nil {
+		e.t.Fatalf("插验证行失败: %v", err)
+	}
+	return vid
 }
 
 // ---------------------------------------------------------------- 5.2 隔离与可见性
@@ -319,7 +357,7 @@ func TestTeamMemberReadsOthersTask(t *testing.T) {
 		t.Errorf("属主 viewerRole got %v want owner", got)
 	}
 	for _, rt := range taskReadRoutes {
-		path := strings.Replace(rt.path, "{id}", itoa(s.task), 1)
+		path := taskReadPath(rt.path, s.task, s.vid)
 		if got := e.status(s.mate, rt.method, path, ""); got != 200 {
 			t.Errorf("%s %s got %d want 200", rt.method, path, got)
 		}
@@ -335,7 +373,7 @@ func TestTeamMemberReadsEveryTaskReadRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, rt := range taskReadRoutes {
-		path := strings.Replace(rt.path, "{id}", itoa(s.task), 1)
+		path := taskReadPath(rt.path, s.task, s.vid)
 		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
 			if got := e.status(s.mate, rt.method, path, ""); got != 200 {
 				t.Errorf("成员 got %d want 200", got)

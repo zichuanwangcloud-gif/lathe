@@ -20,7 +20,9 @@ import (
 
 // ---------------------------------------------------------------- fixture
 
-func randSuffix() string {
+// f12Suffix 给 fixture 标识带随机量（AGENTS.md §5.5）。与 PAT 测试里的
+// randSuffix(t) 同名不同签名，合入 dev 时改名避免重复声明。
+func f12Suffix() string {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
@@ -30,7 +32,7 @@ func randSuffix() string {
 func teamTestUser(t *testing.T, st *Store, prefix string) int64 {
 	t.Helper()
 	var id int64
-	email := fmt.Sprintf("f12-%s-%s@example.com", prefix, randSuffix())
+	email := fmt.Sprintf("f12-%s-%s@example.com", prefix, f12Suffix())
 	if err := st.pool.QueryRow(context.Background(),
 		`INSERT INTO users (email) VALUES ($1) RETURNING id`, email).Scan(&id); err != nil {
 		t.Fatalf("建用户失败: %v", err)
@@ -50,7 +52,7 @@ func teamTestRepo(t *testing.T, st *Store, uid int64, infra ...string) int64 {
 	var id int64
 	if err := st.pool.QueryRow(context.Background(),
 		`INSERT INTO repos (user_id, provider_repo, verify_infra) VALUES ($1, $2, $3) RETURNING id`,
-		uid, "acme/f12-"+randSuffix(), infra).Scan(&id); err != nil {
+		uid, "acme/f12-"+f12Suffix(), infra).Scan(&id); err != nil {
 		t.Fatalf("建仓库失败: %v", err)
 	}
 	return id
@@ -62,7 +64,7 @@ func teamTestTeam(t *testing.T, st *Store, members map[int64]string) int64 {
 	ctx := context.Background()
 	var id int64
 	if err := st.pool.QueryRow(ctx,
-		`INSERT INTO teams (name) VALUES ($1) RETURNING id`, "f12-"+randSuffix()).Scan(&id); err != nil {
+		`INSERT INTO teams (name) VALUES ($1) RETURNING id`, "f12-"+f12Suffix()).Scan(&id); err != nil {
 		t.Fatalf("建团队失败: %v", err)
 	}
 	t.Cleanup(func() { _, _ = st.pool.Exec(context.Background(), `DELETE FROM teams WHERE id = $1`, id) })
@@ -88,7 +90,7 @@ func teamTestTask(t *testing.T, st *Store, uid, repoID int64) int64 {
 	var id int64
 	if err := st.pool.QueryRow(context.Background(), `
 		INSERT INTO tasks (user_id, repo_id, external_key) VALUES ($1,$2,$3) RETURNING id`,
-		uid, repoID, "F12-"+randSuffix()).Scan(&id); err != nil {
+		uid, repoID, "F12-"+f12Suffix()).Scan(&id); err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
 	return id
@@ -262,7 +264,7 @@ func TestListTasksTeamViewRowsMatchDefaultView(t *testing.T) {
 	var mine []int64
 	for i := 0; i < 3; i++ {
 		var id int64
-		key, provider := "F12-"+randSuffix(), "linear"
+		key, provider := "F12-"+f12Suffix(), "linear"
 		if i == 0 {
 			key, provider = issue.Key, "internal"
 		}
@@ -395,7 +397,7 @@ func TestListTasksScopeTeamUsesIndex(t *testing.T) {
 
 	// 20 个用户各 1 个仓库 × 2000 条任务；viewer = 0 号，与 1 号同在团队 T，1 号的仓库共享到 T
 	const users, perRepo = 20, 2000
-	sfx := randSuffix()
+	sfx := f12Suffix()
 	var uids, repos []int64
 	for i := 0; i < users; i++ {
 		var uid, rid int64
@@ -556,7 +558,7 @@ func newLockFixture(t *testing.T, st *Store) *lockFixture {
 	f.team = teamTestTeam(t, st, map[int64]string{f.owner: TeamRoleOwner, f.b: TeamRoleMember, f.c: TeamRoleMember})
 	f.repo = teamTestRepo(t, st, f.b)
 	f.acceptor = teamTestUser(t, st, "lk-acc")
-	f.code = "lk-" + randSuffix()
+	f.code = "lk-" + f12Suffix()
 	h := hashInviteCode(f.code)
 	if err := st.pool.QueryRow(context.Background(), `
 		INSERT INTO team_invitations (team_id, code_hash, code_hint, role, expires_at)

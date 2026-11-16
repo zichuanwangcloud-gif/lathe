@@ -130,7 +130,7 @@ func TestExistingReposStayPrivateAfterMigration(t *testing.T) {
 	ctx := context.Background()
 	uid := teamTestUser(t, st, "private")
 
-	if _, err := st.CreateRepo(ctx, uid, CreateRepoParams{ProviderRepo: "acme/private-" + randSuffix()}); err != nil {
+	if _, err := st.CreateRepo(ctx, uid, CreateRepoParams{ProviderRepo: "acme/private-" + f12Suffix()}); err != nil {
 		t.Fatalf("建仓库失败: %v", err)
 	}
 	var n int

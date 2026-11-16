@@ -161,6 +161,10 @@ runner 侧照 `VerificationRecorder` 的写法声明窄接口，**不 import int
   （均在 `internal/runner/mergepoll.go`）
 - AC7 人工点的取消（`internal/httpapi/api.go` 的 `cancelTask`）**不发信** —— 人自己点的不用通知自己
 
+> **站外渠道**：终态邮件之外，`failed/blocked_spec/awaiting_approval/pr_open`
+> 与 PRD 待签字可按用户配置推送到 Slack / 飞书，见
+> [features/notify-channels.md](./features/notify-channels.md)。
+
 ### T4 log_ref
 
 **探查修正**：`log_ref` 列已存在且可空，**无需迁移**。断点在

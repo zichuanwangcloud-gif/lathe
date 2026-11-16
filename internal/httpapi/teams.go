@@ -126,8 +126,8 @@ func teamError(w http.ResponseWriter, err error) {
 	}
 }
 
-// pathInt 解析路径参数；非法时按「团队不存在」处理（不给 ID 格式探针多一种响应）。
-func pathInt(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
+// teamPathInt 解析路径参数；非法时按「团队不存在」处理（不给 ID 格式探针多一种响应）。
+func teamPathInt(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue(name), 10, 64)
 	if err != nil || id <= 0 {
 		writeJSON(w, http.StatusNotFound, teamNotFound)
@@ -162,7 +162,7 @@ func (a *TeamAPI) createTeam(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) getTeam(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
@@ -175,7 +175,7 @@ func (a *TeamAPI) getTeam(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) renameTeam(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
@@ -194,7 +194,7 @@ func (a *TeamAPI) renameTeam(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) deleteTeam(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
@@ -207,7 +207,7 @@ func (a *TeamAPI) deleteTeam(w http.ResponseWriter, r *http.Request) {
 
 // createInvitation 生成一次性邀请码。响应里带明文码（仅此一次）；不查 users 表。
 func (a *TeamAPI) createInvitation(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
@@ -232,7 +232,7 @@ func (a *TeamAPI) createInvitation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) listInvitations(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
@@ -245,11 +245,11 @@ func (a *TeamAPI) listInvitations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) revokeInvitation(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
-	iid, ok := pathInt(w, r, "iid")
+	iid, ok := teamPathInt(w, r, "iid")
 	if !ok {
 		return
 	}
@@ -283,11 +283,11 @@ func (a *TeamAPI) acceptInvitation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) setMemberRole(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
-	uid, ok := pathInt(w, r, "uid")
+	uid, ok := teamPathInt(w, r, "uid")
 	if !ok {
 		return
 	}
@@ -307,11 +307,11 @@ func (a *TeamAPI) setMemberRole(w http.ResponseWriter, r *http.Request) {
 
 // removeMember 移除成员；uid = 自己时是退出。同一事务内收回离队者的共享。
 func (a *TeamAPI) removeMember(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}
-	uid, ok := pathInt(w, r, "uid")
+	uid, ok := teamPathInt(w, r, "uid")
 	if !ok {
 		return
 	}
@@ -324,7 +324,7 @@ func (a *TeamAPI) removeMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *TeamAPI) transferOwner(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathInt(w, r, "id")
+	id, ok := teamPathInt(w, r, "id")
 	if !ok {
 		return
 	}

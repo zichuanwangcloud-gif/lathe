@@ -19,6 +19,9 @@ type AdminAPI struct {
 	Sessions SessionStore
 	Resets   *store.Resets
 	Auth     *Auth
+	// PATs 在停用账号与代重置密码时吊销该用户全部个人 API 令牌。
+	// 为 nil 时这两个动作直接 500，不静默跳过。
+	PATs PATRevoker
 	// Store 读写系统设置（预览资源阈值等）；为 nil 时设置端点不可用。
 	Store *store.Store
 }
@@ -192,6 +195,16 @@ func (a *AdminAPI) disable(w http.ResponseWriter, r *http.Request) {
 		serverError(w, "清除会话失败", err)
 		return
 	}
+	// PAT 是「没有 Cookie 的会话」：停用同样要落库吊销（Lookup 里的
+	// disabled_at IS NULL 是第二道防线）。半途失败回 500，不报「已停用」。
+	if a.PATs == nil {
+		serverError(w, "吊销个人 API 令牌失败", errors.New("PAT 吊销未接线"))
+		return
+	}
+	if _, err := a.PATs.RevokeUser(r.Context(), u.ID); err != nil {
+		serverError(w, "吊销个人 API 令牌失败", err)
+		return
+	}
 	slog.Info("管理员停用了账号", "target", u.ID, "by", actorOf(r))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
@@ -258,6 +271,10 @@ func (a *AdminAPI) resetPassword(w http.ResponseWriter, r *http.Request) {
 	hash, err := auth.Hash(pw)
 	if err != nil {
 		serverError(w, "生成密码哈希失败", err)
+		return
+	}
+	// 先吊销全部个人 API 令牌，失败则口令不改（mustChange 的 409 不再是唯一屏障）
+	if !revokePATsBeforePasswordChange(w, r, a.PATs, u.ID) {
 		return
 	}
 	// 置 mustChange：这个密码要经第三方之手转交，必须用一次就换掉

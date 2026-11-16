@@ -1,0 +1,12 @@
+web/src/components/AgentEventItem.vue <div v-else-if="ev.kind === 'text'" class="md" v-html="mdOf(ev)"></div>
+web/src/components/AgentEventItem.vue <div v-if="resultText(ev)" class="md" v-html="md(resultText(ev))"></div>
+web/src/components/prd/PRDDocPanel.vue <div class="md" v-html="md(t.description)"></div>
+web/src/components/prd/PRDDocPanel.vue <div v-if="f.detail" class="md" v-html="md(f.detail)"></div>
+web/src/components/prd/PRDDocPanel.vue <div v-if="s.body.body" class="md" v-html="md(s.body.body)"></div>
+web/src/components/prd/ThinkingBlock.vue <div v-else class="t-text md" v-html="md(e.body)"></div>
+web/src/views/IssueDetail.vue <div class="md" v-html="md(c.body)"></div>
+web/src/views/IssueDetail.vue <div v-if="issue.description" class="md" v-html="md(issue.description)" style="margin-top: 8px"></div>
+web/src/views/TaskDetail.vue <div class="md" v-html="md(task.agentSummary)"></div>
+web/src/views/prd/PRDConversation.vue <div class="bubble"><div class="md" v-html="md(pendingInput)"></div></div>
+web/src/views/prd/PRDConversation.vue <div class="md" v-html="md(m.text)"></div>
+web/src/views/prd/PRDConversation.vue <div v-if="m.round.notes" class="md" v-html="md(m.round.notes)"></div>
