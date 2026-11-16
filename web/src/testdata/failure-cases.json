@@ -1,0 +1,126 @@
+[
+  {
+    "name": "tool_result isError=true 是失败",
+    "kind": "tool_result",
+    "payload": {
+      "toolUseId": "t1",
+      "isError": true
+    },
+    "severity": "error"
+  },
+  {
+    "name": "tool_result 无 isError 不是失败",
+    "kind": "tool_result",
+    "payload": {
+      "toolUseId": "t2"
+    },
+    "severity": null
+  },
+  {
+    "name": "tool_result isError=false 不是失败",
+    "kind": "tool_result",
+    "payload": {
+      "isError": false
+    },
+    "severity": null
+  },
+  {
+    "name": "verify_step failed 是失败",
+    "kind": "verify_step",
+    "payload": {
+      "status": "failed"
+    },
+    "severity": "error"
+  },
+  {
+    "name": "verify_step error 是失败",
+    "kind": "verify_step",
+    "payload": {
+      "status": "error"
+    },
+    "severity": "error"
+  },
+  {
+    "name": "verify_step passed 不是失败",
+    "kind": "verify_step",
+    "payload": {
+      "status": "passed"
+    },
+    "severity": null
+  },
+  {
+    "name": "verify_step skipped 不是失败",
+    "kind": "verify_step",
+    "payload": {
+      "status": "skipped"
+    },
+    "severity": null
+  },
+  {
+    "name": "result isError=true 是失败",
+    "kind": "result",
+    "payload": {
+      "subtype": "success",
+      "isError": true
+    },
+    "severity": "error"
+  },
+  {
+    "name": "result subtype=error_max_turns 是失败",
+    "kind": "result",
+    "payload": {
+      "subtype": "error_max_turns",
+      "isError": false
+    },
+    "severity": "error"
+  },
+  {
+    "name": "result success 不是失败",
+    "kind": "result",
+    "payload": {
+      "subtype": "success",
+      "isError": false
+    },
+    "severity": null
+  },
+  {
+    "name": "result 无 subtype 且 isError=false 不是失败（SQL 里 NULL <> 'success' 不成立）",
+    "kind": "result",
+    "payload": {
+      "isError": false
+    },
+    "severity": null
+  },
+  {
+    "name": "raw overflow 是警告",
+    "kind": "raw",
+    "payload": {
+      "type": "overflow",
+      "dropped": 3
+    },
+    "severity": "warn"
+  },
+  {
+    "name": "raw 其他 不是失败",
+    "kind": "raw",
+    "payload": {},
+    "severity": null
+  },
+  {
+    "name": "text 带 isError 也不是失败（只认四种形状）",
+    "kind": "text",
+    "payload": {
+      "isError": true
+    },
+    "severity": null
+  },
+  {
+    "name": "tool_use 本身不是失败",
+    "kind": "tool_use",
+    "payload": {
+      "toolUseId": "t3",
+      "isError": true
+    },
+    "severity": null
+  }
+]

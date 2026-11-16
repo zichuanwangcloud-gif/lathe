@@ -28,6 +28,26 @@ const PLATFORMS = [
   { value: 'gitea', label: 'Gitea', placeholder: 'owner/repo' },
 ]
 const platformLabel = (v) => PLATFORMS.find((p) => p.value === (v || 'github'))?.label || v
+// 执行 agent（f06）：哪些可选由 /api/agent-drivers 决定。codex 要运维配了
+// LATHE_CODEX_HOME 才启用；未启用时选项置灰，后端也会拒绝（双保险）。
+const AGENT_DRIVERS = [
+  { value: 'claude', label: 'claude — Claude Code（默认）' },
+  { value: 'codex', label: 'codex — OpenAI Codex CLI' },
+]
+const driverEnabled = ref({ claude: true, codex: false })
+
+async function loadDrivers() {
+  try {
+    const r = await api.agentDrivers()
+    const m = {}
+    for (const d of r.drivers || []) m[d.name] = !!d.enabled
+    driverEnabled.value = m
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    // 拿不到就保守：只有 claude 可选（与未启用 codex 的部署行为一致）
+    driverEnabled.value = { claude: true, codex: false }
+  }
+}
 
 // 登记新仓库（P1.5 第二步）：各归各的名下，不再需要管理员手工插库
 const newRepo = ref('')
@@ -107,6 +127,7 @@ async function save(repo) {
       verifyTierOverride: repo.verifyTierOverride || '',
       baselineDir: repo.baselineDir || '',
       verifyInfra,
+      agentDriver: repo.agentDriver || 'claude',
     })
     saved.value = repo.id
     setTimeout(() => (saved.value = null), 2000)
@@ -145,7 +166,10 @@ async function deployBaseline(repo, composeFile) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadDrivers()
+})
 </script>
 
 <template>
@@ -259,6 +283,27 @@ onMounted(load)
         </select>
         <small class="faint">
           {{ VERIFY_TIERS.find((t) => t.value === (repo.verifyTierOverride || ''))?.desc }}
+        </small>
+      </label>
+
+      <label class="full">
+        <span>执行 agent</span>
+        <select v-model="repo.agentDriver">
+          <option
+            v-for="d in AGENT_DRIVERS"
+            :key="d.value"
+            :value="d.value"
+            :disabled="!driverEnabled[d.value] && repo.agentDriver !== d.value"
+          >
+            {{ d.label }}{{ driverEnabled[d.value] ? '' : '（本实例未启用）' }}
+          </option>
+        </select>
+        <small class="faint">
+          写代码的 CLI。验证与红-绿证明对两者完全相同。<b>只影响之后新建的任务</b>；
+          在途任务继续用原来的 agent（会话是谁建的就得谁来续）。
+          <template v-if="!driverEnabled.codex">
+            codex 不可选：运维未配置 <span class="mono">LATHE_CODEX_HOME</span>（专用的 codex 配置目录）。
+          </template>
         </small>
       </label>
 

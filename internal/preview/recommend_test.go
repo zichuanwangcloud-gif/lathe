@@ -2,12 +2,16 @@ package preview
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 )
 
 // fakeAgent 喂固定输出并记录调用次数与 prompt。
@@ -15,6 +19,8 @@ type fakeAgent struct {
 	mu     sync.Mutex
 	output string
 	err    error
+	// res 非 nil 时原样返回（f03：模拟 CLI 报失败、带费用的结果）；默认行为不变。
+	res    *agent.Result
 	calls  int
 	prompt string
 }
@@ -26,6 +32,9 @@ func (f *fakeAgent) Run(ctx context.Context, p agent.RunParams) (*agent.Result, 
 	f.prompt = p.Prompt
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.res != nil {
+		return f.res, nil
 	}
 	return &agent.Result{Text: f.output, Success: true}, nil
 }
@@ -133,5 +142,112 @@ func TestParseRecommendationTolerant(t *testing.T) {
 	}
 	if rec.Kind != "dockerfile" {
 		t.Errorf("kind 应以扫描结果为准纠正为 dockerfile，得到 %s", rec.Kind)
+	}
+}
+
+// ---------------------------------------------------------------- f03 用量账本
+
+type fakeUsage struct {
+	mu   sync.Mutex
+	recs []agent.RunRecord
+	err  error
+}
+
+func (f *fakeUsage) RecordAgentRun(_ context.Context, r agent.RunRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recs = append(f.recs, r)
+	return f.err
+}
+
+func (f *fakeUsage) snapshot() []agent.RunRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.RunRecord(nil), f.recs...)
+}
+
+const validRec = `{"path":"deploy/docker-compose.yml","kind":"compose","reason":"自带依赖","env":{},"infra":[],"notes":""}`
+
+func recommendFixture(t *testing.T, withCandidate bool) (*Manager, string) {
+	t.Helper()
+	fd := &fakeDocker{outputs: map[string]fakeResult{"rev-parse": {stdout: "abc123\n"}, "ps": {stdout: ""}}}
+	m, wt := newTestManager(t, fd, 100, 100)
+	if withCandidate {
+		writeFile(t, wt, "deploy/docker-compose.yml", "services:\n  web:\n    image: app\n")
+	} else if err := os.Remove(filepath.Join(wt, "Dockerfile")); err != nil {
+		// newTestManager 默认放了一个 Dockerfile 候选；「没有候选」要把它拿掉
+		t.Fatal(err)
+	}
+	return m, wt
+}
+
+// AC-2d：预览推荐成功与失败都记一行；没起 agent 就没有花费、不记。
+func TestRecommendRecordsUsage(t *testing.T) {
+	cases := []struct {
+		name       string
+		candidate  bool
+		ag         *fakeAgent
+		wantRecs   int
+		wantStatus string
+		wantNilRes bool
+		wantCost   float64
+		wantState  string
+	}{
+		{"成功", true, &fakeAgent{res: &agent.Result{Success: true, Subtype: "success", Text: validRec, CostUSD: 0.05, CostKnown: true}}, 1, "success", false, 0.05, "done"},
+		{"agent 报错", true, &fakeAgent{err: errors.New("boom")}, 1, "error", true, 0, "failed"},
+		{"CLI 报失败", true, &fakeAgent{res: &agent.Result{IsError: true, Subtype: "error_during_execution", CostUSD: 0.02, CostKnown: true}}, 1, "error", false, 0.02, "failed"},
+		{"没有候选：不调 agent", false, &fakeAgent{output: validRec}, 0, "", false, 0, "failed"},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, wt := recommendFixture(t, tc.candidate)
+			u := &fakeUsage{}
+			m.Usage = u
+			m.SetRecommender(tc.ag, "", "project")
+			taskID := int64(100 + i)
+			if err := m.Recommend(context.Background(), taskID, wt, "CR-1"); err != nil {
+				t.Fatal(err)
+			}
+			op := waitRecommend(t, m, taskID)
+			if op.State != tc.wantState {
+				t.Errorf("State got %s, want %s（%+v）", op.State, tc.wantState, op)
+			}
+			recs := u.snapshot()
+			if len(recs) != tc.wantRecs {
+				t.Fatalf("记录数 got %d, want %d", len(recs), tc.wantRecs)
+			}
+			if tc.wantRecs == 0 {
+				return
+			}
+			r := recs[0]
+			if r.Kind != "preview" || r.Phase != "recommend" || r.TaskID != taskID || r.PRDID != 0 {
+				t.Errorf("Kind/Phase/TaskID got %s/%s/%d, want preview/recommend/%d", r.Kind, r.Phase, r.TaskID, taskID)
+			}
+			if got := store.RunStatus(r.Result, r.Err); got != tc.wantStatus {
+				t.Errorf("status got %s, want %s", got, tc.wantStatus)
+			}
+			if (r.Result == nil) != tc.wantNilRes {
+				t.Errorf("Result==nil got %v, want %v", r.Result == nil, tc.wantNilRes)
+			}
+			if r.Result != nil && r.Result.CostUSD != tc.wantCost {
+				t.Errorf("CostUSD got %v, want %v", r.Result.CostUSD, tc.wantCost)
+			}
+			if r.StartedAt.IsZero() || r.EndedAt.Before(r.StartedAt) {
+				t.Errorf("StartedAt/EndedAt got %v/%v", r.StartedAt, r.EndedAt)
+			}
+		})
+	}
+}
+
+// AC-3：记账失败不影响推荐结果。
+func TestRecommendUsageFailureIsNonFatal(t *testing.T) {
+	m, wt := recommendFixture(t, true)
+	m.Usage = &fakeUsage{err: errors.New("boom")}
+	m.SetRecommender(&fakeAgent{output: validRec}, "", "project")
+	if err := m.Recommend(context.Background(), 7, wt, "CR-1"); err != nil {
+		t.Fatal(err)
+	}
+	if op := waitRecommend(t, m, 7); op.State != "done" {
+		t.Errorf("State got %s, want done（%+v）", op.State, op)
 	}
 }

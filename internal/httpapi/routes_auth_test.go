@@ -19,6 +19,7 @@ func TestAdminAndSMTPRequireAuth(t *testing.T) {
 	(&AdminAPI{Users: st.NewUsers(), Sessions: st.NewSessions(), Resets: st.NewResets(), Auth: a}).Routes(mux)
 	(&SMTPAPI{Secrets: st.NewSecrets(testSealer(t)), Auth: a}).Routes(mux)
 	(&AccountAPI{Users: st.NewUsers(), Sessions: st.NewSessions(), Resets: st.NewResets(), Auth: a}).Routes(mux)
+	(&PATAPI{PATs: st.NewPATs(), Auth: a, Sessions: st.NewSessions()}).Routes(mux)
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -36,6 +37,10 @@ func TestAdminAndSMTPRequireAuth(t *testing.T) {
 		{"DELETE", "/api/smtp", ""},
 		// 改密要求登录；注册与忘记密码是公开的，不在此列
 		{"POST", "/api/password/change", `{"currentPassword":"a","newPassword":"b"}`},
+		// 个人 API 令牌管理
+		{"GET", "/api/pat", ""},
+		{"POST", "/api/pat", `{"name":"x","currentPassword":"y"}`},
+		{"DELETE", "/api/pat/1", ""},
 	}
 
 	for _, e := range endpoints {

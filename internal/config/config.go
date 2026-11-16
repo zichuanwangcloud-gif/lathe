@@ -1,6 +1,8 @@
 // Package config 加载 Lathe 的运行配置。
 //
-// 只依赖标准库：配置来源为环境变量，缺失时取默认值。
+// 配置来源为环境变量，缺失时取默认值。除标准库外只依赖 internal/integration/agent
+// 的 CheckCodexHomeNotInTempDir（与 codex 驱动起进程前的复查共用一个实现；
+// agent 只依赖 internal/capbuf，不成环）。
 // 密钥类字段（Linear token、GitHub token）不写入日志，见 Redacted。
 package config
 
@@ -8,10 +10,13 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // Config 是 Lathe 控制面与节点代理的完整配置。
@@ -106,6 +111,14 @@ type Config struct {
 	// Agent 执行
 	ClaudeBin    string        // claude CLI 路径
 	AgentTimeout time.Duration // 单次 agent 执行上限，超时杀进程树
+	// CodexHome 是 codex 驱动的专用 CODEX_HOME（LATHE_CODEX_HOME，f06）。
+	// 空 = codex 驱动不启用，仓库不能选 codex。消费方：CodexDriver 注入子进程
+	// CODEX_HOME（并以 <CodexHome>/home 作子进程 HOME）、PUT /api/repos 的可选性
+	// 校验、GET /api/agent-drivers、运行时面板。codex 的模型/provider/凭据由运维
+	// 写进这个目录（config.toml / auth.json），Lathe 不读也不改。
+	CodexHome string
+	// CodexBin 是 codex CLI 路径（LATHE_CODEX_BIN，默认 codex）。只在 codex 启用时校验。
+	CodexBin string
 	// SettingSources 传给 claude --setting-sources。默认 "project"：只加载
 	// 目标仓库自己的配置，排除执行者个人环境的插件（§9 上下文基线成本）。
 	SettingSources string
@@ -293,6 +306,8 @@ func Load() (Config, error) {
 		WorkspaceRoot:         env("LATHE_WORKSPACE_ROOT", "/opt/lathe/workspaces"),
 		PnpmStore:             env("LATHE_PNPM_STORE", "/opt/lathe/.pnpm-store"),
 		ClaudeBin:             env("LATHE_CLAUDE_BIN", "claude"),
+		CodexHome:             env("LATHE_CODEX_HOME", ""),
+		CodexBin:              env("LATHE_CODEX_BIN", "codex"),
 		AgentTimeout:          envDuration("LATHE_AGENT_TIMEOUT", 45*time.Minute),
 		WorktreeTTL:           envDuration("LATHE_WORKTREE_TTL", 72*time.Hour),
 		ReapInterval:          envDuration("LATHE_REAP_INTERVAL", time.Hour),
@@ -396,7 +411,64 @@ func (c Config) Validate() error {
 	if c.CookieSecure != "" && c.CookieSecure != "true" && c.CookieSecure != "false" {
 		return fmt.Errorf("config: LATHE_COOKIE_SECURE 只能是 true 或 false，得到 %q", c.CookieSecure)
 	}
+	if err := c.validateCodex(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// CodexEnabled 报告本实例是否启用了 codex 驱动（配置了 LATHE_CODEX_HOME）。
+func (c Config) CodexEnabled() bool { return c.CodexHome != "" }
+
+// validateCodex 校验 codex 驱动的两个配置项。不设 LATHE_CODEX_HOME 时 codex
+// 不启用，LATHE_CODEX_BIN 指向什么都不校验 —— 默认部署零影响。
+//
+// 每条拒绝都是「启用了也跑不对」的情形，必须在启动时炸，而不是运行期静默降级：
+//   - 不是绝对路径 / 不存在：子进程的 CODEX_HOME 会随 cwd 漂移或干脆没有；
+//   - 等于个人 ~/.codex：个人的 hooks、技能、配置会在每个目标仓库的任务里生效（P11）；
+//   - 在系统临时目录之下：codex 拒绝创建 helper 二进制，shell 工具一条都不执行
+//     而且不报错（P17），任务只会以「没有改动」或验证失败结束；
+//   - codex 可执行文件找不到。
+func (c Config) validateCodex() error {
+	if c.CodexHome == "" {
+		return nil
+	}
+	if !filepath.IsAbs(c.CodexHome) {
+		return fmt.Errorf("config: LATHE_CODEX_HOME 必须是绝对路径，得到 %q", c.CodexHome)
+	}
+	fi, err := os.Stat(c.CodexHome)
+	if err != nil {
+		return fmt.Errorf("config: LATHE_CODEX_HOME=%s 不可用（需要一个已存在的目录）: %w", c.CodexHome, err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("config: LATHE_CODEX_HOME=%s 不是目录", c.CodexHome)
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		personal := filepath.Join(home, ".codex")
+		if sameDir(c.CodexHome, personal) {
+			return fmt.Errorf("config: LATHE_CODEX_HOME 不得使用个人目录 %s：个人的 hooks、技能与配置会在每个目标仓库的任务里生效。"+
+				"请新建一个专用目录，并在其中执行 CODEX_HOME=<该目录> codex login", personal)
+		}
+	}
+	if err := agent.CheckCodexHomeNotInTempDir(c.CodexHome, os.TempDir()); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if _, err := exec.LookPath(c.CodexBin); err != nil {
+		return fmt.Errorf("config: 已设置 LATHE_CODEX_HOME，但找不到 codex 可执行文件 LATHE_CODEX_BIN=%q: %w", c.CodexBin, err)
+	}
+	return nil
+}
+
+// sameDir 按 Clean + EvalSymlinks 比较两个目录（解析失败用 Clean 后的原值）。
+func sameDir(a, b string) bool {
+	norm := func(p string) string {
+		p = filepath.Clean(p)
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return p
+	}
+	return norm(a) == norm(b)
 }
 
 // PublicURL 返回用于拼接外链的基地址。
