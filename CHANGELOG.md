@@ -20,6 +20,26 @@
   `GET /api/tasks/{id}/events` 支持 `paged` / `before` / `phase` / `kind` / `failures`
   （不带这些参数时响应与旧版完全相同）。
 - `make ui-test`：前端纯函数测试（`node --test`，不引入依赖）与 `v-html` 全量白名单守卫。
+- **个人 API 令牌（PAT）**：个人设置页可签发/命名/吊销带过期时间的令牌，请求带
+  `Authorization: Bearer lathe_pat_…`，权限严格等于本人（管理员签的才是管理员权限）。
+  库里只存 SHA-256，明文只在创建时显示一次；记录最后使用时间；签发需输入当前密码；
+  账号停用、修改/找回/被重置密码后其全部令牌立即失效。令牌管理只能用浏览器登录态发起。
+  `LATHE_ADMIN_TOKEN` 行为不变。迁移 0044。详见 `docs/features/personal-api-token.md`。
+- **收件箱**：`/inbox` 把等你处理的事集中到一个页面，包括需求待补充、等你放行、
+  review 停车、前驱阻塞、失败待处置，以及 PRD 的待回答 / 待批准 / 待逐节确认 / 运行失败。
+  每项一键跳到处理页，顶栏显示未读计数，失败事项可以忽略。事项从现有状态实时派生，
+  新表 `inbox_marks` 只存已读/忽略（迁移 0035）；另给 `tasks` 加了 `(user_id, state)`
+  索引（迁移 0036，CONCURRENTLY）。新增接口 `GET /api/inbox`、`GET /api/inbox/count`、
+  `POST /api/inbox/items/{key}/read|unread|dismiss`、`POST /api/inbox/read-all`。
+  收件箱里的失败原因先经与失败记忆同一套两层脱敏再展示（docs/features/inbox.md）。
+- **云效（Projex）工作项作为任务来源**（[docs/features/tracker-yunxiao.md](docs/features/tracker-yunxiao.md)）：
+  指派给我 / 打上触发标签即接单，也可按工作项 ID 手动开跑；分诊读正文与评论（富文本转纯文本），
+  单子不明确时在云效回帖提问并停下，PR 开出后回帖链接；可选的状态同步（开跑 / PR 已开 / 已合并
+  三个时刻按配置的状态名推进，失败不影响任务）与取消联动（云效改到配置的「取消」状态 → 取消在途任务）。
+  webhook `/webhooks/yunxiao/{slug}` 按用户验签、载荷只取 id 回源拉权威数据、按快照边沿检测防重复接单；
+  令牌与 webhook 密钥 AES-256-GCM 加密存储、界面只显示掩码。出站请求有守卫：接入点只能是中心版或管理员
+  登记的 Region 域名，拨号期拒绝内网地址，不跟随重定向，错误信息不回显上游响应体。
+  迁移 0053–0055。Linear 与内置工单行为不变。
 
 ### Fixed
 

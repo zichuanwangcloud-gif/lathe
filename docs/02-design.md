@@ -101,6 +101,15 @@ sessions(id, user_id, expires_at, created_at)
       -- id 是会话令牌的 sha256，明文只存在于 Cookie 里
 password_reset_tokens(token_hash, user_id, expires_at, used_at, created_at)
       -- 同样只存哈希；单次消费，认领语义同 webhook_deliveries
+personal_access_tokens(id, user_id, name, token_hash, prefix, created_at,
+                       last_used_at, expires_at, revoked_at, use_count)
+      -- 个人 API 令牌（PAT）。只存 SHA-256，明文只在签发响应里出现一次；软吊销。
+      -- 身份来源共三条，Bearer 优先于 Cookie：
+      --   ① LATHE_ADMIN_TOKEN（部署级应急通道，= 内置管理员，守卫 a.Token != ""）
+      --   ② Bearer lathe_pat_…（= 签发者本人，不提权不降权；查不到直接 401，不回落 Cookie）
+      --   ③ 会话 Cookie
+      -- 令牌管理只认 Cookie；停用/改密/找回/代重置都吊销该用户全部 PAT。
+      -- 详见 docs/features/personal-api-token.md
 smtp_settings(id=1, host, port, username, password_enc, from_addr, from_name,
               tls_mode,       -- starttls | tls | none
               verified_at, verify_error)
