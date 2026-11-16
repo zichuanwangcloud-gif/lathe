@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { api } from './api'
 import { auth, refresh, clear, isAdmin, hasLinearToken } from './auth'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import InboxBadge from './components/InboxBadge.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -48,6 +49,7 @@ onMounted(() => {
         <RouterLink to="/" class="brand">Lathe</RouterLink>
         <nav class="row">
           <RouterLink to="/">任务看板</RouterLink>
+          <RouterLink to="/inbox">收件箱 <InboxBadge /></RouterLink>
           <RouterLink to="/issues">工单</RouterLink>
           <RouterLink to="/prds">模糊任务</RouterLink>
           <RouterLink to="/flows">编排</RouterLink>

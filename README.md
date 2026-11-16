@@ -1,6 +1,7 @@
 # Lathe
 
 > 绑定 Linear 账户后，指派给你的 issue 自动变成一个**已验证**的 PR。
+> 需求来源：Linear / 内置工单 / 阿里云云效（Projex）工作项。
 
 Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：bug 类任务必须先在改动前的代码上复现失败，才有权声称修复。
 
@@ -24,6 +25,8 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
 | [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
 | [docs/11-branching-release.md](docs/11-branching-release.md) | 分支管理与发版规范（贡献者必读） |
+| [docs/features/personal-api-token.md](docs/features/personal-api-token.md) | 个人 API 令牌（PAT）：设计、接口、安全边界与验收结果 |
+| [docs/features/inbox.md](docs/features/inbox.md) | 收件箱：待人处理事项聚合 |
 
 ## 技术栈
 
@@ -70,6 +73,10 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #    - Linear Webhook 密钥：建 webhook 时 Linear 生成
 #    - GitHub Webhook 密钥（可选，PR 评论回流用）：建仓库 webhook 时自己填的 Secret
 #    - 邮件发送（SMTP）：用于「忘记密码」，保存时会真投一封测试邮件
+#    - 云效连接（可选，需求来源用阿里云云效 Projex 时）：接入点、组织 ID、个人访问令牌、
+#      webhook 密钥（≥16 位，自己定）、触发标签与可选的状态同步名。保存时用令牌取当前
+#      用户，「指派给我」判定用这个账号 ID。Region 版（专属实例）需管理员先在「系统设置」
+#      登记实例域名，否则保存会被拒（防止服务端被当成访问内网的跳板）
 #    每项保存后会立即验证连通性。Linear 验证时自动获取你的账号 ID，
 #    接单判定直接使用，无需手工填写。
 #
@@ -86,6 +93,12 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 #
 # 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
 #    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
+#
+# 9.（可选）云效任务来源：「设置」页的云效卡片里有回调地址
+#    /webhooks/yunxiao/<同一个随机段>。在云效项目 → 设置 → 自动化规则用 Webhook 模板
+#    新建两条规则（触发「字段变更」与「状态变更」），Body 选【工作项数据】，
+#    Secret 填与卡片里「Webhook 密钥」相同的串。之后指派给你（或打上卡片里配的
+#    触发标签）的工作项就会接单；也可以在卡片里按工作项 ID 手动开跑。
 ```
 
 ### 账号
@@ -95,6 +108,12 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 代重置密码、删除账号及其数据。
 
 忘记密码需要先配好 SMTP。没配的话，管理员可以在用户管理页代为重置。
+
+脚本与 CI 用「个人设置 → 个人 API 令牌」签发 PAT，请求带
+`Authorization: Bearer lathe_pat_…`，**权限与你本人完全相同**（管理员签的才是管理员权限）。
+明文只在创建时显示一次，签发时需输入当前密码；可设过期、可随时吊销。
+**停用账号、修改密码、找回或被管理员重置密码，都会吊销你的全部令牌。**
+`LATHE_ADMIN_TOKEN` 仍保留为部署级应急通道，两者互不影响。
 
 ### 任务预览环境
 
@@ -135,7 +154,7 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_DB_*` | 数据库连接六元组（HOST/PORT/USER/PASSWORD/NAME/SSLMODE），默认对齐 `make dev-infra`（127.0.0.1:55432，lathe/lathe）；镜像部署用它指向外部 Postgres（需 PostgreSQL ≥ 15，0038 用 `UNIQUE NULLS NOT DISTINCT`） |
 | `LATHE_ADMIN_EMAIL` | 内置管理员邮箱，默认 `admin@lathe.local` |
 | `LATHE_ADMIN_PASSWORD` | 内置管理员初始口令，不配则随机生成并打印一次 |
-| `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配 |
+| `LATHE_ADMIN_TOKEN` | 脚本/应急通道的 Bearer 令牌，可不配。日常脚本请用个人 API 令牌，见 [docs/features/personal-api-token.md](docs/features/personal-api-token.md) |
 | `LATHE_LINEAR_TOKEN` | Linear API 令牌的兜底值。**只对内置管理员生效**，且优先级低于设置页（界面里配了就以界面为准，改完即刻生效） |
 | `LATHE_LINEAR_WEBHOOK_SECRET` | Linear webhook 签名密钥的兜底值。**只对内置管理员生效**、优先级低于设置页 |
 | `LATHE_LINEAR_USER_ID` | 「指派给我了吗」接单判定用的 Linear 用户 ID。**只对内置管理员生效**；设置页配 Linear 令牌时会自动取到账号 ID，正常情况不用手工填 |
@@ -163,6 +182,9 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_NODE_NAME` | 节点名（事件 actor 前缀、管理界面运行时面板），默认主机名 |
 | `LATHE_PNPM_STORE` | 验证器跑前端步骤时共享的 pnpm store 目录，默认 `/opt/lathe/.pnpm-store` |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
+
+云效（Projex）任务来源**没有环境变量**：连接只能在「设置」页按人配置，Region 版实例域名
+允许列表只能由管理员在「系统设置」页登记（详见 [docs/features/tracker-yunxiao.md](docs/features/tracker-yunxiao.md)）。
 
 口令用 bcrypt（cost 12）哈希；会话与密码重置令牌在库里只存 SHA-256，
 明文分别只存在于 Cookie 与邮件里。

@@ -22,6 +22,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/creds"
 	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
 	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
+	"github.com/zichuanwangcloud-gif/lathe/internal/inbox"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/mail"
@@ -165,7 +166,8 @@ func serve(cfg config.Config) error {
 		return err
 	}
 
-	go gcSessions(ctx, sessions)
+	pats := st.NewPATs()
+	go gcAuthRows(ctx, sessions, pats)
 
 	// P1.5 第二步：凭据按用户隔离。环境变量兜底只给内置管理员 ——
 	// 那是部署者自己的账号，不该借给普通成员的任务用。
@@ -176,6 +178,10 @@ func serve(cfg config.Config) error {
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID, st)
+	// 云效任务来源（f08）：每用户一条连接，与 integrations 分开存、同一个
+	// Sealer 加密。云效没有环境变量兜底（只能在设置页配）。
+	yunxiaoConns := st.NewYunxiaoConnections(sealer)
+	factory.WithYunxiao(yunxiaoConns)
 
 	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory)
 	if err != nil {
@@ -242,8 +248,10 @@ func serve(cfg config.Config) error {
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
 	// （脚本调用，同时是把自己锁在门外时的应急入口）
+	// 第三条：个人 API 令牌（Bearer lathe_pat_…），身份等于签发者本人。
 	auth := httpapi.NewAuth(os.Getenv("LATHE_ADMIN_TOKEN")).
-		WithStore(users, sessions, admin, cfg.SecureCookies())
+		WithStore(users, sessions, admin, cfg.SecureCookies()).
+		WithPATs(pats)
 	auth.TrustProxy = cfg.TrustedProxy
 	// 「Linear 任务」菜单的显隐依据：与执行队列同一条凭据通路，
 	// 管理员的 env 兜底自然被覆盖；只解密本地凭据，不访问 Linear。
@@ -279,14 +287,39 @@ func serve(cfg config.Config) error {
 		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
 	})
 
+	// 云效工作项回调（f08）：/webhooks/yunxiao/{slug}，与 Linear/GitHub 共用
+	// 用户的随机段、按用户的云效 webhook 密钥验签。没有无 slug 的兜底路径
+	// （同 GitHub 新入口的立场）。
+	mux.Handle("POST /webhooks/yunxiao/{slug}", &httpapi.YunxiaoWebhook{
+		Resolver:   &httpapi.YunxiaoResolver{Users: users, Conns: yunxiaoConns, Store: st},
+		Deliveries: st,
+		Triggers:   yunxiaoConns,
+		Tasks:      q,
+	})
+	(&httpapi.YunxiaoAPI{Conns: yunxiaoConns, Store: st, Auth: auth, Tasks: q}).Routes(mux)
+
 	apiSrv := &httpapi.API{
 		Store:        st,
 		Tasks:        task.NewMachine(st.Pool()),
 		Queue:        q,
 		Auth:         auth,
 		ConfigStatus: configStatus(cfg),
+		// 验证日志读取（f04）：与 Pipeline.LogDir / KnownSecrets 同源（buildPipeline 里的同名字段），
+		// 漏装时日志接口一律 503、静默不可用 —— TestServeWiresVerificationLogIntoAPI 守着。
+		LogDir:       cfg.DataDir,
+		KnownSecrets: cfg.KnownSecrets(),
 	}
 	apiSrv.Routes(mux)
+
+	// 收件箱（docs/features/inbox.md）：等人处理的事项从现有状态实时派生，
+	// 原因文本先过 runner 同一套两层脱敏再上界面。
+	inboxSvc, err := inbox.NewService(st, func(s string) string {
+		return runner.RedactText(s, cfg.KnownSecrets())
+	})
+	if err != nil {
+		return err
+	}
+	(&httpapi.InboxAPI{Service: inboxSvc, Auth: auth}).Routes(mux)
 
 	// 看板「同步 Linear」的只读接口。凭据与执行队列走同一条通路，
 	// 设置页里改完 Linear token 即刻生效，不用重启。
@@ -304,10 +337,15 @@ func serve(cfg config.Config) error {
 		Resets:     st.NewResets(),
 		Auth:       auth,
 		Mail:       mail.NewSender(secrets.LoadSMTP),
+		PATs:       pats,
 		BaseURL:    cfg.PublicURL(),
 		TrustProxy: cfg.TrustedProxy,
 	}
 	accountAPI.Routes(mux)
+
+	// 个人 API 令牌的签发/列出/吊销：只接受会话 Cookie，签发需当前口令。
+	patAPI := &httpapi.PATAPI{PATs: pats, Auth: auth, Sessions: sessions}
+	patAPI.Routes(mux)
 
 	smtpAPI := &httpapi.SMTPAPI{
 		Secrets:  secrets,
@@ -321,6 +359,7 @@ func serve(cfg config.Config) error {
 		Sessions: sessions,
 		Resets:   st.NewResets(),
 		Auth:     auth,
+		PATs:     pats,
 		Store:    st,
 	}
 	adminAPI.Routes(mux)
@@ -813,8 +852,12 @@ func ensureSuperadmin(ctx context.Context, users *store.Users, cfg config.Config
 	return users.ByID(ctx, u.ID)
 }
 
-// gcSessions 定期清理过期会话与过期的密码重置令牌。
-func gcSessions(ctx context.Context, sessions *store.Sessions) {
+// gcAuthRows 定期清理过期会话、过期的密码重置令牌，以及吊销/过期满 30 天的
+// 个人 API 令牌。
+//
+// 同一个定时器、两次独立调用、两段独立日志：PAT 行数不混进会话的计数，
+// 免得运维看到删除数以为全是会话。
+func gcAuthRows(ctx context.Context, sessions *store.Sessions, pats *store.PersonalAccessTokens) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
 	for {
@@ -822,13 +865,15 @@ func gcSessions(ctx context.Context, sessions *store.Sessions) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := sessions.GC(ctx)
-			if err != nil {
+			if n, err := sessions.GC(ctx); err != nil {
 				slog.Warn("清理过期会话失败", "err", err)
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				slog.Info("已清理过期会话与重置令牌", "rows", n)
+			}
+			if n, err := pats.GC(ctx); err != nil {
+				slog.Warn("清理过期个人 API 令牌失败", "err", err)
+			} else if n > 0 {
+				slog.Info("已清理过期个人 API 令牌", "rows", n)
 			}
 		}
 	}

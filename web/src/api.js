@@ -82,9 +82,24 @@ export const api = {
     return request(`/api/tasks${qs ? '?' + qs : ''}`)
   },
   task: (id) => request(`/api/tasks/${id}`),
-  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0
-  taskEvents: (id, after = 0, limit = 200) =>
-    request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`),
+  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0。
+  // opts（回放，docs/features/run-replay.md §3.2.1）：{before, phase, kind, failures}；
+  // 带 opts 时一律附 paged=1，响应多 first_id/has_more。before 与 after 互斥。
+  taskEvents: (id, after = 0, limit = 200, opts) => {
+    if (!opts) return request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`)
+    const q = new URLSearchParams({ paged: '1', limit: String(limit) })
+    if (opts.before != null) q.set('before', String(opts.before))
+    else q.set('after', String(after || 0))
+    if (opts.phase?.length) q.set('phase', [].concat(opts.phase).join(','))
+    if (opts.kind?.length) q.set('kind', [].concat(opts.kind).join(','))
+    if (opts.failures) q.set('failures', '1')
+    return request(`/api/tasks/${id}/events?${q}`)
+  },
+  // 执行日志汇总：各阶段条数/失败数、失败列表、首末失败（不受内存窗口影响）
+  taskEventsSummary: (id) => request(`/api/tasks/${id}/events/summary`),
+  // 完整验证日志按块读取（经服务端脱敏）；offset 只传 0 或上一块的 nextOffset
+  verificationLog: (id, vid, { part = 0, offset = 0, limit = 65536 } = {}) =>
+    request(`/api/tasks/${id}/verifications/${vid}/log?part=${part}&offset=${offset}&limit=${limit}`),
   stats: () => request('/api/stats'),
   // 成本聚合独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
   // 不需要 5 秒新鲜度（后端注释里有完整理由）。
@@ -122,6 +137,23 @@ export const api = {
   addIssueComment: (id, body) =>
     request(`/api/issues/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
   startInternalIssue: (id) => request(`/api/issues/${id}/start`, { method: 'POST' }),
+
+  // 收件箱（docs/features/inbox.md）：等你处理的事项，从现有状态实时派生；
+  // 这里只读状态、只写「读过 / 忽略过」，处理动作仍走原来的详情页。
+  inbox: (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.filter) q.set('filter', params.filter)
+    if (params.kind) q.set('kind', params.kind)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return request(`/api/inbox${qs ? '?' + qs : ''}`)
+  },
+  inboxCount: () => request('/api/inbox/count'),
+  inboxRead: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/read`, { method: 'POST' }),
+  inboxUnread: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/unread`, { method: 'POST' }),
+  inboxDismiss: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/dismiss`, { method: 'POST' }),
+  inboxReadAll: () => request('/api/inbox/read-all', { method: 'POST' }),
 
   // 模糊任务规划（docs/10-prd-template.md）：多轮对话式智能体读代码产出
   // PRD，对抗复核 + 自检过闸、人逐节签字后，一键生成正式任务与编排图。
@@ -223,6 +255,11 @@ export const api = {
   deleteIntegration: (kind) =>
     request(`/api/integrations/${kind}`, { method: 'DELETE' }),
 
+  // 个人 API 令牌（PAT）。签发需带 currentPassword；明文只在 createPAT 的响应里出现一次。
+  pats: () => request('/api/pat'),
+  createPAT: (body) => request('/api/pat', { method: 'POST', body: JSON.stringify(body) }),
+  revokePAT: (id) => request(`/api/pat/${id}`, { method: 'DELETE' }),
+
   smtp: () => request('/api/smtp'),
   saveSmtp: (body) => request('/api/smtp', { method: 'PUT', body: JSON.stringify(body) }),
   verifySmtp: (testTo) =>
@@ -240,6 +277,18 @@ export const api = {
       body: JSON.stringify({ password: password || '' }),
     }),
   deleteUser: (id) => request(`/api/admin/users/${id}`, { method: 'DELETE' }),
+
+  // 云效任务来源（f08）
+  yunxiaoConnection: () => request('/api/yunxiao/connection'),
+  saveYunxiaoConnection: (body) =>
+    request('/api/yunxiao/connection', { method: 'PUT', body: JSON.stringify(body) }),
+  verifyYunxiaoConnection: () => request('/api/yunxiao/connection/verify', { method: 'POST' }),
+  deleteYunxiaoConnection: () => request('/api/yunxiao/connection', { method: 'DELETE' }),
+  runYunxiaoWorkitem: (id) =>
+    request(`/api/yunxiao/workitems/${encodeURIComponent(id)}/run`, { method: 'POST' }),
+  yunxiaoAllowedHosts: () => request('/api/admin/yunxiao/allowed-hosts'),
+  saveYunxiaoAllowedHosts: (hosts) =>
+    request('/api/admin/yunxiao/allowed-hosts', { method: 'PUT', body: JSON.stringify({ hosts }) }),
 }
 
 // 状态的中文名与配色，全站统一。
