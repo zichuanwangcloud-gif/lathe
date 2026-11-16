@@ -25,10 +25,10 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="spread" style="margin-bottom: 16px">
+  <div class="page-head">
     <div>
-      <h2 style="margin: 0">编排流程图</h2>
-      <p class="dim" style="margin: 4px 0 0">
+      <h1>编排流程图</h1>
+      <p class="dim">
         一批带依赖关系的任务一次性建图、自动按序调度——不用每个后继手动重新入队。
       </p>
     </div>

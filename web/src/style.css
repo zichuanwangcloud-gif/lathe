@@ -1,106 +1,159 @@
+/* 视觉体系参照 Multica（packages/ui/styles/tokens.css）：zinc 中性灰阶 +
+   「外壳 → 页面画布 → 内容卡片」三层表面，控件紧凑（32px 高、6px 圆角）。
+   变量名沿用既有命名，组件里的 var(--surface-2) 等一行不用改。 */
 :root {
-  --bg: #0f1115;
-  --surface: #171a21;
-  --surface-2: #1e222b;
-  --border: #2a2f3a;
-  --text: #e4e7ec;
-  --text-dim: #9aa3b2;
-  --text-faint: #6b7280;
-  --accent: #5b9cf6;
-  /* 填充级强调色：白字 4.88:1 达标（原 #5b9cf6 填充只有 2.79:1，过不了 WCAG 1.4.3）。
-     --accent 只做文字/描边级用途（暗底 6.78:1 合格）；凡是白字压上去的填充底，
-     一律用 --accent-strong。 */
-  --accent-strong: #2f6fd0;
-  --accent-strong-hover: #2a63ba;
-  /* 同上：--bad #f85149 填充压白字只有 3.35:1，破坏性操作的确认按钮用深红 */
-  --bad-strong: #d13438;
-  --bad-strong-hover: #b32d31;
+  --shell: oklch(0.155 0.005 285.823);   /* 侧栏所在的最外层框 */
+  --bg: oklch(0.18 0.005 285.823);        /* 页面画布 */
+  --surface: oklch(0.21 0.006 285.885);   /* 卡片 / 有边界的内容组 */
+  --surface-2: oklch(0.274 0.006 286.033);/* hover / 次级填充 */
+  --surface-selected: oklch(0.3 0.006 286.033);
+  --border: oklch(1 0 0 / 10%);
+  --border-soft: oklch(1 0 0 / 6%);
+  --input-border: oklch(1 0 0 / 15%);
+  --text: oklch(0.985 0 0);
+  --text-dim: oklch(0.705 0.015 286.067);
+  --text-faint: oklch(0.60 0.015 286.067);
+  --accent: oklch(0.65 0.16 255);         /* 品牌蓝：只做文字 / 描边级 */
+  --accent-bg: oklch(0.65 0.16 255 / 18%);
+  /* 白字压在上面的填充底一律用 strong（WCAG 1.4.3） */
+  --accent-strong: oklch(0.56 0.194 256.4);
+  --accent-strong-hover: oklch(0.51 0.19 256.4);
+  /* 主按钮：Multica 用前景色反相填充，而不是品牌色 */
+  --primary: oklch(0.92 0.004 286.32);
+  --primary-hover: oklch(0.86 0.004 286.32);
+  --primary-fg: oklch(0.21 0.006 285.885);
+  --bad-strong: oklch(0.577 0.245 27.325);
+  --bad-strong-hover: oklch(0.52 0.23 27.325);
 
-  --ok: #3fb950;
-  --ok-bg: rgba(63, 185, 80, 0.12);
-  --bad: #f85149;
-  --bad-bg: rgba(248, 81, 73, 0.12);
-  --warn: #d29922;
-  --warn-bg: rgba(210, 153, 34, 0.12);
-  --run: #58a6ff;
-  --run-bg: rgba(88, 166, 255, 0.12);
-  --idle: #8b949e;
-  --idle-bg: rgba(139, 148, 158, 0.12);
+  --ok: oklch(0.70 0.15 145);
+  --bad: oklch(0.704 0.191 22.216);
+  --warn: oklch(0.75 0.15 80);
+  --run: oklch(0.70 0.15 250);
+  --idle: oklch(0.705 0.015 286.067);
+  --ok-bg: color-mix(in oklab, var(--ok) 14%, transparent);
+  --bad-bg: color-mix(in oklab, var(--bad) 14%, transparent);
+  --warn-bg: color-mix(in oklab, var(--warn) 14%, transparent);
+  --run-bg: color-mix(in oklab, var(--run) 14%, transparent);
+  --idle-bg: color-mix(in oklab, var(--idle) 14%, transparent);
+
+  --surface-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 1px 1px rgb(0 0 0 / 0.16);
+  --floating-shadow: 0 20px 48px rgb(0 0 0 / 0.46), 0 4px 12px rgb(0 0 0 / 0.28);
 
   --radius: 8px;
+  --radius-sm: 6px;
+  --radius-lg: 12px;
+  --control-h: 32px;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: dark;
 }
 
 @media (prefers-color-scheme: light) {
   :root:not([data-theme='dark']) {
-    --bg: #f6f7f9;
-    --surface: #ffffff;
-    --surface-2: #f0f2f5;
-    --border: #d8dce3;
-    --text: #1c2024;
-    --text-dim: #5b6472;
-    --text-faint: #8b929e;
-    /* 亮主题链接/描边加深：#5b9cf6 在亮底上只有 2.60:1，#2f6fd0 有 4.55:1。
-       填充级 strong 与暗主题共用（白字对比与底色无关）。 */
-    --accent: #2f6fd0;
+    --shell: oklch(0.9644 0.0013 286.375);
+    --bg: oklch(0.988 0 0);
+    --surface: oklch(1 0 0);
+    --surface-2: oklch(0.967 0.001 286.375);
+    --surface-selected: oklch(0.935 0.003 286.375);
+    --border: oklch(0.92 0.004 286.32);
+    --border-soft: oklch(0.945 0.003 286.32);
+    --input-border: oklch(0.90 0.004 286.32);
+    --text: oklch(0.141 0.005 285.823);
+    /* 0.505 由 AA 钉死：在最深的浅色表面（侧栏 hover）上仍有 4.5:1 */
+    --text-dim: oklch(0.505 0.016 285.938);
+    --text-faint: oklch(0.606 0.016 285.938);
+    --accent: oklch(0.52 0.19 256.4);
+    --accent-bg: oklch(0.56 0.194 256.4 / 12%);
+    --primary: oklch(0.21 0.006 285.885);
+    --primary-hover: oklch(0.30 0.006 285.885);
+    --primary-fg: oklch(0.985 0 0);
+    /* 浅底上的状态色压深一档，文字级对比才够 */
+    --ok: oklch(0.52 0.15 145);
+    --bad: oklch(0.56 0.22 27);
+    --warn: oklch(0.56 0.13 70);
+    --run: oklch(0.52 0.18 250);
+    --idle: oklch(0.505 0.016 285.938);
+    --surface-shadow: 0 1px 2px rgb(15 23 42 / 0.04), 0 1px 1px rgb(15 23 42 / 0.03);
+    --floating-shadow: 0 16px 40px rgb(15 23 42 / 0.14), 0 3px 10px rgb(15 23 42 / 0.08);
     color-scheme: light;
   }
 }
-
-:root { color-scheme: dark; }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  background: var(--bg);
+  background: var(--shell);
   color: var(--text);
-  font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font: 14px/20px var(--sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+
+h1, h2, h3 { letter-spacing: -0.01em; font-weight: 600; }
+h1 { font-size: 20px; line-height: 28px; }
+h2 { font-size: 16px; line-height: 24px; }
+h3 { font-size: 14px; line-height: 20px; }
 
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 button {
   font: inherit;
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--control-h);
+  border: 1px solid var(--input-border);
+  background: var(--surface);
   color: var(--text);
-  padding: 6px 14px;
-  border-radius: var(--radius);
-  transition: border-color .15s, background .15s;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--surface-shadow);
+  white-space: nowrap;
+  transition: background .12s, border-color .12s, color .12s;
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
+button:hover:not(:disabled) { background: var(--surface-2); }
 button:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #fff; }
-button.primary:hover:not(:disabled) {
-  background: var(--accent-strong-hover);
-  border-color: var(--accent-strong-hover);
-}
-button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+button.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-fg); }
+button.primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
+button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
 button.danger-solid { background: var(--bad-strong); border-color: var(--bad-strong); color: #fff; }
 button.danger-solid:hover:not(:disabled) {
   background: var(--bad-strong-hover);
   border-color: var(--bad-strong-hover);
 }
+button.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-dim); }
+button.ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
 
 input, select, textarea {
   font: inherit;
-  background: var(--bg);
+  background: transparent;
   color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 7px 10px;
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius-sm);
+  padding: 5px 10px;
+  transition: border-color .12s, box-shadow .12s;
 }
+input:not([type='checkbox']):not([type='radio']), select { min-height: var(--control-h); }
+select option { background: var(--surface); color: var(--text); }
 /* focus 不再移除 outline：全局 :focus-visible 焦点环统一兜底（见文件尾）。 */
-input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+input:focus, select:focus, textarea:focus {
+  border-color: var(--text-faint);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--text-faint) 25%, transparent);
+}
+::placeholder { color: var(--text-faint); }
 
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--surface-shadow);
   padding: 16px;
 }
 
@@ -108,19 +161,33 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 .dim { color: var(--text-dim); }
 .faint { color: var(--text-faint); }
 
+/* 状态胶囊：Multica 式「圆点 + 文字」，底色极淡 */
 .badge {
-  display: inline-block;
-  padding: 2px 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 8px;
   border-radius: 999px;
   font-size: 12px;
+  line-height: 18px;
   font-weight: 500;
   white-space: nowrap;
+  border: 1px solid transparent;
+}
+.badge::before {
+  content: "";
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
 }
 .badge.ok   { color: var(--ok);   background: var(--ok-bg); }
 .badge.bad  { color: var(--bad);  background: var(--bad-bg); }
 .badge.warn { color: var(--warn); background: var(--warn-bg); }
 .badge.run  { color: var(--run);  background: var(--run-bg); }
 .badge.idle { color: var(--idle); background: var(--idle-bg); }
+.badge.run::before { animation: badge-pulse 1.6s ease-in-out infinite; }
+@keyframes badge-pulse { 50% { opacity: .35; } }
 
 .row { display: flex; align-items: center; gap: 10px; }
 .spread { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -131,12 +198,12 @@ th {
   text-align: left;
   font-weight: 500;
   color: var(--text-dim);
-  font-size: 12.5px;
+  font-size: 12px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
-td { padding: 11px 12px; border-bottom: 1px solid var(--border); }
+td { padding: 8px 12px; height: 40px; border-bottom: 1px solid var(--border-soft); }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: var(--surface-2); }
 
@@ -164,7 +231,7 @@ pre {
 .error-banner {
   background: var(--bad-bg);
   color: var(--bad);
-  border: 1px solid var(--bad);
+  border: 1px solid color-mix(in oklab, var(--bad) 35%, transparent);
   border-radius: var(--radius);
   padding: 10px 14px;
   margin-bottom: 16px;
@@ -174,6 +241,7 @@ pre {
    从 App.vue 的 scoped 样式提到这里 —— 现在有五个页面要用它。 */
 .login-wrap {
   min-height: 100vh;
+  background: var(--shell);
   display: grid;
   place-items: center;
   padding: 20px;
@@ -184,7 +252,8 @@ pre {
   flex-direction: column;
   gap: 14px;
 }
-.login-card h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+.login-card { padding: 28px; }
+.login-card h1 { margin: 0; font-size: 24px; line-height: 32px; letter-spacing: -0.02em; }
 .login-card p { margin: 0; }
 
 /* 认证卡片底部的辅助链接（去注册 / 忘记密码 / 回登录） */
@@ -208,7 +277,7 @@ pre {
    此前全站没有任何焦点样式，唯一的 focus 规则还在移除 outline —— 键盘用户
    完全无法定位焦点（WCAG 2.4.7 Focus Visible）。 */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid color-mix(in oklab, var(--accent) 70%, transparent);
   outline-offset: 2px;
 }
 
@@ -222,3 +291,40 @@ pre {
     scroll-behavior: auto !important;
   }
 }
+
+/* 滚动条：细、只在悬停时显形（参照 Multica scrollbar-slim） */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in oklab, var(--text) 14%, transparent) transparent; }
+
+/* ---------------------------------------------------------------- 页面骨架 */
+
+/* 页面头：标题 + 一行说明 + 右侧操作，Multica 每个列表页的统一开头 */
+.page-head {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
+  margin-bottom: 20px;
+}
+.page-head h1 { margin: 0; }
+.page-head p { margin: 2px 0 0; font-size: 13px; }
+
+/* 视图常是多根片段，直接落在画布里；相邻卡片之间统一留白 */
+.page-inner > .card + .card { margin-top: 16px; }
+
+/* 分段控件：筛选标签用一条浅底轨道包住，选中项浮起，替代一排独立按钮 */
+.seg {
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  flex-wrap: wrap;
+}
+.seg > button {
+  min-height: 28px; padding: 0 10px;
+  background: transparent; border-color: transparent; box-shadow: none;
+  color: var(--text-dim);
+}
+.seg > button:hover:not(:disabled) { background: transparent; color: var(--text); }
+.seg > button.primary,
+.seg > button[aria-pressed='true'] {
+  background: var(--surface); color: var(--text);
+  border-color: var(--border); box-shadow: var(--surface-shadow);
+}
+/* 只有一个标题、没有操作区的页面，也对齐页面头的节奏 */
+.page-inner > h1:first-child { margin: 0 0 20px; }

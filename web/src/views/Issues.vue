@@ -89,10 +89,10 @@ onMounted(load)
 
 <template>
   <div>
-    <div class="spread" style="margin-bottom: 16px">
+    <div class="page-head">
       <div>
-        <h2 style="margin: 0">工单</h2>
-        <p class="dim" style="margin: 4px 0 0">
+        <h1>工单</h1>
+        <p class="dim">
           手动维护的需求列表 —— 不经过 Linear。建单、写需求、开跑；agent 的提问会落在工单评论区。
         </p>
       </div>
