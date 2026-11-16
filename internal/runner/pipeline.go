@@ -522,11 +522,14 @@ func deref(s *string) string {
 // stageTriage 判断单子明确度与任务类型。单子不明确时回帖提问并转
 // blocked_spec（产品边界：不猜），以 errHalt 正常终止。
 func (p *Pipeline) stageTriage(rc *runCtx) error {
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateTriaging, rc.actor, &task.TransitionOpts{
+	triaging, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateTriaging, rc.actor, &task.TransitionOpts{
 		Payload: rc.takeRetryPayload(),
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+	// 平台状态同步（started）：只对实现了 StatusSyncer 的 tracker 生效，尽力而为。
+	syncTrackerStatus(rc.ctx, rc.tracker, triaging, rc.params.IssueRef, tracker.LifecycleStarted)
 
 	issue, err := rc.tracker.Issue(rc.ctx, rc.params.IssueRef)
 	if err != nil {
@@ -1176,6 +1179,8 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 	if _, err := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); err != nil {
 		slog.Warn("回帖失败", "task", rc.tk.ID, "err", err)
 	}
+	// 平台状态同步（pr_open）：在转移与回帖之后，尽力而为。
+	syncTrackerStatus(rc.ctx, rc.tracker, opened, rc.params.IssueRef, tracker.LifecyclePROpen)
 
 	// F2.3-AC5：本任务到达 pr_open，唤醒它直接依赖它、此前被阻塞的后继。
 	// 唤醒失败只告警；被唤醒的任务会在调度器下一轮轮询里自然被捞到，
