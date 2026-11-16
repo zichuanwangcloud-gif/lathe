@@ -9,6 +9,14 @@
 
 ### Added
 
+- **团队自定义技能**（docs/features/team-skills.md）：可按仓库登记带版本的自定义技能，任务
+  实现阶段物化到 `.claude/skills/team-<slug>/`，与产品内置技能分命名空间、不进 PR；名称防
+  路径穿越、大小/数量上限、内容凭据扫描、属主隔离。版本不可变，任务第一次物化时钉住版本
+  （新表 `team_skills` / `team_skill_versions` / `team_task_skills`，迁移 0061–0063），续跑用
+  同一版、从头重建重钉最新版。隐藏靠每个技能目录里的哨兵 `.gitignore`，不写 mirror 共享的
+  `info/exclude`；物化前对路径逐级拒绝符号链接与被目标仓库跟踪的路径，物化前后 `git status`
+  必须不变，提交前复位哨兵 —— 技能文件骗不过「工作区无改动」判死。物化失败落新失败阶段
+  `team_skill_failed`，重试一律回到实现阶段重新物化。不新增环境变量。
 - **定时建单**（`docs/features/scheduled-issue.md`）：每日 / 每周 / 每 N 小时三种规则，
   到点用属主自己的 Linear 令牌在 Linear 建单（指派给自己或打接单标签），之后走正常的
   接单 → 分诊 → 验证 → PR，调度器本身不建任务、不碰代码。同一计划时刻多节点只建一次

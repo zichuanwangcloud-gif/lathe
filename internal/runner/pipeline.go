@@ -15,6 +15,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
 	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
@@ -141,6 +142,12 @@ type Pipeline struct {
 	// 为 nil 时该层关闭，形态表照旧工作（测试与老装配）。
 	KnownSecrets []string
 
+	// TeamSkills 读写团队自定义技能（f11，docs/features/team-skills.md）：
+	// 实现阶段钉版本并物化进 .claude/skills/team-<slug>/，提交前复位哨兵。
+	// 为 nil 时整个机制关闭，行为与引入它之前完全一致（测试与老装配）。
+	// *store.Store 直接满足该接口。
+	TeamSkills TeamSkillSource
+
 	// Stacks 起 per-task 依赖隔离栈（T8）；为 nil 时不起栈，
 	// 验证命令用宿主环境跑 —— 与本字段引入之前完全一致。
 	//
@@ -262,6 +269,10 @@ type runCtx struct {
 	// review 是 PR review 二轮（plan.Review）本轮要处理的意见，setup 里
 	// 收集一次；非二轮恒为 nil。
 	review *pendingReview
+	// teamPins 是本轮实现阶段钉住并物化的团队技能（f11），供 stageCommit /
+	// 修复轮前的 hideTeamSkills 复用；为 nil 表示这一轮没经过 stageImplement
+	// （续跑入口），hideTeamSkills 届时从库里取。
+	teamPins []store.TeamSkillPin
 
 	retryNoted bool // 重试决策是否已落进某次转移的 payload
 }
@@ -757,6 +768,13 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		return p.fail(rc, StageSkillMissing, err)
 	}
 
+	// f11：团队自定义技能。钉版本（首次）→ 路径体检 → 物化进 team-<slug>/
+	// （目录内哨兵让它对 git 不可见）→ 写后自检。同样在驱动 agent 之前，
+	// 任何一步失败都落 StageTeamSkillFailed（重试会回到这里重新物化）。
+	if err := p.prepareTeamSkills(rc); err != nil {
+		return err
+	}
+
 	prompt, resumeFlag := p.implementPrompt(rc)
 	implRes, reported, err := p.runAgent(rc, "implement", prompt, rc.implSession, resumeFlag)
 	// 驱动上报的真实会话 ID 永远优先（codex 不接受预分配 ID，P3）：库已由
@@ -1002,6 +1020,11 @@ func (p *Pipeline) stageCommit(rc *runCtx) error {
 		return err
 	}
 
+	// f11：哨兵在 worktree 里，agent 能删能改。判断「有没有改动」之前先复位，
+	// 否则团队技能文件会骗过「工作区无改动」判死、被 add -A 带进 PR。
+	if err := p.hideTeamSkills(rc); err != nil {
+		return p.fail(rc, StageTeamSkillFailed, err)
+	}
 	changed, err := p.Worktrees.HasChanges(rc.ctx, rc.wt)
 	if err != nil {
 		return p.fail(rc, StageCheckChanges, err)
@@ -1165,6 +1188,12 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		}
 		if fixRes.IsError {
 			slog.Warn("修复轮未成功完成", "task", rc.tk.ID, "subtype", fixRes.Subtype)
+			break
+		}
+		// f11：与 stageCommit 同理，判断改动前先复位团队技能的哨兵。复位失败
+		// 与「提交修复改动失败」同款处理：不提交，按当前验证结果收尾。
+		if herr := p.hideTeamSkills(rc); herr != nil {
+			slog.Warn("修复轮复位团队技能失败，不提交，按当前验证结果收尾", "task", rc.tk.ID, "err", herr)
 			break
 		}
 		// 没产生改动的修复轮等于没修 —— 跳出按失败收尾，不空烧轮次
