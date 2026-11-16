@@ -387,6 +387,10 @@ var tokenShapes = []tokenShape{
 	{re: regexp.MustCompile(`\b(?:gh[pousr]|github_pat)_([A-Za-z0-9_]{16,})\b`), group: 1},
 	// Linear API key（同上，前缀保留）。
 	{re: regexp.MustCompile(`\blin_api_([A-Za-z0-9]{16,})\b`), group: 1},
+	// Lathe 自己签发的个人 API 令牌（lathe_pat_ + 43 个 base64url）。它不来自
+	// 环境变量，层 1 抓不到。整段抹掉、不保留前缀 —— 固定前缀没有额外排障价值。
+	// 尾部不加 \b：base64url 末位可能是 `-`，加了会回溯把它留在原文里。
+	{re: regexp.MustCompile(`\b(lathe_pat_[A-Za-z0-9_\-]{32,})`), group: 1},
 	// Anthropic / OpenAI 风格的 sk- 密钥（前缀保留）。
 	{re: regexp.MustCompile(`\b(sk-[A-Za-z0-9\-_]{16,})\b`), group: 1},
 	// Slack bot/app/user token（前缀保留）。

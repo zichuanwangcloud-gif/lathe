@@ -3,6 +3,7 @@ import { ref, computed, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth, refresh } from '../auth'
 import { confirmDialog } from '../confirm'
+import PersonalTokens from '../components/PersonalTokens.vue'
 import YunxiaoConnection from '../components/YunxiaoConnection.vue'
 
 // 每个用户专属的 webhook 回调地址（P1.5 第二步）：
@@ -263,6 +264,7 @@ onMounted(load)
     </p>
   </div>
 
+  <PersonalTokens />
   <YunxiaoConnection />
 
   <div class="card cred">
