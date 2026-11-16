@@ -285,6 +285,20 @@ type RunParams struct {
 	//   codex：不接受预分配 ID，读到 thread.started 时回调 thread_id。
 	// 与 OnEvent 同一份契约：在读取协程里同步执行，实现须并发安全、尽量轻量。
 	OnSession func(id string)
+
+	// StreamInput 为真时以 --input-format stream-json --replay-user-messages 启动，
+	// prompt 作为 stdin 的第一帧写入（运行中插话，docs/features/interject.md）。
+	// stdin 的生命周期见 session.go 的包注释：首条 result / ctx 结束或看门狗 /
+	// Wait 返回，三者任一先到即关。默认 false（走位置参数，与引入本字段之前
+	// 逐行一致）—— 分诊、PRD 规划、预览推荐都不打开它。
+	StreamInput bool
+	// OnReady 在进程起来、stdin 可写后回调一次，交出可投递句柄。
+	// 仅 StreamInput 时生效；为 nil 时插话机制整体消失。
+	OnReady func(*Session)
+	// OnDelivery 是注入帧的投递回显（--replay-user-messages 的 isReplay 事件）。
+	// 在**读协程**里同步调用，契约：只许做内存操作（非阻塞发信号），
+	// 禁止任何 I/O —— 尤其是 DB 写。读协程被拖慢会让看门狗与事件流一起变慢。
+	OnDelivery func(deliveryID string)
 }
 
 // ErrNoResultEvent 表示 CLI 退出了但没给出终局 result 事件。
@@ -303,10 +317,30 @@ func (d *ClaudeDriver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	if p.Resume && p.SessionID == "" {
 		return nil, fmt.Errorf("agent: Resume 需要 SessionID")
 	}
+	if p.StreamInput && p.Prompt == "" {
+		// 流式输入下 prompt 是 stdin 首帧；没有首帧 CLI 只会干等。
+		return nil, fmt.Errorf("agent: StreamInput 需要非空 Prompt（作为 stdin 首帧）")
+	}
 
+	// 走共用的 supervise（与 codex 同一份进程监管）：总超时 / 静默判死 /
+	// 杀整棵进程树 / 管道宽限期都在那里，claude 只决定「怎么起」与「怎么读」。
+	// StreamInput 时另起 stdin 管道，会话句柄同时喂给 parse（首条 result 关
+	// stdin）与 Started（交出句柄）。
+	if p.StreamInput {
+		l, sess, err := d.claudeStreamLaunch(p)
+		if err != nil {
+			return nil, err
+		}
+		// 兜底关闭点：supervise 的 Exited / BeforeKill / OnResult 之外，
+		// 起进程失败这条路也要收掉写端（否则每次失败漏一个 fd）。
+		defer sess.closeStdin()
+		return supervise(ctx, l,
+			superviseLimits{Timeout: d.timeout, Idle: d.idleTimeout()},
+			claudeParse(p, sess), p.OnEvent)
+	}
 	return supervise(ctx, d.claudeLaunch(p),
 		superviseLimits{Timeout: d.timeout, Idle: d.idleTimeout()},
-		parseClaude, p.OnEvent)
+		claudeParse(p, nil), p.OnEvent)
 }
 
 // claudeLaunch 构造 claude 的启动描述。stdin 不接（nil），与抽出 supervise
@@ -320,14 +354,76 @@ func (d *ClaudeDriver) claudeLaunch(p RunParams) launch {
 	}
 }
 
-// parseClaude 是 claude 的 supervise parse：每一条可解析的 JSON 行先喂看门狗
-// 再投递，不过滤 —— touch 集合与抽出 supervise 之前逐行相同（非 JSON 行、
-// 坏 JSON 行不 touch）。f01 的过滤加在这里时，Touch 已经在过滤之前。
+// claudeStreamLaunch 构造 StreamInput 模式的启动描述（运行中插话）：
+//
+//   - prompt 不作位置参数，改走 stdin 的第一帧（buildArgs 已按 StreamInput 分支）；
+//   - stdin 必须是 *os.File（os.Pipe 读端）。原因见 launch.Stdin 的注释：
+//     传普通 io.Reader 时 os/exec 会起一条拷贝协程，cmd.Wait 要等它读到 EOF，
+//     而写端要等首条 result 才关 —— 死锁。
+//   - 三个生命周期钩子都挂在 Session 上，与 supervise 的三个时机一一对应：
+//     Started（交出句柄）/ BeforeKill（ctx 或看门狗，杀进程组之前）/
+//     Exited（cmd.Wait 返回后的兜底）。首条 result 的关闭点在 parse 里。
+//
+// 返回的 Session 必须由调用方兜底 closeStdin（起进程失败时 supervise 不会
+// 走到 Exited，写端会漏）。
+func (d *ClaudeDriver) claudeStreamLaunch(p RunParams) (launch, *Session, error) {
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		return launch{}, nil, fmt.Errorf("agent: 建 stdin 管道失败: %w", err)
+	}
+	first, err := userFrame(newFrameID(), p.Prompt)
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		return launch{}, nil, err
+	}
+	sess := newSession(stdinW)
+	sess.writeFirst(first)
+
+	l := launch{
+		Bin:   d.bin,
+		Args:  d.buildArgs(p),
+		Dir:   p.Dir,
+		Env:   append(sanitizedEnv(), p.ExtraEnv...),
+		Stdin: stdinR,
+		Started: func() {
+			if p.OnReady != nil {
+				p.OnReady(sess)
+			}
+		},
+		// 杀进程组之前先关写端：让 CLI 读到 EOF 自己收尾，
+		// 而不是被 SIGKILL 打断在写一半的输出上。
+		BeforeKill: sess.closeStdin,
+		Exited:     sess.closeStdin,
+	}
+	return l, sess, nil
+}
+
+// claudeParse 是 claude 的 supervise parse。sess 非 nil（StreamInput）时
+// 首条 result 到达即关 stdin，并把注入帧的回显交给 OnDelivery。
+//
+// 过滤规则在 parseStreamWith 里（Touch 由它自己调，且在过滤之前 ——
+// 被丢弃的 command_lifecycle / replay 回显照样证明进程活着）。
+func claudeParse(p RunParams, sess *Session) func(io.Reader, parseHooks) (*Result, error) {
+	return func(r io.Reader, h parseHooks) (*Result, error) {
+		onResult := func() {}
+		if sess != nil {
+			onResult = sess.closeStdin
+		}
+		return parseStreamWith(r, streamHooks{
+			Touch:      h.Touch,
+			OnEvent:    h.Emit,
+			OnDelivery: p.OnDelivery,
+			OnResult:   onResult,
+			Whitelist:  p.StreamInput,
+		})
+	}
+}
+
+// parseClaude 是 claude 的 supervise parse（非流式）。保留这个名字是为了既有
+// 测试与 supervise 的默认调用点；行为与引入 StreamInput 之前逐行相同。
 func parseClaude(r io.Reader, h parseHooks) (*Result, error) {
-	return parseStream(r, func(e Event) {
-		h.Touch()
-		h.Emit(e)
-	})
+	return claudeParse(RunParams{}, nil)(r, h)
 }
 
 func (d *ClaudeDriver) buildArgs(p RunParams) []string {
@@ -350,14 +446,62 @@ func (d *ClaudeDriver) buildArgs(p RunParams) []string {
 	}
 	args = append(args, p.ExtraArgs...)
 
+	if p.StreamInput {
+		// prompt 不作位置参数：它是 stdin 的第一帧（Run 写入）。
+		return append(args, "--input-format", "stream-json", "--replay-user-messages")
+	}
 	if p.Prompt != "" {
 		args = append(args, p.Prompt)
 	}
 	return args
 }
 
+// streamHooks 是 parseStreamWith 的回调集合（均可为 nil）。
+type streamHooks struct {
+	// Touch 每一条可解析的 JSON 行都调，**过滤之前** —— 喂看门狗。
+	Touch func()
+	// OnEvent 只收放行的事件。
+	OnEvent func(Event)
+	// OnDelivery 收 isReplay 回显的 uuid（读协程上同步调用，只许做内存操作）。
+	OnDelivery func(id string)
+	// OnResult 在第一条 result 到达时调一次（StreamInput 用来关 stdin）。
+	OnResult func()
+	// Whitelist 为真时（StreamInput 模式）只放行 system/assistant/user/result。
+	Whitelist bool
+}
+
+// replayProbe 只取回显判定需要的两个字段。
+type replayProbe struct {
+	IsReplay bool   `json:"isReplay"`
+	UUID     string `json:"uuid"`
+}
+
 // parseStream 逐行解析 NDJSON 事件，返回终局 result。
 func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
+	return parseStreamWith(r, streamHooks{OnEvent: onEvent})
+}
+
+// parseStreamWith 是 parseStream 的完整实现。过滤规则（按顺序）：
+//
+//  0. 每一条 JSON 行先 Touch() —— 过滤在喂看门狗之后，被丢弃的事件照样证明进程活着
+//  1. type=user 且 isReplay=true → OnDelivery(uuid)，不交给 OnEvent【所有模式】
+//     这是 --replay-user-messages 对我们写进 stdin 的帧的回显：它的 content
+//     是 text 块，Digest 会把它记成 KindText —— 人插的话就会以 **agent 自己说的
+//     正文** 出现在事件流里，审计上张冠李戴。
+//  2. type=command_lifecycle → 丢弃【所有模式】
+//     --input-format stream-json 的命令排队/开始/完成通知，是 CLI 的连接性噪声，
+//     不是 agent 产出；不丢的话 Digest 的 default 分支会把它退化成 raw。
+//  3. Whitelist 为真时：type ∉ {system, assistant, user, result} → 丢弃【仅 StreamInput】
+//  4. 其余照旧交给 OnEvent（含非 replay 的 user = 真·工具结果回灌）
+//
+// 1、2 两种形状只会由流式输入产生，非流式模式下它们根本不出现，过滤是 no-op。
+// 3 只在 StreamInput 开：非流式下未知类型仍按 docs/04「提炼不出结构时保底 raw」。
+// system/<非 init>（thinking_tokens、api_retry…）一律放行，Digest 照旧记 raw。
+//
+// 一次运行出现多条 result（result 前一刻写进管道的插话被 CLI 当成新 turn）时：
+// NumTurns、DurationMS 是单 turn 量 → 各条求和；其余字段（含进程累计的
+// total_cost_usd）取最后一条 —— 会话的终局状态就是最后一个 turn 之后的样子。
+func parseStreamWith(r io.Reader, h streamHooks) (*Result, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
 
@@ -372,11 +516,29 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 		if err := json.Unmarshal(line, &env); err != nil {
 			continue // 单行解析失败不应终止整次执行
 		}
+		if h.Touch != nil {
+			h.Touch()
+		}
 
-		if onEvent != nil {
+		switch t := EventType(env.Type); {
+		case t == EventUser:
+			var rp replayProbe
+			if err := json.Unmarshal(line, &rp); err == nil && rp.IsReplay {
+				if h.OnDelivery != nil {
+					h.OnDelivery(rp.UUID)
+				}
+				continue
+			}
+		case t == "command_lifecycle":
+			continue
+		case h.Whitelist && t != EventSystem && t != EventAssistant && t != EventResult:
+			continue
+		}
+
+		if h.OnEvent != nil {
 			raw := make(json.RawMessage, len(line))
 			copy(raw, line)
-			onEvent(Event{
+			h.OnEvent(Event{
 				Type:      EventType(env.Type),
 				Subtype:   env.Subtype,
 				SessionID: env.SessionID,
@@ -391,7 +553,8 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 		if err := json.Unmarshal(line, &re); err != nil {
 			return nil, fmt.Errorf("agent: 解析 result 事件失败: %w", err)
 		}
-		result = &Result{
+		first := result == nil
+		next := &Result{
 			SessionID:         re.SessionID,
 			Success:           re.Subtype == "success" && !re.IsError,
 			IsError:           re.IsError,
@@ -407,6 +570,14 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 			// 不跨 result 相加（modelUsage 与 total_cost_usd 都是进程累计）。
 			Usage:     usageOf(&re),
 			CostKnown: true,
+		}
+		if !first {
+			next.NumTurns += result.NumTurns
+			next.DurationMS += result.DurationMS
+		}
+		result = next
+		if first && h.OnResult != nil {
+			h.OnResult()
 		}
 	}
 	if err := sc.Err(); err != nil {

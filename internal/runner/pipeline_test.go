@@ -1336,7 +1336,9 @@ func phasesOf(rs []usageRow) string {
 	return strings.Join(p, ",")
 }
 
-func taskOwner(t *testing.T, pool *pgxpool.Pool, taskID int64) (int64, int64) {
+// taskOwnerAndRepo 读任务的 (属主, 仓库) —— 与插话那组测试的 taskOwner
+// （只读属主、走 *task.Machine）同名不同参，改名避免同包重名。
+func taskOwnerAndRepo(t *testing.T, pool *pgxpool.Pool, taskID int64) (int64, int64) {
 	t.Helper()
 	var u, r int64
 	if err := pool.QueryRow(context.Background(), `SELECT user_id, repo_id FROM tasks WHERE id=$1`, taskID).Scan(&u, &r); err != nil {
@@ -1381,7 +1383,7 @@ func TestPipelineRecordsAgentRunPerInvocation(t *testing.T) {
 	if got := phasesOf(rs); got != "triage,implement,fix-1" {
 		t.Fatalf("phase 序列 got %s, want triage,implement,fix-1", got)
 	}
-	user, repoID := taskOwner(t, pool, taskID)
+	user, repoID := taskOwnerAndRepo(t, pool, taskID)
 	wantBuckets := []string{"triage", "implement", "implement"}
 	for i, r := range rs {
 		if r.bucket != wantBuckets[i] || r.kind != "task" || r.status != "success" || r.user != user || r.repo != repoID || !r.ordered {
@@ -1635,7 +1637,7 @@ func TestUsageTierFollowsAttemptAcrossFreshRetry(t *testing.T) {
 	}
 
 	q := store.UsageQuery{From: time.Now().Add(-time.Hour), To: time.Now().Add(time.Hour), Group: "tier"}
-	user, _ := taskOwner(t, pool, taskID)
+	user, _ := taskOwnerAndRepo(t, pool, taskID)
 	us, err := st.UsageStats(ctx, user, q)
 	if err != nil {
 		t.Fatal(err)

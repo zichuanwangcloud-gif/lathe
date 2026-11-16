@@ -32,8 +32,6 @@ var (
 	ErrTeamSkillSlugTaken = errors.New("store: 同仓库已有同名在役技能")
 	// ErrTeamSkillLimit 表示仓库在役技能数已达上限。
 	ErrTeamSkillLimit = errors.New("store: 仓库在役技能数已达上限")
-	// ErrTaskNotFound 表示任务不存在或不属于当前用户。
-	ErrTaskNotFound = errors.New("store: 任务不存在")
 )
 
 // pinnedCountWindow 是列表里 pinnedTaskCount 的统计窗口。常量不做配置：唯一

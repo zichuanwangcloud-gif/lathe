@@ -36,11 +36,24 @@ type Capabilities struct {
 	// PreassignedSession：claude 支持（--session-id）；codex 不支持（P3），
 	// 真实 ID 走 OnSession。只用于文档/断言，不拒绝。
 	PreassignedSession bool
+	// StreamInput：claude 支持（--input-format stream-json --replay-user-messages，
+	// 运行中插话 f01）；codex 不支持。runner 在 Submit 与 runAgent 两处据此
+	// 决定要不要打开 StreamInput/OnReady/OnDelivery —— 对不支持的驱动不设，
+	// 于是 codex 永远走不到这里。
+	StreamInput bool
 }
 
 // requires 返回这次执行要求的能力。
+//
+// StreamInput 的三个字段互相绑定：OnReady/OnDelivery 只在流式输入下有
+// 意义（没有 stdin 就没有句柄，也不会有回显）。任何一个被设上就算要求
+// StreamInput —— 否则「只设了 OnDelivery」会在不支持的驱动上被静默忽略，
+// 调用方以为插话机制装好了。
 func (p RunParams) requires() Capabilities {
-	return Capabilities{FromPR: p.FromPR != ""}
+	return Capabilities{
+		FromPR:      p.FromPR != "",
+		StreamInput: p.StreamInput || p.OnReady != nil || p.OnDelivery != nil,
+	}
 }
 
 // CapabilitiesOf 返回驱动的能力表。未知驱动 = 零值（全不支持）。
@@ -48,7 +61,7 @@ func (p RunParams) requires() Capabilities {
 func CapabilitiesOf(driver string) Capabilities {
 	switch normalizeDriver(driver) {
 	case DriverClaude:
-		return Capabilities{FromPR: true, PreassignedSession: true}
+		return Capabilities{FromPR: true, PreassignedSession: true, StreamInput: true}
 	default:
 		return Capabilities{}
 	}
@@ -59,6 +72,9 @@ func checkCapabilities(driver string, p RunParams) error {
 	need, have := p.requires(), CapabilitiesOf(driver)
 	if need.FromPR && !have.FromPR {
 		return fmt.Errorf("%w: %s 不支持 FromPR", ErrUnsupportedParam, normalizeDriver(driver))
+	}
+	if need.StreamInput && !have.StreamInput {
+		return fmt.Errorf("%w: %s 不支持运行中插话（流式输入）", ErrUnsupportedParam, normalizeDriver(driver))
 	}
 	return nil
 }

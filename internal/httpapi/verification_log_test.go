@@ -395,10 +395,12 @@ func TestVerificationLogOwnership(t *testing.T) {
 		}
 	})
 	t.Run("给定 LogDir 为空 断言 503", func(t *testing.T) {
-		api2 := *f.api
-		api2.LogDir = ""
-		srv2 := apiServer(t, &api2)
-		if code, _, raw := getLog(t, srv2.URL, f.tk.ID, vid, ""); code != http.StatusServiceUnavailable {
+		// API 现在内嵌 sync.Mutex（插话限流器），不能按值拷贝 —— 直接改
+		// fixture 上那一个实例，跑完复位。路由是闭在同一个指针上的。
+		prev := f.api.LogDir
+		f.api.LogDir = ""
+		t.Cleanup(func() { f.api.LogDir = prev })
+		if code, _, raw := f.get(t, vid, ""); code != http.StatusServiceUnavailable {
 			t.Errorf("got %d %s, want 503", code, raw)
 		}
 	})

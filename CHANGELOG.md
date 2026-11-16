@@ -9,6 +9,20 @@
 
 ### Added
 
+- **运行中插话**（`docs/features/interject.md`）：属主可在实现阶段（及验证期的修复轮）
+  给正在跑的 agent 追加指示 —— 任务详情页新增「运行中插话」面板，话会送进正在运行的
+  那次 claude 进程（同一个 turn 吸收，不打断它）。消息先落库再投递、可查；没有活会话时
+  记为「已记录待投递」，在下一次 agent 轮次开场补投，没有下一轮就标「未进入模型」并写明
+  原因。插话不推进、不改任何任务状态，不改变验证判定（验证仍只看 diff）。
+  新增接口 `POST /api/tasks/{id}/interject`、`GET /api/tasks/{id}/interjections`，
+  迁移 `0032_interjections`，配置项 `LATHE_INTERJECT_MAX_CHARS` / `LATHE_INTERJECT_RATE_LIMIT` /
+  `LATHE_INTERJECT_WINDOW`。
+  - **驱动启动方式变化（对所有 claude 实现/修复轮生效，无开关）**：实现、修复轮（含
+    `--resume`）改为 `--input-format stream-json --replay-user-messages`、prompt 走 stdin 首帧；
+    首条 result 即关 stdin。分诊、PRD 规划、预览推荐不变。
+  - **事件流更干净**：流式输入下 CLI 的 `command_lifecycle` 通知与人插的话的回显不再落成
+    `raw` / 冒充 agent 正文的 `text` 行。
+  - 一次运行出现多条 result 时，`agent_num_turns` / `agent_duration_ms` 按各条求和，其余取末条。
 - **团队与角色**（[docs/features/team-roles.md](docs/features/team-roles.md)）。
   - 建团队（创建者是 owner），用**一次性邀请码**邀请组员：128 位随机码，库里只存
     SHA-256，48 小时、单次有效、可撤销，猜码按 IP 限流（10 次 / 15 分钟）。邀请不按

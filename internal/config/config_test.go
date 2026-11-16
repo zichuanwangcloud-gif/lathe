@@ -466,3 +466,38 @@ func TestLoadRejectsMalformedPRDStallDurations(t *testing.T) {
 		}
 	}
 }
+
+// f01 运行中插话的三个配置项：非法值启动报错并点名变量（AGENTS.md §3 配置行）。
+func TestLoadRejectsInvalidInterjectConfig(t *testing.T) {
+	cases := []struct {
+		key, val string
+		wantErr  bool
+	}{
+		{"LATHE_INTERJECT_MAX_CHARS", "0", true},
+		{"LATHE_INTERJECT_MAX_CHARS", "-1", true},
+		{"LATHE_INTERJECT_MAX_CHARS", "16385", true},
+		{"LATHE_INTERJECT_MAX_CHARS", "abc", true},
+		{"LATHE_INTERJECT_MAX_CHARS", "16384", false},
+		{"LATHE_INTERJECT_RATE_LIMIT", "0", true},
+		{"LATHE_INTERJECT_RATE_LIMIT", "101", true},
+		{"LATHE_INTERJECT_RATE_LIMIT", "x", true},
+		{"LATHE_INTERJECT_RATE_LIMIT", "100", false},
+		{"LATHE_INTERJECT_WINDOW", "1d", true},
+		{"LATHE_INTERJECT_WINDOW", "500ms", true},
+		{"LATHE_INTERJECT_WINDOW", "2m", true},
+		{"LATHE_INTERJECT_WINDOW", "1m", false},
+		{"LATHE_INTERJECT_WINDOW", "1s", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key+"="+tc.val, func(t *testing.T) {
+			t.Setenv(tc.key, tc.val)
+			_, err := Load()
+			if gotErr := err != nil; gotErr != tc.wantErr {
+				t.Fatalf("Load() err=%v，got 报错=%v want=%v", err, gotErr, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), tc.key) {
+				t.Errorf("错误应点名变量 %s，got: %v", tc.key, err)
+			}
+		})
+	}
+}

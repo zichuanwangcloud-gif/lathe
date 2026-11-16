@@ -212,6 +212,9 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_GITHUB_WEBHOOK_SECRET` | GitHub 仓库 webhook 签名密钥的兜底值（PR 评论回流验签）。与其它凭据类环境变量一样**只对内置管理员生效**、优先级低于设置页；普通成员须在设置页各自配置 |
 | `LATHE_FIX_ATTEMPTS` | 验证失败后的修复轮回数上限（resume 原实现会话就地修复再验证），默认 `2` |
 | `LATHE_AGENT_TIMEOUT` | agent 单次执行超时，默认 `45m` |
+| `LATHE_INTERJECT_MAX_CHARS` | 运行中插话单条长度上限（按字符计），默认 `8192`，取值 `1..16384`（16384 是库表的硬上限）；超长返回 413、不落库。非法值启动直接报错 |
+| `LATHE_INTERJECT_RATE_LIMIT` | 运行中插话限流：同一任务在窗口内最多几条，默认 `5`，取值 `1..100`；超出返回 429、不落库。非法值启动直接报错 |
+| `LATHE_INTERJECT_WINDOW` | 运行中插话限流窗口，默认 `10s`，取值 `1s..1m`（Go 时长写法；`1d`、`abc` 启动直接报错） |
 | `LATHE_AGENT_ENV_EXTRA` | agent 子进程环境白名单的显式开口（逗号分隔变量名）。默认白名单只放行 PATH/HOME 等操作性变量，`LATHE_ADMIN_TOKEN`、数据库口令、GitHub token 不进 agent 进程 |
 | `LATHE_CLAUDE_BIN` | claude 二进制名或路径，默认 `claude`（从 PATH 解析） |
 | `LATHE_CODEX_HOME` | codex 驱动的**专用** `CODEX_HOME`；不配 = codex 不启用（仓库页不能选 codex，默认部署行为不变）。子进程的 `CODEX_HOME` 指向它、`HOME` 换成 `<它>/home`（个人 `~/.codex` 与 `~/.agents/skills` 都进不来）。必须是已存在的绝对路径目录，**不得是个人 `~/.codex`**，**不得放在系统临时目录（`TMPDIR`，默认 `/tmp`）下**——codex 会拒绝在那里执行任何命令且不报错；违反任一条启动直接报错。启用步骤：`mkdir` 专用目录 → `CODEX_HOME=<dir> codex login --with-api-key` → 在 `<dir>/config.toml` 写模型/provider → 设本变量。详见 `docs/features/multi-cli.md` |

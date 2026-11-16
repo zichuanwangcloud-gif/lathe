@@ -3,6 +3,7 @@ import { ref, reactive, onMounted, onUnmounted, computed, inject, nextTick, watc
 import { useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime, formatDuration } from '../api'
 import AgentEventItem from '../components/AgentEventItem.vue'
+import InterjectPanel from '../components/InterjectPanel.vue'
 import TaskTeamSkills from '../components/TaskTeamSkills.vue'
 import TaskUsage from '../components/TaskUsage.vue'
 import VerifyLogViewer from '../components/VerifyLogViewer.vue'
@@ -653,6 +654,7 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <InterjectPanel :task-id="task.id" :state="task.state" />
     <!-- 执行日志面板（docs/04 §3.4）：按阶段分节，当前阶段置顶展开 -->
     <div class="card">
       <div class="spread">

@@ -121,7 +121,8 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		case *ast.CallExpr:
 			switch name := callName(node.Fun); name {
 			case "buildPipeline", "newQueue", "startWorkers",
-				"q.Reconcile", "previewMgr.SweepVerifyStacks", "newScheduler":
+				"q.Reconcile", "previewMgr.SweepVerifyStacks",
+				"pipeline.Interjections.StartupSweep", "newScheduler":
 				hits = append(hits, hit{name, node.Pos()})
 			}
 		}
@@ -139,7 +140,7 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 
 	for _, name := range []string{
 		"buildPipeline", "newQueue", "q.Reconcile",
-		"previewMgr.SweepVerifyStacks", "startWorkers", "newScheduler",
+		"previewMgr.SweepVerifyStacks", "pipeline.Interjections.StartupSweep", "startWorkers", "newScheduler",
 	} {
 		if idx(name) < 0 {
 			t.Fatalf("serve 里应调用 %s，实际调用序列：%v", name, hits)
@@ -155,11 +156,17 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		{"newQueue", "队列要先建出来"},
 		{"q.Reconcile", "启动恢复必须在 worker 启动前完成，避免同一任务被两边同时捡起"},
 		{"previewMgr.SweepVerifyStacks", "开机清扫要在 worker 起栈之前，否则可能删掉 worker 刚起的栈"},
+		{"pipeline.Interjections.StartupSweep", "插话启动清扫要在 worker 之前：worker 一旦开始补投，遗留的 delivering 行就分不清是不是本进程的"},
 		{"newScheduler", "定时建单调度器要先构造好（路由与 startWorkers 共用同一个实例）再交给启动点"},
 	} {
 		if i := idx(before.name); i > start {
 			t.Errorf("%s 必须排在 startWorkers 之前（%s）；实际序列：%v", before.name, before.why, hits)
 		}
+	}
+	// 插话启动清扫要在 Reconcile 之后：Reconcile 把在途任务转回 queued，
+	// 清扫据此保留它们的 queued 插话（留给下一轮补投）而不是误判 failed。
+	if idx("pipeline.Interjections.StartupSweep") < idx("q.Reconcile") {
+		t.Errorf("插话启动清扫必须排在 q.Reconcile 之后；实际序列：%v", hits)
 	}
 
 	// 只有一个启动点：serve 里不该再有裸的 `go q.work(...)` /

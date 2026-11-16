@@ -69,7 +69,11 @@ var (
 		"Prompt", "Dir", "SessionID", "Resume", "PermissionMode", "SettingSources",
 		"ExtraEnv", "ExtraArgs", "OnEvent", "Driver", "OnSession",
 	}
-	codexRejects = []string{"FromPR"}
+	// StreamInput / OnReady / OnDelivery 是 f01 插话对 claude 的专属要求
+	// （--input-format stream-json）：codex 不接 stdin 的第二帧，也不存在
+	// 「进程在跑时追加一句话」的通道，明确拒绝。Router 的
+	// Capabilities.StreamInput 保证 runner 根本不会给 codex 设它们。
+	codexRejects = []string{"FromPR", "StreamInput", "OnReady", "OnDelivery"}
 )
 
 // Run 执行一次 codex 任务。无论成功失败，返回前都保证子进程树已回收。
