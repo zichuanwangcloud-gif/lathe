@@ -73,7 +73,7 @@ func TestNotifyWiring(t *testing.T) {
 		if got, ok := p.Chat.(*store.NotifyChannels); !ok || got != nc {
 			t.Errorf("Pipeline.Chat got %T(%p), want 同一个 *store.NotifyChannels(%p)", p.Chat, got, nc)
 		}
-		svc := buildPRDService(cfg, st, p.Worktrees, nil, nc)
+		svc := buildPRDService(cfg, st, p.Worktrees, nil, nil, nc)
 		if got, ok := svc.ReviewNotifier.(*store.NotifyChannels); !ok || got != nc {
 			t.Errorf("prd.Service.ReviewNotifier got %T(%p), want 同一个 NC(%p)", svc.ReviewNotifier, got, nc)
 		}
@@ -85,7 +85,7 @@ func TestNotifyWiring(t *testing.T) {
 		if p2.Chat != nil {
 			t.Errorf("nc=nil 时 Pipeline.Chat got %T, want nil 接口", p2.Chat)
 		}
-		if s2 := buildPRDService(cfg, st, p.Worktrees, nil, nil); s2.ReviewNotifier != nil {
+		if s2 := buildPRDService(cfg, st, p.Worktrees, nil, nil, nil); s2.ReviewNotifier != nil {
 			t.Errorf("nc=nil 时 ReviewNotifier got %T, want nil 接口", s2.ReviewNotifier)
 		}
 	})

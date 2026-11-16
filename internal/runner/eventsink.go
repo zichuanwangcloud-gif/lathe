@@ -41,6 +41,10 @@ const PhaseImplementReentry = "implement-reentry"
 // 内部活动不出现在 stdout 里，落在 ~/.claude/projects/<slug>/<session>/subagents/
 // 下。sink 起一个 watcher 协程轮询那个目录，提炼出的条目投进同一个
 // BatchSink，两条源在下游是同一条流。
+//
+// 这条源只有 claude 有（agent.SubagentDirFor 对其它驱动返回空串）：codex 没有
+// 对应的磁盘记录契约，明确降级为「只看主会话」。runner 不直接碰 claude 的
+// 磁盘布局。
 type EventSink struct {
 	batch *agent.BatchSink
 
@@ -56,9 +60,9 @@ type EventSink struct {
 // newEventSink 启动一个 sink 并立即起 flush 协程。
 // rec 为 nil 时返回 nil —— 调用方（含测试）不接线则整个机制消失。
 //
-// cwd 与 sessionID 用于定位 subagent 记录目录；任一为空则只走 stdout 一条源
-// （例如测试里不关心 subagent 时）。
-func newEventSink(ctx context.Context, rec AgentEventRecorder, taskID int64, phase, cwd, sessionID string) *EventSink {
+// driver、cwd 与 sessionID 用于定位 subagent 记录目录；驱动没有这份记录
+// （codex）或 cwd/sessionID 任一为空时只走 stdout 一条源。
+func newEventSink(ctx context.Context, rec AgentEventRecorder, taskID int64, phase, driver, cwd, sessionID string) *EventSink {
 	if rec == nil {
 		return nil
 	}
@@ -68,7 +72,7 @@ func newEventSink(ctx context.Context, rec AgentEventRecorder, taskID int64, pha
 	s := &EventSink{
 		batch: agent.NewBatchSink(ctx, write, fmt.Sprintf("task=%d phase=%s", taskID, phase)),
 	}
-	s.startWatch(cwd, sessionID)
+	s.startWatch(driver, cwd, sessionID)
 	return s
 }
 
@@ -76,8 +80,8 @@ func newEventSink(ctx context.Context, rec AgentEventRecorder, taskID int64, pha
 //
 // 目录不存在是常态（agent 压根没派活），此时 Poll 一直返回空 —— 不预先
 // 判断目录存在性，因为它是在 agent 跑起来之后才被创建的。
-func (s *EventSink) startWatch(cwd, sessionID string) {
-	dir := agent.SubagentDir(agent.ProjectsRoot(), cwd, sessionID)
+func (s *EventSink) startWatch(driver, cwd, sessionID string) {
+	dir := agent.SubagentDirFor(driver, cwd, sessionID)
 	if dir == "" {
 		return
 	}

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"strings"
 	"testing"
@@ -336,3 +337,72 @@ func testSecrets(t *testing.T, st *store.Store) *store.Secrets {
 var (
 	_ runner.FailureMemory = (*store.Store)(nil)
 )
+
+// f04 AC-8：serve 里 httpapi.API 字面量必须装上验证日志读取的两个字段，
+// 且与 Pipeline 同源（LogDir=cfg.DataDir、KnownSecrets=cfg.KnownSecrets()）。
+//
+// 与 docs/08 T4「struct literal 漏一个字段而单测全绿」同类防线：漏装时日志
+// 接口一律 503、静默不可用，单测里 API{LogDir: t.TempDir()} 照样全绿。
+func TestServeWiresVerificationLogIntoAPI(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("解析 main.go 失败: %v", err)
+	}
+	var serve *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "serve" {
+			serve = fd
+		}
+	}
+	if serve == nil {
+		t.Fatal("main.go 里找不到 serve 函数")
+	}
+
+	var lits []*ast.CompositeLit
+	ast.Inspect(serve.Body, func(n ast.Node) bool {
+		if cl, ok := n.(*ast.CompositeLit); ok {
+			if sel, ok := cl.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "API" {
+				if x, ok := sel.X.(*ast.Ident); ok && x.Name == "httpapi" {
+					lits = append(lits, cl)
+				}
+			}
+		}
+		return true
+	})
+	if len(lits) != 1 {
+		t.Fatalf("serve 里 httpapi.API 字面量个数 got %d, want 1", len(lits))
+	}
+
+	src := func(e ast.Expr) string {
+		var b strings.Builder
+		_ = printer.Fprint(&b, fset, e)
+		return b.String()
+	}
+	got := map[string]string{}
+	var keys []string
+	for _, el := range lits[0].Elts {
+		kv, ok := el.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		k := src(kv.Key)
+		got[k] = src(kv.Value)
+		keys = append(keys, k)
+	}
+	want := map[string]string{"LogDir": "cfg.DataDir", "KnownSecrets": "cfg.KnownSecrets()"}
+	var missing []string
+	for _, k := range []string{"LogDir", "KnownSecrets"} {
+		v, ok := got[k]
+		if !ok {
+			missing = append(missing, k)
+			continue
+		}
+		if v != want[k] {
+			t.Errorf("httpapi.API.%s 的值 got %q, want %q（与 Pipeline 同源）", k, v, want[k])
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("httpapi.API 字面量 missing keys %v；got keys %v, want 含 [LogDir KnownSecrets]", missing, keys)
+	}
+}

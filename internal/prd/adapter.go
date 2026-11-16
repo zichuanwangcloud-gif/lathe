@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 本文件把 *store.Store 适配成 prd.Store。
@@ -57,6 +58,8 @@ func (a *StoreAdapter) RepoForPRD(ctx context.Context, prdID, userID int64) (Rep
 			MaxFiles: repo.PRDTaskMaxFiles,
 			MaxChain: chain,
 		},
+		VCSProvider: vcs.Provider(repo.VCSProvider),
+		VCSBaseURL:  repo.VCSBaseURL,
 	}, nil
 }
 

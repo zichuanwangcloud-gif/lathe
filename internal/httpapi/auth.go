@@ -37,10 +37,12 @@ type SessionStore interface {
 
 // Auth 认证用户并保护接口。
 //
-// 两条认证通道并存：
+// 三条认证通道并存：
 //   - 会话 Cookie —— 人在浏览器里的正常登录态。
-//   - Authorization: Bearer <LATHE_ADMIN_TOKEN> —— 给脚本和 curl 用，
-//     同时是「SMTP 挂了且管理员把自己锁在门外」时的应急入口。
+//   - Authorization: Bearer lathe_pat_… —— 个人 API 令牌，给脚本与 CI 用，
+//     身份与权限严格等于签发它的用户本人。
+//   - Authorization: Bearer <LATHE_ADMIN_TOKEN> —— 部署级应急入口
+//     （「SMTP 挂了且管理员把自己锁在门外」），优先于 PAT 判定。
 //
 // 两者都为空（没配令牌又没接库）时一律拒绝，而不是默认放行：
 // 把「忘了配」的后果做成不可用而非不设防。
@@ -69,6 +71,10 @@ type Auth struct {
 	// 为 nil 时一律按未绑定处理。
 	HasLinearToken func(ctx context.Context, userID int64) bool
 
+	// PATs 是个人 API 令牌（PAT）的查询后端，WithPATs 注入。
+	// 为 nil 时 PAT 通道关闭（lookupPAT 恒返回 nil），既有单测不必逐个改。
+	PATs PATLookup
+
 	logins     *limiter
 	loginsOnce sync.Once
 }
@@ -93,6 +99,20 @@ func (a *Auth) WithStore(users *store.Users, sessions SessionStore, bootstrap *s
 	a.Sessions = sessions
 	a.Bootstrap = bootstrap
 	a.SecureCookie = secure
+	return a
+}
+
+// PATLookup 是 Auth 解析个人 API 令牌所需的窄接口。*store.PersonalAccessTokens 天然满足。
+//
+// Lookup 一并回令牌行 id，供 Touch 节流记录最后使用时间。
+type PATLookup interface {
+	Lookup(ctx context.Context, plain string) (*store.User, int64, error)
+	Touch(ctx context.Context, tokenID int64) error
+}
+
+// WithPATs 接上个人 API 令牌通道。单测可注入假件。
+func (a *Auth) WithPATs(p PATLookup) *Auth {
+	a.PATs = p
 	return a
 }
 
@@ -365,15 +385,29 @@ func (a *Auth) RequireAdminFunc(next http.HandlerFunc) http.Handler {
 }
 
 // resolve 解析当前请求的身份：Bearer 令牌优先，其次会话 Cookie。
+//
+// Bearer 段是两条互不覆盖的支路，各自把关：
+//   - 管理员令牌：守卫必须保持 a.Token != ""。少了它，LATHE_ADMIN_TOKEN 未配置时
+//     TrimSpace 会把 NBSP/EM SPACE/NEL 压成空串，与空的管理员令牌「相等」，
+//     未认证者直接拿到 bootstrapUser（PRD f05 §10.1，TestAdminTokenEmptyRejectsWhitespaceBearer 守门）。
+//   - 个人 API 令牌（PAT）：守卫是形态前缀 lathe_pat_，与 a.Token 无关 —— 没配管理员
+//     令牌的部署里 PAT 照样可用。形态判定用未 trim 的值：多一个空格就不认，
+//     不给空白字符参与判定开口子。形态像 PAT 却查不到直接 nil，不回落 Cookie，
+//     否则「令牌已吊销但浏览器恰好有会话」会以会话身份成功，掩盖吊销。
 func (a *Auth) resolve(r *http.Request) *store.User {
 	if !a.Enabled() {
 		return nil
 	}
 
-	if h := r.Header.Get("Authorization"); h != "" && a.Token != "" {
-		token, ok := strings.CutPrefix(h, "Bearer ")
-		if ok && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(a.Token)) == 1 {
-			return a.bootstrapUser()
+	if h := r.Header.Get("Authorization"); h != "" {
+		if token, ok := strings.CutPrefix(h, "Bearer "); ok {
+			if a.Token != "" &&
+				subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(a.Token)) == 1 {
+				return a.bootstrapUser()
+			}
+			if strings.HasPrefix(token, store.PATPrefix) {
+				return a.lookupPAT(r, token)
+			}
 		}
 	}
 
@@ -384,6 +418,24 @@ func (a *Auth) resolve(r *http.Request) *store.User {
 	u, err := a.Sessions.Lookup(r.Context(), c.Value)
 	if err != nil {
 		return nil
+	}
+	return u
+}
+
+// lookupPAT 用个人 API 令牌换取身份，命中后节流记录最后使用时间。
+//
+// 不区分不存在/过期/吊销/停用（统一当未登录，区分会变成预言机）。
+// Touch 只记录，失败不改鉴权结论；它在这里是唯一调用点。
+func (a *Auth) lookupPAT(r *http.Request, token string) *store.User {
+	if a.PATs == nil { // 未注入时 PAT 通道关闭而非崩
+		return nil
+	}
+	u, id, err := a.PATs.Lookup(r.Context(), token)
+	if err != nil || u == nil {
+		return nil
+	}
+	if err := a.PATs.Touch(r.Context(), id); err != nil {
+		slog.Warn("更新个人 API 令牌最后使用时间失败", "token_id", id, "user_id", u.ID, "err", err)
 	}
 	return u
 }

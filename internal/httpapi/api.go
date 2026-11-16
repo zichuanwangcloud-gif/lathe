@@ -9,14 +9,17 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // maxJSONBody 限制请求体大小。
@@ -52,6 +55,19 @@ type API struct {
 
 	// ConfigStatus 返回凭据配置状态（不含 token 本身）。
 	ConfigStatus func() map[string]any
+
+	// CodexEnabled 表示本实例启用了 codex 驱动（运维配置了 LATHE_CODEX_HOME，f06）。
+	// 消费方：PUT /api/repos/{id} 拒绝在未启用的实例上选 codex；
+	// GET /api/agent-drivers 告诉仓库页 codex 选项可不可选。
+	CodexEnabled bool
+
+	// LogDir 是完整验证日志的根（verifications.log_ref 相对它），与
+	// Pipeline.LogDir 同源（cfg.DataDir）。为空时日志接口一律 503。
+	LogDir string
+
+	// KnownSecrets 是脱敏权威层的登记值（cfg.KnownSecrets()），与
+	// Pipeline.KnownSecrets 同源。日志块返回前与安全切点检验都用它。
+	KnownSecrets []string
 }
 
 // Routes 把 API 注册到 mux。
@@ -64,17 +80,27 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/logout", a.Auth.Logout)
 	mux.HandleFunc("GET /api/me", a.Auth.Me)
 
-	// 读。全部按 CurrentUser 隔离（P1.5 第二步）：任何人只能看到
-	// 自己名下的任务与仓库配置，管理员也不例外 —— 跨用户读取的
-	// 后门宁可没有，排障走数据库。
+	// 读。除 /api/admin/* 的显式聚合外，读接口全部按 CurrentUser 隔离
+	// （P1.5 第二步）：任何人只能看到自己名下的任务与仓库配置，管理员也
+	// 不例外 —— 跨用户读取的后门宁可没有，排障走数据库。
+	//
+	// 唯一的例外是 f03 的 GET /api/admin/usage：需求要求管理员看全局用量，
+	// 所以显式开一个 RequireAdmin 的独立端点，只返回聚合与 user_id，不带
+	// email 与任何任务/PRD/仓库标签（docs/features/usage-stats.md §3.6）。
 	mux.Handle("GET /api/tasks", a.Auth.RequireFunc(a.listTasks))
 	mux.Handle("GET /api/tasks/{id}", a.Auth.RequireFunc(a.taskDetail))
 	mux.Handle("GET /api/tasks/{id}/events", a.Auth.RequireFunc(a.taskEvents))
+	mux.Handle("GET /api/tasks/{id}/events/summary", a.Auth.RequireFunc(a.taskEventsSummary))
+	mux.Handle("GET /api/tasks/{id}/verifications/{vid}/log", a.Auth.RequireFunc(a.verificationLog))
 	mux.Handle("GET /api/stats", a.Auth.RequireFunc(a.stats))
 	mux.Handle("GET /api/stats/cost", a.Auth.RequireFunc(a.costStats))
 	mux.Handle("GET /api/stats/metrics", a.Auth.RequireFunc(a.metricsStats))
+	mux.Handle("GET /api/usage", a.Auth.RequireFunc(a.usage))
+	mux.Handle("GET /api/tasks/{id}/usage", a.Auth.RequireFunc(a.taskUsage))
+	mux.Handle("GET /api/admin/usage", a.Auth.RequireAdminFunc(a.adminUsage))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
+	mux.Handle("GET /api/agent-drivers", a.Auth.RequireFunc(a.agentDrivers))
 
 	// 写
 	mux.Handle("POST /api/tasks", a.Auth.RequireFunc(a.triggerTask))
@@ -136,20 +162,45 @@ func (a *API) taskDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, detail)
 }
 
+// ownedTask 是任务读接口共用的归属判定：不存在与不是自己的任务一律
+// 404「任务不存在」（不用 403 暴露存在性，AGENTS.md §7）。
+//
+// 抽成一处是为了团队可见性（f12）落地时只改这一个函数体。只给**读**接口用；
+// 调用方的 store 查询一律传 tk.UserID（任务属主），不传 CurrentUser(r).ID。
+func (a *API) ownedTask(w http.ResponseWriter, r *http.Request) (*task.Task, bool) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return nil, false
+	}
+	tk, err := a.Tasks.Get(r.Context(), id)
+	if err != nil || tk.UserID != CurrentUser(r).ID {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
+		return nil, false
+	}
+	return tk, true
+}
+
+// eventPhaseRe 是 /events?phase= 的白名单：流水线会写的全部阶段（与
+// agent_events_phase_check 同一集合，含 0041 的 implement-reentry）。
+var eventPhaseRe = regexp.MustCompile(`^(triage|implement|implement-reentry|verify|review|push|fix-[0-9]+)$`)
+
+// eventKinds 是 /events?kind= 的白名单（0014 的 kind CHECK 的 9 个值）。
+var eventKinds = map[string]bool{
+	"init": true, "text": true, "thinking": true, "tool_use": true, "tool_result": true,
+	"result": true, "verify_step": true, "raw": true, "agent_start": true,
+}
+
 // taskEvents 增量拉取 agent 执行事件（docs/04 §3.3）。
 //
 // 轮询协议：after 传上次的 last_id（首轮传 0），游标 id 严格单调，
 // 将来换 SSE + Last-Event-ID 时客户端协议不变，只是传输升级。
+//
+// 回放扩展（docs/features/run-replay.md §3.2.1）：paged/before/phase/kind/failures
+// 任一出现时响应多带 first_id/has_more；一个都不带时行为与响应和旧版**完全一致**
+// （顶层键恰为 {events, last_id}）—— 这是与旧客户端、f01 测试的兼容契约。
 func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
+	tk, ok := a.ownedTask(w, r)
 	if !ok {
-		return
-	}
-
-	// 权限与 taskDetail 同一原则：不是自己的任务按 404 处理
-	tk, err := a.Tasks.Get(r.Context(), id)
-	if err != nil || tk.UserID != CurrentUser(r).ID {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "任务不存在"})
 		return
 	}
 
@@ -157,12 +208,104 @@ func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
 	limit, _ := strconv.Atoi(q.Get("limit"))
 
-	events, lastID, err := a.Store.AgentEventsAfter(r.Context(), id, tk.UserID, after, limit)
+	extended := q.Has("paged") || q.Has("before") || q.Has("phase") || q.Has("kind") || q.Has("failures")
+	if !extended {
+		events, lastID, err := a.Store.AgentEventsAfter(r.Context(), tk.ID, tk.UserID, after, limit)
+		if err != nil {
+			serverError(w, "查询执行日志失败", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"events": events, "last_id": lastID})
+		return
+	}
+
+	bad := func(msg string) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+	}
+	if q.Has("paged") && q.Get("paged") != "1" {
+		bad("paged 参数只接受 1")
+		return
+	}
+	var f store.EventFilter
+	if q.Has("failures") {
+		if q.Get("failures") != "1" {
+			bad("failures 参数只接受 1")
+			return
+		}
+		f.FailuresOnly = true
+	}
+	if q.Has("phase") {
+		for _, p := range strings.Split(q.Get("phase"), ",") {
+			p = strings.TrimSpace(p)
+			if !eventPhaseRe.MatchString(p) {
+				bad(fmt.Sprintf("phase 参数含未知阶段 %q", p))
+				return
+			}
+			f.Phases = append(f.Phases, p)
+		}
+	}
+	if q.Has("kind") {
+		for _, k := range strings.Split(q.Get("kind"), ",") {
+			k = strings.TrimSpace(k)
+			if !eventKinds[k] {
+				bad(fmt.Sprintf("kind 参数含未知类别 %q", k))
+				return
+			}
+			f.Kinds = append(f.Kinds, k)
+		}
+	}
+
+	var (
+		events  []store.AgentEvent
+		hasMore bool
+		err     error
+		lastID  = after
+	)
+	if q.Has("before") {
+		if q.Has("after") {
+			bad("before 与 after 不能同时传")
+			return
+		}
+		before, perr := strconv.ParseInt(q.Get("before"), 10, 64)
+		if perr != nil || before <= 0 {
+			bad("before 参数须为正整数")
+			return
+		}
+		events, hasMore, err = a.Store.AgentEventsBefore(r.Context(), tk.ID, tk.UserID, before, f, limit)
+		lastID = 0
+	} else {
+		events, hasMore, err = a.Store.AgentEventsAfterFiltered(r.Context(), tk.ID, tk.UserID, after, f, limit)
+	}
 	if err != nil {
 		serverError(w, "查询执行日志失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"events": events, "last_id": lastID})
+
+	var firstID any // 本批为空时为 null
+	if len(events) > 0 {
+		firstID = events[0].ID
+		lastID = events[len(events)-1].ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"events": events, "last_id": lastID, "first_id": firstID, "has_more": hasMore,
+	})
+}
+
+// taskEventsSummary 汇总一个任务的全部事件（不受前端内存窗口影响）：
+// 各阶段条数/起止/失败数、失败列表（前 200）、首末失败。
+//
+// 与 costStats 同理独立成端点，不放进 5 秒轮询的 /api/tasks/{id}。
+func (a *API) taskEventsSummary(w http.ResponseWriter, r *http.Request) {
+	tk, ok := a.ownedTask(w, r)
+	if !ok {
+		return
+	}
+	sum, err := a.Store.AgentEventsSummary(r.Context(), tk.ID)
+	if err != nil {
+		serverError(w, "汇总执行日志失败", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sum)
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
@@ -568,7 +711,9 @@ func (a *API) previewRetry(ctx context.Context, tk *task.Task) (runner.RetryPlan
 			if berr != nil {
 				base = repos[0].DefaultBranch
 			}
-			wtState = a.Scenes.Inspect(ctx, repos[0].ProviderRepo, path, branch, base)
+			// 镜像键按仓库所在平台实例算（GitHub 即 providerRepo 本身，与此前相同）。
+			key := vcs.RepoKey(vcs.Provider(repos[0].VCSProvider), repos[0].VCSBaseURL, repos[0].ProviderRepo)
+			wtState = a.Scenes.Inspect(ctx, key, path, branch, base)
 		}
 	}
 
@@ -630,23 +775,65 @@ func (a *API) createRepo(w http.ResponseWriter, r *http.Request) {
 		ProviderRepo  string `json:"providerRepo"`
 		DefaultBranch string `json:"defaultBranch"`
 		HotfixBase    string `json:"hotfixBase"`
+		// VCSProvider 是代码平台：github（缺省）/ gitlab / gitea。
+		VCSProvider string `json:"vcsProvider"`
+		// VCSBaseURL 不接受：实例地址只有一个真相源（凭据），仓库只是登记
+		// 那一刻的快照。传了就 400，而不是静默忽略。
+		VCSBaseURL *json.RawMessage `json:"vcsBaseUrl"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
 		return
 	}
-	body.ProviderRepo = strings.TrimSpace(body.ProviderRepo)
-	if body.ProviderRepo == "" || !strings.Contains(body.ProviderRepo, "/") {
+	if body.VCSBaseURL != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": "providerRepo 须为 owner/repo 形式，如 acme/demo",
+			"error": "实例地址不在这里填：登记时会自动取你在个人设置里为该平台配置的实例地址",
 		})
 		return
+	}
+	provider := vcs.Provider(strings.TrimSpace(body.VCSProvider))
+	if provider == "" {
+		provider = vcs.ProviderGitHub
+	}
+	if !provider.Valid() {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "代码平台须为 github / gitlab / gitea 之一",
+		})
+		return
+	}
+	body.ProviderRepo = strings.TrimSpace(body.ProviderRepo)
+	if _, _, err := vcs.SplitRef(provider, body.ProviderRepo); err != nil {
+		msg := "providerRepo 须为 owner/repo 形式，如 acme/demo"
+		if provider != vcs.ProviderGitHub {
+			msg = "providerRepo 须为 group/repo 或 group/subgroup/repo 形式：" + err.Error()
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+		return
+	}
+
+	// 自建平台：实例地址从当前用户同平台凭据复制一份钉死（非密列，不解密）。
+	baseURL := ""
+	if provider != vcs.ProviderGitHub {
+		u, err := a.Store.IntegrationBaseURL(r.Context(), CurrentUser(r).ID, string(provider))
+		if err != nil {
+			if errors.Is(err, store.ErrIntegrationNotFound) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "请先在个人设置里配置 " + provider.DisplayName() + " 令牌与实例地址",
+				})
+				return
+			}
+			serverError(w, "读取凭据实例地址失败", err)
+			return
+		}
+		baseURL = u
 	}
 
 	repo, err := a.Store.CreateRepo(r.Context(), CurrentUser(r).ID, store.CreateRepoParams{
 		ProviderRepo:  body.ProviderRepo,
 		DefaultBranch: strings.TrimSpace(body.DefaultBranch),
 		HotfixBase:    strings.TrimSpace(body.HotfixBase),
+		VCSProvider:   string(provider),
+		VCSBaseURL:    baseURL,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRepoExists) {
@@ -657,6 +844,19 @@ func (a *API) createRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, repo)
+}
+
+// agentDrivers 列出可选的执行 agent 及本实例是否启用（f06）。
+//
+// 只给仓库页决定选项可不可选：只有 name/enabled 两个键，不含任何路径、
+// 版本或凭据；不涉及属主资源（与用户无关的实例能力），登录即可读。
+func (a *API) agentDrivers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"drivers": []map[string]any{
+			{"name": agent.DriverClaude, "enabled": true},
+			{"name": agent.DriverCodex, "enabled": a.CodexEnabled},
+		},
+	})
 }
 
 func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
@@ -680,9 +880,21 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		VerifyTierOverride *string `json:"verifyTierOverride"`
 		// 指针区分「未传」（不动）与「空串」（清空基线目录）
 		BaselineDir *string `json:"baselineDir"`
+		// 平台、实例与路径登记后不可改（只认存在与否）：迁移需要删除后重新登记。
+		VCSProvider  *json.RawMessage `json:"vcsProvider"`
+		VCSBaseURL   *json.RawMessage `json:"vcsBaseUrl"`
+		ProviderRepo *json.RawMessage `json:"providerRepo"`
+		// 执行 agent：nil = 不动。只影响之后新建的任务（任务创建时钉死）。
+		AgentDriver *string `json:"agentDriver"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
+		return
+	}
+	if body.VCSProvider != nil || body.VCSBaseURL != nil || body.ProviderRepo != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "仓库的代码平台、实例地址与路径登记后不可修改；需要换平台或实例请删除后重新登记",
+		})
 		return
 	}
 
@@ -711,6 +923,23 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 			"error": "基线目录须为绝对路径（运行节点本机路径），如 /opt/CloudRouter",
 		})
 		return
+	}
+	if body.AgentDriver != nil {
+		switch *body.AgentDriver {
+		case agent.DriverClaude:
+		case agent.DriverCodex:
+			if !a.CodexEnabled {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "本实例未启用 codex 驱动（运维未配置 LATHE_CODEX_HOME）",
+				})
+				return
+			}
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "执行 agent 须为 claude / codex 之一",
+			})
+			return
+		}
 	}
 	// 受保护分支列表清空等于关掉最后一道闸门，必须拒绝
 	if body.ProtectedBranches != nil && len(body.ProtectedBranches) == 0 {
@@ -748,6 +977,7 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		VerifyInfra:        body.VerifyInfra,
 		VerifyTierOverride: body.VerifyTierOverride,
 		BaselineDir:        body.BaselineDir,
+		AgentDriver:        body.AgentDriver,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRepoNotFound) {

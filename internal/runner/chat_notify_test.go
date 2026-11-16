@@ -133,7 +133,7 @@ func waitDeliveries(t *testing.T, pool *pgxpool.Pool, userID int64, eventType st
 	}
 }
 
-func taskOwner(t *testing.T, m *task.Machine, id int64) *task.Task {
+func loadTask(t *testing.T, m *task.Machine, id int64) *task.Task {
 	t.Helper()
 	tk, err := m.Get(context.Background(), id)
 	if err != nil {
@@ -240,7 +240,7 @@ func TestPipelineFailureStillFailsWithBrokenChatNotifier(t *testing.T) {
 					t.Errorf("Execute 的错误冒出了通知字样 %q：%v", bad, err)
 				}
 			}
-			final := taskOwner(t, m, taskID)
+			final := loadTask(t, m, taskID)
 			if final.State != task.StateFailed {
 				t.Errorf("state got %s, want failed", final.State)
 			}
@@ -295,7 +295,7 @@ func TestChatTerminalSnapshotsBeforeGoroutine(t *testing.T) {
 	pool, m, taskID, _, _ := pipelineFixture(t)
 	ctx := context.Background()
 	nc := realNC(t)
-	tk := taskOwner(t, m, taskID)
+	tk := loadTask(t, m, taskID)
 	addSlack(t, nc, tk.UserID)
 
 	gated, err := m.Transition(ctx, taskID, task.StateVerifying, "test", nil)
@@ -400,7 +400,7 @@ func TestPipelineEmitsBlockedSpecAndGateAndPROpen(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			pool, m, taskID, repo, src := pipelineFixture(t)
 			nc := realNC(t)
-			owner := taskOwner(t, m, taskID)
+			owner := loadTask(t, m, taskID)
 			addSlack(t, nc, owner.UserID)
 			ag, gh := c.setup(t, pool, taskID)
 
@@ -412,7 +412,7 @@ func TestPipelineEmitsBlockedSpecAndGateAndPROpen(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("Execute: %v", err)
 			}
-			final := taskOwner(t, m, taskID)
+			final := loadTask(t, m, taskID)
 			if final.State != c.want.state {
 				t.Fatalf("state got %s, want %s", final.State, c.want.state)
 			}

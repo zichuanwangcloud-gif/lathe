@@ -439,13 +439,6 @@ func (n *NotifyChannels) FinishTest(ctx context.Context, d *notify.Delivery, now
 	return tx.Commit(ctx)
 }
 
-func nullIfEmpty(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
 // RetryDelivery 把本用户一条非 test 的 gave_up 投递改回 pending（attempts 归零）。
 // 先按归属查行：零行即 ErrDeliveryNotFound（属主隔离优先，httpapi 回 404）。
 func (n *NotifyChannels) RetryDelivery(ctx context.Context, userID, id int64, now time.Time) error {

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 本文件测 F4.3 rebase 跟进在 WorktreeManager 这一层新增的两个方法：
@@ -42,7 +44,7 @@ func TestWorktreeManagerRebaseOnto(t *testing.T) {
 	gitOut(t, predWT.Path, "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "pred 的改动")
 	oldBaseTip := gitOut(t, predWT.Path, "rev-parse", "HEAD")
 
-	if err := m.Push(ctx, predWT, repo, nil); err != nil {
+	if err := m.Push(ctx, predWT, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("推送 pred 分支失败: %v", err)
 	}
 
@@ -75,7 +77,7 @@ func TestWorktreeManagerRebaseOnto(t *testing.T) {
 	}
 
 	// ---- 执行 RebaseOnto ----
-	if err := m.RebaseOnto(ctx, succWT, oldBaseTip, "dev"); err != nil {
+	if err := m.RebaseOnto(ctx, succWT, oldBaseTip, "dev", src, vcs.GitAuth{}); err != nil {
 		t.Fatalf("RebaseOnto 失败: %v", err)
 	}
 
@@ -133,7 +135,7 @@ func TestWorktreeManagerRebaseOntoConflict(t *testing.T) {
 	gitOut(t, src, "add", ".")
 	gitOut(t, src, "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "dev 冲突改动")
 
-	err = m.RebaseOnto(ctx, wt, oldBaseTip, "dev")
+	err = m.RebaseOnto(ctx, wt, oldBaseTip, "dev", src, vcs.GitAuth{})
 	if err == nil {
 		t.Fatal("同一处改了不同内容应产生 rebase 冲突，RebaseOnto 应报错")
 	}
@@ -155,7 +157,7 @@ func TestWorktreeManagerForcePush(t *testing.T) {
 	}
 	gitOut(t, wt.Path, "-c", "user.email=t@e.st", "-c", "user.name=t",
 		"commit", "-q", "--allow-empty", "-m", "第一版")
-	if err := m.Push(ctx, wt, repo, nil); err != nil {
+	if err := m.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("首次 Push 失败: %v", err)
 	}
 
@@ -165,19 +167,19 @@ func TestWorktreeManagerForcePush(t *testing.T) {
 	rewrittenHead := gitOut(t, wt.Path, "rev-parse", "HEAD")
 
 	// 普通 Push 应被拒绝（non-fast-forward）
-	if err := m.Push(ctx, wt, repo, nil); err == nil {
+	if err := m.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err == nil {
 		t.Fatal("改写历史后的普通 Push 应被拒绝")
 	}
 
 	// ForcePush 应成功
-	if err := m.ForcePush(ctx, wt, repo, nil); err != nil {
+	if err := m.ForcePush(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("ForcePush 应成功: %v", err)
 	}
 
 	// 远端分支确实更新到了新历史：fetch 后镜像命名空间里的 tip 应等于
 	// 改写后的 HEAD；顺带确认此时再来一次普通 Push 也不再被拒绝
 	// （远端已与本地一致，"Everything up-to-date"）。
-	if err := m.Push(ctx, wt, repo, nil); err != nil {
+	if err := m.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Errorf("ForcePush 之后远端应已与本地一致，普通 Push 不应再被拒绝: %v", err)
 	}
 	remoteHead := gitOut(t, src, "rev-parse", wt.Branch)
@@ -203,10 +205,10 @@ func TestWorktreeManagerForcePushRejectsProtectedBranch(t *testing.T) {
 	tampered := *wt
 	tampered.Branch = "dev"
 
-	if err := m.ForcePush(ctx, &tampered, repo, nil); err == nil {
+	if err := m.ForcePush(ctx, &tampered, repo, vcs.GitAuth{}, nil); err == nil {
 		t.Error("推送到受保护分支应被拒绝")
 	}
-	if err := m.ForcePush(ctx, nil, repo, nil); err == nil {
+	if err := m.ForcePush(ctx, nil, repo, vcs.GitAuth{}, nil); err == nil {
 		t.Error("传 nil 工作区应报错")
 	}
 }
