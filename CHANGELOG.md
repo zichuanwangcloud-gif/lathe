@@ -9,6 +9,13 @@
 
 ### Added
 
+- **收件箱**：`/inbox` 把等你处理的事集中到一个页面，包括需求待补充、等你放行、
+  review 停车、前驱阻塞、失败待处置，以及 PRD 的待回答 / 待批准 / 待逐节确认 / 运行失败。
+  每项一键跳到处理页，顶栏显示未读计数，失败事项可以忽略。事项从现有状态实时派生，
+  新表 `inbox_marks` 只存已读/忽略（迁移 0035）；另给 `tasks` 加了 `(user_id, state)`
+  索引（迁移 0036，CONCURRENTLY）。新增接口 `GET /api/inbox`、`GET /api/inbox/count`、
+  `POST /api/inbox/items/{key}/read|unread|dismiss`、`POST /api/inbox/read-all`。
+  收件箱里的失败原因先经与失败记忆同一套两层脱敏再展示（docs/features/inbox.md）。
 - **云效（Projex）工作项作为任务来源**（[docs/features/tracker-yunxiao.md](docs/features/tracker-yunxiao.md)）：
   指派给我 / 打上触发标签即接单，也可按工作项 ID 手动开跑；分诊读正文与评论（富文本转纯文本），
   单子不明确时在云效回帖提问并停下，PR 开出后回帖链接；可选的状态同步（开跑 / PR 已开 / 已合并

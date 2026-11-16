@@ -117,6 +117,23 @@ export const api = {
     request(`/api/issues/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
   startInternalIssue: (id) => request(`/api/issues/${id}/start`, { method: 'POST' }),
 
+  // 收件箱（docs/features/inbox.md）：等你处理的事项，从现有状态实时派生；
+  // 这里只读状态、只写「读过 / 忽略过」，处理动作仍走原来的详情页。
+  inbox: (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.filter) q.set('filter', params.filter)
+    if (params.kind) q.set('kind', params.kind)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return request(`/api/inbox${qs ? '?' + qs : ''}`)
+  },
+  inboxCount: () => request('/api/inbox/count'),
+  inboxRead: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/read`, { method: 'POST' }),
+  inboxUnread: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/unread`, { method: 'POST' }),
+  inboxDismiss: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/dismiss`, { method: 'POST' }),
+  inboxReadAll: () => request('/api/inbox/read-all', { method: 'POST' }),
+
   // 模糊任务规划（docs/10-prd-template.md）：多轮对话式智能体读代码产出
   // PRD，对抗复核 + 自检过闸、人逐节签字后，一键生成正式任务与编排图。
   prds: (params = {}) => {
