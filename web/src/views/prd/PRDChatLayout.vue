@@ -198,20 +198,21 @@ const activeId = computed(() => String(route.params.id || ''))
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 8px 12px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
+  min-height: var(--control-h);
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--input-border);
   color: var(--text);
   background: var(--surface-2);
   font-weight: 500;
 }
-.new-btn:hover { text-decoration: none; border-color: var(--accent); }
-.new-btn.on { border-color: var(--accent); color: var(--accent); }
+.new-btn:hover { text-decoration: none; background: var(--surface-2); }
+.new-btn.on { background: var(--surface-selected); }
 
 .icon { border: none; background: none; padding: 4px 8px; color: var(--text-faint); font-size: 16px; }
 .icon:hover:not(:disabled) { color: var(--text); }
 
-.search { margin: 0 12px 8px; padding: 6px 10px; font-size: 13px; border-radius: 10px; }
+.search { margin: 0 12px 8px; padding: 5px 10px; font-size: 13px; border-radius: var(--radius-sm); }
 
 .list { flex: 1; overflow-y: auto; padding: 0 8px 16px; }
 .side-msg { padding: 20px 8px; color: var(--text-faint); font-size: 13px; text-align: center; }

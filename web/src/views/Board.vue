@@ -96,31 +96,38 @@ onUnmounted(() => clearInterval(timer))
 </script>
 
 <template>
+  <header class="page-head">
+    <div>
+      <h1>任务看板</h1>
+      <p class="dim">共 {{ total }} 条 · 每 5 秒自动刷新</p>
+    </div>
+  </header>
+
   <div v-if="error" role="alert" class="error-banner">{{ error }}</div>
 
   <div v-if="stats" class="stats">
     <div class="card stat">
+      <div class="stat-label">进行中</div>
       <div class="stat-num">{{ stats.active }}</div>
-      <div class="dim">进行中</div>
     </div>
     <div class="card stat">
+      <div class="stat-label">失败</div>
       <div class="stat-num">{{ stats.byState?.failed || 0 }}</div>
-      <div class="dim">失败</div>
     </div>
     <div class="card stat">
+      <div class="stat-label">待补充需求</div>
       <div class="stat-num">{{ stats.byState?.blocked_spec || 0 }}</div>
-      <div class="dim">待补充需求</div>
     </div>
     <div class="card stat">
+      <div class="stat-label">成功率</div>
       <div class="stat-num">
         {{ stats.successRate < 0 ? '—' : Math.round(stats.successRate * 100) + '%' }}
       </div>
-      <div class="dim">成功率</div>
     </div>
   </div>
 
-  <div class="card toolbar">
-    <div class="wrap">
+  <div class="toolbar">
+    <div class="seg" role="group" aria-label="按状态筛选">
       <button :class="{ primary: filter === '' }" :aria-pressed="filter === ''" @click="setFilter('')">全部</button>
       <button :class="{ primary: filter === ACTIVE }" :aria-pressed="filter === ACTIVE" @click="setFilter(ACTIVE)">进行中</button>
       <button :class="{ primary: filter === 'failed' }" :aria-pressed="filter === 'failed'" @click="setFilter('failed')">失败</button>
@@ -136,10 +143,7 @@ onUnmounted(() => clearInterval(timer))
     </div>
   </div>
 
-  <CostPanel />
-  <MetricsPanel />
-
-  <div class="card scroll-x" style="padding: 0">
+  <div class="card scroll-x list" style="padding: 0">
     <table v-if="tasks.length">
       <thead>
         <tr>
@@ -189,8 +193,6 @@ onUnmounted(() => clearInterval(timer))
     </div>
   </div>
 
-  <p class="faint" style="margin-top: 12px">共 {{ total }} 条 · 每 5 秒自动刷新</p>
-
   <!-- 超过一页才显示翻页；筛选/页码都在 URL 里，链接可分享 -->
   <div v-if="pages > 1" class="row" style="justify-content: flex-end; margin-top: 4px">
     <button :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
@@ -198,18 +200,23 @@ onUnmounted(() => clearInterval(timer))
     <button :disabled="page >= pages" @click="goPage(page + 1)">下一页</button>
   </div>
 
+  <h2 class="section-title">度量</h2>
+  <CostPanel />
+  <MetricsPanel />
+
   <PreviewDialog v-if="previewTask" :task="previewTask" @close="previewTask = null" />
 </template>
 
 <style scoped>
 .stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
-  margin-bottom: 16px;
+  margin-bottom: 20px;
 }
-.stat { text-align: center; }
-.stat-num { font-size: 28px; font-weight: 600; line-height: 1.2; }
+.stat { padding: 12px 16px; }
+.stat-label { font-size: 12px; color: var(--text-dim); }
+.stat-num { font-size: 24px; font-weight: 600; line-height: 32px; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 
 .toolbar {
   display: flex;
@@ -217,8 +224,10 @@ onUnmounted(() => clearInterval(timer))
   justify-content: space-between;
   gap: 14px;
   flex-wrap: wrap;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
 }
+.list { margin-bottom: 8px; }
+.section-title { margin: 28px 0 12px; font-size: 14px; color: var(--text-dim); font-weight: 500; }
 
 .failure {
   max-width: 320px;
