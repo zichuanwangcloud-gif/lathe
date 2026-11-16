@@ -57,6 +57,7 @@ onMounted(() => {
           <RouterLink v-if="hasLinearToken()" to="/schedules">定时建单</RouterLink>
           <RouterLink to="/usage">用量</RouterLink>
           <RouterLink to="/repos">仓库配置</RouterLink>
+          <RouterLink to="/teams">团队</RouterLink>
           <RouterLink to="/settings">个人设置</RouterLink>
           <RouterLink v-if="isAdmin()" to="/admin/settings">系统设置</RouterLink>
           <RouterLink v-if="isAdmin()" to="/users">用户管理</RouterLink>
