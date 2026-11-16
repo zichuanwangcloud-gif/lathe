@@ -50,10 +50,14 @@ func TestFindCredential_Shapes(t *testing.T) {
 	}
 }
 
-// tokenShapesCountAtF11 是 f11 实现时 tokenShapes 的条目数。谁往表里塞 PEM
-// （或任何别的规则）都会让这条锁变红，提醒他同步处理 FindCredential 里的
-// 私有 PEM 正则（见 redact.go 的 pemPrivateKeyHeader 注释）。
-const tokenShapesCountAtF11 = 10
+// tokenShapesBaseline 是这条锁的基线条目数。谁往表里塞 PEM（或任何别的
+// 规则）都会让这条锁变红，提醒他同步处理 FindCredential 里的私有 PEM 正则
+// （见 redact.go 的 pemPrivateKeyHeader 注释）。
+//
+// 基线随并行线一起前进：f11 实现时是 10；合入 dev 时 dev 的 PAT 线（#27）
+// 加了 lathe_pat_ 这一条，变成 11 —— 只改这个数字，PEM 私有规则无需同步
+// （新增的那条不认 PEM 头）。
+const tokenShapesBaseline = 11
 
 // AC-5（r3）：PEM 检出只在 FindCredential 侧，脱敏（替换）语义不变。
 func TestFindCredential_PEMDoesNotChangeRedaction(t *testing.T) {
@@ -65,9 +69,9 @@ func TestFindCredential_PEMDoesNotChangeRedaction(t *testing.T) {
 			}
 		})
 	}
-	if got := len(tokenShapes); got != tokenShapesCountAtF11 {
+	if got := len(tokenShapes); got != tokenShapesBaseline {
 		t.Errorf("len(tokenShapes) = %d, want %d（改了形态表就同步检查 FindCredential 的 PEM 私有规则）",
-			got, tokenShapesCountAtF11)
+			got, tokenShapesBaseline)
 	}
 }
 

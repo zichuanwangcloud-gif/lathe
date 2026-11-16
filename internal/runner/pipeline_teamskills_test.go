@@ -185,7 +185,7 @@ func scriptedAgent(mutate func(string) error) *fakeAgent {
 	}
 }
 
-func writeFix(dir string) error {
+func writeFixGreeting(dir string) error {
 	if err := os.WriteFile(filepath.Join(dir, "main_test.go"),
 		[]byte("package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"), 0o644); err != nil {
 		return err
@@ -301,7 +301,7 @@ func TestPipelineTeamSkillsAgentDeletesSentinelStillNotCommitted(t *testing.T) {
 		wantStage Stage
 	}{
 		{"写代码并删哨兵仍不提交技能文件", func(dir string) error {
-			if err := writeFix(dir); err != nil {
+			if err := writeFixGreeting(dir); err != nil {
 				return err
 			}
 			return os.Remove(filepath.Join(dir, ".claude/skills/team-acme-testing/.gitignore"))
@@ -352,7 +352,7 @@ func TestPipelineHideTeamSkillsRefusesSymlinkPlantedByAgent(t *testing.T) {
 	outside := t.TempDir()
 	gh := okGH()
 	p := e.pipeline(t, gh, scriptedAgent(func(dir string) error {
-		if err := writeFix(dir); err != nil {
+		if err := writeFixGreeting(dir); err != nil {
 			return err
 		}
 		dest := filepath.Join(dir, ".claude/skills/team-acme-testing")
@@ -503,7 +503,7 @@ func runUntilImplementFails(t *testing.T, e *tsEnv) (*Pipeline, string) {
 		t.Fatal("前置：第一轮应已钉住")
 	}
 	// 续跑的 agent：实现阶段写代码（成功与否不影响物化断言）
-	p.Agent = &fakeAgent{results: []*agent.Result{{Success: true, Text: "ok"}}, mutate: []func(string) error{writeFix}}
+	p.Agent = &fakeAgent{results: []*agent.Result{{Success: true, Text: "ok"}}, mutate: []func(string) error{writeFixGreeting}}
 	return p, e.wtPath(t)
 }
 
@@ -801,7 +801,7 @@ func TestPipelineTeamSkillsNoCrossUserResidue(t *testing.T) {
 			b := newTSEnvKey(t, st, provider, nil, "CR-778")
 			b.src = src
 			pb := b.pipeline(t, okGH(), scriptedAgent(func(dir string) error {
-				if err := writeFix(dir); err != nil {
+				if err := writeFixGreeting(dir); err != nil {
 					return err
 				}
 				if err := os.MkdirAll(filepath.Join(dir, ".claude/skills/b-new"), 0o755); err != nil {

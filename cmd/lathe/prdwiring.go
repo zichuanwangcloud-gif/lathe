@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
 	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 规划管线的装配（docs/10）。放在 cmd 层而不是 internal/prd 里，是为了让
@@ -22,8 +24,27 @@ type prdWorktrees struct {
 	wm *runner.WorktreeManager
 }
 
-func (p prdWorktrees) EnsureMirror(ctx context.Context, providerRepo, cloneURL string) (string, error) {
-	return p.wm.EnsureMirror(ctx, providerRepo, cloneURL)
+func (p prdWorktrees) EnsureMirror(ctx context.Context, key, cloneURL string, auth vcs.GitAuth) (string, error) {
+	return p.wm.EnsureMirror(ctx, key, cloneURL, auth)
+}
+
+// prdGitAuth 为 PRD 规划检出按属主解析代码平台鉴权（prd.GitAuthSource）。
+//
+// 与流水线同一处实例比对：凭据地址与仓库钉死的实例不一致返回
+// vcs.ErrInstanceMismatch，token 不发往别的实例。
+type prdGitAuth struct{ f runner.ClientFactory }
+
+func (a prdGitAuth) GitAuth(ctx context.Context, userID int64, t vcs.Target) (vcs.GitAuth, error) {
+	c, err := a.f.ForUser(ctx, userID)
+	if err != nil {
+		return vcs.GitAuth{}, err
+	}
+	v, ok := c.(runner.VCSClients)
+	if !ok {
+		return vcs.GitAuth{}, fmt.Errorf("prd: 客户端不支持代码平台 %q", t.Provider)
+	}
+	_, auth, err := v.VCS(ctx, t)
+	return auth, err
 }
 
 func (p prdWorktrees) CreateDetached(ctx context.Context, providerRepo, base, name string) (*prd.Checkout, error) {

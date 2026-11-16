@@ -1,6 +1,6 @@
 # 团队自定义技能（team skills）
 
-> **状态：已实现**（分支 `feat/team-skills`，目标 `dev`）· 迁移 0062–0064（并行开发号段，见 §6）
+> **状态：已实现**（分支 `feat/team-skills`，目标 `dev`）· 迁移 0061–0063（见 §6）
 > 设计评审稿：`/opt/lathe-wt/prd/f11-team-skills.md`（r5，含五轮评审答复）。本文是它的定稿：
 > 去掉了易漂移的行号（只留「文件 + 符号名」，与 `docs/08-debt-cleanup.md` 的引用约定一致），
 > 补上实现落点与验收结果。
@@ -39,9 +39,9 @@
 
 | 表（迁移） | 作用 | 关键约束 |
 |---|---|---|
-| `team_skills`（0062） | 技能本体：`user_id`、`repo_id`、`slug`、`title`、`enabled`、`archived_at` | `slug` CHECK（字符集 + 长度）；部分唯一索引 `team_skills_active_slug (repo_id, slug) WHERE archived_at IS NULL`（归档不占名字） |
-| `team_skill_versions`（0063） | 不可变版本：`files` jsonb、`content_sha256`、`total_bytes`、`note` | 只 INSERT；`UNIQUE (skill_id, version)`；`total_bytes ≤ 262144` |
-| `team_task_skills`（0064） | 任务钉版本：一条任务一行，`pinned` jsonb，冗余 `user_id/repo_id` | `pinned = []`（钉过了、当时没启用的技能）与「没有这一行」（还没钉）可分；属主索引 `(user_id, repo_id, pinned_at DESC)` |
+| `team_skills`（0061） | 技能本体：`user_id`、`repo_id`、`slug`、`title`、`enabled`、`archived_at` | `slug` CHECK（字符集 + 长度）；部分唯一索引 `team_skills_active_slug (repo_id, slug) WHERE archived_at IS NULL`（归档不占名字） |
+| `team_skill_versions`（0062） | 不可变版本：`files` jsonb、`content_sha256`、`total_bytes`、`note` | 只 INSERT；`UNIQUE (skill_id, version)`；`total_bytes ≤ 262144` |
+| `team_task_skills`（0063） | 任务钉版本：一条任务一行，`pinned` jsonb，冗余 `user_id/repo_id` | `pinned = []`（钉过了、当时没启用的技能）与「没有这一行」（还没钉）可分；属主索引 `(user_id, repo_id, pinned_at DESC)` |
 
 `user_id/repo_id` 一律由服务端从 `repos` / `tasks` 行抄来，不接受 API 传入。
 
@@ -165,7 +165,7 @@ materializeTeamSkills：
 | R12 | agent 无法通过 PR 新增/修改**被本任务钉住的** `team-<slug>/` 下的文件（哨兵隐藏 + 提交前复位）。作用域只限当前 worktree 的这几个目录 |
 | R13（既有，非本功能引入） | 产品技能的 `StageSkillMissing` 不在 `stageOrder` 里，review 二轮有提交时会被 `default` 送去 `EntryVerify`。建议另开 `fix/skill-missing-retry` |
 | R14（既有，非本功能引入） | 产品技能路径的 `excludeSkillsDir` 把 `.claude/skills/` 写进 mirror 共享的 `info/exclude`：同 provider 仓库的所有 worktree（跨用户、永久）里 agent 新增的 `.claude/skills/**` 都不进 PR。f11 不调用、不修改它；`TestPipelineTeamSkillsNoCrossUserResidue/ProductSkillResidueIsPreexisting` 把现状固化成可观察事实。建议另开 `fix/skill-exclude-scope` 改用哨兵方案 |
-| 迁移号 | 0062–0064 是编排方分配的并行开发号段，与 dev 当前最大号 0031 之间跳号，**违反** AGENTS.md §6.6；合入 dev 时按 dev 当时最大号 +1 连续重编号，只改文件名，不改迁移内容 |
+| 迁移号 | 编排方给 f11 分配的是并行开发号段 0062–0064；合入 dev 时按 dev 当时最大号（0060）连续重编号为 0061–0063，只改文件名与注释里的号，不改迁移内容（AGENTS.md §6.6） |
 | 重建路径 | `TestFreshRebuildRepinsLatest` 真跑一轮（首次物化钉 v1）→ 保存 v2 → 按生产的回收路径（`Discard` 删盘 + 收割机 `ClaimForReap` 置空 `worktree_path`，与 `memory_test.go` 的 `reclaimWorktree` 同一夹具）→ 重入队 → Fresh 执行。只 `Discard` 不落账时，重建会被 `ClaimedWorktreePaths` 把本任务自己的旧路径算作在途占用而拒绝接管 —— 那是既有行为，与 f11 无关 |
 
 ## 7. 验收结果

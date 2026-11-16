@@ -3,6 +3,7 @@ import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
 import Board from './views/Board.vue'
+import Inbox from './views/Inbox.vue'
 import LinearIssues from './views/LinearIssues.vue'
 import TaskDetail from './views/TaskDetail.vue'
 import FlowList from './views/FlowList.vue'
@@ -13,6 +14,7 @@ import PRDConversation from './views/prd/PRDConversation.vue'
 import Issues from './views/Issues.vue'
 import IssueDetail from './views/IssueDetail.vue'
 import Repos from './views/Repos.vue'
+import Usage from './views/Usage.vue'
 import PersonalSettings from './views/PersonalSettings.vue'
 import SystemSettings from './views/SystemSettings.vue'
 import Users from './views/Users.vue'
@@ -22,6 +24,7 @@ import ForgotPassword from './views/ForgotPassword.vue'
 import ResetPassword from './views/ResetPassword.vue'
 import ChangePassword from './views/ChangePassword.vue'
 import NotFound from './views/NotFound.vue'
+import Schedules from './views/Schedules.vue'
 import { auth, refresh, isAdmin, mustChangePassword, hasLinearToken } from './auth'
 import { setPasswordChangeHandler } from './api'
 import './style.css'
@@ -30,6 +33,7 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'board', component: Board },
+    { path: '/inbox', name: 'inbox', component: Inbox },
     // 内置工单（docs/09）：不依赖 Linear 的手动需求入口，所有人可用
     { path: '/issues', name: 'issues', component: Issues },
     { path: '/issues/:id', name: 'issue', component: IssueDetail, props: true },
@@ -50,8 +54,12 @@ const router = createRouter({
     },
     // 「Linear 任务」只有绑定了 Linear API 令牌的人可见（菜单与守卫同一依据）
     { path: '/linear', name: 'linear', component: LinearIssues, meta: { linear: true } },
+    // 定时建单：到点用你的 Linear 令牌建单，同样只对绑了令牌的人可见
+    { path: '/schedules', name: 'schedules', component: Schedules, meta: { linear: true } },
     { path: '/tasks/:id', name: 'task', component: TaskDetail, props: true },
     { path: '/repos', name: 'repos', component: Repos },
+    // 用量统计（f03）：所有人可用；?scope=all 的全局视图只对管理员生效，后端强制鉴权
+    { path: '/usage', name: 'usage', component: Usage },
     { path: '/settings', name: 'settings', component: PersonalSettings },
     { path: '/admin/settings', name: 'system-settings', component: SystemSettings, meta: { admin: true } },
     { path: '/users', name: 'users', component: Users, meta: { admin: true } },

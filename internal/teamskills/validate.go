@@ -26,7 +26,7 @@ import (
 const (
 	// MaxFiles 是单个版本的文件数上限（含 SKILL.md）。
 	MaxFiles = 16
-	// MaxVersionBytes 是单个版本全部内容的 UTF-8 字节数上限，与 0063 的
+	// MaxVersionBytes 是单个版本全部内容的 UTF-8 字节数上限，与 0062 的
 	// total_bytes CHECK 同值。
 	MaxVersionBytes = 256 << 10
 	// MaxFileBytes 是单个文件的字节数上限：防止一个文件吃掉整个配额。

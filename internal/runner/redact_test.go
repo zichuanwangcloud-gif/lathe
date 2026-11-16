@@ -982,3 +982,71 @@ func firstN(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// f04：RedactForDisplay 是日志读取接口的脱敏入口，必须与写入侧的
+// redactText（无 StackEnv）逐字节一致 —— 不另写一套规则。
+func TestRedactForDisplayMatchesRedactText(t *testing.T) {
+	reg := []string{"postgres://lathe:f04RegisteredPw9@db.internal:5432/app"}
+	cases := []struct{ name, in string }{
+		{"给定登记的 DSN 断言与 redactText 一致", "dsn=postgres://lathe:f04RegisteredPw9@db.internal:5432/app ok"},
+		{"给定未登记的 DSN 断言形态层同样生效", "dial postgres://u:p4ssw0rdXYZ@h:5432/db failed"},
+		{"给定 kv 形态 断言一致", "API_KEY=abcdefghijklmnopqrstuvwxyz012345\n"},
+		{"给定跨行 kv 断言一致", "password:\n  hunter2hunter2\n"},
+		{"给定空串 断言为空", ""},
+		{"给定普通文本 断言原样", "go build ./... ok\n中文输出\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := RedactForDisplay(c.in, reg)
+			want := redactText(c.in, reg, nil)
+			if got != want {
+				t.Errorf("got %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// AC-12：Lathe 自己签发的个人 API 令牌（lathe_pat_ + 43 个 base64url）不来自
+// 环境变量，层 1 抓不到，必须由层 2 形态表整段抹掉；不足 32 字符的不误伤。
+func TestRedactLathePATShape(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		mustGone string
+		redacted bool
+	}{
+		{
+			name:     "给定 curl 里的 Bearer PAT_断言整段抹掉",
+			in:       "curl -H 'Authorization: Bearer lathe_pat_" + strings.Repeat("A", 43) + "'",
+			mustGone: "lathe_pat_AAA",
+			redacted: true,
+		},
+		{
+			name:     "给定以 - 结尾的 PAT_断言末尾字符也不残留",
+			in:       "token lathe_pat_" + strings.Repeat("b", 42) + "- end",
+			mustGone: strings.Repeat("b", 42) + "-",
+			redacted: true,
+		},
+		{
+			name:     "给定不足 32 字符的普通文本_断言不误伤",
+			in:       "the lathe_pat_ prefix is short",
+			redacted: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactSecrets(tc.in, nil)
+			if tc.mustGone != "" && strings.Contains(got, tc.mustGone) {
+				t.Errorf("明文残留 got=%q mustGone=%q", got, tc.mustGone)
+			}
+			if gotRed := strings.Contains(got, "[REDACTED]"); gotRed != tc.redacted {
+				t.Errorf("是否抹除 got=%v want=%v（输出 %q）", gotRed, tc.redacted, got)
+			}
+			if !tc.redacted && got != tc.in {
+				t.Errorf("不该改动 got=%q want=%q", got, tc.in)
+			}
+			t.Logf("前: %s", tc.in)
+			t.Logf("后: %s", got)
+		})
+	}
+}

@@ -57,10 +57,6 @@ func notFound(w http.ResponseWriter, what string) {
 	writeJSON(w, http.StatusNotFound, map[string]any{"error": what + "不存在"})
 }
 
-func badRequest(w http.ResponseWriter, msg string) {
-	writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
-}
-
 // pathInt 解析路径参数；非法值按「不存在」处理（404），不暴露格式细节之外的信息。
 func pathInt(r *http.Request, name string) (int64, bool) {
 	v, err := strconv.ParseInt(r.PathValue(name), 10, 64)

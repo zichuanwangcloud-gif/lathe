@@ -2,17 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/zichuanwangcloud-gif/lathe/internal/config"
+	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // claimLeaseDuration 是 ClaimReady 打的租约时长。
@@ -477,7 +481,7 @@ func (q *queue) runOneClaimed(ctx context.Context, tk *task.Task) {
 		if tk.BranchName != nil {
 			branch = *tk.BranchName
 		}
-		q.worktrees.Discard(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch)
+		q.worktrees.Discard(ctx, repoCfg.RepoKey(), *tk.WorktreePath, branch)
 	}
 	slog.Info("重试决策", "task", tk.ID, "plan", plan.String(), "reasons", plan.Reasons)
 
@@ -628,7 +632,7 @@ func (q *queue) inspectTask(ctx context.Context, tk *task.Task, repoCfg runner.R
 	if err != nil {
 		base = repoCfg.DefaultBranch
 	}
-	return q.worktrees.Inspect(ctx, repoCfg.ProviderRepo, *tk.WorktreePath, branch, base)
+	return q.worktrees.Inspect(ctx, repoCfg.RepoKey(), *tk.WorktreePath, branch, base)
 }
 
 // resolveRepo 查出属主名下要用的仓库：第一条配置。
@@ -663,12 +667,18 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 		tierOverride  string
 		excludeDirs   []string
 		verifyInfra   []string
+		vcsProvider   string
+		vcsBaseURL    string
 	)
+	// vcs_provider / vcs_base_url：仓库所在的代码平台实例（登记时钉死）。
+	// 与 runner.NewRepoLookup、store.GetRepo 三处同步读取（§6 已知债务）。
 	err = q.store.Pool().QueryRow(ctx, `
 		SELECT provider_repo, default_branch, hotfix_base, protected_branches, branch_pattern,
-		       COALESCE(verify_tier_override, ''), exclude_dirs, verify_infra
+		       COALESCE(verify_tier_override, ''), exclude_dirs, verify_infra,
+		       vcs_provider, COALESCE(vcs_base_url, '')
 		FROM repos WHERE id = $1`, repoID,
-	).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs, &verifyInfra)
+	).Scan(&providerRepo, &defaultBranch, &hotfixBase, &protected, &pattern, &tierOverride, &excludeDirs, &verifyInfra,
+		&vcsProvider, &vcsBaseURL)
 	if err != nil {
 		return cfg, "", fmt.Errorf("读取仓库配置失败（repo_id=%d）: %w", repoID, err)
 	}
@@ -682,8 +692,11 @@ func (q *queue) loadRepoConfig(ctx context.Context, repoID int64) (cfg runner.Re
 		ExcludeDirs:        excludeDirs,
 		VerifyTierOverride: tierOverride,
 		VerifyInfra:        verifyInfra,
+		VCSProvider:        vcs.Provider(vcsProvider),
+		VCSBaseURL:         vcsBaseURL,
 	}
-	return cfg, "git@github.com:" + providerRepo + ".git", nil
+	// 单一真相源：GitHub 仍是 "git@github.com:<repo>.git"（与此前逐字节相同）。
+	return cfg, cfg.CloneURL(), nil
 }
 
 // commentUnresolved 在无法接单时尽力回帖说明原因。
@@ -707,4 +720,49 @@ func (q *queue) commentUnresolved(ctx context.Context, ownerUserID int64, provid
 	if _, err := tr.Comment(ctx, ref, body); err != nil {
 		slog.Warn("接单失败回帖也没发出去", "issue", issueKey, "err", err)
 	}
+}
+
+// EnqueueYunxiao 实现 httpapi.YunxiaoEnqueuer：云效工作项入队（f08）。
+//
+// 与 Linear 的 Enqueue 同一口径：仓库取属主的第一个仓库（resolveRepo），
+// 建不出时尽力在云效回帖说明原因。external_id = 工作项 id（回帖、拉单的
+// 定位引用），external_key = serialNumber（人读编号，取消联动按它找）。
+//
+// 撞活任务唯一索引（SQLSTATE 23505）时包成 httpapi.ErrYunxiaoTaskActive ——
+// 判定只在这里做，不改 internal/task。
+func (q *queue) EnqueueYunxiao(ctx context.Context, ownerUserID int64, workitemID, serial string) (int64, error) {
+	repoID, gateMode, err := q.resolveRepo(ctx, ownerUserID)
+	if err != nil {
+		slog.Error("无法确定云效任务归属仓库", "workitem", workitemID, "owner", ownerUserID, "err", err)
+		q.commentUnresolved(ctx, ownerUserID, tracker.ProviderYunxiao, workitemID, serial, err)
+		return 0, fmt.Errorf("%w：%v", httpapi.ErrYunxiaoNoRepo, err)
+	}
+	tk, err := q.tasks.Create(ctx, task.CreateParams{
+		UserID: ownerUserID, RepoID: repoID, ExternalKey: serial, ExternalID: workitemID,
+		TrackerProvider: tracker.ProviderYunxiao,
+		GateMode:        gateMode,
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return 0, httpapi.ErrYunxiaoTaskActive
+		}
+		return 0, err
+	}
+	return tk.ID, nil
+}
+
+// CancelForYunxiao 实现 httpapi.YunxiaoEnqueuer：云效工作项被改到用户配置
+// 的「取消」状态时联动取消在途任务。语义边界与 CancelForIssue 完全一致：
+// 只改数据库状态，不会停下正在跑的 agent（T7-AC6 的已知边界）。
+func (q *queue) CancelForYunxiao(ctx context.Context, ownerUserID int64, key string) ([]int64, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, nil
+	}
+	active, err := q.tasks.ActiveByKey(ctx, ownerUserID, tracker.ProviderYunxiao, key)
+	if err != nil {
+		return nil, err
+	}
+	reason := fmt.Sprintf("云效工作项 %s 已被取消", key)
+	return q.cancelActiveTasks(ctx, active, reason, "system:webhook", key)
 }
