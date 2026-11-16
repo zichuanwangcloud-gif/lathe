@@ -14,12 +14,19 @@ import (
 var ErrRepoNotFound = errors.New("store: 仓库不存在")
 
 // ErrRepoExists 表示该用户名下已登记过这个仓库。
-var ErrRepoExists = errors.New("store: 该仓库已在你的配置中")
+//
+// 唯一约束是 (user_id, provider_repo)，与平台无关：同一路径不能同时登记在
+// 两个平台（docs/features/vcs-gitlab-gitea.md §4）。
+var ErrRepoExists = errors.New("store: 该仓库已在你的配置中（同一路径不能同时登记在两个平台）")
 
 // TaskRow 是任务列表里的一行（含展示所需的关联字段）。
 type TaskRow struct {
-	ID          int64  `json:"id"`
-	UserID      int64  `json:"userId"`
+	ID     int64 `json:"id"`
+	UserID int64 `json:"userId"`
+	// RepoID 只在团队视图（ListTasks TeamView=true）与 TaskDetailForViewer 里填充；
+	// 默认视图与属主版 TaskDetail 一律为 0（omitempty：响应与 f12 之前逐字节相同）。
+	// 新调用方要用它，必须走 viewer 版或自己查 tasks.repo_id（docs/features/team-roles.md §3.3）。
+	RepoID      int64  `json:"repoId,omitempty"`
 	ExternalKey string `json:"externalKey"`
 	// TrackerProvider 是需求来源平台（'linear' | 'internal'）；
 	// 前端据此把 key 渲染成 Linear 链接或内置工单页链接。
@@ -51,6 +58,8 @@ type TaskRow struct {
 	AgentCostUSD    *float64 `json:"agentCostUsd"`
 	AgentDurationMS *int64   `json:"agentDurationMs"`
 	AgentNumTurns   *int     `json:"agentNumTurns"`
+	// AgentDriver 是任务钉死的执行 agent（0048，f06）。NULL（老任务）读成 "claude"。
+	AgentDriver string `json:"agentDriver"`
 }
 
 // ListTasksParams 是任务列表的过滤条件。
@@ -63,6 +72,9 @@ type ListTasksParams struct {
 	States []string
 	Limit  int
 	Offset int
+	// TeamView 为 true 时（GET /api/tasks?scope=team）额外包含「我所在团队的
+	// 共享仓库里别人的任务」，走 listTasksTeamSQL；false 时是 f12 之前那条 SQL，一字不改。
+	TeamView bool
 }
 
 // ListTasks 按更新时间倒序返回指定用户名下的任务列表。
@@ -80,6 +92,10 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 		states = p.States
 	}
 
+	if p.TeamView {
+		return s.listTasksTeam(ctx, p, states)
+	}
+
 	var total int
 	if err := s.pool.QueryRow(ctx, `
 		SELECT count(*) FROM tasks
@@ -94,7 +110,8 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 		       r.provider_repo, t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
 		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns,
-		       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END
+		       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END,
+		       COALESCE(t.agent_driver, 'claude')
 		FROM tasks t
 		JOIN repos r ON r.id = t.repo_id
 		LEFT JOIN issues i ON t.tracker_provider = 'internal'
@@ -116,7 +133,7 @@ func (s *Store) ListTasks(ctx context.Context, p ListTasksParams) ([]TaskRow, in
 			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
 			&t.AgentSessionID, &t.LeaseExpiresAt,
 			&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
-			&t.IssueID,
+			&t.IssueID, &t.AgentDriver,
 		); err != nil {
 			return nil, 0, fmt.Errorf("store: 读取任务行失败: %w", err)
 		}
@@ -151,6 +168,10 @@ type TaskDetail struct {
 	Task          TaskRow           `json:"task"`
 	Events        []EventRow        `json:"events"`
 	Verifications []VerificationRow `json:"verifications"`
+	// ViewerRole 是当前查看者对任务所属仓库的关系（owner / team_owner / team_admin /
+	// team_member），只由 TaskDetailForViewer 填充；属主版 TaskDetail 留空不序列化。
+	// 前端据此只做按钮显隐 —— 权限判定仍在服务端。
+	ViewerRole RepoRole `json:"viewerRole,omitempty"`
 }
 
 // TaskDetail 读取单个任务的完整信息。
@@ -165,7 +186,8 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		       r.provider_repo, COALESCE(r.baseline_dir, ''), t.created_at, t.updated_at,
 		       t.agent_session_id, t.lease_expires_at,
 		       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns,
-		       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END
+		       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END,
+		       COALESCE(t.agent_driver, 'claude')
 		FROM tasks t JOIN repos r ON r.id = t.repo_id
 		LEFT JOIN issues i ON t.tracker_provider = 'internal'
 		       AND i.user_id = t.user_id AND i.key = t.external_key
@@ -176,7 +198,7 @@ func (s *Store) TaskDetail(ctx context.Context, id, userID int64) (*TaskDetail, 
 		&t.ProviderRepo, &t.BaselineDir, &t.CreatedAt, &t.UpdatedAt,
 		&t.AgentSessionID, &t.LeaseExpiresAt,
 		&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
-		&t.IssueID,
+		&t.IssueID, &t.AgentDriver,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("store: 读取任务 %d 失败: %w", id, err)
@@ -302,7 +324,18 @@ type RepoRow struct {
 	// 的 estimate 超限就拒绝进 ready_for_review，除非 §10 记了「接受超限」。
 	PRDTaskMaxLines int `json:"prdTaskMaxLines"`
 	PRDTaskMaxFiles int `json:"prdTaskMaxFiles"`
+	// VCSProvider / VCSBaseURL 是仓库所在的代码平台实例（migration 0050）：
+	// 登记时写入、之后不可改（UpdateRepo 的 SET 子句不含它们）。GitHub 的
+	// VCSBaseURL 恒为空串。
+	VCSProvider string `json:"vcsProvider"`
+	VCSBaseURL  string `json:"vcsBaseUrl"`
+	// AgentDriver 是之后新建的任务用哪个 CLI 写代码（'claude' | 'codex'，0047，f06）。
+	// 只影响新建任务：任务创建时复制进 tasks.agent_driver 钉死。
+	AgentDriver string `json:"agentDriver"`
 }
+
+// repoVCSCols 是四处仓库查询共用的平台列（追加在各自列清单末尾）。
+const repoVCSCols = `, vcs_provider, COALESCE(vcs_base_url, '')`
 
 // ListRepos 返回指定用户名下的仓库配置。
 func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) {
@@ -310,7 +343,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
 		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		       verify_infra, prd_task_max_lines, prd_task_max_files
+		       verify_infra, prd_task_max_lines, prd_task_max_files, agent_driver`+repoVCSCols+`
 		FROM repos WHERE user_id = $1 ORDER BY id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询仓库列表失败: %w", err)
@@ -323,7 +356,7 @@ func (s *Store) ListRepos(ctx context.Context, userID int64) ([]RepoRow, error) 
 		if err := rows.Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 			&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 			&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra,
-			&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles); err != nil {
+			&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.AgentDriver, &r.VCSProvider, &r.VCSBaseURL); err != nil {
 			return nil, fmt.Errorf("store: 读取仓库行失败: %w", err)
 		}
 		out = append(out, r)
@@ -339,12 +372,12 @@ func (s *Store) GetRepo(ctx context.Context, id, userID int64) (*RepoRow, error)
 		SELECT id, provider_repo, default_branch, hotfix_base,
 		       protected_branches, branch_pattern, dep_strategy, gate_mode,
 		       exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		       prd_task_max_lines, prd_task_max_files
+		       prd_task_max_lines, prd_task_max_files, agent_driver`+repoVCSCols+`
 		FROM repos WHERE id = $1 AND user_id = $2`, id, userID,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir,
-		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
+		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.AgentDriver, &r.VCSProvider, &r.VCSBaseURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
@@ -378,6 +411,9 @@ type UpdateRepoParams struct {
 	// 想回出厂值就显式填 400 / 8。
 	PRDTaskMaxLines *int
 	PRDTaskMaxFiles *int
+	// AgentDriver 是 'claude' | 'codex'，nil = 不修改。取值域由 CHECK 约束兜底，
+	// 「本实例有没有启用 codex」由 API 层校验（store 不知道运行时配置）。
+	AgentDriver *string
 }
 
 // ErrInvalidPRDTaskLimit 表示量级上限填了非正数。
@@ -418,19 +454,20 @@ func (s *Store) UpdateRepo(ctx context.Context, id, userID int64, p UpdateRepoPa
 			END,
 			verify_infra = COALESCE($11, verify_infra),
 			prd_task_max_lines = COALESCE($12, prd_task_max_lines),
-			prd_task_max_files = COALESCE($13, prd_task_max_files)
+			prd_task_max_files = COALESCE($13, prd_task_max_files),
+			agent_driver = COALESCE($14, agent_driver)
 		WHERE id = $1 AND user_id = $2
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
 		          exclude_dirs, COALESCE(verify_tier_override, ''), COALESCE(baseline_dir, ''),
-		          verify_infra, prd_task_max_lines, prd_task_max_files`,
+		          verify_infra, prd_task_max_lines, prd_task_max_files, agent_driver`+repoVCSCols,
 		id, userID, p.DefaultBranch, p.HotfixBase, nilIfEmpty(p.ProtectedBranches), p.BranchPattern, p.GateMode,
 		p.ExcludeDirs, p.VerifyTierOverride, p.BaselineDir, p.VerifyInfra,
-		p.PRDTaskMaxLines, p.PRDTaskMaxFiles,
+		p.PRDTaskMaxLines, p.PRDTaskMaxFiles, p.AgentDriver,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
 		&r.ExcludeDirs, &r.VerifyTierOverride, &r.BaselineDir, &r.VerifyInfra,
-		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
+		&r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.AgentDriver, &r.VCSProvider, &r.VCSBaseURL)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoNotFound
 	}
@@ -445,6 +482,10 @@ type CreateRepoParams struct {
 	ProviderRepo  string
 	DefaultBranch string
 	HotfixBase    string
+	// VCSProvider 空串按 github；VCSBaseURL 只对 gitlab/gitea 有意义，由
+	// handler 从该用户同平台凭据的 integrations.base_url 复制（不来自请求体）。
+	VCSProvider string
+	VCSBaseURL  string
 }
 
 // CreateRepo 给用户登记一个仓库配置。
@@ -455,18 +496,20 @@ type CreateRepoParams struct {
 func (s *Store) CreateRepo(ctx context.Context, userID int64, p CreateRepoParams) (*RepoRow, error) {
 	var r RepoRow
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO repos (user_id, provider_repo, default_branch, hotfix_base)
+		INSERT INTO repos (user_id, provider_repo, default_branch, hotfix_base, vcs_provider, vcs_base_url)
 		VALUES ($1, $2,
 		        COALESCE(NULLIF($3,''), 'dev'),
-		        COALESCE(NULLIF($4,''), 'main'))
+		        COALESCE(NULLIF($4,''), 'main'),
+		        COALESCE(NULLIF($5,''), 'github'),
+		        NULLIF($6,''))
 		RETURNING id, provider_repo, default_branch, hotfix_base,
 		          protected_branches, branch_pattern, dep_strategy, gate_mode,
 		          COALESCE(verify_tier_override, ''),
-		          prd_task_max_lines, prd_task_max_files`,
-		userID, p.ProviderRepo, p.DefaultBranch, p.HotfixBase,
+		          prd_task_max_lines, prd_task_max_files, agent_driver`+repoVCSCols,
+		userID, p.ProviderRepo, p.DefaultBranch, p.HotfixBase, p.VCSProvider, p.VCSBaseURL,
 	).Scan(&r.ID, &r.ProviderRepo, &r.DefaultBranch, &r.HotfixBase,
 		&r.ProtectedBranches, &r.BranchPattern, &r.DepStrategy, &r.GateMode,
-		&r.VerifyTierOverride, &r.PRDTaskMaxLines, &r.PRDTaskMaxFiles)
+		&r.VerifyTierOverride, &r.PRDTaskMaxLines, &r.PRDTaskMaxFiles, &r.AgentDriver, &r.VCSProvider, &r.VCSBaseURL)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		// 23505 = unique_violation，这里只可能是 (user_id, provider_repo)
@@ -478,9 +521,102 @@ func (s *Store) CreateRepo(ctx context.Context, userID int64, p CreateRepoParams
 	return &r, nil
 }
 
+// IntegrationBaseURL 读某用户某类凭据的实例地址（非密列，不解密）。
+// 凭据行不存在或地址为空时返回 ErrIntegrationNotFound。
+func (s *Store) IntegrationBaseURL(ctx context.Context, userID int64, kind string) (string, error) {
+	var base *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT base_url FROM integrations WHERE user_id = $1 AND kind = $2`, userID, kind).Scan(&base)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (base == nil || *base == "")) {
+		return "", ErrIntegrationNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: 读取凭据实例地址失败: %w", err)
+	}
+	return *base, nil
+}
+
 func nilIfEmpty(s []string) any {
 	if len(s) == 0 {
 		return nil
 	}
 	return s
+}
+
+// listTasksTeamSQL 是 scope=team 任务列表的 SQL（f12；ListTasks 与 AC-28 的 EXPLAIN
+// 引用同一个常量，测的就是跑的）。参数：$1 viewer，$2 状态过滤（NULL=不过滤），
+// $3 limit，$4 offset。
+//
+// 两臂 UNION ALL，每臂各自按索引取前 limit+offset 条，外层归并后再 LIMIT/OFFSET：
+//
+//	臂 1  我自己的任务                         → tasks_user_updated 上 Index Cond (user_id = $1)
+//	臂 2  我所在团队共享仓库里【别人】的任务   → tasks_repo_updated 上 Index Cond (repo_id = r2.id)
+//
+// t.user_id <> $1 让两臂不相交，UNION ALL 不需要去重。不用
+// `user_id = $1 OR repo_id IN (…)`：那种写法只能得到整表扫描 + Filter（PRD §10.2 B4 实测）。
+//
+// 【列清单副本】外层 SELECT 与 Scan 复制了 ListTasks 默认 SQL 的列（多一列 t.repo_id）。
+// 谁往默认 SQL 加列，必须同步加到这里；TestListTasksTeamViewRowsMatchDefaultView 会抓住漏改。
+const listTasksTeamSQL = `
+SELECT t.id, t.user_id, t.external_key, t.tracker_provider, t.state, t.task_kind, t.verify_tier,
+       t.branch_name, t.pr_url, t.failure_reason, t.failure_stage, t.worktree_path,
+       r.provider_repo, t.created_at, t.updated_at,
+       t.agent_session_id, t.lease_expires_at,
+       t.agent_summary, t.agent_cost_usd, t.agent_duration_ms, t.agent_num_turns,
+       CASE WHEN t.tracker_provider = 'internal' THEN i.id ELSE NULL END,
+       COALESCE(t.agent_driver, 'claude'),
+       t.repo_id
+FROM (
+  (SELECT t.* FROM tasks t
+    WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
+    ORDER BY t.updated_at DESC, t.id DESC LIMIT $3::int + $4::int)
+  UNION ALL
+  (SELECT t.* FROM tasks t
+     JOIN repos r2 ON r2.id = t.repo_id
+     JOIN team_members m ON m.team_id = r2.team_id AND m.user_id = $1
+    WHERE t.user_id <> $1 AND ($2::text[] IS NULL OR t.state = ANY($2))
+    ORDER BY t.updated_at DESC, t.id DESC LIMIT $3::int + $4::int)
+) t
+JOIN repos r ON r.id = t.repo_id
+LEFT JOIN issues i ON t.tracker_provider = 'internal'
+       AND i.user_id = t.user_id AND i.key = t.external_key
+ORDER BY t.updated_at DESC, t.id DESC
+LIMIT $3::int OFFSET $4::int`
+
+// listTasksTeamCountSQL 与 listTasksTeamSQL 同形的两臂计数，total 才与列表一致。
+const listTasksTeamCountSQL = `
+SELECT (SELECT count(*) FROM tasks t
+         WHERE t.user_id = $1 AND ($2::text[] IS NULL OR t.state = ANY($2)))
+     + (SELECT count(*) FROM tasks t
+          JOIN repos r2 ON r2.id = t.repo_id
+          JOIN team_members m ON m.team_id = r2.team_id AND m.user_id = $1
+         WHERE t.user_id <> $1 AND ($2::text[] IS NULL OR t.state = ANY($2)))`
+
+// listTasksTeam 是 ListTasks 的团队视图分支（参数已规整）。
+func (s *Store) listTasksTeam(ctx context.Context, p ListTasksParams, states any) ([]TaskRow, int, error) {
+	var total int
+	if err := s.pool.QueryRow(ctx, listTasksTeamCountSQL, p.UserID, states).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("store: 统计团队任务数失败: %w", err)
+	}
+	rows, err := s.pool.Query(ctx, listTasksTeamSQL, p.UserID, states, p.Limit, p.Offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: 查询团队任务列表失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]TaskRow, 0, p.Limit)
+	for rows.Next() {
+		var t TaskRow
+		if err := rows.Scan(
+			&t.ID, &t.UserID, &t.ExternalKey, &t.TrackerProvider, &t.State, &t.TaskKind, &t.VerifyTier,
+			&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.WorktreePath,
+			&t.ProviderRepo, &t.CreatedAt, &t.UpdatedAt,
+			&t.AgentSessionID, &t.LeaseExpiresAt,
+			&t.AgentSummary, &t.AgentCostUSD, &t.AgentDurationMS, &t.AgentNumTurns,
+			&t.IssueID, &t.AgentDriver, &t.RepoID,
+		); err != nil {
+			return nil, 0, fmt.Errorf("store: 读取团队任务行失败: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, total, rows.Err()
 }

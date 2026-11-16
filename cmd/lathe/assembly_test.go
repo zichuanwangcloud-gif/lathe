@@ -25,6 +25,7 @@ import (
 	"errors"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"strings"
 	"testing"
@@ -54,7 +55,7 @@ func TestBuildPipelineReturnsStacksAlreadyWired(t *testing.T) {
 		HeavySlots:    1,
 	}
 
-	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -120,7 +121,8 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		case *ast.CallExpr:
 			switch name := callName(node.Fun); name {
 			case "buildPipeline", "newQueue", "startWorkers",
-				"q.Reconcile", "previewMgr.SweepVerifyStacks":
+				"q.Reconcile", "previewMgr.SweepVerifyStacks",
+				"pipeline.Interjections.StartupSweep", "newScheduler":
 				hits = append(hits, hit{name, node.Pos()})
 			}
 		}
@@ -138,7 +140,7 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 
 	for _, name := range []string{
 		"buildPipeline", "newQueue", "q.Reconcile",
-		"previewMgr.SweepVerifyStacks", "startWorkers",
+		"previewMgr.SweepVerifyStacks", "pipeline.Interjections.StartupSweep", "startWorkers", "newScheduler",
 	} {
 		if idx(name) < 0 {
 			t.Fatalf("serve 里应调用 %s，实际调用序列：%v", name, hits)
@@ -154,21 +156,63 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 		{"newQueue", "队列要先建出来"},
 		{"q.Reconcile", "启动恢复必须在 worker 启动前完成，避免同一任务被两边同时捡起"},
 		{"previewMgr.SweepVerifyStacks", "开机清扫要在 worker 起栈之前，否则可能删掉 worker 刚起的栈"},
+		{"pipeline.Interjections.StartupSweep", "插话启动清扫要在 worker 之前：worker 一旦开始补投，遗留的 delivering 行就分不清是不是本进程的"},
+		{"newScheduler", "定时建单调度器要先构造好（路由与 startWorkers 共用同一个实例）再交给启动点"},
 	} {
 		if i := idx(before.name); i > start {
 			t.Errorf("%s 必须排在 startWorkers 之前（%s）；实际序列：%v", before.name, before.why, hits)
 		}
+	}
+	// 插话启动清扫要在 Reconcile 之后：Reconcile 把在途任务转回 queued，
+	// 清扫据此保留它们的 queued 插话（留给下一轮补投）而不是误判 failed。
+	if idx("pipeline.Interjections.StartupSweep") < idx("q.Reconcile") {
+		t.Errorf("插话启动清扫必须排在 q.Reconcile 之后；实际序列：%v", hits)
 	}
 
 	// 只有一个启动点：serve 里不该再有裸的 `go q.work(...)` /
 	// `go mergePoller.Run(...)` / `go sweeper.Run(...)` —— 那会绕过这个结构。
 	for _, g := range goStmts {
 		if strings.HasPrefix(g, "q.work") || strings.HasPrefix(g, "mergePoller.") ||
-			strings.HasPrefix(g, "sweeper.") {
+			strings.HasPrefix(g, "sweeper.") || strings.HasPrefix(g, "scheduler.") ||
+			strings.HasPrefix(g, "notifyWorker.") {
 			t.Errorf("serve 里不该直接 `go %s`：后台执行者只能由 startWorkers 启动，"+
 				"那是「装配完成后才启动」这条约束的唯一承载点", g)
 		}
 	}
+
+	// startWorkers 的最后一个参数是 *schedule.Runner，serve 里的调用实参个数与之相等
+	var sw *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "startWorkers" {
+			sw = fd
+		}
+	}
+	if sw == nil {
+		t.Fatal("main.go 里找不到 startWorkers 函数")
+	}
+	params := 0
+	var lastType string
+	for _, fld := range sw.Type.Params.List {
+		n := len(fld.Names)
+		if n == 0 {
+			n = 1
+		}
+		params += n
+		if star, ok := fld.Type.(*ast.StarExpr); ok {
+			lastType = "*" + callName(star.X)
+		} else {
+			lastType = callName(fld.Type)
+		}
+	}
+	if lastType != "*schedule.Runner" {
+		t.Errorf("startWorkers 的最后一个参数类型应是 *schedule.Runner，got %q", lastType)
+	}
+	ast.Inspect(serve.Body, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok && callName(c.Fun) == "startWorkers" && len(c.Args) != params {
+			t.Errorf("serve 里调用 startWorkers 的实参个数 got %d, want %d（与签名一致）", len(c.Args), params)
+		}
+		return true
+	})
 }
 
 // startWorkers 必须真的把三条后台循环都起起来 —— 只起 worker 不起
@@ -202,7 +246,7 @@ func TestStartWorkersLaunchesAllLoops(t *testing.T) {
 		return true
 	})
 
-	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false}
+	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false, "scheduler.Run": false, "notifyWorker.Run": false}
 	for _, g := range goStmts {
 		for k := range want {
 			if strings.HasPrefix(g, k) {
@@ -246,7 +290,7 @@ var _ runner.VerifyStackUp = verifyStacks{}
 func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -292,7 +336,7 @@ func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 func TestVerifyStacksReturnsTrueNilWithoutInfra(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -336,3 +380,72 @@ func testSecrets(t *testing.T, st *store.Store) *store.Secrets {
 var (
 	_ runner.FailureMemory = (*store.Store)(nil)
 )
+
+// f04 AC-8：serve 里 httpapi.API 字面量必须装上验证日志读取的两个字段，
+// 且与 Pipeline 同源（LogDir=cfg.DataDir、KnownSecrets=cfg.KnownSecrets()）。
+//
+// 与 docs/08 T4「struct literal 漏一个字段而单测全绿」同类防线：漏装时日志
+// 接口一律 503、静默不可用，单测里 API{LogDir: t.TempDir()} 照样全绿。
+func TestServeWiresVerificationLogIntoAPI(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("解析 main.go 失败: %v", err)
+	}
+	var serve *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "serve" {
+			serve = fd
+		}
+	}
+	if serve == nil {
+		t.Fatal("main.go 里找不到 serve 函数")
+	}
+
+	var lits []*ast.CompositeLit
+	ast.Inspect(serve.Body, func(n ast.Node) bool {
+		if cl, ok := n.(*ast.CompositeLit); ok {
+			if sel, ok := cl.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "API" {
+				if x, ok := sel.X.(*ast.Ident); ok && x.Name == "httpapi" {
+					lits = append(lits, cl)
+				}
+			}
+		}
+		return true
+	})
+	if len(lits) != 1 {
+		t.Fatalf("serve 里 httpapi.API 字面量个数 got %d, want 1", len(lits))
+	}
+
+	src := func(e ast.Expr) string {
+		var b strings.Builder
+		_ = printer.Fprint(&b, fset, e)
+		return b.String()
+	}
+	got := map[string]string{}
+	var keys []string
+	for _, el := range lits[0].Elts {
+		kv, ok := el.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		k := src(kv.Key)
+		got[k] = src(kv.Value)
+		keys = append(keys, k)
+	}
+	want := map[string]string{"LogDir": "cfg.DataDir", "KnownSecrets": "cfg.KnownSecrets()"}
+	var missing []string
+	for _, k := range []string{"LogDir", "KnownSecrets"} {
+		v, ok := got[k]
+		if !ok {
+			missing = append(missing, k)
+			continue
+		}
+		if v != want[k] {
+			t.Errorf("httpapi.API.%s 的值 got %q, want %q（与 Pipeline 同源）", k, v, want[k])
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("httpapi.API 字面量 missing keys %v；got keys %v, want 含 [LogDir KnownSecrets]", missing, keys)
+	}
+}

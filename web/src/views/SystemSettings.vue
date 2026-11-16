@@ -3,6 +3,7 @@ import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth } from '../auth'
 import { confirmDialog } from '../confirm'
+import YunxiaoAllowedHosts from '../components/YunxiaoAllowedHosts.vue'
 
 // 系统设置（仅管理员）：SMTP 发信通道是全站唯一的发件人，
 // 所有系统邮件（密码重置、通知类）都经它发出；收件人由每个人
@@ -276,6 +277,8 @@ onMounted(() => {
     <span v-if="thresholdSaved" class="faint" style="margin-left: 10px">已保存，即刻生效</span>
   </div>
 
+  <YunxiaoAllowedHosts />
+
   <div v-if="runtime" class="card">
     <div class="label">运行时</div>
     <dl>
@@ -283,6 +286,9 @@ onMounted(() => {
       <dt>工作区根目录</dt><dd class="mono break">{{ runtime.workspaceRoot }}</dd>
       <dt>依赖 store</dt><dd class="mono break">{{ runtime.pnpmStore || '未配置' }}</dd>
       <dt>claude 可执行文件</dt><dd class="mono">{{ runtime.claudeBin }}</dd>
+      <dt>codex 可执行文件</dt><dd class="mono">{{ runtime.codexBin || '—' }}</dd>
+      <dt>codex 驱动</dt>
+      <dd>{{ runtime.codexEnabled ? '已启用' : '未启用（未配置 LATHE_CODEX_HOME）' }}</dd>
       <dt>agent 超时</dt><dd>{{ runtime.agentTimeout }}</dd>
       <dt>执行模式</dt><dd>{{ runtime.mode }}</dd>
     </dl>

@@ -521,9 +521,12 @@ func (e *WebhookEvent) IsCancelled() bool {
 }
 
 func truncate(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) <= n {
+	// 按 rune 计量（AGENTS.md §9）：按字节切会切断多字节字符，错误串一旦
+	// 落库就是 SQLSTATE 22021。先把非法序列清掉，再数 rune。
+	s = strings.TrimSpace(strings.ToValidUTF8(s, ""))
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…(已截断)"
+	return string(r[:n]) + "…(已截断)"
 }

@@ -1,8 +1,12 @@
 <script setup>
 import { ref, onMounted, inject } from 'vue'
 import { api, UnauthorizedError } from '../api'
+import TeamSkillCard from '../components/TeamSkillCard.vue'
 
 const repos = ref([])
+// 我加入的团队（共享下拉的候选；f12）
+const teams = ref([])
+const sharing = ref(null) // 正在提交共享变更的 repo.id
 const error = ref('')
 const saved = ref(null)
 const onUnauthorized = inject('onUnauthorized')
@@ -20,8 +24,38 @@ const VERIFY_TIERS = [
   { value: 'heavy', label: '强制 heavy', desc: '必须给出红-绿复现证明：复现测试在改动前失败、改动后通过，回归通过。' },
 ]
 
+// 代码平台：登记时选定、之后不可改（迁移需删除后重新登记）。
+// 自建实例的地址取自个人设置里该平台凭据的实例地址，这里不填。
+const PLATFORMS = [
+  { value: 'github', label: 'GitHub', placeholder: 'owner/repo' },
+  { value: 'gitlab', label: 'GitLab', placeholder: 'group/repo 或 group/subgroup/repo' },
+  { value: 'gitea', label: 'Gitea', placeholder: 'owner/repo' },
+]
+const platformLabel = (v) => PLATFORMS.find((p) => p.value === (v || 'github'))?.label || v
+// 执行 agent（f06）：哪些可选由 /api/agent-drivers 决定。codex 要运维配了
+// LATHE_CODEX_HOME 才启用；未启用时选项置灰，后端也会拒绝（双保险）。
+const AGENT_DRIVERS = [
+  { value: 'claude', label: 'claude — Claude Code（默认）' },
+  { value: 'codex', label: 'codex — OpenAI Codex CLI' },
+]
+const driverEnabled = ref({ claude: true, codex: false })
+
+async function loadDrivers() {
+  try {
+    const r = await api.agentDrivers()
+    const m = {}
+    for (const d of r.drivers || []) m[d.name] = !!d.enabled
+    driverEnabled.value = m
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    // 拿不到就保守：只有 claude 可选（与未启用 codex 的部署行为一致）
+    driverEnabled.value = { claude: true, codex: false }
+  }
+}
+
 // 登记新仓库（P1.5 第二步）：各归各的名下，不再需要管理员手工插库
 const newRepo = ref('')
+const newPlatform = ref('github')
 const newBusy = ref(false)
 
 // 基线目录检测/部署状态，按 repo.id 存一份（不进 repos.value，
@@ -35,7 +69,7 @@ async function add() {
   newBusy.value = true
   error.value = ''
   try {
-    await api.createRepo({ providerRepo })
+    await api.createRepo({ providerRepo, vcsProvider: newPlatform.value })
     newRepo.value = ''
     await load()
   } catch (e) {
@@ -47,10 +81,13 @@ async function add() {
 
 async function load() {
   try {
-    const r = await api.repos()
+    // scope=team：我的 + 团队共享给我的。owned=false 的行只读（配置只有属主能改）
+    const [r, t] = await Promise.all([api.reposWithTeam(), api.teams()])
+    teams.value = t.teams || []
     // 编辑态与服务端数据分开，避免输入过程中被自动刷新覆盖
     repos.value = (r.repos || []).map((x) => ({
       ...x,
+      shareTeam: x.teamId ?? '',
       protectedText: (x.protectedBranches || []).join(', '),
       excludeText: (x.excludeDirs || []).join(', '),
       infraText: (x.verifyInfra || []).join(', '),
@@ -97,6 +134,7 @@ async function save(repo) {
       verifyTierOverride: repo.verifyTierOverride || '',
       baselineDir: repo.baselineDir || '',
       verifyInfra,
+      agentDriver: repo.agentDriver || 'claude',
     })
     saved.value = repo.id
     setTimeout(() => (saved.value = null), 2000)
@@ -135,7 +173,28 @@ async function deployBaseline(repo, composeFile) {
   }
 }
 
-onMounted(load)
+function teamName(id) {
+  return teams.value.find((t) => t.id === id)?.name || `团队 #${id}`
+}
+
+// 共享 / 取消共享：只有仓库属主能做；共享的是任务可见性，不是配置编辑权与凭据。
+async function applyShare(repo) {
+  sharing.value = repo.id
+  error.value = ''
+  try {
+    await api.shareRepo(repo.id, repo.shareTeam === '' ? null : Number(repo.shareTeam))
+    await load()
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    sharing.value = null
+  }
+}
+
+onMounted(() => {
+  load()
+  loadDrivers()
+})
 </script>
 
 <template>
@@ -145,31 +204,79 @@ onMounted(load)
   <div class="card">
     <h2>登记仓库</h2>
     <p class="faint" style="margin: 6px 0 12px">
-      把你要让 Lathe 干活的 GitHub 仓库登记到自己名下，例如 <code class="mono">acme/demo</code>。
+      把你要让 Lathe 干活的仓库（GitHub / GitLab / Gitea，含自建实例）登记到自己名下，例如 <code class="mono">acme/demo</code>。
       登记后把 issue 指派给你的 Linear 账号即可触发任务。
     </p>
     <form class="row" style="display: flex; gap: 10px" @submit.prevent="add">
+      <select v-model="newPlatform" :disabled="newBusy" aria-label="代码平台">
+        <option v-for="p in PLATFORMS" :key="p.value" :value="p.value">{{ p.label }}</option>
+      </select>
       <input
         v-model="newRepo"
         class="mono"
         style="flex: 1"
-        placeholder="owner/repo"
+        :placeholder="PLATFORMS.find((p) => p.value === newPlatform)?.placeholder"
         :disabled="newBusy"
       />
       <button class="primary" :disabled="newBusy || !newRepo.trim()">
         {{ newBusy ? '登记中…' : '登记' }}
       </button>
     </form>
+    <p v-if="newPlatform !== 'github'" class="faint hint">
+      登记 {{ platformLabel(newPlatform) }} 仓库前，请先在个人设置里配置 {{ platformLabel(newPlatform) }}
+      令牌与实例地址；实例地址会在登记时固定到仓库上。
+    </p>
   </div>
 
   <div v-if="!repos.length" class="card empty">
     你名下还没有仓库 —— 在上方登记一个，issue 才会被路由到这里。
   </div>
 
-  <div v-for="repo in repos" :key="repo.id" class="card repo">
+  <!-- 团队共享给我的仓库：只读视图。配置编辑表单只对 owned 渲染（权限判定仍在服务端） -->
+  <div v-for="repo in repos.filter((r) => r.owned === false)" :key="'s' + repo.id" class="card repo">
+    <div class="spread">
+      <h2 class="mono">{{ repo.providerRepo }}</h2>
+      <span class="badge">共享自「{{ teamName(repo.teamId) }}」· 只读</span>
+    </div>
+    <dl class="readonly">
+      <dt>默认基线分支</dt><dd class="mono">{{ repo.defaultBranch }}</dd>
+      <dt>hotfix 基线分支</dt><dd class="mono">{{ repo.hotfixBase }}</dd>
+      <dt>受保护分支</dt><dd class="mono">{{ (repo.protectedBranches || []).join(', ') }}</dd>
+      <dt>准入档位</dt><dd class="mono">{{ repo.gateMode }}</dd>
+      <dt>验证档位</dt><dd class="mono">{{ repo.verifyTierOverride || '自动' }}</dd>
+      <dt>验证依赖隔离</dt><dd class="mono">{{ (repo.verifyInfra || []).join(', ') || '无' }}</dd>
+    </dl>
+    <small class="faint">
+      任务由仓库属主用他自己的凭据执行；你能看任务与验证证据，不能改配置、不能操作他的任务。
+    </small>
+  </div>
+
+  <div v-for="repo in repos.filter((r) => r.owned !== false)" :key="repo.id" class="card repo">
     <div class="spread">
       <h2 class="mono">{{ repo.providerRepo }}</h2>
       <span v-if="saved === repo.id" class="badge ok">已保存</span>
+    </div>
+
+    <p class="faint platform">
+      代码平台：<b>{{ platformLabel(repo.vcsProvider) }}</b>
+      <span v-if="repo.vcsBaseUrl" class="mono">（{{ repo.vcsBaseUrl }}）</span>
+      · 只读，需要换平台请重新登记仓库
+    </p>
+
+    <div class="row share" style="display: flex; gap: 8px; align-items: center; margin-top: 10px">
+      <span class="dim">共享到团队</span>
+      <select v-model="repo.shareTeam" :disabled="sharing === repo.id">
+        <option value="">不共享（私有）</option>
+        <option v-for="t in teams" :key="t.id" :value="t.id">{{ t.name }}</option>
+      </select>
+      <button
+        type="button"
+        :disabled="sharing === repo.id || String(repo.shareTeam) === String(repo.teamId ?? '')"
+        @click="applyShare(repo)"
+      >
+        {{ sharing === repo.id ? '提交中…' : '应用' }}
+      </button>
+      <small class="faint">共享后团队成员可以只读查看这个仓库下的任务与验证证据；凭据永不共享。</small>
     </div>
 
     <div class="fields">
@@ -240,6 +347,27 @@ onMounted(load)
       </label>
 
       <label class="full">
+        <span>执行 agent</span>
+        <select v-model="repo.agentDriver">
+          <option
+            v-for="d in AGENT_DRIVERS"
+            :key="d.value"
+            :value="d.value"
+            :disabled="!driverEnabled[d.value] && repo.agentDriver !== d.value"
+          >
+            {{ d.label }}{{ driverEnabled[d.value] ? '' : '（本实例未启用）' }}
+          </option>
+        </select>
+        <small class="faint">
+          写代码的 CLI。验证与红-绿证明对两者完全相同。<b>只影响之后新建的任务</b>；
+          在途任务继续用原来的 agent（会话是谁建的就得谁来续）。
+          <template v-if="!driverEnabled.codex">
+            codex 不可选：运维未配置 <span class="mono">LATHE_CODEX_HOME</span>（专用的 codex 配置目录）。
+          </template>
+        </small>
+      </label>
+
+      <label class="full">
         <span>基线目录</span>
         <div class="row" style="display: flex; gap: 8px">
           <input
@@ -298,6 +426,8 @@ onMounted(load)
     </div>
 
     <button class="primary" @click="save(repo)">保存</button>
+
+    <TeamSkillCard :repo-id="repo.id" />
   </div>
 </template>
 
@@ -306,6 +436,8 @@ h1 { font-size: 22px; margin: 0 0 16px; }
 h2 { font-size: 15px; margin: 0; }
 
 .repo { margin-bottom: 16px; }
+.hint { margin: 8px 0 0; font-size: 12px; }
+.platform { margin: 6px 0 0; font-size: 12px; }
 
 .fields {
   display: grid;
@@ -318,6 +450,10 @@ label > span { font-size: 13px; color: var(--text-dim); }
 label small { font-size: 12px; }
 .full { grid-column: 1 / -1; }
 
+.readonly { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 14px 0; }
+.readonly dt { font-size: 13px; color: var(--text-dim); }
+.readonly dd { margin: 0; }
+.share { flex-wrap: wrap; }
 .baseline-status { margin: -6px 0 14px; }
 .baseline-services { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-direction: column; gap: 6px; }
 .baseline-services li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

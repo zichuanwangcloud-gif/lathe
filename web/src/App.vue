@@ -6,6 +6,7 @@ import { auth, refresh, clear, isAdmin, hasLinearToken } from './auth'
 import { computed } from 'vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import NavIcon from './components/NavIcon.vue'
+import InboxBadge from './components/InboxBadge.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -29,16 +30,20 @@ const navGroups = computed(() => [
     label: '工作区',
     items: [
       { to: '/', icon: 'board', text: '任务看板', exact: true },
+      { to: '/inbox', icon: 'inbox', text: '收件箱', badge: true },
       { to: '/issues', icon: 'issues', text: '工单' },
       { to: '/prds', icon: 'prd', text: '模糊任务' },
       { to: '/flows', icon: 'flow', text: '编排' },
       hasLinearToken() && { to: '/linear', icon: 'linear', text: 'Linear 任务' },
+      hasLinearToken() && { to: '/schedules', icon: 'clock', text: '定时建单' },
+      { to: '/usage', icon: 'chart', text: '用量' },
     ].filter(Boolean),
   },
   {
     label: '配置',
     items: [
       { to: '/repos', icon: 'repo', text: '仓库配置' },
+      { to: '/teams', icon: 'users', text: '团队' },
       { to: '/settings', icon: 'user', text: '个人设置' },
     ],
   },
@@ -90,6 +95,7 @@ onMounted(() => {
           >
             <NavIcon :name="it.icon" />
             <span>{{ it.text }}</span>
+            <InboxBadge v-if="it.badge" class="nav-badge" />
           </RouterLink>
         </div>
       </nav>
@@ -166,6 +172,7 @@ nav { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: c
 .nav-item:hover { text-decoration: none; background: color-mix(in oklab, var(--surface-2) 70%, transparent); color: var(--text); }
 .nav-item.on { background: var(--surface-selected); color: var(--text); }
 .nav-item .icon { flex: none; opacity: .85; }
+.nav-badge { margin-left: auto; }
 
 .account { border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 1px; }
 .who { display: flex; align-items: center; gap: 8px; padding: 4px 8px 8px; min-width: 0; }

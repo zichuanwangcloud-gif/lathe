@@ -8,13 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
+	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 下面这些窄接口让流水线可被完整单测，无需真实的 Linear/GitHub/claude。
@@ -88,6 +92,10 @@ type Pipeline struct {
 	// 见 notify.go 的 TaskMail 注释。
 	Mail TaskMail
 
+	// Chat 把等人出手的事件推到站外渠道（Slack / 飞书，f09）。为 nil 时关闭。
+	// 与 Mail 并排、互不影响：见 notify.go 的 ChatNotifier 注释。
+	Chat ChatNotifier
+
 	// BaseURL 是本实例对外地址，通知邮件里的详情页链接用它拼。
 	// 空串时邮件省略链接那一行，而不是拼一个指向 localhost 的无用链接。
 	BaseURL string
@@ -110,6 +118,12 @@ type Pipeline struct {
 	// （docs/04-agent-visibility.md）；为 nil 时整个可见性机制关闭。
 	AgentEvents AgentEventRecorder
 
+	// Usage 落每次 agent 运行的用量账本（f03，agent_runs）；UsageTier 是定档后的
+	// 档位回补。为 nil 时整个记账关闭（测试装配与老用法不受影响），与
+	// AgentEvents 同一立场。记账失败只告警，绝不影响流水线。
+	Usage     agent.UsageRecorder
+	UsageTier agent.TierBackfiller
+
 	// Memory 读写跨任务失败记忆（§3.6 第 16 条）：fail() 往里写，
 	// 分诊/实现提示词从里读。为 nil 时整个机制关闭（测试与老装配）。
 	//
@@ -127,6 +141,12 @@ type Pipeline struct {
 	//
 	// 为 nil 时该层关闭，形态表照旧工作（测试与老装配）。
 	KnownSecrets []string
+
+	// TeamSkills 读写团队自定义技能（f11，docs/features/team-skills.md）：
+	// 实现阶段钉版本并物化进 .claude/skills/team-<slug>/，提交前复位哨兵。
+	// 为 nil 时整个机制关闭，行为与引入它之前完全一致（测试与老装配）。
+	// *store.Store 直接满足该接口。
+	TeamSkills TeamSkillSource
 
 	// Stacks 起 per-task 依赖隔离栈（T8）；为 nil 时不起栈，
 	// 验证命令用宿主环境跑 —— 与本字段引入之前完全一致。
@@ -166,6 +186,12 @@ type Pipeline struct {
 	// 成实际的 BASE_URL/TOKEN；为空则跟随 cc-switch 当前激活通道。
 	TriageChannel    string
 	ImplementChannel string
+
+	// Interjections 是运行中插话（docs/features/interject.md）：实现与修复轮的
+	// agent 以流式输入启动并登记活会话，queued 插话在下一次 runAgent 开场补投，
+	// Execute 收尾时结算。为 nil 时整个机制关闭，agent 启动方式与引入本字段
+	// 之前逐行一致（测试与老装配）。生产装配永远接（没有开关）。
+	Interjections *Interjections
 }
 
 // ExecuteParams 描述一次流水线执行。
@@ -210,6 +236,17 @@ type runCtx struct {
 	clients Clients // 失败传播按每个后继自己的 provider 分派 tracker 用
 	tracker tracker.Tracker
 	gh      GitHubAPI
+	// auth 是本任务属主对仓库所在平台实例的 git 鉴权（GitLab/Gitea）；GitHub
+	// 恒为零值（走宿主 SSH）。setup 里经 resolveVCS 解出，随 runCtx 生命周期结束。
+	auth vcs.GitAuth
+	// vcsErr 是 setup 记下的代码平台确定性配置错误（凭据缺失 / 实例不一致）。
+	// setup 失败时任务留在 queued，而 queued 没有 →failed 的边，所以这里只记下，
+	// 由各入口阶段第一次合法转移之后的 vcsGate 落 failed。
+	vcsErr error
+	// secrets 是本任务属主解出的 vcs token（脱敏权威层用）。每任务一份、随
+	// runCtx 结束，不追加进共享的 Pipeline.KnownSecrets（无共享可变状态，无锁，
+	// A 的 token 也不会进 B 任务的替换表）。
+	secrets []string
 
 	tk   *task.Task // 任务行（每次转移后刷新）
 	plan *RetryPlan // 非空表示断点续跑
@@ -238,9 +275,22 @@ type runCtx struct {
 	// review 是 PR review 二轮（plan.Review）本轮要处理的意见，setup 里
 	// 收集一次；非二轮恒为 nil。
 	review *pendingReview
+	// teamPins 是本轮实现阶段钉住并物化的团队技能（f11），供 stageCommit /
+	// 修复轮前的 hideTeamSkills 复用；为 nil 表示这一轮没经过 stageImplement
+	// （续跑入口），hideTeamSkills 届时从库里取。
+	teamPins []store.TeamSkillPin
 
 	retryNoted bool // 重试决策是否已落进某次转移的 payload
 }
+
+// driver 是本任务钉死的执行 agent（tasks.agent_driver，建任务时从仓库复制）。
+//
+// runner 里唯一的取值点：分诊、实现、implement-reentry、fix-N、review 二轮都从
+// 这里取，于是 Execute 的所有调用点（派发、rebase 跟进重验……）自动拿到同一个
+// 驱动 —— RepoConfig 上根本没有驱动字段，不存在「某个调用方忘了填」。
+// 与 gate_mode 同一做法（gateBeforePush 读 rc.tk.GateMode）。NULL 已在
+// taskColumns 里读成 claude，这里永远非空。
+func (rc *runCtx) driver() string { return rc.tk.AgentDriver }
 
 // IssueRefOf 给出某任务行在需求平台上的定位引用：
 // 平台侧主键（Linear UUID）优先；为空时退回人读 key —— 内置工单的
@@ -295,6 +345,13 @@ func (rc *runCtx) takeRetryPayload() map[string]any {
 // 实现与验证。任一步失败都会走 fail()：回帖说明原因 + 保留 worktree
 // 现场 + 推送通知，且不自动重试（D4）。
 func (p *Pipeline) Execute(ctx context.Context, params ExecuteParams) error {
+	// 插话收尾结算（T1）：放在 setup 之前，setup 失败也覆盖。本次执行把任务
+	// 带到不会再跑 agent 的状态（pr_open/awaiting_approval/failed/blocked_spec，
+	// 或执行期间被取消）时，没进入模型的 queued 插话以人读原因判 failed。
+	// 只读 tasks.state，不做任何状态转移。
+	if p.Interjections != nil {
+		defer p.Interjections.SettleTask(ctx, params.TaskID)
+	}
 	rc, entry, err := p.setup(ctx, params)
 	if err != nil {
 		return err
@@ -371,6 +428,7 @@ func (p *Pipeline) gateBeforePush(rc *runCtx) error {
 	// 不发信就只能靠人主动去翻面板才发现「活早就干完了」。
 	p.mailTerminal(rc.ctx, gated,
 		"这个仓库配了人工闸门（gate_mode=manual）：到任务详情页点「确认开 PR」后才会推分支并开 PR。")
+	p.chatTerminal(rc.ctx, gated, notify.EventAwaitingApproval)
 
 	slog.Info("人工闸门拦住了开 PR，等人确认",
 		"task", rc.tk.ID, "issue", rc.tk.ExternalKey, "gate_mode", rc.tk.GateMode)
@@ -433,12 +491,23 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	if at, ok := tr.(tracker.AttributedTracker); ok {
 		tr = at.WithActor(fmt.Sprintf("task-%d", tk.ID))
 	}
-	gh, err := clients.GitHub(ctx)
+	// 代码平台按仓库行上钉死的 (平台, 实例) 分派。GitHub 与此前完全同一调用、
+	// 同一失败文案；GitLab/Gitea 的确定性配置错误（凭据缺失/实例不一致）只记下，
+	// 由入口阶段的 vcsGate 落 failed，暂时性错误与 GitHub 同口径留 queued。
+	var vcsErr error
+	gh, auth, err := resolveVCS(ctx, clients, params.Repo.Target())
 	if err != nil {
-		return nil, "", fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		if params.Repo.Target().Provider == vcs.ProviderGitHub {
+			return nil, "", fmt.Errorf("获取 GitHub 客户端失败（请在设置里配置并验证凭据）: %w", err)
+		}
+		if !isVCSConfigErr(err) {
+			return nil, "", fmt.Errorf("获取代码平台客户端失败（%s）: %w", params.Repo.Target().Provider, err)
+		}
+		gh, auth, vcsErr = nil, vcs.GitAuth{}, err
 	}
 
-	rc := &runCtx{ctx: ctx, params: params, actor: actor, clients: clients, tracker: tr, gh: gh, tk: tk}
+	rc := &runCtx{ctx: ctx, params: params, actor: actor, clients: clients, tracker: tr, gh: gh, tk: tk,
+		auth: auth, vcsErr: vcsErr, secrets: auth.RedactValues()}
 	rc.scope = failureScopeOf(tk)
 	rc.profile, rc.profileErr = ParseProfile(tk.Profile)
 	entry := EntryTriage
@@ -477,7 +546,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 		Path:       deref(tk.WorktreePath),
 		Branch:     deref(tk.BranchName),
 		BaseBranch: base,
-		Mirror:     p.Worktrees.MirrorPath(params.Repo.ProviderRepo),
+		Mirror:     p.Worktrees.MirrorPath(params.Repo.RepoKey()),
 	}
 	if tk.AgentSessionID != nil {
 		rc.implSession = *tk.AgentSessionID
@@ -490,7 +559,7 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	// 或都已在之前的轮次处理过）就不该唤起 agent —— 让它对着空意见列表
 	// 「改点什么」只会产出无意义的 diff。降级为只重新验证，任务照常回到
 	// pr_open，验证证据照常落库。
-	if rc.plan.Review && entry == EntryImplement {
+	if rc.plan.Review && entry == EntryImplement && rc.vcsErr == nil {
 		rc.review = p.collectReview(rc)
 		if len(rc.review.Comments) == 0 {
 			plan := *rc.plan
@@ -502,8 +571,8 @@ func (p *Pipeline) setup(ctx context.Context, params ExecuteParams) (*runCtx, En
 	}
 
 	// 提交/验证入口的 diff 与基线工作区都解析自 mirror 命名空间，先刷新。
-	if entry == EntryCommit || entry == EntryVerify {
-		if _, err := p.Worktrees.EnsureMirror(ctx, params.Repo.ProviderRepo, params.CloneURL); err != nil {
+	if (entry == EntryCommit || entry == EntryVerify) && rc.vcsErr == nil {
+		if _, err := p.Worktrees.EnsureMirror(ctx, params.Repo.RepoKey(), params.CloneURL, rc.auth); err != nil {
 			return nil, "", fmt.Errorf("续跑前刷新 mirror 失败: %w", err)
 		}
 	}
@@ -522,11 +591,17 @@ func deref(s *string) string {
 // stageTriage 判断单子明确度与任务类型。单子不明确时回帖提问并转
 // blocked_spec（产品边界：不猜），以 errHalt 正常终止。
 func (p *Pipeline) stageTriage(rc *runCtx) error {
-	if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateTriaging, rc.actor, &task.TransitionOpts{
+	triaging, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateTriaging, rc.actor, &task.TransitionOpts{
 		Payload: rc.takeRetryPayload(),
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
+	// 平台状态同步（started）：只对实现了 StatusSyncer 的 tracker 生效，尽力而为。
+	syncTrackerStatus(rc.ctx, rc.tracker, triaging, rc.params.IssueRef, tracker.LifecycleStarted)
 
 	issue, err := rc.tracker.Issue(rc.ctx, rc.params.IssueRef)
 	if err != nil {
@@ -539,7 +614,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		return p.fail(rc, StageTriageRun, err)
 	}
 	triageSession := p.newID()
-	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", triageDir, triageSession)
+	triageSink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, "triage", rc.driver(), triageDir, triageSession)
 	// 兜底：Close 幂等，下面判错前那次显式 Close 才是正常路径；这里只防
 	// Run 里 panic 时 flush/watcher 协程泄漏
 	defer triageSink.Close()
@@ -547,6 +622,7 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 	// 最该被知道的地方 —— 上次若因单子不明确 blocked_spec 过，这次分诊
 	// 直接看到那段历史，判定就有了上下文。分诊是新会话，提示词里没有
 	// 任何失败信息，所以不排除本任务的记录（alreadyInPrompt=false）。
+	triageStart := time.Now()
 	triageRes, err := p.Agent.Run(rc.ctx, agent.RunParams{
 		Prompt:         p.withFailureMemory(rc.ctx, rc.scope, TriagePrompt(issue.Context()), false),
 		Dir:            triageDir,
@@ -555,9 +631,13 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		SettingSources: p.SettingSources,
 		ExtraEnv:       channelEnv(p.TriageChannel),
 		OnEvent:        triageSink.OnEvent,
+		// 分诊会话不落 agent_session_id（只用来建事件汇），所以不传 OnSession
+		Driver: rc.driver(),
 	})
 	// 成功与失败路径都必须 drain：失败时缓冲里恰是排障最关键的现场
 	triageSink.Close()
+	// 用量记账在判错之前：失败/被杀的运行同样花了钱（f03）
+	p.recordRun(rc, "triage", triageSession, false, triageStart, triageRes, err)
 	if err != nil {
 		return p.fail(rc, StageTriageRun, err)
 	}
@@ -573,12 +653,15 @@ func (p *Pipeline) stageTriage(rc *runCtx) error {
 		if _, cerr := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); cerr != nil {
 			slog.Warn("回帖失败", "task", rc.tk.ID, "err", cerr)
 		}
-		if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
+		blocked, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
 			FailureReason: strPtr(verdict.Reason),
 			Payload:       map[string]any{"question": verdict.Question},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		// 站外通知（f09）：任务停下来等人补需求，邮件面此前对它沉默。
+		p.chatTerminal(rc.ctx, blocked, notify.EventBlockedSpec)
 		return errHalt
 	}
 
@@ -617,7 +700,7 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		wt, err := p.Worktrees.Create(rc.ctx, CreateParams{
 			Repo: rc.params.Repo, CloneURL: rc.params.CloneURL,
 			Kind: rc.kind, IssueKey: rc.issue.Identifier, Title: rc.issue.Title,
-			TaskID: rc.tk.ID, ClaimedPaths: claimed,
+			TaskID: rc.tk.ID, ClaimedPaths: claimed, Auth: rc.auth,
 		})
 		if err != nil {
 			return p.fail(rc, StageCreateWorktree, err)
@@ -658,6 +741,9 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 		return err
 	}
 	rc.tk = tk
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
 	// 现场重挂（A2 审计 B1）：任务从 review_feedback 的显式人工出口回来
 	// 时，工作区可能已经不在了。这一轮不能丢弃重建 —— 第一轮的提交早已
@@ -671,11 +757,11 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	// 失败即 fail 而不退回重建 —— 悄悄重建正是这个模式要避免的事，
 	// 理由如实写进失败原因，让人在事件流里看得见为什么。
 	if rc.plan != nil && rc.plan.Rebuild {
-		if _, err := p.Worktrees.EnsureMirror(rc.ctx, rc.params.Repo.ProviderRepo, rc.params.CloneURL); err != nil {
+		if _, err := p.Worktrees.EnsureMirror(rc.ctx, rc.params.Repo.RepoKey(), rc.params.CloneURL, rc.auth); err != nil {
 			return p.fail(rc, StageCreateWorktree, fmt.Errorf(
 				"从 review_feedback 重新发起一轮 review，但仓库镜像不可用，无法重挂现场: %w", err))
 		}
-		if err := p.Worktrees.Reattach(rc.ctx, rc.params.Repo.ProviderRepo, rc.wt.Path, rc.wt.Branch); err != nil {
+		if err := p.Worktrees.Reattach(rc.ctx, rc.params.Repo.RepoKey(), rc.wt.Path, rc.wt.Branch, rc.params.CloneURL, rc.auth); err != nil {
 			return p.fail(rc, StageCreateWorktree, fmt.Errorf(
 				"从 review_feedback 重新发起一轮 review，但工作区现场无法重挂: %w", err))
 		}
@@ -689,17 +775,37 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 	}
 
 	// F7.2：worktree 已就位（新建或续跑复用现场），画像也已确认合法，
-	// 在驱动 agent 之前把节点画像声明的技能物化进 .claude/skills/。
+	// 在驱动 agent 之前把节点画像声明的技能物化进驱动的技能目录
+	// （claude 读 .claude/skills/，codex 读 .codex/skills/）。
 	if err := p.materializeSkills(rc); err != nil {
 		return p.fail(rc, StageSkillMissing, err)
 	}
 
+	// f11：团队自定义技能。钉版本（首次）→ 路径体检 → 物化进 team-<slug>/
+	// （目录内哨兵让它对 git 不可见）→ 写后自检。同样在驱动 agent 之前，
+	// 任何一步失败都落 StageTeamSkillFailed（重试会回到这里重新物化）。
+	if err := p.prepareTeamSkills(rc); err != nil {
+		return err
+	}
+
 	prompt, resumeFlag := p.implementPrompt(rc)
-	implRes, err := p.runAgent(rc, "implement", prompt, rc.implSession, resumeFlag)
+	implRes, reported, err := p.runAgent(rc, "implement", prompt, rc.implSession, resumeFlag)
+	// 驱动上报的真实会话 ID 永远优先（codex 不接受预分配 ID，P3）：库已由
+	// OnSession 闭包写过，这里只更新 rc。claude 恒为空串，行为不变。
+	if reported != "" {
+		rc.implSession = reported
+	}
 
 	// resume 失败降级：会话数据丢失（被清理/不在本机）时 claude --resume
-	// 报错退出。降级为同工作区新会话收尾，而不是把可用现场一起判死。
-	if err != nil && resumeFlag {
+	// （codex exec resume）报错退出。降级为同工作区新会话收尾，而不是把
+	// 可用现场一起判死。
+	//
+	// 两类错误不降级：本节点没有这个驱动（ErrDriverUnavailable）、驱动不支持
+	// 所需能力（ErrUnsupportedParam）。它们不是「会话丢了」—— 降级会先
+	// SetSessionID(newID) 冲掉库里有效的会话 ID，之后在有该驱动的节点上重试
+	// 也续不上了。直接落到下面的 p.fail(StageImplementRun)，会话原样保留。
+	if err != nil && resumeFlag &&
+		!errors.Is(err, agent.ErrDriverUnavailable) && !errors.Is(err, agent.ErrUnsupportedParam) {
 		slog.Warn("resume 会话失败，降级为同工作区新会话", "task", rc.tk.ID, "err", err)
 		rc.implSession = p.newID()
 		if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, rc.implSession); serr != nil {
@@ -710,7 +816,10 @@ func (p *Pipeline) stageImplement(rc *runCtx) error {
 			// 新会话没有第一轮的记忆，review 意见更得带上，否则这一轮白跑。
 			reentry += "\n\n" + reviewPromptOf(rc.review)
 		}
-		implRes, err = p.runAgent(rc, PhaseImplementReentry, reentry, rc.implSession, false)
+		implRes, reported, err = p.runAgent(rc, PhaseImplementReentry, reentry, rc.implSession, false)
+		if reported != "" {
+			rc.implSession = reported
+		}
 	}
 
 	// 终局摘要落库含 fail 路径：有 result 就存（docs/04 §3.5）
@@ -763,15 +872,29 @@ func (p *Pipeline) implementPrompt(rc *runCtx) (prompt string, resume bool) {
 // 半场，通道不该中途换。通道优先取节点画像的 ModelChannel（F7.1-AC2：
 // 不同节点可路由到不同通道），画像未设置该字段时回落到仓库/流水线级
 // 的 p.ImplementChannel（既有行为，F7.1-AC4 的回归保证）。
-func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (*agent.Result, error) {
+//
+// reported 是驱动在这次执行里上报的真实会话 ID（RunParams.OnSession，
+// codex 的 thread_id）；没上报（claude 恒如此）为空串。上报时 OnSession 闭包
+// 已经把它落了库（SetSessionID 是字段记账、不是状态转移）；rc 的字段只由
+// 调用方在 runner 自己的协程里改 —— 闭包跑在驱动的读协程里，不碰 rc。
+func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bool) (res *agent.Result, reported string, err error) {
 	prompt = p.injectFailureMemory(rc, phase, prompt, resume)
-	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.wt.Path, session)
+	// 开场补投（运行中插话）：在失败记忆之后，所以最终 prompt 恒为
+	// base + [失败记忆段] + [插话段] —— 插话段永远是最后一段。无插话时原样返回。
+	var pf *prefilled
+	if p.Interjections != nil {
+		prompt, pf = p.Interjections.prefillInterjections(rc.ctx, rc.tk.ID, phase, session, prompt)
+	}
+	sink := newEventSink(rc.ctx, p.AgentEvents, rc.tk.ID, phase, rc.driver(), rc.wt.Path, session)
 	defer sink.Close() // 兜底，同 stageTriage
 	channel := p.ImplementChannel
 	if rc.profile != nil && rc.profile.ModelChannel != "" {
 		channel = rc.profile.ModelChannel
 	}
-	res, err := p.Agent.Run(rc.ctx, agent.RunParams{
+	var got atomic.Value // string
+	ctx, taskID := rc.ctx, rc.tk.ID
+	start := time.Now()
+	params := agent.RunParams{
 		Prompt:         prompt,
 		Dir:            rc.wt.Path,
 		SessionID:      session,
@@ -780,9 +903,59 @@ func (p *Pipeline) runAgent(rc *runCtx, phase, prompt, session string, resume bo
 		SettingSources: p.SettingSources,
 		ExtraEnv:       channelEnv(channel),
 		OnEvent:        sink.OnEvent,
-	})
+		Driver:         rc.driver(),
+		OnSession: func(id string) {
+			if id == "" {
+				return
+			}
+			// 一拿到就落库：进程中途崩溃，库里也已是可 resume 的真实 ID
+			if serr := p.Tasks.SetSessionID(ctx, taskID, id); serr != nil {
+				slog.Warn("驱动上报的会话 ID 落库失败", "task", taskID, "phase", phase, "err", serr)
+			}
+			got.Store(id)
+		},
+	}
+	if ij := p.Interjections; ij != nil && ij.supported(rc.tk) {
+		params.StreamInput = true
+		params.OnReady = func(s *agent.Session) { ij.Register(taskID, s, phase, session) }
+		// 读协程上：只发内存信号，零 I/O（interject.go 的线程模型）
+		params.OnDelivery = ij.Ack
+	}
+	res, err = p.Agent.Run(rc.ctx, params)
+	if p.Interjections != nil {
+		p.Interjections.Unregister(rc.tk.ID)
+		p.Interjections.finishPrefill(rc.ctx, pf, res)
+	}
 	sink.Close()
-	return res, err
+	reported, _ = got.Load().(string)
+	// 账本的会话 ID 取驱动上报的真实 ID（codex 的 thread_id），没上报回落传入的 session
+	recSession := session
+	if reported != "" {
+		recSession = reported
+	}
+	p.recordRun(rc, phase, recSession, resume, start, res, err)
+	return res, reported, err
+}
+
+// recordRun 落一次任务侧 agent 运行的用量账本（f03）。在调用方判 err 之前同步调用，
+// 所以任何失败分支都已记过账；落库失败只告警（agent.RecordRun）。
+//
+// 档位取本次 Execute 内存里的 rc.tier，**不读** tasks.verify_tier：Fresh 重跑时
+// 任务行上还挂着上一次尝试的旧档，读库会把这次的分诊/实现记成旧档。定档前写下
+// 的行由 stageVerify 里的回补补上。review_round 看 plan.Review（PR review 那一轮
+// 的 resume、降级重入与修复回路都归 review 桶）。
+func (p *Pipeline) recordRun(rc *runCtx, phase, session string, resume bool, start time.Time, res *agent.Result, err error) {
+	if p.Usage == nil {
+		return
+	}
+	agent.RecordRun(rc.ctx, p.Usage, agent.RunRecord{
+		Kind: "task", TaskID: rc.tk.ID, Phase: phase,
+		ReviewRound: rc.plan != nil && rc.plan.Review,
+		VerifyTier:  string(rc.tier),
+		SessionID:   session, Resume: resume,
+		StartedAt: start, EndedAt: time.Now(),
+		Result: res, Err: err,
+	})
 }
 
 // channelEnv 把 cc-switch 通道名编成注入 agent 子进程的环境变量；
@@ -873,7 +1046,15 @@ func (p *Pipeline) stageCommit(rc *runCtx) error {
 		}
 		rc.tk = tk
 	}
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
+	// f11：哨兵在 worktree 里，agent 能删能改。判断「有没有改动」之前先复位，
+	// 否则团队技能文件会骗过「工作区无改动」判死、被 add -A 带进 PR。
+	if err := p.hideTeamSkills(rc); err != nil {
+		return p.fail(rc, StageTeamSkillFailed, err)
+	}
 	changed, err := p.Worktrees.HasChanges(rc.ctx, rc.wt)
 	if err != nil {
 		return p.fail(rc, StageCheckChanges, err)
@@ -941,6 +1122,13 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		return err
 	}
 	rc.tk = tk
+	// f03：本次尝试的后续运行（fix-N）带上档位；定档前写下的用量行回补成这一档。
+	// rc.tier 唯一的读点是上面的定档入口，已在其后，赋值不改变任何既有行为。
+	rc.tier = tier
+	p.backfillUsageTier(rc, tier)
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
 	// F7.1：节点画像损坏或字段非法时，在这里（已进入 verifying、可以
 	// 合法转 failed 的状态）以可读原因失败——覆盖 stageImplement 没
@@ -971,7 +1159,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 	runVerify := func(round int) (Report, error) {
 		logs := p.stepLogger(rc.tk.ID, round)
 		if tier == TierHeavy {
-			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.ProviderRepo, rc.wt, steps,
+			return p.runHeavy(rc.ctx, rc.tk.ID, rc.params.Repo.RepoKey(), rc.wt, steps,
 				changedFiles, rc.params.Repo.ExcludeDirs, rc.params.Repo.VerifyInfra, logs)
 		}
 		// light 档设计上「不起栈」（verify.go 的 TierLight 注释）：
@@ -1006,7 +1194,7 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 			fixSession = p.newID()
 			fixResume = false
 		}
-		fixRes, ferr := p.runAgent(rc, fmt.Sprintf("fix-%d", attempt),
+		fixRes, reported, ferr := p.runAgent(rc, fmt.Sprintf("fix-%d", attempt),
 			FixPrompt(attempt, p.MaxFixAttempts, f, report.Summary()), fixSession, fixResume)
 		p.persistAgentResult(rc.ctx, rc.tk.ID, fixRes)
 		if ferr != nil {
@@ -1014,13 +1202,28 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 			break
 		}
 		if !fixResume {
-			if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, fixSession); serr != nil {
+			// 驱动上报的真实 ID 优先：codex 下 fixSession 只是 Lathe 自己编的
+			// UUID，codex 不认识它，用它覆盖刚落库的 thread_id 会让下一轮
+			// resume 撞 no rollout found。claude 下 reported 恒为空，id == fixSession。
+			id := fixSession
+			if reported != "" {
+				id = reported
+			}
+			if serr := p.Tasks.SetSessionID(rc.ctx, rc.tk.ID, id); serr != nil {
 				slog.Warn("修复会话 ID 落库失败", "task", rc.tk.ID, "err", serr)
 			}
-			rc.implSession = fixSession
+			rc.implSession = id
+		} else if reported != "" {
+			rc.implSession = reported
 		}
 		if fixRes.IsError {
 			slog.Warn("修复轮未成功完成", "task", rc.tk.ID, "subtype", fixRes.Subtype)
+			break
+		}
+		// f11：与 stageCommit 同理，判断改动前先复位团队技能的哨兵。复位失败
+		// 与「提交修复改动失败」同款处理：不提交，按当前验证结果收尾。
+		if herr := p.hideTeamSkills(rc); herr != nil {
+			slog.Warn("修复轮复位团队技能失败，不提交，按当前验证结果收尾", "task", rc.tk.ID, "err", herr)
 			break
 		}
 		// 没产生改动的修复轮等于没修 —— 跳出按失败收尾，不空烧轮次
@@ -1058,12 +1261,14 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		if _, cerr := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); cerr != nil {
 			slog.Warn("回帖失败", "task", rc.tk.ID, "err", cerr)
 		}
-		if _, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
+		blocked, err := p.Tasks.Transition(rc.ctx, rc.tk.ID, task.StateBlockedSpec, rc.actor, &task.TransitionOpts{
 			FailureReason: strPtr(red.Err.Error()),
 			Payload:       map[string]any{"reason": "repro_not_red"},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		p.chatTerminal(rc.ctx, blocked, notify.EventBlockedSpec)
 		return errHalt
 	}
 
@@ -1096,11 +1301,24 @@ func (p *Pipeline) stageVerify(rc *runCtx) error {
 		// 那一步（不是回帖用的 Summary —— 后者只有步骤名与耗时，没有
 		// 输出，下一个 agent 从中学不到任何东西）。写入侧脱敏 + 截断，
 		// 见 redact.go 的分层说明与 Pipeline.failureExcerpt。
-		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), p.failureExcerpt(report))
+		return p.failWithExcerpt(rc, StageVerifyFailed, errors.New(cause), p.failureExcerptFor(rc, report))
 	}
 
 	rc.report = report
 	return nil
+}
+
+// backfillUsageTier 把本任务里此前没有档位的用量行补成刚定下的档（只补 NULL）。
+// 与 persistVerifications 同一立场：失败只告警，没补上的行下次定档再补。
+func (p *Pipeline) backfillUsageTier(rc *runCtx, tier VerifyTier) {
+	if p.UsageTier == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(rc.ctx), 3*time.Second)
+	defer cancel()
+	if err := p.UsageTier.SetAgentRunTier(ctx, rc.tk.ID, string(tier)); err != nil {
+		slog.Warn("用量档位回补失败", "task", rc.tk.ID, "tier", tier, "err", err)
+	}
 }
 
 // ---------------------------------------------------------------- 阶段：推送与开 PR
@@ -1120,8 +1338,11 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		}
 		rc.tk = tk
 	}
+	if err := p.vcsGate(rc); err != nil {
+		return err
+	}
 
-	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo, func(prog PushProgress) {
+	if err := p.Worktrees.Push(rc.ctx, rc.wt, rc.params.Repo, rc.auth, func(prog PushProgress) {
 		p.pushProgress(rc, prog)
 	}); err != nil {
 		return p.fail(rc, StagePush, err)
@@ -1170,12 +1391,15 @@ func (p *Pipeline) stagePushAndPR(rc *runCtx) error {
 		headline = "**Lathe 已按 review 意见更新 PR，并重新通过验证**"
 	}
 	p.mailTerminal(rc.ctx, opened, "PR："+pr.URL+"\n\n"+verifySummary)
+	p.chatTerminal(rc.ctx, opened, notify.EventPROpen)
 
 	body := fmt.Sprintf("%s\n\n%s\n\n```\n%s```\n\n请人工复核后合并。",
 		headline, pr.URL, verifySummary)
 	if _, err := rc.tracker.Comment(rc.ctx, rc.params.IssueRef, body); err != nil {
 		slog.Warn("回帖失败", "task", rc.tk.ID, "err", err)
 	}
+	// 平台状态同步（pr_open）：在转移与回帖之后，尽力而为。
+	syncTrackerStatus(rc.ctx, rc.tracker, opened, rc.params.IssueRef, tracker.LifecyclePROpen)
 
 	// F2.3-AC5：本任务到达 pr_open，唤醒它直接依赖它、此前被阻塞的后继。
 	// 唤醒失败只告警；被唤醒的任务会在调度器下一轮轮询里自然被捞到，
@@ -1241,8 +1465,8 @@ func mergedExcludeDirs(global, repo []string) []string {
 	return append(out, repo...)
 }
 
-func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, providerRepo string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string, logs StepLogger) (Report, error) {
-	base, err := p.Worktrees.CreateDetached(ctx, providerRepo, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
+func (p *Pipeline) runHeavy(ctx context.Context, taskID int64, repoKey string, wt *Worktree, lightSteps []Step, changedFiles []string, repoExclude []string, repoInfra []string, logs StepLogger) (Report, error) {
+	base, err := p.Worktrees.CreateDetached(ctx, repoKey, wt.BaseBranch, fmt.Sprintf("task-%d-base", taskID))
 	if err != nil {
 		return Report{}, err
 	}
@@ -1507,6 +1731,7 @@ func (p *Pipeline) failWithExcerpt(rc *runCtx, stage Stage, cause error, excerpt
 		mailDetail = fmt.Sprintf("工作区已保留在 %s（分支 %s），可直接进去接手；重试会优先续跑该现场。", rc.wt.Path, rc.wt.Branch)
 	}
 	p.mailTerminal(rc.ctx, failed, mailDetail)
+	p.chatTerminal(rc.ctx, failed, notify.EventFailed)
 
 	// 跨任务失败记忆（§3.6 第 16 条）：同样放在转移之后 —— 任务没真的落成
 	// failed 就不该留下这条记忆。写它的是 fail() 而不是各调用点，

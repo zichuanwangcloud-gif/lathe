@@ -15,6 +15,16 @@ import (
 
 const apiTestToken = "test-admin-token"
 
+// taskReadRoutes 是每一个任务【读】接口的显式表（AC-54）。f04 已合入，由后合入的
+// f12 补上它新增的两条（docs/features/team-roles.md §3.11 f04 行 (a) 分支）。
+// 表里的 {id} 由调用方换成任务 ID，{vid} 换成该任务上一条带日志的验证行 ID。
+var taskReadRoutes = []struct{ method, path string }{
+	{"GET", "/api/tasks/{id}"},
+	{"GET", "/api/tasks/{id}/events?after=0"},
+	{"GET", "/api/tasks/{id}/events/summary"},
+	{"GET", "/api/tasks/{id}/verifications/{vid}/log"},
+}
+
 func apiFixture(t *testing.T) (*API, *store.Store, *task.Machine, int64) {
 	t.Helper()
 
@@ -114,6 +124,8 @@ func TestAPIRequiresAuth(t *testing.T) {
 		{"GET", "/api/tasks", ""},
 		{"GET", "/api/tasks/1", ""},
 		{"GET", "/api/tasks/1/events", ""},
+		{"GET", "/api/tasks/1/events/summary", ""},
+		{"GET", "/api/tasks/1/verifications/1/log", ""},
 		{"GET", "/api/stats", ""},
 		{"GET", "/api/stats/cost", ""},
 		{"GET", "/api/stats/metrics", ""},

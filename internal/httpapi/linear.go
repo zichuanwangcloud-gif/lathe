@@ -27,6 +27,7 @@ type LinearAPI struct {
 func (a *LinearAPI) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/linear/issues", a.Auth.RequireFunc(a.listIssues))
 	mux.Handle("GET /api/linear/issues/{id}", a.Auth.RequireFunc(a.issueDetail))
+	mux.Handle("GET /api/linear/teams", a.Auth.RequireFunc(a.listTeams))
 }
 
 // client 取当前用户的 Linear 客户端；失败时已写好响应，返回 nil。
@@ -81,4 +82,18 @@ func (a *LinearAPI) issueDetail(w http.ResponseWriter, r *http.Request) {
 		"description": issue.Description,
 		"comments":    issue.Comments,
 	})
+}
+
+// listTeams 返回当前用户 Linear 可见的团队（定时建单选团队用）。
+func (a *LinearAPI) listTeams(w http.ResponseWriter, r *http.Request) {
+	c := a.client(w, r)
+	if c == nil {
+		return
+	}
+	teams, err := c.Teams(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"teams": teams})
 }
