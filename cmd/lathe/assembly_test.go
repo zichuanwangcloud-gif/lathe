@@ -25,6 +25,7 @@ import (
 	"errors"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"strings"
 	"testing"
@@ -54,7 +55,7 @@ func TestBuildPipelineReturnsStacksAlreadyWired(t *testing.T) {
 		HeavySlots:    1,
 	}
 
-	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	p, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -165,7 +166,8 @@ func TestServeStartsWorkersAfterEverythingIsWired(t *testing.T) {
 	// `go mergePoller.Run(...)` / `go sweeper.Run(...)` —— 那会绕过这个结构。
 	for _, g := range goStmts {
 		if strings.HasPrefix(g, "q.work") || strings.HasPrefix(g, "mergePoller.") ||
-			strings.HasPrefix(g, "sweeper.") || strings.HasPrefix(g, "scheduler.") {
+			strings.HasPrefix(g, "sweeper.") || strings.HasPrefix(g, "scheduler.") ||
+			strings.HasPrefix(g, "notifyWorker.") {
 			t.Errorf("serve 里不该直接 `go %s`：后台执行者只能由 startWorkers 启动，"+
 				"那是「装配完成后才启动」这条约束的唯一承载点", g)
 		}
@@ -237,7 +239,7 @@ func TestStartWorkersLaunchesAllLoops(t *testing.T) {
 		return true
 	})
 
-	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false, "scheduler.Run": false}
+	want := map[string]bool{"q.work": false, "mergePoller.Run": false, "sweeper.Run": false, "scheduler.Run": false, "notifyWorker.Run": false}
 	for _, g := range goStmts {
 		for k := range want {
 			if strings.HasPrefix(g, k) {
@@ -281,7 +283,7 @@ var _ runner.VerifyStackUp = verifyStacks{}
 func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -327,7 +329,7 @@ func TestVerifyStacksTranslatesErrorIdentities(t *testing.T) {
 func TestVerifyStacksReturnsTrueNilWithoutInfra(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude"}
-	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	_, pm, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatalf("buildPipeline 失败: %v", err)
 	}
@@ -371,3 +373,72 @@ func testSecrets(t *testing.T, st *store.Store) *store.Secrets {
 var (
 	_ runner.FailureMemory = (*store.Store)(nil)
 )
+
+// f04 AC-8：serve 里 httpapi.API 字面量必须装上验证日志读取的两个字段，
+// 且与 Pipeline 同源（LogDir=cfg.DataDir、KnownSecrets=cfg.KnownSecrets()）。
+//
+// 与 docs/08 T4「struct literal 漏一个字段而单测全绿」同类防线：漏装时日志
+// 接口一律 503、静默不可用，单测里 API{LogDir: t.TempDir()} 照样全绿。
+func TestServeWiresVerificationLogIntoAPI(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("解析 main.go 失败: %v", err)
+	}
+	var serve *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "serve" {
+			serve = fd
+		}
+	}
+	if serve == nil {
+		t.Fatal("main.go 里找不到 serve 函数")
+	}
+
+	var lits []*ast.CompositeLit
+	ast.Inspect(serve.Body, func(n ast.Node) bool {
+		if cl, ok := n.(*ast.CompositeLit); ok {
+			if sel, ok := cl.Type.(*ast.SelectorExpr); ok && sel.Sel.Name == "API" {
+				if x, ok := sel.X.(*ast.Ident); ok && x.Name == "httpapi" {
+					lits = append(lits, cl)
+				}
+			}
+		}
+		return true
+	})
+	if len(lits) != 1 {
+		t.Fatalf("serve 里 httpapi.API 字面量个数 got %d, want 1", len(lits))
+	}
+
+	src := func(e ast.Expr) string {
+		var b strings.Builder
+		_ = printer.Fprint(&b, fset, e)
+		return b.String()
+	}
+	got := map[string]string{}
+	var keys []string
+	for _, el := range lits[0].Elts {
+		kv, ok := el.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		k := src(kv.Key)
+		got[k] = src(kv.Value)
+		keys = append(keys, k)
+	}
+	want := map[string]string{"LogDir": "cfg.DataDir", "KnownSecrets": "cfg.KnownSecrets()"}
+	var missing []string
+	for _, k := range []string{"LogDir", "KnownSecrets"} {
+		v, ok := got[k]
+		if !ok {
+			missing = append(missing, k)
+			continue
+		}
+		if v != want[k] {
+			t.Errorf("httpapi.API.%s 的值 got %q, want %q（与 Pipeline 同源）", k, v, want[k])
+		}
+	}
+	if len(missing) > 0 {
+		t.Errorf("httpapi.API 字面量 missing keys %v；got keys %v, want 含 [LogDir KnownSecrets]", missing, keys)
+	}
+}

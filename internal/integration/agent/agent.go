@@ -1,8 +1,9 @@
-// Package agent 驱动 claude CLI 执行编码任务。
+// Package agent 驱动编码 agent CLI（claude / codex）执行编码任务。
 //
 // 设计要点（docs/03-tech-stack.md §3 理由①）：本包是进程监管器。
 // 所有子进程放进独立进程组，context 取消或超时时杀整棵进程树，
-// 确保 Lathe 退出后不留游荡的 claude 进程。
+// 确保 Lathe 退出后不留游荡的 agent 进程。进程监管只有一份（supervise.go），
+// 各 CLI 的私有输出由各自的驱动归一成同一个 Event（docs/features/multi-cli.md）。
 package agent
 
 import (
@@ -14,13 +15,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 	"unicode/utf8"
-
-	"github.com/zichuanwangcloud-gif/lathe/internal/capbuf"
 )
 
 // maxLineBytes 是单条 stream-json 事件的上限。
@@ -68,17 +67,34 @@ const (
 	EventUser EventType = "user"
 	// EventResult 终局事件，携带成败、耗时、成本。
 	EventResult EventType = "result"
+	// EventOther 不属于前四类的行（codex 的 turn.started、重连 error 等）。
+	EventOther EventType = "other"
 )
 
-// Event 是一条已解析的 stream-json 事件。
+// 驱动名。空串一律按 DriverClaude 处理（向后兼容：零值 = 现在的行为）。
+const (
+	DriverClaude = "claude"
+	DriverCodex  = "codex"
+)
+
+// Event 是一条已解析的 agent 事件（各 CLI 的私有输出归一后的形状）。
 //
 // 只结构化 Lathe 真正要用的字段，其余保留在 Raw 里，
 // 避免 CLI 增删字段就把驱动打挂。
 type Event struct {
+	// Driver 是产出这条事件的驱动（DriverClaude | DriverCodex；零值 = claude）。
+	// Digest 按它分派到对应 CLI 的提炼逻辑。
+	Driver    string
 	Type      EventType
 	Subtype   string
 	SessionID string
-	Raw       json.RawMessage
+	// Raw 是 CLI 的原始一行（私有格式，只给 Digest 用）。
+	Raw json.RawMessage
+
+	// codexTurn 是 codex 驱动在 turn.completed/turn.failed 上附带的运行时统计
+	// （本次 Run 到此为止的轮数与墙钟耗时）：单行 JSON 里没有这两个值，
+	// Digest 又是逐行无状态的，只能由驱动带过来。其余事件为 nil。
+	codexTurn *codexTurnMeta
 }
 
 // Result 是一次 agent 执行的终局摘要。
@@ -97,6 +113,13 @@ type Result struct {
 	// 独立的失败模式，必须与"改不动代码"区分开来上报。
 	PermissionDenials []json.RawMessage
 	APIErrorStatus    json.RawMessage
+
+	// Usage 是这次运行的 token 用量（f03）。多条 result 时随末条覆盖，
+	// 与 CostUSD 同组，见 Usage 类型注释。
+	Usage Usage
+	// CostKnown 表示 CostUSD 是 CLI 报的真实账单。false = 未知（如 codex
+	// 不报费用），账本落 NULL 而不是 $0。零值即「未知」，未改的驱动默认安全。
+	CostKnown bool
 }
 
 // resultEvent 映射 type=result 事件里 Lathe 关心的字段。
@@ -112,6 +135,65 @@ type resultEvent struct {
 	TerminalReason    string            `json:"terminal_reason"`
 	PermissionDenials []json.RawMessage `json:"permission_denials"`
 	APIErrorStatus    json.RawMessage   `json:"api_error_status"`
+
+	// Usage 是主循环的量（单 turn），ModelUsage 是进程累计、含 subagent
+	// 的逐模型量。取 ModelUsage 为主，缺它才回落 Usage（f03）。
+	Usage      *claudeUsage                `json:"usage"`
+	ModelUsage map[string]claudeModelUsage `json:"modelUsage"`
+}
+
+// claudeUsage 是 result.usage（snake_case）。
+type claudeUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+// claudeModelUsage 是 result.modelUsage 的一项（camelCase）。
+type claudeModelUsage struct {
+	InputTokens              int64   `json:"inputTokens"`
+	OutputTokens             int64   `json:"outputTokens"`
+	CacheReadInputTokens     int64   `json:"cacheReadInputTokens"`
+	CacheCreationInputTokens int64   `json:"cacheCreationInputTokens"`
+	CostUSD                  float64 `json:"costUSD"`
+}
+
+// usageOf 从**一条** result 事件取用量：有 modelUsage 用各模型之和（明细
+// 按 costUSD 降序、并列按模型名升序，结果确定），没有就回落该条的 usage，
+// 两个都没有则 Present=false。不看其他 result —— 跨 result 的取舍由调用方
+// 的覆盖赋值决定（末条整组胜出）。
+func usageOf(re *resultEvent) Usage {
+	var u Usage
+	if len(re.ModelUsage) > 0 {
+		u.Present = true
+		for name, m := range re.ModelUsage {
+			u.InputTokens += m.InputTokens
+			u.OutputTokens += m.OutputTokens
+			u.CacheReadTokens += m.CacheReadInputTokens
+			u.CacheCreationTokens += m.CacheCreationInputTokens
+			u.Models = append(u.Models, ModelUsage{
+				Model: name, InputTokens: m.InputTokens, OutputTokens: m.OutputTokens,
+				CacheReadTokens: m.CacheReadInputTokens, CacheCreationTokens: m.CacheCreationInputTokens,
+				CostUSD: m.CostUSD,
+			})
+		}
+		sort.Slice(u.Models, func(i, j int) bool {
+			if u.Models[i].CostUSD != u.Models[j].CostUSD {
+				return u.Models[i].CostUSD > u.Models[j].CostUSD
+			}
+			return u.Models[i].Model < u.Models[j].Model
+		})
+		return u
+	}
+	if re.Usage != nil {
+		u.Present = true
+		u.InputTokens = re.Usage.InputTokens
+		u.OutputTokens = re.Usage.OutputTokens
+		u.CacheReadTokens = re.Usage.CacheReadInputTokens
+		u.CacheCreationTokens = re.Usage.CacheCreationInputTokens
+	}
+	return u
 }
 
 // envelope 是所有事件的公共头部。
@@ -121,8 +203,8 @@ type envelope struct {
 	SessionID string `json:"session_id"`
 }
 
-// Driver 按配置启动 claude CLI。
-type Driver struct {
+// ClaudeDriver 按配置启动 claude CLI。
+type ClaudeDriver struct {
 	bin     string
 	timeout time.Duration
 	// idle 是静默判死阈值（见 idleTimeout）。留成字段只为测试能调短；
@@ -130,7 +212,10 @@ type Driver struct {
 	idle time.Duration
 }
 
-// NewDriver 构造驱动。bin 为空时取 "claude"。
+// Driver 是 ClaudeDriver 的旧名，保留为别名：既有装配与测试一行不改。
+type Driver = ClaudeDriver
+
+// NewDriver 构造 claude 驱动。bin 为空时取 "claude"。
 func NewDriver(bin string, timeout time.Duration) *Driver {
 	if bin == "" {
 		bin = "claude"
@@ -142,7 +227,7 @@ func NewDriver(bin string, timeout time.Duration) *Driver {
 }
 
 // idleTimeout 返回本次运行使用的静默判死阈值（零值退化为默认值）。
-func (d *Driver) idleTimeout() time.Duration {
+func (d *ClaudeDriver) idleTimeout() time.Duration {
 	if d.idle > 0 {
 		return d.idle
 	}
@@ -191,6 +276,15 @@ type RunParams struct {
 	// OnEvent 每解析出一条事件就回调一次（可为 nil）。
 	// 回调在读取协程里同步执行，实现应尽量轻量。
 	OnEvent func(Event)
+
+	// Driver 选择驱动：空串 = claude。Router 按它分派。
+	// runner 从任务行（tasks.agent_driver，建任务时从仓库钉死）取值。
+	Driver string
+	// OnSession 在驱动一拿到「真实会话 ID」时回调（可为 nil）。
+	//   claude：ID 是预分配的（SessionID），不回调。
+	//   codex：不接受预分配 ID，读到 thread.started 时回调 thread_id。
+	// 与 OnEvent 同一份契约：在读取协程里同步执行，实现须并发安全、尽量轻量。
+	OnSession func(id string)
 }
 
 // ErrNoResultEvent 表示 CLI 退出了但没给出终局 result 事件。
@@ -199,7 +293,7 @@ var ErrNoResultEvent = errors.New("agent: CLI 未输出 result 事件（可能�
 // Run 执行一次 agent 任务，流式解析事件并返回终局摘要。
 //
 // 无论成功失败，返回前都保证子进程树已被回收。
-func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
+func (d *ClaudeDriver) Run(ctx context.Context, p RunParams) (*Result, error) {
 	if p.Prompt == "" && !p.Resume && p.FromPR == "" {
 		return nil, fmt.Errorf("agent: Prompt 为空且非续跑，无事可做")
 	}
@@ -210,153 +304,33 @@ func (d *Driver) Run(ctx context.Context, p RunParams) (*Result, error) {
 		return nil, fmt.Errorf("agent: Resume 需要 SessionID")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
-	// 报错用的实际上限：调用方可能带了更紧的 deadline（如预览推荐的
-	// 10 分钟），超时时报 45 分钟会误导排障
-	limit := d.timeout
-	if dl, ok := ctx.Deadline(); ok {
-		if remain := time.Until(dl); remain < limit {
-			limit = remain
-		}
-	}
-
-	args := d.buildArgs(p)
-
-	// 刻意不用 exec.CommandContext：它只杀直接子进程，而 claude 会派生
-	// 自己的子进程。这里用 Setpgid 建独立进程组，超时后杀整组。
-	cmd := exec.Command(d.bin, args...)
-	cmd.Dir = p.Dir
-	cmd.Env = append(sanitizedEnv(), p.ExtraEnv...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// stdout/stderr 都用自建管道、在后台读，而不是 StdoutPipe +「读到 EOF
-	// 再 Wait」。EOF 要等**所有**持有写端的进程都退出 —— agent 用 Bash
-	// 留下的后台进程（dev server 之类）会继承这两个 fd，它不退出管道就不关，
-	// Run 一直挂到执行超时：一次成功的执行被报成超时，期间进程树、事件 sink
-	// 的协程、worker 槽位全被占着。现在先等进程退出，再给读端一段宽限期。
-	outR, outW, err := os.Pipe()
-	if err != nil {
-		return nil, fmt.Errorf("agent: 建 stdout 管道失败: %w", err)
-	}
-	defer func() { _ = outR.Close() }()
-	errR, errW, err := os.Pipe()
-	if err != nil {
-		_ = outW.Close()
-		return nil, fmt.Errorf("agent: 建 stderr 管道失败: %w", err)
-	}
-	defer func() { _ = errR.Close() }()
-	cmd.Stdout, cmd.Stderr = outW, errW
-
-	startErr := cmd.Start()
-	// 父进程必须关掉自己的写端，否则读端永远等不到 EOF
-	_ = outW.Close()
-	_ = errW.Close()
-	if startErr != nil {
-		return nil, fmt.Errorf("agent: 启动 %s 失败: %w", d.bin, startErr)
-	}
-	pgid := cmd.Process.Pid
-
-	// 监听取消：一旦 ctx 结束就杀整个进程组
-	killed := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			killProcessGroup(pgid)
-		case <-killed:
-		}
-	}()
-	defer close(killed)
-
-	// 静默看门狗：连续 idleTimeout 没有产出任何事件就判死并杀掉进程组。
-	// 它独立于总超时 —— 「跑得久」和「卡住了」是两回事，报错也要能分开。
-	idle := newIdleWatch(d.idleTimeout())
-	defer idle.stop()
-	go func() {
-		select {
-		case <-idle.fired:
-			killProcessGroup(pgid)
-		case <-killed:
-		}
-	}()
-
-	// 事件在后台读，OnEvent 因此在这个协程里回调（RunParams.OnEvent 的
-	// 契约本来就是「在读取协程里同步执行」，调用方的实现须并发安全）。
-	type parsed struct {
-		result *Result
-		err    error
-	}
-	var out parsed
-	parseDone := make(chan struct{})
-	go func() {
-		out.result, out.err = parseStream(outR, func(e Event) {
-			idle.touch()
-			if p.OnEvent != nil {
-				p.OnEvent(e)
-			}
-		})
-		close(parseDone)
-	}()
-	// stderr 只留头尾：只用于报错，CLI 狂刷时内存不该跟着涨。
-	stderr := capbuf.New(stderrHead, stderrTail)
-	stderrDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(stderr, errR)
-		close(stderrDone)
-	}()
-
-	waitErr := cmd.Wait()
-	// 兜底：即使正常退出也再扫一遍进程组，杀掉可能残留的孙子进程。
-	// 同组的遗留后台进程死了，它们持有的写端随之关闭，读端拿到 EOF。
-	killProcessGroup(pgid)
-
-	// 进程已退出，管道里剩下的内容一般毫秒级读完。宽限期过了还没 EOF，
-	// 说明写端被逃出进程组的进程（setsid 之类）攥着 —— 强关读端，不再等。
-	deadline := time.Now().Add(pipeDrainGrace)
-	forced := drainOrClose(parseDone, outR, deadline)
-	drainOrClose(stderrDone, errR, deadline)
-
-	result, parseErr := out.result, out.err
-	if forced {
-		if result != nil {
-			// result 已到手，读端是我们自己关的，读错误不算执行失败
-			parseErr = nil
-		} else if parseErr != nil {
-			parseErr = fmt.Errorf("agent: CLI 已退出但 stdout 被逃出进程组的后台进程占用，"+
-				"%v 后强制停止读取: %w", pipeDrainGrace, parseErr)
-		}
-	}
-
-	// 静默判死要先于总超时判：两者都是「进程被杀、没有 result」，但原因
-	// 完全不同，报错必须能分开 —— 一个是设的上限太小，一个是进程卡住了。
-	if idle.firedNow() {
-		return result, fmt.Errorf("%w（%v 内没有任何输出，进程树已回收，stderr: %s）",
-			ErrIdle, d.idleTimeout(), stderr.String())
-	}
-	if ctxErr := ctx.Err(); errors.Is(ctxErr, context.DeadlineExceeded) {
-		return result, fmt.Errorf("agent: 执行超时（上限 %v），进程树已回收", limit.Round(time.Second))
-	} else if ctxErr != nil {
-		return result, fmt.Errorf("agent: 执行被取消: %w", ctxErr)
-	}
-
-	if parseErr != nil {
-		return result, parseErr
-	}
-	if result == nil {
-		return nil, fmt.Errorf("%w（退出错误: %v，stderr: %s）",
-			ErrNoResultEvent, waitErr, stderr.String())
-	}
-
-	// CLI 以非零码退出但给了 result 事件时，以 result 为准：
-	// is_error/subtype 描述得比退出码精确。
-	if waitErr != nil && !result.IsError {
-		return result, fmt.Errorf("agent: CLI 非零退出（%v），stderr: %s",
-			waitErr, stderr.String())
-	}
-	return result, nil
+	return supervise(ctx, d.claudeLaunch(p),
+		superviseLimits{Timeout: d.timeout, Idle: d.idleTimeout()},
+		parseClaude, p.OnEvent)
 }
 
-func (d *Driver) buildArgs(p RunParams) []string {
+// claudeLaunch 构造 claude 的启动描述。stdin 不接（nil），与抽出 supervise
+// 之前逐字节相同；env = 白名单 + 调用方显式注入（同名后者生效）。
+func (d *ClaudeDriver) claudeLaunch(p RunParams) launch {
+	return launch{
+		Bin:  d.bin,
+		Args: d.buildArgs(p),
+		Dir:  p.Dir,
+		Env:  append(sanitizedEnv(), p.ExtraEnv...),
+	}
+}
+
+// parseClaude 是 claude 的 supervise parse：每一条可解析的 JSON 行先喂看门狗
+// 再投递，不过滤 —— touch 集合与抽出 supervise 之前逐行相同（非 JSON 行、
+// 坏 JSON 行不 touch）。f01 的过滤加在这里时，Touch 已经在过滤之前。
+func parseClaude(r io.Reader, h parseHooks) (*Result, error) {
+	return parseStream(r, func(e Event) {
+		h.Touch()
+		h.Emit(e)
+	})
+}
+
+func (d *ClaudeDriver) buildArgs(p RunParams) []string {
 	args := []string{"--print", "--output-format", "stream-json", "--verbose"}
 
 	switch {
@@ -429,6 +403,10 @@ func parseStream(r io.Reader, onEvent func(Event)) (*Result, error) {
 			TerminalReason:    re.TerminalReason,
 			PermissionDenials: re.PermissionDenials,
 			APIErrorStatus:    re.APIErrorStatus,
+			// f03：Usage/CostKnown 与 CostUSD 同一组覆盖赋值 —— 末条胜出，
+			// 不跨 result 相加（modelUsage 与 total_cost_usd 都是进程累计）。
+			Usage:     usageOf(&re),
+			CostKnown: true,
 		}
 	}
 	if err := sc.Err(); err != nil {

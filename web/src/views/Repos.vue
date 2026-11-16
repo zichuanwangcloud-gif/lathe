@@ -20,8 +20,38 @@ const VERIFY_TIERS = [
   { value: 'heavy', label: '强制 heavy', desc: '必须给出红-绿复现证明：复现测试在改动前失败、改动后通过，回归通过。' },
 ]
 
+// 代码平台：登记时选定、之后不可改（迁移需删除后重新登记）。
+// 自建实例的地址取自个人设置里该平台凭据的实例地址，这里不填。
+const PLATFORMS = [
+  { value: 'github', label: 'GitHub', placeholder: 'owner/repo' },
+  { value: 'gitlab', label: 'GitLab', placeholder: 'group/repo 或 group/subgroup/repo' },
+  { value: 'gitea', label: 'Gitea', placeholder: 'owner/repo' },
+]
+const platformLabel = (v) => PLATFORMS.find((p) => p.value === (v || 'github'))?.label || v
+// 执行 agent（f06）：哪些可选由 /api/agent-drivers 决定。codex 要运维配了
+// LATHE_CODEX_HOME 才启用；未启用时选项置灰，后端也会拒绝（双保险）。
+const AGENT_DRIVERS = [
+  { value: 'claude', label: 'claude — Claude Code（默认）' },
+  { value: 'codex', label: 'codex — OpenAI Codex CLI' },
+]
+const driverEnabled = ref({ claude: true, codex: false })
+
+async function loadDrivers() {
+  try {
+    const r = await api.agentDrivers()
+    const m = {}
+    for (const d of r.drivers || []) m[d.name] = !!d.enabled
+    driverEnabled.value = m
+  } catch (e) {
+    if (e instanceof UnauthorizedError) return onUnauthorized()
+    // 拿不到就保守：只有 claude 可选（与未启用 codex 的部署行为一致）
+    driverEnabled.value = { claude: true, codex: false }
+  }
+}
+
 // 登记新仓库（P1.5 第二步）：各归各的名下，不再需要管理员手工插库
 const newRepo = ref('')
+const newPlatform = ref('github')
 const newBusy = ref(false)
 
 // 基线目录检测/部署状态，按 repo.id 存一份（不进 repos.value，
@@ -35,7 +65,7 @@ async function add() {
   newBusy.value = true
   error.value = ''
   try {
-    await api.createRepo({ providerRepo })
+    await api.createRepo({ providerRepo, vcsProvider: newPlatform.value })
     newRepo.value = ''
     await load()
   } catch (e) {
@@ -97,6 +127,7 @@ async function save(repo) {
       verifyTierOverride: repo.verifyTierOverride || '',
       baselineDir: repo.baselineDir || '',
       verifyInfra,
+      agentDriver: repo.agentDriver || 'claude',
     })
     saved.value = repo.id
     setTimeout(() => (saved.value = null), 2000)
@@ -135,7 +166,10 @@ async function deployBaseline(repo, composeFile) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadDrivers()
+})
 </script>
 
 <template>
@@ -145,21 +179,28 @@ onMounted(load)
   <div class="card">
     <h2>登记仓库</h2>
     <p class="faint" style="margin: 6px 0 12px">
-      把你要让 Lathe 干活的 GitHub 仓库登记到自己名下，例如 <code class="mono">acme/demo</code>。
+      把你要让 Lathe 干活的仓库（GitHub / GitLab / Gitea，含自建实例）登记到自己名下，例如 <code class="mono">acme/demo</code>。
       登记后把 issue 指派给你的 Linear 账号即可触发任务。
     </p>
     <form class="row" style="display: flex; gap: 10px" @submit.prevent="add">
+      <select v-model="newPlatform" :disabled="newBusy" aria-label="代码平台">
+        <option v-for="p in PLATFORMS" :key="p.value" :value="p.value">{{ p.label }}</option>
+      </select>
       <input
         v-model="newRepo"
         class="mono"
         style="flex: 1"
-        placeholder="owner/repo"
+        :placeholder="PLATFORMS.find((p) => p.value === newPlatform)?.placeholder"
         :disabled="newBusy"
       />
       <button class="primary" :disabled="newBusy || !newRepo.trim()">
         {{ newBusy ? '登记中…' : '登记' }}
       </button>
     </form>
+    <p v-if="newPlatform !== 'github'" class="faint hint">
+      登记 {{ platformLabel(newPlatform) }} 仓库前，请先在个人设置里配置 {{ platformLabel(newPlatform) }}
+      令牌与实例地址；实例地址会在登记时固定到仓库上。
+    </p>
   </div>
 
   <div v-if="!repos.length" class="card empty">
@@ -171,6 +212,12 @@ onMounted(load)
       <h2 class="mono">{{ repo.providerRepo }}</h2>
       <span v-if="saved === repo.id" class="badge ok">已保存</span>
     </div>
+
+    <p class="faint platform">
+      代码平台：<b>{{ platformLabel(repo.vcsProvider) }}</b>
+      <span v-if="repo.vcsBaseUrl" class="mono">（{{ repo.vcsBaseUrl }}）</span>
+      · 只读，需要换平台请重新登记仓库
+    </p>
 
     <div class="fields">
       <label>
@@ -236,6 +283,27 @@ onMounted(load)
         </select>
         <small class="faint">
           {{ VERIFY_TIERS.find((t) => t.value === (repo.verifyTierOverride || ''))?.desc }}
+        </small>
+      </label>
+
+      <label class="full">
+        <span>执行 agent</span>
+        <select v-model="repo.agentDriver">
+          <option
+            v-for="d in AGENT_DRIVERS"
+            :key="d.value"
+            :value="d.value"
+            :disabled="!driverEnabled[d.value] && repo.agentDriver !== d.value"
+          >
+            {{ d.label }}{{ driverEnabled[d.value] ? '' : '（本实例未启用）' }}
+          </option>
+        </select>
+        <small class="faint">
+          写代码的 CLI。验证与红-绿证明对两者完全相同。<b>只影响之后新建的任务</b>；
+          在途任务继续用原来的 agent（会话是谁建的就得谁来续）。
+          <template v-if="!driverEnabled.codex">
+            codex 不可选：运维未配置 <span class="mono">LATHE_CODEX_HOME</span>（专用的 codex 配置目录）。
+          </template>
         </small>
       </label>
 
@@ -306,6 +374,8 @@ h1 { font-size: 22px; margin: 0 0 16px; }
 h2 { font-size: 15px; margin: 0; }
 
 .repo { margin-bottom: 16px; }
+.hint { margin: 8px 0 0; font-size: 12px; }
+.platform { margin: 6px 0 0; font-size: 12px; }
 
 .fields {
   display: grid;

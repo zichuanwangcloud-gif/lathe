@@ -332,13 +332,6 @@ func (s *Store) ListScheduleRuns(ctx context.Context, scheduleID, userID int64, 
 	return out, rows.Err()
 }
 
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
 // prefixCols 给逗号分隔的列清单逐个加表别名前缀（第一个由调用方自己写）。
 func prefixCols(cols, prefix string) string {
 	out := []byte{}

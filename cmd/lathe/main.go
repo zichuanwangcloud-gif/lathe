@@ -22,9 +22,11 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/creds"
 	"github.com/zichuanwangcloud-gif/lathe/internal/flow"
 	"github.com/zichuanwangcloud-gif/lathe/internal/httpapi"
+	"github.com/zichuanwangcloud-gif/lathe/internal/inbox"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/linear"
 	"github.com/zichuanwangcloud-gif/lathe/internal/mail"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/prd"
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
@@ -32,6 +34,9 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs/gitea"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs/gitlab"
 	"github.com/zichuanwangcloud-gif/lathe/internal/webui"
 )
 
@@ -158,6 +163,9 @@ func serve(cfg config.Config) error {
 	slog.Info("凭据加密已就绪", "key_source", keySource)
 
 	secrets := st.NewSecrets(sealer)
+	// 站外通知渠道（Slack / 飞书，f09）：URL 与签名密钥同凭据一样加密入库。
+	// 白名单只此一处：保存时校验与发送时校验用的是同一份 notify.AllowedHosts。
+	notifyChannels := st.NewNotifyChannels(sealer, notify.AllowedHosts)
 	users := st.NewUsers()
 	sessions := st.NewSessions()
 
@@ -166,7 +174,8 @@ func serve(cfg config.Config) error {
 		return err
 	}
 
-	go gcSessions(ctx, sessions)
+	pats := st.NewPATs()
+	go gcAuthRows(ctx, sessions, pats)
 
 	// P1.5 第二步：凭据按用户隔离。环境变量兜底只给内置管理员 ——
 	// 那是部署者自己的账号，不该借给普通成员的任务用。
@@ -177,8 +186,12 @@ func serve(cfg config.Config) error {
 		GitHubToken:         cfg.GitHubToken,
 		LinearUserID:        os.Getenv("LATHE_LINEAR_USER_ID"),
 	}, admin.ID, st)
+	// 云效任务来源（f08）：每用户一条连接，与 integrations 分开存、同一个
+	// Sealer 加密。云效没有环境变量兜底（只能在设置页配）。
+	yunxiaoConns := st.NewYunxiaoConnections(sealer)
+	factory.WithYunxiao(yunxiaoConns)
 
-	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory)
+	pipeline, previewMgr, err := buildPipeline(cfg, st, secrets, factory, notifyChannels)
 	if err != nil {
 		return err
 	}
@@ -211,6 +224,8 @@ func serve(cfg config.Config) error {
 	// 与分诊同级走便宜通道；推荐只是预填，启动仍是人拍板。
 	previewMgr.SetRecommender(agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
 		cfg.TriageChannel, cfg.SettingSources)
+	// 用量账本（f03）：推荐也是一次真实的 agent 运行，归属由 store 从任务行取
+	previewMgr.Usage = st
 
 	// T6 worktree TTL 收割机。复用 pipeline 那一份 Worktrees ——
 	// 两边不能是两套配置（同 MergePoller 的注释）。
@@ -241,8 +256,10 @@ func serve(cfg config.Config) error {
 
 	// 两条认证通道：邮箱口令（正常登录）与 LATHE_ADMIN_TOKEN 的 Bearer
 	// （脚本调用，同时是把自己锁在门外时的应急入口）
+	// 第三条：个人 API 令牌（Bearer lathe_pat_…），身份等于签发者本人。
 	auth := httpapi.NewAuth(os.Getenv("LATHE_ADMIN_TOKEN")).
-		WithStore(users, sessions, admin, cfg.SecureCookies())
+		WithStore(users, sessions, admin, cfg.SecureCookies()).
+		WithPATs(pats)
 	auth.TrustProxy = cfg.TrustedProxy
 	// 「Linear 任务」菜单的显隐依据：与执行队列同一条凭据通路，
 	// 管理员的 env 兜底自然被覆盖；只解密本地凭据，不访问 Linear。
@@ -277,6 +294,30 @@ func serve(cfg config.Config) error {
 		Deliveries: st,
 		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
 	})
+	// GitLab / Gitea 同形：/webhooks/{gitlab,gitea}/{slug}，同一个用户随机段，
+	// 各平台各自的密钥；信任判定用属主自己的平台令牌查成员/协作者关系。
+	vcsResolver := &vcsWebhookResolver{users: users, factory: factory}
+	mux.Handle("POST /webhooks/gitlab/{slug}", &httpapi.GitLabWebhook{
+		Resolver:   vcsResolver,
+		Deliveries: st,
+		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
+	})
+	mux.Handle("POST /webhooks/gitea/{slug}", &httpapi.GiteaWebhook{
+		Resolver:   vcsResolver,
+		Deliveries: st,
+		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
+	})
+
+	// 云效工作项回调（f08）：/webhooks/yunxiao/{slug}，与 Linear/GitHub 共用
+	// 用户的随机段、按用户的云效 webhook 密钥验签。没有无 slug 的兜底路径
+	// （同 GitHub 新入口的立场）。
+	mux.Handle("POST /webhooks/yunxiao/{slug}", &httpapi.YunxiaoWebhook{
+		Resolver:   &httpapi.YunxiaoResolver{Users: users, Conns: yunxiaoConns, Store: st},
+		Deliveries: st,
+		Triggers:   yunxiaoConns,
+		Tasks:      q,
+	})
+	(&httpapi.YunxiaoAPI{Conns: yunxiaoConns, Store: st, Auth: auth, Tasks: q}).Routes(mux)
 
 	apiSrv := &httpapi.API{
 		Store:        st,
@@ -284,8 +325,23 @@ func serve(cfg config.Config) error {
 		Queue:        q,
 		Auth:         auth,
 		ConfigStatus: configStatus(cfg),
+		CodexEnabled: cfg.CodexEnabled(),
+		// 验证日志读取（f04）：与 Pipeline.LogDir / KnownSecrets 同源（buildPipeline 里的同名字段），
+		// 漏装时日志接口一律 503、静默不可用 —— TestServeWiresVerificationLogIntoAPI 守着。
+		LogDir:       cfg.DataDir,
+		KnownSecrets: cfg.KnownSecrets(),
 	}
 	apiSrv.Routes(mux)
+
+	// 收件箱（docs/features/inbox.md）：等人处理的事项从现有状态实时派生，
+	// 原因文本先过 runner 同一套两层脱敏再上界面。
+	inboxSvc, err := inbox.NewService(st, func(s string) string {
+		return runner.RedactText(s, cfg.KnownSecrets())
+	})
+	if err != nil {
+		return err
+	}
+	(&httpapi.InboxAPI{Service: inboxSvc, Auth: auth}).Routes(mux)
 
 	// 看板「同步 Linear」的只读接口。凭据与执行队列走同一条通路，
 	// 设置页里改完 Linear token 即刻生效，不用重启。
@@ -315,10 +371,15 @@ func serve(cfg config.Config) error {
 		Resets:     st.NewResets(),
 		Auth:       auth,
 		Mail:       mail.NewSender(secrets.LoadSMTP),
+		PATs:       pats,
 		BaseURL:    cfg.PublicURL(),
 		TrustProxy: cfg.TrustedProxy,
 	}
 	accountAPI.Routes(mux)
+
+	// 个人 API 令牌的签发/列出/吊销：只接受会话 Cookie，签发需当前口令。
+	patAPI := &httpapi.PATAPI{PATs: pats, Auth: auth, Sessions: sessions}
+	patAPI.Routes(mux)
 
 	smtpAPI := &httpapi.SMTPAPI{
 		Secrets:  secrets,
@@ -327,11 +388,20 @@ func serve(cfg config.Config) error {
 	}
 	smtpAPI.Routes(mux)
 
+	// 站外通知渠道的个人设置（f09）：保存即发测试消息，投递记录可查可重试。
+	notifyAPI := &httpapi.NotifyAPI{
+		Channels: notifyChannels,
+		Sender:   notify.NewProductionSender(),
+		Auth:     auth,
+	}
+	notifyAPI.Routes(mux)
+
 	adminAPI := &httpapi.AdminAPI{
 		Users:    users,
 		Sessions: sessions,
 		Resets:   st.NewResets(),
 		Auth:     auth,
+		PATs:     pats,
 		Store:    st,
 	}
 	adminAPI.Routes(mux)
@@ -433,18 +503,9 @@ func serve(cfg config.Config) error {
 	// agent 驱动另起一个实例：Driver 无状态，与执行共用没有好处，分开
 	// 反而让规划超时将来能独立调。
 	prdAPI := &httpapi.PRDAPI{
-		Store: st,
-		Auth:  auth,
-		Planner: &prd.Service{
-			Store:     prd.NewStoreAdapter(st),
-			Agent:     agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
-			Worktrees: prdWorktrees{wm: pipeline.Worktrees},
-			Issues:    prdIssues{st: st},
-			Flows:     prdFlows{svc: flowSvc},
-			Channel:   cfg.ImplementChannel,
-			// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
-			SettingSources: cfg.SettingSources,
-		},
+		Store:   st,
+		Auth:    auth,
+		Planner: buildPRDService(cfg, st, pipeline.Worktrees, flowSvc, factory, notifyChannels),
 	}
 	prdAPI.Routes(mux)
 
@@ -477,7 +538,7 @@ func serve(cfg config.Config) error {
 	// 更实的影响：那一段窗口里被领走的任务 p.Stacks == nil → 整个起栈
 	// 分支跳过 → 既不起栈也不留痕。而那个窗口恰恰是最热的时刻 ——
 	// 上面的 Reconcile 刚把所有在途任务重新入队。
-	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets, scheduler)
+	startWorkers(ctx, q, pipeline, st, factory, cfg, secrets, notifyChannels, scheduler)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -509,7 +570,7 @@ func serve(cfg config.Config) error {
 // 而不是被硬杀。注意被取消的 ctx 会一路传进拆栈路径 —— 那正是
 // VerifyStack.Down 必须自己解绑取消的原因（见 preview/verifystack.go）。
 func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *store.Store,
-	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets, scheduler *schedule.Runner) {
+	factory runner.ClientFactory, cfg config.Config, secrets *store.Secrets, nc *store.NotifyChannels, scheduler *schedule.Runner) {
 	go q.work(ctx)
 
 	// F4.1 合并检测的轮询兜底 + F4.2 现场回收 + F4.3 后继链自动 rebase
@@ -556,6 +617,12 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 	}
 	go sweeper.Run(ctx)
 
+	// 站外通知 outbox 的投递者（f09）：每 notify.DrainInterval 一轮，逐行领取发送，
+	// 失败退避重试至多 notify.MaxAttempts 次。它只读写 notify_deliveries 这张旁路表，
+	// 与任务状态机没有任何交集 —— 它挂了、慢了，任务照样流转。
+	notifyWorker := notify.NewWorker(nc, notify.NewProductionSender(), cfg.PublicURL())
+	go notifyWorker.Run(ctx)
+
 	// 定时建单调度器（docs/features/scheduled-issue.md）：只往 Linear 建单，不进入执行管线。
 	// Runner 已在 serve 里构造（「立即运行」要用同一个实例），这里只负责启动。
 	// 关掉时 API 照常可用（可以先配规则），「立即运行」返回 503。
@@ -564,6 +631,45 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 	} else {
 		slog.Warn("定时建单调度器已被 LATHE_SCHEDULER_ENABLED=false 关闭：规则不会到点建单")
 	}
+}
+
+// buildPRDService 装配模糊任务规划服务（docs/10）。
+//
+// 从 serve 的字面量里提出来，是为了让装配测试能断言 ReviewNotifier 接的是
+// 同一个 *store.NotifyChannels（同 buildPipeline 的做法）。函数体保持键值字面量。
+func buildPRDService(cfg config.Config, st *store.Store, wm *runner.WorktreeManager, flowSvc *flow.Service, factory runner.ClientFactory, nc *store.NotifyChannels) *prd.Service {
+	return &prd.Service{
+		Store:     prd.NewStoreAdapter(st),
+		Agent:     agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		Worktrees: prdWorktrees{wm: wm},
+		Issues:    prdIssues{st: st},
+		Flows:     prdFlows{svc: flowSvc},
+		Channel:   cfg.ImplementChannel,
+		// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
+		SettingSources: cfg.SettingSources,
+		// GitLab/Gitea 仓库的规划检出按 PRD 属主取代码平台鉴权
+		GitAuth: prdGitAuth{f: factory},
+		// 用量账本（f03）：规划/复核的每次尝试各记一行
+		Usage: st,
+		// PRD 进 ready_for_review 时推站外通知（f09）。nil NC 不能装进接口：
+		// 那会得到一个「非 nil 接口里的 nil 指针」，notifyReview 会在它上面调方法。
+		ReviewNotifier: reviewNotifierOf(nc),
+	}
+}
+
+// reviewNotifierOf / chatNotifierOf 让 nil NC 落成 nil 接口（关闭），而不是装了 nil 指针的接口。
+func reviewNotifierOf(nc *store.NotifyChannels) prd.ReviewNotifier {
+	if nc == nil {
+		return nil
+	}
+	return nc
+}
+
+func chatNotifierOf(nc *store.NotifyChannels) runner.ChatNotifier {
+	if nc == nil {
+		return nil
+	}
+	return nc
 }
 
 // buildPipeline 装配流水线。
@@ -575,7 +681,7 @@ func startWorkers(ctx context.Context, q *queue, pipeline *runner.Pipeline, st *
 // 返回 preview.Manager 给调用方复用：验证隔离栈与预览环境用的是同一套
 // docker 能力与同一组资源阈值，另起一个实例等于两套配置，迟早不一致
 // （apiSrv.Baselines 复用它是同一个先例）。
-func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, factory runner.ClientFactory) (*runner.Pipeline, *preview.Manager, error) {
+func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, factory runner.ClientFactory, nc *store.NotifyChannels) (*runner.Pipeline, *preview.Manager, error) {
 	wm, err := runner.NewWorktreeManager(cfg.WorkspaceRoot)
 	if err != nil {
 		return nil, nil, err
@@ -594,16 +700,21 @@ func buildPipeline(cfg config.Config, st *store.Store, secrets *store.Secrets, f
 		Tasks:         task.NewMachine(st.Pool()),
 		Worktrees:     wm,
 		Verifier:      runner.NewVerifier(15*time.Minute, cfg.PnpmStore),
-		Agent:         agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout),
+		Agent:         agentRouter(cfg),
 		ClientFactory: factory,
 		Notifier:      logNotifier{},
 		Mail:          taskMailer{store: st, sender: mail.NewSender(secrets.LoadSMTP)},
+		// 站外渠道（Slack / 飞书，f09）：*store.NotifyChannels 直接满足 runner.ChatNotifier，不写适配器。
+		Chat:          chatNotifierOf(nc),
 		BaseURL:       cfg.PublicURL(),
 		LogDir:        cfg.DataDir,
 		Verifications: st,
 		Stacks:        verifyStacks{pm},
 		AgentEvents:   st,
-		Memory:        st,
+		// 用量账本（f03）：每次 agent 运行一行 + 定档后的档位回补
+		Usage:     st,
+		UsageTier: st,
+		Memory:    st,
 		// 脱敏权威层的登记值：配置里的 DB 口令/集成 token（见 config.KnownSecrets）。
 		// 隔离栈连接串与进程环境由 runner 自己在脱敏时补上（它拿得到 StackEnv）。
 		KnownSecrets:     cfg.KnownSecrets(),
@@ -684,6 +795,74 @@ func (r *githubWebhookResolver) ResolveGitHub(ctx context.Context, slug string) 
 	return &httpapi.GitHubWebhookTarget{OwnerID: u.ID, Secret: secret}, nil
 }
 
+// vcsWebhookResolver 把 GitLab/Gitea 回调路径里的 slug 解析成投递目标。
+//
+// 与 githubWebhookResolver 同一立场：没有空 slug 兜底；密钥取该用户该平台的
+// webhook 凭据，未配置即拒绝路由（404）。成员/协作者查询客户端用属主自己的
+// 平台令牌构造；令牌没配时留空，handler 按「无法确认成员关系」一律拒绝（fail-closed）。
+type vcsWebhookResolver struct {
+	users   *store.Users
+	factory *creds.Factory
+}
+
+func (r *vcsWebhookResolver) ResolveVCSWebhook(ctx context.Context, p vcs.Provider, slug string) (*httpapi.VCSWebhookTarget, error) {
+	if slug == "" {
+		return nil, fmt.Errorf("缺少回调地址随机段")
+	}
+	var secretKind, tokenKind string
+	switch p {
+	case vcs.ProviderGitLab:
+		secretKind, tokenKind = store.KindGitLabWebhook, store.KindGitLab
+	case vcs.ProviderGitea:
+		secretKind, tokenKind = store.KindGiteaWebhook, store.KindGitea
+	default:
+		return nil, fmt.Errorf("未知代码平台 %q", p)
+	}
+	u, err := r.users.ByWebhookSlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if u.Disabled() {
+		return nil, fmt.Errorf("账号已停用")
+	}
+	prov := r.factory.ProviderFor(u.ID)
+	secret, _, err := prov.Token(ctx, secretKind)
+	if err != nil || secret == "" {
+		return nil, fmt.Errorf("该用户尚未配置 %s webhook 密钥", p.DisplayName())
+	}
+	target := &httpapi.VCSWebhookTarget{OwnerID: u.ID, Secret: secret}
+	token, base, _, terr := prov.TokenWithBaseURL(ctx, tokenKind)
+	if terr != nil || base == "" {
+		return target, nil
+	}
+	switch p {
+	case vcs.ProviderGitLab:
+		if c, err := gitlab.New(base, token); err == nil {
+			target.GitLab = c
+		}
+	case vcs.ProviderGitea:
+		if c, err := gitea.New(base, token); err == nil {
+			target.Gitea = c
+		}
+	}
+	return target, nil
+}
+
+// agentRouter 装配任务流水线的 agent 驱动：按任务钉死的 agent_driver 分派
+// （f06，docs/features/multi-cli.md）。claude 恒在；codex 只在运维配置了
+// LATHE_CODEX_HOME 时注册 —— 没配时钉死为 codex 的任务得到
+// agent.ErrDriverUnavailable，以可读原因失败，会话 ID 原样保留。
+//
+// PRD 规划与预览推荐不走这里：它们继续只用 claude（各自有 claude 专属的
+// 输出修正与超时收尾逻辑），装配时直接给 agent.NewDriver。
+func agentRouter(cfg config.Config) *agent.Router {
+	claude := agent.NewDriver(cfg.ClaudeBin, cfg.AgentTimeout)
+	if !cfg.CodexEnabled() {
+		return agent.NewRouter(claude, nil)
+	}
+	return agent.NewRouter(claude, agent.NewCodexDriver(cfg.CodexBin, cfg.CodexHome, cfg.AgentTimeout))
+}
+
 // configStatus 生成给管理界面的配置状态。
 //
 // 只报告「配没配、从哪个环境变量读」，绝不包含凭据内容本身。
@@ -703,6 +882,10 @@ func configStatus(cfg config.Config) func() map[string]any {
 				"workspaceRoot": cfg.WorkspaceRoot,
 				"pnpmStore":     cfg.PnpmStore,
 				"claudeBin":     cfg.ClaudeBin,
+				// codex 只报「可执行文件 + 启用了没有」：LATHE_CODEX_HOME 的路径与
+				// 其中的任何文件（config.toml / auth.json）都不进面板
+				"codexBin":      cfg.CodexBin,
+				"codexEnabled":  cfg.CodexEnabled(),
 				"agentTimeout":  cfg.AgentTimeout.String(),
 				"triageChannel": cfg.TriageChannel,
 				"implChannel":   cfg.ImplementChannel,
@@ -828,8 +1011,12 @@ func ensureSuperadmin(ctx context.Context, users *store.Users, cfg config.Config
 	return users.ByID(ctx, u.ID)
 }
 
-// gcSessions 定期清理过期会话与过期的密码重置令牌。
-func gcSessions(ctx context.Context, sessions *store.Sessions) {
+// gcAuthRows 定期清理过期会话、过期的密码重置令牌，以及吊销/过期满 30 天的
+// 个人 API 令牌。
+//
+// 同一个定时器、两次独立调用、两段独立日志：PAT 行数不混进会话的计数，
+// 免得运维看到删除数以为全是会话。
+func gcAuthRows(ctx context.Context, sessions *store.Sessions, pats *store.PersonalAccessTokens) {
 	t := time.NewTicker(time.Hour)
 	defer t.Stop()
 	for {
@@ -837,13 +1024,15 @@ func gcSessions(ctx context.Context, sessions *store.Sessions) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := sessions.GC(ctx)
-			if err != nil {
+			if n, err := sessions.GC(ctx); err != nil {
 				slog.Warn("清理过期会话失败", "err", err)
-				continue
-			}
-			if n > 0 {
+			} else if n > 0 {
 				slog.Info("已清理过期会话与重置令牌", "rows", n)
+			}
+			if n, err := pats.GC(ctx); err != nil {
+				slog.Warn("清理过期个人 API 令牌失败", "err", err)
+			} else if n > 0 {
+				slog.Info("已清理过期个人 API 令牌", "rows", n)
 			}
 		}
 	}

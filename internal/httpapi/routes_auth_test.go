@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 )
 
@@ -19,6 +20,7 @@ func TestAdminAndSMTPRequireAuth(t *testing.T) {
 	(&AdminAPI{Users: st.NewUsers(), Sessions: st.NewSessions(), Resets: st.NewResets(), Auth: a}).Routes(mux)
 	(&SMTPAPI{Secrets: st.NewSecrets(testSealer(t)), Auth: a}).Routes(mux)
 	(&AccountAPI{Users: st.NewUsers(), Sessions: st.NewSessions(), Resets: st.NewResets(), Auth: a}).Routes(mux)
+	(&PATAPI{PATs: st.NewPATs(), Auth: a, Sessions: st.NewSessions()}).Routes(mux)
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -36,6 +38,10 @@ func TestAdminAndSMTPRequireAuth(t *testing.T) {
 		{"DELETE", "/api/smtp", ""},
 		// 改密要求登录；注册与忘记密码是公开的，不在此列
 		{"POST", "/api/password/change", `{"currentPassword":"a","newPassword":"b"}`},
+		// 个人 API 令牌管理
+		{"GET", "/api/pat", ""},
+		{"POST", "/api/pat", `{"name":"x","currentPassword":"y"}`},
+		{"DELETE", "/api/pat/1", ""},
 	}
 
 	for _, e := range endpoints {
@@ -83,4 +89,35 @@ func testSealer(t *testing.T) secret.Sealer {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// AC-24（f09）：站外通知渠道的全部新路由未认证一律 401。
+// 同上面那张表的规矩：加了路由就补一行，别让新接口悄悄裸奔。
+func TestNotifyChannelRequiresAuth(t *testing.T) {
+	st := testStoreForAPI(t)
+	a := NewAuth(apiTestToken).WithStore(st.NewUsers(), st.NewSessions(), nil, false)
+
+	mux := http.NewServeMux()
+	(&NotifyAPI{
+		Channels: st.NewNotifyChannels(testSealer(t), notify.AllowedHosts),
+		Sender:   notify.NewProductionSender(),
+		Auth:     a,
+	}).Routes(mux)
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	for _, e := range []struct{ method, path, body string }{
+		{"GET", "/api/notify/channels", ""},
+		{"PUT", "/api/notify/channels/slack", `{"url":"https://hooks.slack.com/services/x","enabled":true}`},
+		{"POST", "/api/notify/channels/slack/test", ""},
+		{"DELETE", "/api/notify/channels/slack", ""},
+		{"GET", "/api/notify/deliveries", ""},
+		{"POST", "/api/notify/deliveries/1/retry", ""},
+	} {
+		resp := do(t, srv, e.method, e.path, e.body, false)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s %s 未认证 got %d, want 401", e.method, e.path, resp.StatusCode)
+		}
+	}
 }

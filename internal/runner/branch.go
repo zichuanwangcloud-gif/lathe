@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // TaskKind 是任务类型，决定基线分支与分支前缀。
@@ -53,6 +55,37 @@ type RepoConfig struct {
 	// 分叉，而不是从 repos 配置的默认分支"，值来自 tasks.base_ref，由
 	// 调度器在派发前填充——本文件不关心是谁填的。
 	BaseRefOverride string
+	// VCSProvider / VCSBaseURL 是仓库所在的代码平台实例，对应
+	// repos.vcs_provider / repos.vcs_base_url（登记时钉死）。两个都是
+	// **非密**字段；git 鉴权（vcs.GitAuth）刻意不放进 RepoConfig ——
+	// 它被到处复制、被打印，秘密放进来就要审计所有复制与打印路径。
+	// 零值（空串）按 github 处理：存量调用方与测试夹具不受影响。
+	VCSProvider vcs.Provider
+	VCSBaseURL  string
+}
+
+// provider 返回规范化后的平台（零值按 github）。
+func (c RepoConfig) provider() vcs.Provider {
+	if c.VCSProvider == "" {
+		return vcs.ProviderGitHub
+	}
+	return c.VCSProvider
+}
+
+// Target 是仓库所在的平台实例（resolveVCS 据此选客户端、比对凭据地址）。
+func (c RepoConfig) Target() vcs.Target {
+	return vcs.Target{Provider: c.provider(), BaseURL: c.VCSBaseURL}
+}
+
+// RepoKey 是镜像/工作区的磁盘键（vcs.RepoKey 的薄包装）。GitHub 即 ProviderRepo。
+func (c RepoConfig) RepoKey() string {
+	return vcs.RepoKey(c.provider(), c.VCSBaseURL, c.ProviderRepo)
+}
+
+// CloneURL 是 git 远端地址（vcs.CloneURL 的薄包装）。GitHub 即
+// "git@github.com:<repo>.git"，与引入平台之前逐字节相同。
+func (c RepoConfig) CloneURL() string {
+	return vcs.CloneURL(c.provider(), c.VCSBaseURL, c.ProviderRepo)
 }
 
 // DefaultRepoConfig 返回符合 CloudRouter 约定的默认配置。
