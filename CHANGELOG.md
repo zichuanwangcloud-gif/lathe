@@ -9,6 +9,14 @@
 
 ### Added
 
+- **仓库可选 codex 作为执行 agent**（f06，`docs/features/multi-cli.md`）。仓库设置页新增「执行 agent」
+  下拉（claude / codex），默认 claude、**不配置的部署行为不变**；运维配置 `LATHE_CODEX_HOME`
+  （专用 codex 目录）后 codex 才可选。验证体系（heavy/light、红-绿证明、修复回路、闸门）对两种
+  agent 完全相同。驱动在建任务时从仓库钉死（迁移 0047/0048），分诊、实现、修复回路、review 二轮、
+  rebase 跟进重验都用同一个；review 意见续跑用 `codex exec resume <thread_id>` 保持原会话。
+  codex 子进程同样走环境变量白名单与显式工作目录，并隔离个人 `~/.codex` 与 `~/.agents/skills`。
+  任务详情页显示驱动徽标（codex 的费用显示为「未知」），系统设置页显示 codex 是否启用。
+  新增 `GET /api/agent-drivers`；新增环境变量 `LATHE_CODEX_HOME`、`LATHE_CODEX_BIN`。
 - **用量统计**（docs/features/usage-stats.md）：按任务、仓库、验证档位、阶段与时间范围
   聚合 token、费用、时长；新增 `/usage` 页面、`GET /api/usage`、`GET /api/tasks/{id}/usage`、
   管理员 `GET /api/admin/usage`（migration 0038–0040）。每次 agent 运行（分诊、实现、修复、

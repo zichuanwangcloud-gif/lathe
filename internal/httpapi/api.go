@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/preview"
 	"github.com/zichuanwangcloud-gif/lathe/internal/runner"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
@@ -54,6 +55,11 @@ type API struct {
 	// ConfigStatus 返回凭据配置状态（不含 token 本身）。
 	ConfigStatus func() map[string]any
 
+	// CodexEnabled 表示本实例启用了 codex 驱动（运维配置了 LATHE_CODEX_HOME，f06）。
+	// 消费方：PUT /api/repos/{id} 拒绝在未启用的实例上选 codex；
+	// GET /api/agent-drivers 告诉仓库页 codex 选项可不可选。
+	CodexEnabled bool
+
 	// LogDir 是完整验证日志的根（verifications.log_ref 相对它），与
 	// Pipeline.LogDir 同源（cfg.DataDir）。为空时日志接口一律 503。
 	LogDir string
@@ -93,6 +99,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /api/admin/usage", a.Auth.RequireAdminFunc(a.adminUsage))
 	mux.Handle("GET /api/repos", a.Auth.RequireFunc(a.listRepos))
 	mux.Handle("GET /api/config", a.Auth.RequireFunc(a.config))
+	mux.Handle("GET /api/agent-drivers", a.Auth.RequireFunc(a.agentDrivers))
 
 	// 写
 	mux.Handle("POST /api/tasks", a.Auth.RequireFunc(a.triggerTask))
@@ -794,6 +801,19 @@ func (a *API) createRepo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, repo)
 }
 
+// agentDrivers 列出可选的执行 agent 及本实例是否启用（f06）。
+//
+// 只给仓库页决定选项可不可选：只有 name/enabled 两个键，不含任何路径、
+// 版本或凭据；不涉及属主资源（与用户无关的实例能力），登录即可读。
+func (a *API) agentDrivers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"drivers": []map[string]any{
+			{"name": agent.DriverClaude, "enabled": true},
+			{"name": agent.DriverCodex, "enabled": a.CodexEnabled},
+		},
+	})
+}
+
 func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -815,6 +835,8 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		VerifyTierOverride *string `json:"verifyTierOverride"`
 		// 指针区分「未传」（不动）与「空串」（清空基线目录）
 		BaselineDir *string `json:"baselineDir"`
+		// 执行 agent：nil = 不动。只影响之后新建的任务（任务创建时钉死）。
+		AgentDriver *string `json:"agentDriver"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
@@ -846,6 +868,23 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 			"error": "基线目录须为绝对路径（运行节点本机路径），如 /opt/CloudRouter",
 		})
 		return
+	}
+	if body.AgentDriver != nil {
+		switch *body.AgentDriver {
+		case agent.DriverClaude:
+		case agent.DriverCodex:
+			if !a.CodexEnabled {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "本实例未启用 codex 驱动（运维未配置 LATHE_CODEX_HOME）",
+				})
+				return
+			}
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "执行 agent 须为 claude / codex 之一",
+			})
+			return
+		}
 	}
 	// 受保护分支列表清空等于关掉最后一道闸门，必须拒绝
 	if body.ProtectedBranches != nil && len(body.ProtectedBranches) == 0 {
@@ -883,6 +922,7 @@ func (a *API) updateRepo(w http.ResponseWriter, r *http.Request) {
 		VerifyInfra:        body.VerifyInfra,
 		VerifyTierOverride: body.VerifyTierOverride,
 		BaselineDir:        body.BaselineDir,
+		AgentDriver:        body.AgentDriver,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRepoNotFound) {

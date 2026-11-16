@@ -114,6 +114,8 @@ export const api = {
   adminUsage: (params = {}) => request('/api/admin/usage' + usageQuery(params)),
   taskUsage: (id) => request(`/api/tasks/${id}/usage`),
   repos: () => request('/api/repos'),
+  // 可选的执行 agent 及本实例是否启用（f06）：只有 name/enabled，不含路径
+  agentDrivers: () => request('/api/agent-drivers'),
   config: () => request('/api/config'),
 
   // 编排流程图（PRD 07）：批量建图、查图、列出我建过的图
