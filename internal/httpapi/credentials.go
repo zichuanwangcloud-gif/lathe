@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // VerifyResult 是一次连接验证的结果。
@@ -20,9 +21,17 @@ type VerifyResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// VerifyRequest 是一次连通性验证的入参。BaseURL 只对自建平台
+// （gitlab/gitea）有值：验证要连到用户自己的实例上。
+type VerifyRequest struct {
+	Kind    string
+	Token   string
+	BaseURL string
+}
+
 // Verifier 验证某类凭据的连通性。
 type Verifier interface {
-	Verify(ctx context.Context, kind, token string) VerifyResult
+	Verify(ctx context.Context, req VerifyRequest) VerifyResult
 }
 
 // CredentialAPI 管理凭据的配置与验证。
@@ -92,6 +101,9 @@ func (c *CredentialAPI) save(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		Token string `json:"token"`
+		// BaseURL 是自建 GitLab/Gitea 的实例地址。指针区分「没传」与「传了空串」：
+		// 不接受地址的种类传了（哪怕是空串）一律 400，不静默忽略。
+		BaseURL *string `json:"baseUrl"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体格式错误"})
@@ -103,13 +115,33 @@ func (c *CredentialAPI) save(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := c.Secrets.Save(r.Context(), c.owner(r), kind, body.Token); err != nil {
+	baseURL := ""
+	switch {
+	case body.BaseURL != nil && !store.KindAcceptsBaseURL(kind):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "凭据类型 " + kind + " 不接受实例地址（baseUrl）"})
+		return
+	case body.BaseURL != nil && strings.TrimSpace(*body.BaseURL) != "":
+		norm, err := vcs.NormalizeBaseURL(*body.BaseURL)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		baseURL = norm
+	}
+	if store.KindNeedsBaseURL(kind) && baseURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": "请填写实例地址（baseUrl），如 https://gitlab.example.com",
+		})
+		return
+	}
+
+	if err := c.Secrets.SaveWithBaseURL(r.Context(), c.owner(r), kind, body.Token, baseURL); err != nil {
 		serverError(w, "保存凭据失败", err)
 		return
 	}
 	c.invalidate(c.owner(r), kind)
 
-	result := c.runVerify(r.Context(), c.owner(r), kind, body.Token)
+	result := c.runVerify(r.Context(), c.owner(r), VerifyRequest{Kind: kind, Token: body.Token, BaseURL: baseURL})
 	writeJSON(w, http.StatusOK, map[string]any{"saved": true, "verify": result})
 }
 
@@ -121,7 +153,7 @@ func (c *CredentialAPI) verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := c.Secrets.Get(r.Context(), c.owner(r), kind)
+	token, baseURL, err := c.Secrets.GetWithBaseURL(r.Context(), c.owner(r), kind)
 	if err != nil {
 		if errors.Is(err, store.ErrIntegrationNotFound) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -132,7 +164,8 @@ func (c *CredentialAPI) verify(w http.ResponseWriter, r *http.Request) {
 		serverError(w, "读取凭据失败", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"verify": c.runVerify(r.Context(), c.owner(r), kind, token)})
+	writeJSON(w, http.StatusOK, map[string]any{"verify": c.runVerify(r.Context(), c.owner(r),
+		VerifyRequest{Kind: kind, Token: token, BaseURL: baseURL})})
 }
 
 func (c *CredentialAPI) remove(w http.ResponseWriter, r *http.Request) {
@@ -150,11 +183,12 @@ func (c *CredentialAPI) remove(w http.ResponseWriter, r *http.Request) {
 }
 
 // runVerify 执行验证并把结果记进数据库，供界面展示"上次验证情况"。
-func (c *CredentialAPI) runVerify(ctx context.Context, userID int64, kind, token string) VerifyResult {
+func (c *CredentialAPI) runVerify(ctx context.Context, userID int64, req VerifyRequest) VerifyResult {
 	if c.Verifier == nil {
 		return VerifyResult{OK: false, Error: "未配置验证器"}
 	}
-	res := c.Verifier.Verify(ctx, kind, token)
+	kind := req.Kind
+	res := c.Verifier.Verify(ctx, req)
 
 	if res.OK {
 		_ = c.Secrets.MarkVerified(ctx, userID, kind, res.AccountName)

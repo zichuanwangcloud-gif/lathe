@@ -1,0 +1,133 @@
+[
+  {
+    "id": 1,
+    "phase": "implement",
+    "kind": "init",
+    "body": "会话就绪",
+    "payload": {},
+    "at": "2026-11-01T10:00:00.000Z"
+  },
+  {
+    "id": 2,
+    "phase": "implement",
+    "kind": "text",
+    "body": "先读代码",
+    "payload": {},
+    "at": "2026-11-01T10:00:01.000Z"
+  },
+  {
+    "id": 3,
+    "phase": "implement",
+    "kind": "tool_use",
+    "tool": "Bash",
+    "body": "Bash go build ./...",
+    "payload": {
+      "toolUseId": "tu-1"
+    },
+    "at": "2026-11-01T10:00:02.000Z",
+    "result": {
+      "id": 4,
+      "phase": "implement",
+      "kind": "tool_result",
+      "body": "ok",
+      "payload": {
+        "toolUseId": "tu-1"
+      },
+      "at": "2026-11-01T10:00:05.500Z"
+    },
+    "durationMs": 3500
+  },
+  {
+    "id": 5,
+    "phase": "implement",
+    "kind": "tool_use",
+    "tool": "Agent",
+    "body": "Agent 找测试",
+    "payload": {
+      "toolUseId": "tu-2"
+    },
+    "at": "2026-11-01T10:00:06.000Z",
+    "result": {
+      "id": 10,
+      "phase": "implement",
+      "kind": "tool_result",
+      "body": "子 agent 完成",
+      "payload": {
+        "toolUseId": "tu-2"
+      },
+      "at": "2026-11-01T10:00:08.000Z"
+    },
+    "durationMs": 2000
+  },
+  {
+    "subagent": true,
+    "id": "sub-sa1",
+    "agentId": "sa1",
+    "title": "去找 group 的测试",
+    "list": [
+      {
+        "id": 7,
+        "phase": "implement",
+        "kind": "tool_use",
+        "agentId": "sa1",
+        "tool": "Grep",
+        "body": "Grep TestGroup",
+        "payload": {
+          "toolUseId": "tu-s1"
+        },
+        "at": "2026-11-01T10:00:06.200Z",
+        "result": {
+          "id": 8,
+          "phase": "implement",
+          "kind": "tool_result",
+          "agentId": "sa1",
+          "body": "model_test.go",
+          "payload": {
+            "toolUseId": "tu-s1",
+            "isError": true
+          },
+          "at": "2026-11-01T10:00:06.300Z"
+        },
+        "durationMs": null
+      },
+      {
+        "id": 9,
+        "phase": "implement",
+        "kind": "text",
+        "agentId": "sa1",
+        "body": "找到了",
+        "payload": {},
+        "at": "2026-11-01T10:00:07.000Z"
+      }
+    ]
+  },
+  {
+    "id": 11,
+    "phase": "implement",
+    "kind": "tool_result",
+    "body": "孤儿结果（老数据无 id）",
+    "payload": {},
+    "at": "2026-11-01T10:00:09.000Z"
+  },
+  {
+    "id": 12,
+    "phase": "implement",
+    "kind": "tool_use",
+    "tool": "Read",
+    "body": "Read a.go（老数据无 id）",
+    "payload": {},
+    "at": "2026-11-01T10:00:10.000Z",
+    "result": null,
+    "durationMs": null
+  },
+  {
+    "id": 13,
+    "phase": "implement",
+    "kind": "tool_result",
+    "body": "重复结果",
+    "payload": {
+      "toolUseId": "tu-1"
+    },
+    "at": "2026-11-01T10:00:11.000Z"
+  }
+]

@@ -19,6 +19,9 @@ type AdminAPI struct {
 	Sessions SessionStore
 	Resets   *store.Resets
 	Auth     *Auth
+	// PATs 在停用账号与代重置密码时吊销该用户全部个人 API 令牌。
+	// 为 nil 时这两个动作直接 500，不静默跳过。
+	PATs PATRevoker
 	// Store 读写系统设置（预览资源阈值等）；为 nil 时设置端点不可用。
 	Store *store.Store
 }
@@ -192,6 +195,16 @@ func (a *AdminAPI) disable(w http.ResponseWriter, r *http.Request) {
 		serverError(w, "清除会话失败", err)
 		return
 	}
+	// PAT 是「没有 Cookie 的会话」：停用同样要落库吊销（Lookup 里的
+	// disabled_at IS NULL 是第二道防线）。半途失败回 500，不报「已停用」。
+	if a.PATs == nil {
+		serverError(w, "吊销个人 API 令牌失败", errors.New("PAT 吊销未接线"))
+		return
+	}
+	if _, err := a.PATs.RevokeUser(r.Context(), u.ID); err != nil {
+		serverError(w, "吊销个人 API 令牌失败", err)
+		return
+	}
 	slog.Info("管理员停用了账号", "target", u.ID, "by", actorOf(r))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
@@ -260,6 +273,10 @@ func (a *AdminAPI) resetPassword(w http.ResponseWriter, r *http.Request) {
 		serverError(w, "生成密码哈希失败", err)
 		return
 	}
+	// 先吊销全部个人 API 令牌，失败则口令不改（mustChange 的 409 不再是唯一屏障）
+	if !revokePATsBeforePasswordChange(w, r, a.PATs, u.ID) {
+		return
+	}
 	// 置 mustChange：这个密码要经第三方之手转交，必须用一次就换掉
 	if err := a.Users.SetPassword(r.Context(), u.ID, hash, true); err != nil {
 		serverError(w, "重置密码失败", err)
@@ -276,7 +293,9 @@ func (a *AdminAPI) resetPassword(w http.ResponseWriter, r *http.Request) {
 
 // remove 删除账号及其名下全部数据。
 //
-// 任务、仓库配置、凭据、会话、重置令牌都由外键 ON DELETE CASCADE 带走。
+// 任务、仓库配置、凭据、会话、重置令牌、团队成员关系都由外键 ON DELETE CASCADE 带走。
+// 团队守卫（f12）：此人是某个仍有其他成员的团队的 owner → 409（先转让）；
+// 此人是团队唯一成员 → 团队同一事务内一起删除。
 // 唯一带不走的是 worktree 占的磁盘目录 —— 先把路径打进日志，让人能手工
 // 回收；自动回收留到第二步（那时任务归属清晰）。
 func (a *AdminAPI) remove(w http.ResponseWriter, r *http.Request) {
@@ -287,12 +306,27 @@ func (a *AdminAPI) remove(w http.ResponseWriter, r *http.Request) {
 	if !a.guardLastAdmin(w, r, u) {
 		return
 	}
+	// 删账号必须过团队守卫（f12：不留无主团队）。Store 未装配时 fail-closed，
+	// 【不回落】到 Users.Delete —— 回落等于静默绕过「最后一个 owner」守卫。
+	if a.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "团队守卫未装配，拒绝删除账号"})
+		return
+	}
 
 	if paths, err := a.Users.WorktreePaths(r.Context(), u.ID); err == nil && len(paths) > 0 {
 		slog.Warn("删除用户后以下工作区目录需手工清理", "user", u.ID, "paths", paths)
 	}
 
-	if err := a.Users.Delete(r.Context(), u.ID); err != nil {
+	if err := a.Store.DeleteUserGuarded(r.Context(), u.ID); err != nil {
+		var owns *store.UserOwnsTeamError
+		if errors.As(err, &owns) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": strings.TrimPrefix(owns.Error(), "store: ")})
+			return
+		}
+		if errors.Is(err, store.ErrTeamBusy) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "团队数据正忙，请重试"})
+			return
+		}
 		serverError(w, "删除用户失败", err)
 		return
 	}

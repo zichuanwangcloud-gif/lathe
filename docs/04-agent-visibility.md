@@ -69,13 +69,20 @@ stream-json 事件流是**执行实况**，Result.Text 是终局自述；让模�
 ### 3.1 数据通路
 
 ```
-claude CLI ──stdout NDJSON──> agent.Driver ──OnEvent──> EventSink（新增）
-                                                              │ Digest 提炼
-                                                              ▼
-                                                      agent_events 表
-                                                              ▲
-前端 TaskDetail 日志面板 <── GET /api/tasks/{id}/events ──────┘
+claude CLI ──stream-json──> ClaudeDriver ─┐
+                                          ├─ 归一成 agent.Event{Driver,...} ──OnEvent──> EventSink
+codex  CLI ──exec --json──> CodexDriver ──┘                                                │ Digest（按 Driver 分派）
+                                                                                           ▼
+                                                                                   agent_events 表
+                                                                                           ▲
+前端 TaskDetail 日志面板 <── GET /api/tasks/{id}/events ───────────────────────────────────┘
 ```
+
+f06（多 CLI 驱动）起，事件先由各自的驱动归一成同一个 `agent.Event`（多一个 `Driver` 字段），
+`Digest` 按驱动分派提炼，产出的 `Entry.Kind` 只有既有那几种（`agent_events` 的 CHECK 约束一字未改）。
+codex 的工具调用映射成 `Bash` / `Edit` 等同名工具、带 `toolUseId` 配对与 `exitCode`/`isError`，
+界面不用为 codex 写分支；codex 产出的每条事件 payload 带 `driver:"codex"`。映射表见
+[features/multi-cli.md](./features/multi-cli.md)。
 
 ### 3.2 EventSink：批量落库器
 
@@ -108,12 +115,34 @@ GET /api/tasks/{id}/events?after=<id>&limit=<n>
 - SSE 暂缓：轮询（2s）已满足"实时滚动"的体感；游标 `id` 严格单调，将来换
   SSE + Last-Event-ID 时客户端协议不变，只是传输升级
 
+回放扩展（f04，详见 `docs/features/run-replay.md` §3.2）：
+
+```
+GET /api/tasks/{id}/events?paged=1&before=<id>&phase=a,b&kind=a,b&failures=1&limit=<n>
+→ { "events": [...], "last_id": 12345, "first_id": 12001, "has_more": true }
+GET /api/tasks/{id}/events/summary
+→ { total, phases[{phase,count,firstId,lastId,firstAt,lastAt,failures}], failures[≤200],
+    failuresTruncated, failureCount, firstFailure, lastFailure }
+GET /api/tasks/{id}/verifications/{vid}/log?part=&offset=&limit=
+→ { text（已脱敏）, offset, nextOffset, size, eof, withheld, parts, part }
+```
+
+- 一个新参数都不带时响应**恰为** `{events, last_id}`，与上面的旧协议逐字段相同
+- `phase` / `kind` 白名单校验；失败判定是一段共用 SQL，与前端 `replay.js` 由同一张
+  fixture 驱动测试
+- 日志块只在「安全切点」上切（切开脱敏与整体脱敏结果相同），日志被后一次运行覆盖时
+  返回 404 `log_overwritten`
+
 ### 3.4 前端（TaskDetail.vue）
+
+> 回放视图（f04）落地后本节的加载与面板行为以 `docs/features/run-replay.md` §3.3 为准；
+> 下面是一期的基本形态，仍然成立的部分照留。
 
 - **执行日志面板**：按 kind 渲染 —— `text` 正文 markdown；`tool_use` 工具名
   + 参数摘要一行；`tool_result` 默认折叠；`thinking` 灰显折叠；`result`
   渲染成徽章行（耗时 / 成本 / turns）；`verify_step` 带红绿状态色
-- 任务进行中 2s 轮询增量（带 `after=last_id`）；进入终态后再拉一次收尾即停
+- 任务进行中 2s 轮询增量（带 `after=last_id`）；~~进入终态后再拉一次收尾即停~~
+  终态任务改为回放模式：先取最后一页，「加载更早」按需向前翻页（f04）
 - 阶段分节：按 `phase` 分组（分诊 / 实现 / 验证），当前进行中的阶段置顶展开
 
 ### 3.5 终局摘要落库（L1）
@@ -194,6 +223,10 @@ GET /api/tasks/{id}/events?after=<id>&limit=<n>
 ---
 
 ## 7. 第二条数据源：subagent 的内部活动（0014）
+
+> **只对 claude 有效**（f06）：这条数据源读的是 claude 落在磁盘上的内部 transcript。codex 没有对应的
+> 记录契约，codex 任务明确降级为「只看主会话」——runner 经 `agent.SubagentDirFor(driver, …)` 取目录，
+> 对 codex 返回空串，不起 watcher。
 
 ### 7.1 问题：21% 的活动不在 stdout 上
 
@@ -284,7 +317,22 @@ transcript**（那里的 `toolUseResult` 带 `agentId`/`description`/`status`）
 | 不做 | 原因 |
 |---|---|
 | 节点图 / 小地图 / 相机跟随 | 无人值守批处理，人是事后看结论；两三个 subagent 撑不起一张图，缩进树足够 |
-| 时间轴回拖（time travel） | 同上：没人坐在旁边拖进度条。phase 折叠已经回答「现在跑到哪」 |
+| 时间轴回拖（time travel） | 同上：没人坐在旁边拖进度条。phase 折叠已经回答「现在跑到哪」。仍然不做，定位功能见 §8 |
 | 把 stdout 换成读 transcript | 格式无文档、可能变；换过去等于把主可见性押在内部实现上（§7.2） |
 | subagent → 父调用的连线 | 需要多读一份父 transcript，收益是「对上一句话」，而标题已经能对上（§7.4） |
 | 归档 transcript 原文 | 它本来就留在 `~/.claude` 下，且不随 worktree 清理消失；init 事件已记 sessionId + cwd，任何时候都能回到原始现场 |
+
+## 8. 回放视图（f04）
+
+**结论：把「定位」而不是「播放」作为回放的核心交互；证明条只读 `verifications`；
+时间按入库时刻如实标注粒度。** 完整设计与验收见 `docs/features/run-replay.md`。
+
+- **为什么是定位**：人是在任务结束后来看结论的（§7.6）。要回答的问题是「哪一步挂了、
+  挂之前卡了多久」，所以给的是：失败一键定位（含超过 200 个失败时按当前 id 向服务端取下一个）、
+  `#ev-<id>` 深链接、≥30s 的静默分隔线，而不是一个要人坐着拖的进度条。
+- **为什么证明条只读 verifications**：那张表是可审计的证据本体；事件流可能因溢出丢事件
+  （§3.2）。重试复用任务行且日志路径会被覆盖，所以证明条先按「进入 verifying」切运行、
+  再按 `log_ref` 的 `(round, NN)` 与 status 序列切轮次；推断不可靠时不给总判定。
+- **时间粒度**：`at` 是入库时刻、200ms 批量刷库，误差约 ±200ms（§7.5）。界面显示相对
+  偏移，悬停写明「入库时间，粒度约 ±200ms」，小于 1s 的间隔不显示。
+

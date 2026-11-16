@@ -17,7 +17,7 @@ func TestBuildPipelineWiresInterjections(t *testing.T) {
 	st := testStore(t)
 	cfg := config.Config{WorkspaceRoot: t.TempDir(), ClaudeBin: "claude", LightSlots: 1, HeavySlots: 1,
 		Database: config.Database{Password: "db-pass-" + uniqueKey("x")}}
-	p, _, err := buildPipeline(cfg, st, testSecrets(t, st), nil)
+	p, _, err := buildPipeline(cfg, st, testSecrets(t, st), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

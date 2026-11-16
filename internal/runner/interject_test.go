@@ -157,12 +157,25 @@ func TestRunAgentStreamInputOnlyWithRegistry(t *testing.T) {
 	}
 }
 
-// AC-21：dev 上（f06 未合入）驱动能力判定恒真。
-func TestStreamInputSupportedDefaultsTrue(t *testing.T) {
-	for _, tk := range []*task.Task{nil, {}, {ID: 1}} {
-		if !streamInputSupported(tk) {
-			t.Errorf("streamInputSupported(%+v) got=false want=true", tk)
-		}
+// AC-21：驱动能力判定按任务钉死的驱动问能力表（f06 合入后按 PRD §3.2 第 7 条
+// 从「恒真」改成表驱动）。空串 = claude（0048 之前的老任务读出时就是 claude）。
+func TestStreamInputSupportedByDriver(t *testing.T) {
+	cases := []struct {
+		name string
+		tk   *task.Task
+		want bool
+	}{
+		{"nil 任务（没有驱动可问）", nil, false},
+		{"零值任务，空串驱动按 claude", &task.Task{ID: 1}, true},
+		{"claude 支持流式输入", &task.Task{ID: 2, AgentDriver: "claude"}, true},
+		{"codex 不支持（422，见 AC-21 的 Submit 用例）", &task.Task{ID: 3, AgentDriver: "codex"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := streamInputSupported(tc.tk); got != tc.want {
+				t.Errorf("streamInputSupported(%+v) got=%v want=%v", tc.tk, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -195,7 +208,7 @@ func TestRunAgentPrefillsPendingInterjections(t *testing.T) {
 			p.Interjections = ij
 			tk, _ := m.Get(context.Background(), taskID)
 			rc := &runCtx{ctx: context.Background(), tk: tk, wt: &Worktree{Path: t.TempDir()}}
-			_, _ = p.runAgent(rc, "fix-1", "BASE", "sess-x", true)
+			_, _, _ = p.runAgent(rc, "fix-1", "BASE", "sess-x", true)
 
 			got := ag.calls[0].Prompt
 			for _, want := range []string{"BASE", a, b, interjectHeading, interjectGuard} {
@@ -357,7 +370,7 @@ func TestPrefillAfterFailureMemory(t *testing.T) {
 
 		// finishPrefill 单独验：num_turns==0 → 退回 queued
 		rc := &runCtx{ctx: ctx, tk: tk, wt: &Worktree{Path: t.TempDir()}}
-		_, _ = p.runAgent(rc, "implement", "BASE", "sess-original", true)
+		_, _, _ = p.runAgent(rc, "implement", "BASE", "sess-original", true)
 		for _, r := range ijRows(t, pool, taskID) {
 			if r.status != store.InterjectionQueued {
 				t.Errorf("num_turns=0 后行 %d got=%s want=queued（不是 delivered）", r.id, r.status)
@@ -677,7 +690,7 @@ func TestInterjectRaceRevertVsSettle(t *testing.T) {
 		p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, ag, &fakeNotifier{})
 		p.Interjections = ij
 		tk, _ := m.Get(ctx, taskID)
-		_, _ = p.runAgent(&runCtx{ctx: ctx, tk: tk, wt: &Worktree{Path: t.TempDir()}}, "fix-1", "FIX", "s", true)
+		_, _, _ = p.runAgent(&runCtx{ctx: ctx, tk: tk, wt: &Worktree{Path: t.TempDir()}}, "fix-1", "FIX", "s", true)
 		got, _ := ij.Store.GetInterjection(ctx, r.Row.ID)
 		if got.Status != store.InterjectionDelivered || got.Phase == nil || *got.Phase != "fix-1" {
 			t.Errorf("补投后 got=%+v want delivered/fix-1", got)

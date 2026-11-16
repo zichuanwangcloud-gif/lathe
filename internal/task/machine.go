@@ -65,6 +65,11 @@ type Task struct {
 	PRNumber  *int
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// AgentDriver 是任务钉死的执行 agent（'claude' | 'codex'，migration 0048）：
+	// 建任务那刻从 repos.agent_driver 复制，之后不变 —— 会话是哪个 CLI 建的，
+	// 就必须由哪个 CLI 续。读出时 NULL（0048 之前的老任务）一律是 "claude"，
+	// 所以这个值永远非空。
+	AgentDriver string
 }
 
 // Machine 在数据库上执行状态转移，并把每次转移写入 task_events。
@@ -104,7 +109,7 @@ const taskColumns = `
 	task_kind, verify_tier, agent_session_id, worktree_path,
 	branch_name, pr_url, failure_reason, failure_stage, node_id, lease_expires_at,
 	flow_id, depends_on, depends_on_at, base_ref, priority, profile, pr_number,
-	created_at, updated_at`
+	created_at, updated_at, COALESCE(agent_driver, 'claude')`
 
 // taskColumnsQualified 是 taskColumns 的 tasks. 限定版本，供 ClaimReady 这类
 // 联表（FROM candidate）查询使用 —— 不限定会因列名歧义报错。
@@ -113,7 +118,7 @@ const taskColumnsQualified = `
 	tasks.task_kind, tasks.verify_tier, tasks.agent_session_id, tasks.worktree_path,
 	tasks.branch_name, tasks.pr_url, tasks.failure_reason, tasks.failure_stage, tasks.node_id, tasks.lease_expires_at,
 	tasks.flow_id, tasks.depends_on, tasks.depends_on_at, tasks.base_ref, tasks.priority, tasks.profile, tasks.pr_number,
-	tasks.created_at, tasks.updated_at`
+	tasks.created_at, tasks.updated_at, COALESCE(tasks.agent_driver, 'claude')`
 
 // CreateParams 是建任务所需的最小输入。
 type CreateParams struct {
@@ -197,9 +202,11 @@ func (m *Machine) Create(ctx context.Context, p CreateParams) (*Task, error) {
 	row := tx.QueryRow(ctx, `
 		INSERT INTO tasks (
 			user_id, repo_id, external_key, external_id, tracker_provider, state, gate_mode, task_kind,
-			flow_id, depends_on, depends_on_at, priority, base_ref, profile
+			flow_id, depends_on, depends_on_at, priority, base_ref, profile, agent_driver
 		)
-		VALUES ($1, $2, $3, NULLIF($7, ''), $14, $4, $5, $6, $8, $9, $10, $11, $12, COALESCE($13, '{}'::jsonb))
+		VALUES ($1, $2, $3, NULLIF($7, ''), $14, $4, $5, $6, $8, $9, $10, $11, $12, COALESCE($13, '{}'::jsonb),
+		        -- 执行 agent 在这里从仓库钉死（f06）：之后改仓库配置不影响这个任务
+		        (SELECT agent_driver FROM repos WHERE id = $2))
 		RETURNING `+taskColumns,
 		p.UserID, p.RepoID, p.ExternalKey, StateQueued, p.GateMode, p.TaskKind, p.ExternalID,
 		p.FlowID, p.DependsOn, dependsOnAt, p.Priority, p.BaseRef, nilIfEmptyJSON(p.Profile),
@@ -486,13 +493,23 @@ func (m *Machine) ListOpenPRTasks(ctx context.Context) ([]*Task, error) {
 // 不按状态过滤：调用方需要看到终态任务，才能如实回报「任务已合并/已取消，
 // 忽略」，而不是笼统的「找不到」。
 func (m *Machine) TasksByPR(ctx context.Context, userID int64, providerRepo string, prNumber int) ([]*Task, error) {
+	return m.TasksByVCSPR(ctx, userID, "github", providerRepo, prNumber)
+}
+
+// TasksByVCSPR 是 TasksByPR 加一道代码平台过滤（repos.vcs_provider）。
+//
+// 唯一约束 (user_id, provider_repo) 保证同一用户一个路径只在一个平台上，所以
+// 平台过滤挡的是「GitHub webhook 带着一个 GitLab 仓库的路径与编号投进来」这类
+// 跨平台串扰，而不是同名仓库消歧。两处属主过滤原样保留（见 TasksByPR）。
+func (m *Machine) TasksByVCSPR(ctx context.Context, userID int64, provider, providerRepo string, prNumber int) ([]*Task, error) {
 	rows, err := m.pool.Query(ctx, `
 		SELECT `+taskColumnsQualified+`
 		FROM tasks JOIN repos r ON r.id = tasks.repo_id
 		WHERE tasks.user_id = $1 AND r.user_id = $1
 		  AND lower(r.provider_repo) = lower($2)
 		  AND tasks.pr_number = $3
-		ORDER BY tasks.id DESC`, userID, providerRepo, prNumber)
+		  AND r.vcs_provider = $4
+		ORDER BY tasks.id DESC`, userID, providerRepo, prNumber, provider)
 	if err != nil {
 		return nil, fmt.Errorf("task: 按 PR 查询任务失败: %w", err)
 	}
@@ -1069,7 +1086,7 @@ func scanTask(row pgx.Row) (*Task, error) {
 		&t.TaskKind, &t.VerifyTier, &t.AgentSessionID, &t.WorktreePath,
 		&t.BranchName, &t.PRURL, &t.FailureReason, &t.FailureStage, &t.NodeID, &t.LeaseExpiresAt,
 		&t.FlowID, &t.DependsOn, &t.DependsOnAt, &t.BaseRef, &t.Priority, &t.Profile, &t.PRNumber,
-		&t.CreatedAt, &t.UpdatedAt,
+		&t.CreatedAt, &t.UpdatedAt, &t.AgentDriver,
 	)
 	if err != nil {
 		return nil, err

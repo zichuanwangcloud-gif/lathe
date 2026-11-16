@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 本文件用真实 git 操作（本地 bare repo 当 origin，不碰真 GitHub）验证
@@ -69,7 +71,7 @@ func TestStackedPRSuccessorAncestryIncludesPredecessorTip(t *testing.T) {
 
 	// 前驱到 pr_open 前必然已 push —— 只有这样它的 tip 才会出现在
 	// origin 的 refs/remotes/origin/* 命名空间。
-	if err := m.Push(ctx, predWt, repo, nil); err != nil {
+	if err := m.Push(ctx, predWt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("前驱 push 失败: %v", err)
 	}
 
@@ -131,7 +133,7 @@ func TestStackedPRSuccessorDiffExcludesPredecessorChanges(t *testing.T) {
 	if err := m.Commit(ctx, predWt, "feat: 前驱任务新增 fileA"); err != nil {
 		t.Fatalf("前驱提交失败: %v", err)
 	}
-	if err := m.Push(ctx, predWt, repo, nil); err != nil {
+	if err := m.Push(ctx, predWt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("前驱 push 失败: %v", err)
 	}
 
@@ -201,7 +203,7 @@ func TestStackedPRWithoutBaseRefOverridePollutesDiff(t *testing.T) {
 	if err := m.Commit(ctx, predWt, "feat: 前驱任务新增 fileA"); err != nil {
 		t.Fatalf("前驱提交失败: %v", err)
 	}
-	if err := m.Push(ctx, predWt, repo, nil); err != nil {
+	if err := m.Push(ctx, predWt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("前驱 push 失败: %v", err)
 	}
 
@@ -268,7 +270,7 @@ func TestStackedPRIndependentRootUnaffectedByPredecessor(t *testing.T) {
 		t.Fatalf("前驱提交失败: %v", err)
 	}
 	predTip := gitOut(t, predWt.Path, "rev-parse", "HEAD")
-	if err := m.Push(ctx, predWt, repo, nil); err != nil {
+	if err := m.Push(ctx, predWt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("前驱 push 失败: %v", err)
 	}
 

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // gitOut 在指定目录跑 git 并返回输出。
@@ -31,7 +33,7 @@ func TestEnsureMirrorDisablesMirrorPush(t *testing.T) {
 	src := sourceRepo(t)
 	m := newManager(t)
 
-	mirror, err := m.EnsureMirror(context.Background(), "acme/demo", src)
+	mirror, err := m.EnsureMirror(context.Background(), "acme/demo", src, vcs.GitAuth{})
 	if err != nil {
 		t.Fatalf("EnsureMirror 失败: %v", err)
 	}
@@ -68,7 +70,7 @@ func TestPushTaskBranch(t *testing.T) {
 	gitOut(t, wt.Path, "add", ".")
 	gitOut(t, wt.Path, "-c", "user.email=t@e.st", "-c", "user.name=t", "commit", "-qm", "改动")
 
-	if err := m.Push(ctx, wt, repo, nil); err != nil {
+	if err := m.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("Push 失败: %v", err)
 	}
 
@@ -97,7 +99,7 @@ func TestPushRejectsProtectedBranch(t *testing.T) {
 		tampered := *wt
 		tampered.Branch = bad // 模拟配置错误或调用方传错
 
-		err := m.Push(ctx, &tampered, repo, nil)
+		err := m.Push(ctx, &tampered, repo, vcs.GitAuth{}, nil)
 		if err == nil {
 			t.Errorf("推送到 %q 应被拒绝", bad)
 			continue
@@ -108,7 +110,7 @@ func TestPushRejectsProtectedBranch(t *testing.T) {
 		}
 	}
 
-	if err := m.Push(ctx, nil, repo, nil); err == nil {
+	if err := m.Push(ctx, nil, repo, vcs.GitAuth{}, nil); err == nil {
 		t.Error("传 nil 工作区应报错")
 	}
 }
@@ -135,7 +137,7 @@ func TestPushOnlyTouchesTaskBranch(t *testing.T) {
 	// 直接在 mirror 上把 dev 向前推进（模拟本地 dev 与远端分叉）
 	gitOut(t, wt.Mirror, "update-ref", "refs/heads/dev", gitOut(t, wt.Path, "rev-parse", "HEAD"))
 
-	if err := m.Push(ctx, wt, repo, nil); err != nil {
+	if err := m.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("Push 失败: %v", err)
 	}
 
@@ -311,7 +313,7 @@ func TestPushNonFastForwardRejected(t *testing.T) {
 	}
 	gitOut(t, wt.Path, "-c", "user.email=t@e.st", "-c", "user.name=t",
 		"commit", "-q", "--allow-empty", "-m", "第一版")
-	if err := m.Push(ctx, wt, repo, nil); err != nil {
+	if err := m.Push(ctx, wt, repo, vcs.GitAuth{}, nil); err != nil {
 		t.Fatalf("首次 Push 失败: %v", err)
 	}
 
@@ -319,7 +321,7 @@ func TestPushNonFastForwardRejected(t *testing.T) {
 	gitOut(t, wt.Path, "-c", "user.email=t@e.st", "-c", "user.name=t",
 		"commit", "-q", "--amend", "--allow-empty", "-m", "改写历史")
 
-	err = m.Push(ctx, wt, repo, nil)
+	err = m.Push(ctx, wt, repo, vcs.GitAuth{}, nil)
 	if err == nil {
 		t.Fatal("改写历史后的推送应被拒绝（non-fast-forward）")
 	}

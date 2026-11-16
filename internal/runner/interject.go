@@ -103,11 +103,18 @@ type TaskGetter interface {
 
 // streamInputSupported 是「该任务所用的 agent 驱动支持运行中输入吗」的唯一判定。
 //
-// dev 上只有 claude 一个驱动，恒为真。f06（多 CLI 驱动）合入后改为
-// agent.CapabilitiesOf(<任务驱动>).StreamInput（Task.AgentDriver，空串 = claude）。
+// 按 f06（多 CLI 驱动）定义的任务驱动问能力表：Task.AgentDriver，空串 = claude
+// （docs/features/interject.md §3.2 第 7 条）。当前只有 claude 支持流式输入，
+// codex 明确不支持（Router.Capabilities.StreamInput 为 false）。
+//
 // 消费方两处：runAgent（不支持就不设 StreamInput/OnReady/OnDelivery）与
 // Submit（不支持 → 422）。开场补投不看驱动：它只是把文本拼进 prompt。
-func streamInputSupported(_ *task.Task) bool { return true }
+func streamInputSupported(tk *task.Task) bool {
+	if tk == nil {
+		return false
+	}
+	return agent.CapabilitiesOf(tk.AgentDriver).StreamInput
+}
 
 // InterjectHooks 是 Submit 内部时序点的观察钩子，**仅测试用**（生产装配留零值）。
 // 用来在确定的时刻断开客户端、放开闸门，验证「行落库之后的路径与请求 ctx 无关」。

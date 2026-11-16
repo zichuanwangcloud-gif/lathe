@@ -78,13 +78,30 @@ export const api = {
     if (params.state) q.set('state', params.state)
     if (params.limit) q.set('limit', params.limit)
     if (params.offset) q.set('offset', params.offset)
+    // scope=team：含「我所在团队共享仓库里别人的任务」（f12）；不传 = 只看自己的
+    if (params.scope) q.set('scope', params.scope)
     const qs = q.toString()
     return request(`/api/tasks${qs ? '?' + qs : ''}`)
   },
   task: (id) => request(`/api/tasks/${id}`),
-  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0
-  taskEvents: (id, after = 0, limit = 200) =>
-    request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`),
+  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0。
+  // opts（回放，docs/features/run-replay.md §3.2.1）：{before, phase, kind, failures}；
+  // 带 opts 时一律附 paged=1，响应多 first_id/has_more。before 与 after 互斥。
+  taskEvents: (id, after = 0, limit = 200, opts) => {
+    if (!opts) return request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`)
+    const q = new URLSearchParams({ paged: '1', limit: String(limit) })
+    if (opts.before != null) q.set('before', String(opts.before))
+    else q.set('after', String(after || 0))
+    if (opts.phase?.length) q.set('phase', [].concat(opts.phase).join(','))
+    if (opts.kind?.length) q.set('kind', [].concat(opts.kind).join(','))
+    if (opts.failures) q.set('failures', '1')
+    return request(`/api/tasks/${id}/events?${q}`)
+  },
+  // 执行日志汇总：各阶段条数/失败数、失败列表、首末失败（不受内存窗口影响）
+  taskEventsSummary: (id) => request(`/api/tasks/${id}/events/summary`),
+  // 完整验证日志按块读取（经服务端脱敏）；offset 只传 0 或上一块的 nextOffset
+  verificationLog: (id, vid, { part = 0, offset = 0, limit = 65536 } = {}) =>
+    request(`/api/tasks/${id}/verifications/${vid}/log?part=${part}&offset=${offset}&limit=${limit}`),
   stats: () => request('/api/stats'),
   // 成本聚合独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
   // 不需要 5 秒新鲜度（后端注释里有完整理由）。
@@ -92,7 +109,37 @@ export const api = {
   // 平台自度量（环节耗时分位数 + 失败分类直方图）。同样独立于 /api/stats，
   // 理由与 costStats 一样：那两个聚合都要扫 task_events，而看板 5 秒一轮。
   metricsStats: () => request('/api/stats/metrics'),
+  // 用量统计（f03，docs/features/usage-stats.md）。参数原样转成 query string：
+  // from / to / repo / tier / bucket / group / limit。管理员全局视图走独立端点，
+  // 后端强制鉴权（普通成员 403）。
+  usage: (params = {}) => request('/api/usage' + usageQuery(params)),
+  adminUsage: (params = {}) => request('/api/admin/usage' + usageQuery(params)),
+  taskUsage: (id) => request(`/api/tasks/${id}/usage`),
   repos: () => request('/api/repos'),
+  // 团队视图：我的 + 团队共享给我的（行上带 owned / teamId；非 owned 只读）
+  reposWithTeam: () => request('/api/repos?scope=team'),
+  shareRepo: (id, teamId) =>
+    request(`/api/repos/${id}/sharing`, { method: 'POST', body: JSON.stringify({ teamId }) }),
+
+  // 团队与角色（f12）：团队共享的是任务可见性，不是凭据或仓库配置的编辑权
+  teams: () => request('/api/teams'),
+  team: (id) => request(`/api/teams/${id}`),
+  createTeam: (name) => request('/api/teams', { method: 'POST', body: JSON.stringify({ name }) }),
+  renameTeam: (id, name) => request(`/api/teams/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+  deleteTeam: (id) => request(`/api/teams/${id}`, { method: 'DELETE' }),
+  teamInvitations: (id) => request(`/api/teams/${id}/invitations`),
+  createInvitation: (id, body) =>
+    request(`/api/teams/${id}/invitations`, { method: 'POST', body: JSON.stringify(body) }),
+  revokeInvitation: (id, iid) => request(`/api/teams/${id}/invitations/${iid}`, { method: 'DELETE' }),
+  acceptInvitation: (code) =>
+    request('/api/team-invitations/accept', { method: 'POST', body: JSON.stringify({ code }) }),
+  setMemberRole: (id, uid, role) =>
+    request(`/api/teams/${id}/members/${uid}`, { method: 'PATCH', body: JSON.stringify({ role }) }),
+  removeMember: (id, uid) => request(`/api/teams/${id}/members/${uid}`, { method: 'DELETE' }),
+  transferTeam: (id, userId) =>
+    request(`/api/teams/${id}/transfer`, { method: 'POST', body: JSON.stringify({ userId }) }),
+  // 可选的执行 agent 及本实例是否启用（f06）：只有 name/enabled，不含路径
+  agentDrivers: () => request('/api/agent-drivers'),
   config: () => request('/api/config'),
 
   // 编排流程图（PRD 07）：批量建图、查图、列出我建过的图
@@ -116,6 +163,23 @@ export const api = {
   addIssueComment: (id, body) =>
     request(`/api/issues/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) }),
   startInternalIssue: (id) => request(`/api/issues/${id}/start`, { method: 'POST' }),
+
+  // 收件箱（docs/features/inbox.md）：等你处理的事项，从现有状态实时派生；
+  // 这里只读状态、只写「读过 / 忽略过」，处理动作仍走原来的详情页。
+  inbox: (params = {}) => {
+    const q = new URLSearchParams()
+    if (params.filter) q.set('filter', params.filter)
+    if (params.kind) q.set('kind', params.kind)
+    if (params.limit) q.set('limit', params.limit)
+    if (params.offset) q.set('offset', params.offset)
+    const qs = q.toString()
+    return request(`/api/inbox${qs ? '?' + qs : ''}`)
+  },
+  inboxCount: () => request('/api/inbox/count'),
+  inboxRead: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/read`, { method: 'POST' }),
+  inboxUnread: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/unread`, { method: 'POST' }),
+  inboxDismiss: (key) => request(`/api/inbox/items/${encodeURIComponent(key)}/dismiss`, { method: 'POST' }),
+  inboxReadAll: () => request('/api/inbox/read-all', { method: 'POST' }),
 
   // 模糊任务规划（docs/10-prd-template.md）：多轮对话式智能体读代码产出
   // PRD，对抗复核 + 自检过闸、人逐节签字后，一键生成正式任务与编排图。
@@ -174,6 +238,18 @@ export const api = {
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueKey }) }),
   linearIssues: () => request('/api/linear/issues'),
   linearIssue: (id) => request(`/api/linear/issues/${encodeURIComponent(id)}`),
+  linearTeams: () => request('/api/linear/teams'),
+
+  // 定时建单（docs/features/scheduled-issue.md）：到点只在 Linear 建单，之后走正常接单
+  schedules: () => request('/api/schedules'),
+  createSchedule: (body) => request('/api/schedules', { method: 'POST', body: JSON.stringify(body) }),
+  updateSchedule: (id, body) =>
+    request(`/api/schedules/${id}`, { method: 'PUT', body: JSON.stringify(body) }),
+  deleteSchedule: (id) => request(`/api/schedules/${id}`, { method: 'DELETE' }),
+  runSchedule: (id) => request(`/api/schedules/${id}/run`, { method: 'POST' }),
+  scheduleRuns: (id, limit = 50) => request(`/api/schedules/${id}/runs?limit=${limit}`),
+  previewSchedule: (body) =>
+    request('/api/schedules/preview', { method: 'POST', body: JSON.stringify(body) }),
   startIssue: (issueId, issueKey) =>
     request('/api/tasks', { method: 'POST', body: JSON.stringify({ issueId, issueKey }) }),
   retry: (id, mode = 'auto') =>
@@ -203,6 +279,26 @@ export const api = {
   createRepo: (body) =>
     request('/api/repos', { method: 'POST', body: JSON.stringify(body) }),
   repoBaseline: (id) => request(`/api/repos/${id}/baseline`),
+
+  // 团队自定义技能（f11，docs/features/team-skills.md）：按仓库登记，版本不可变
+  teamSkills: (repoId) => request(`/api/repos/${repoId}/team-skills`),
+  teamSkill: (repoId, sid) => request(`/api/repos/${repoId}/team-skills/${sid}`),
+  teamSkillVersion: (repoId, sid, v) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}/versions/${v}`),
+  createTeamSkill: (repoId, body) =>
+    request(`/api/repos/${repoId}/team-skills`, { method: 'POST', body: JSON.stringify(body) }),
+  appendTeamSkillVersion: (repoId, sid, body) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}/versions`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  restoreTeamSkillVersion: (repoId, sid, v) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}/versions/${v}/restore`, { method: 'POST' }),
+  updateTeamSkill: (repoId, sid, body) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  archiveTeamSkill: (repoId, sid) =>
+    request(`/api/repos/${repoId}/team-skills/${sid}`, { method: 'DELETE' }),
+  taskTeamSkills: (taskId) => request(`/api/tasks/${taskId}/team-skills`),
   deployRepoBaseline: (id, composeFile) =>
     request(`/api/repos/${id}/baseline/deploy`, {
       method: 'POST',
@@ -210,12 +306,32 @@ export const api = {
     }),
 
   integrations: () => request('/api/integrations'),
-  saveIntegration: (kind, token) =>
-    request(`/api/integrations/${kind}`, { method: 'PUT', body: JSON.stringify({ token }) }),
+  // baseUrl 只对自建平台（gitlab/gitea）传：其余种类传了会被后端 400 拒绝。
+  saveIntegration: (kind, token, baseUrl) =>
+    request(`/api/integrations/${kind}`, {
+      method: 'PUT',
+      body: JSON.stringify(baseUrl ? { token, baseUrl } : { token }),
+    }),
   verifyIntegration: (kind) =>
     request(`/api/integrations/${kind}/verify`, { method: 'POST' }),
   deleteIntegration: (kind) =>
     request(`/api/integrations/${kind}`, { method: 'DELETE' }),
+
+  // 站外通知渠道（Slack / 飞书，f09）
+  notifyChannels: () => request('/api/notify/channels'),
+  saveNotifyChannel: (kind, body) =>
+    request(`/api/notify/channels/${kind}`, { method: 'PUT', body: JSON.stringify(body) }),
+  testNotifyChannel: (kind) =>
+    request(`/api/notify/channels/${kind}/test`, { method: 'POST' }),
+  deleteNotifyChannel: (kind) =>
+    request(`/api/notify/channels/${kind}`, { method: 'DELETE' }),
+  notifyDeliveries: (limit = 10) => request(`/api/notify/deliveries?limit=${limit}`),
+  retryDelivery: (id) =>
+    request(`/api/notify/deliveries/${id}/retry`, { method: 'POST' }),
+  // 个人 API 令牌（PAT）。签发需带 currentPassword；明文只在 createPAT 的响应里出现一次。
+  pats: () => request('/api/pat'),
+  createPAT: (body) => request('/api/pat', { method: 'POST', body: JSON.stringify(body) }),
+  revokePAT: (id) => request(`/api/pat/${id}`, { method: 'DELETE' }),
 
   smtp: () => request('/api/smtp'),
   saveSmtp: (body) => request('/api/smtp', { method: 'PUT', body: JSON.stringify(body) }),
@@ -240,6 +356,18 @@ export const api = {
     request(`/api/tasks/${taskId}/interject`, { method: 'POST', body: JSON.stringify({ message }) }),
   interjections: (taskId, afterRev = 0) =>
     request(`/api/tasks/${taskId}/interjections?after_rev=${afterRev}`),
+
+  // 云效任务来源（f08）
+  yunxiaoConnection: () => request('/api/yunxiao/connection'),
+  saveYunxiaoConnection: (body) =>
+    request('/api/yunxiao/connection', { method: 'PUT', body: JSON.stringify(body) }),
+  verifyYunxiaoConnection: () => request('/api/yunxiao/connection/verify', { method: 'POST' }),
+  deleteYunxiaoConnection: () => request('/api/yunxiao/connection', { method: 'DELETE' }),
+  runYunxiaoWorkitem: (id) =>
+    request(`/api/yunxiao/workitems/${encodeURIComponent(id)}/run`, { method: 'POST' }),
+  yunxiaoAllowedHosts: () => request('/api/admin/yunxiao/allowed-hosts'),
+  saveYunxiaoAllowedHosts: (hosts) =>
+    request('/api/admin/yunxiao/allowed-hosts', { method: 'PUT', body: JSON.stringify({ hosts }) }),
 }
 
 // 状态的中文名与配色，全站统一。
@@ -297,6 +425,16 @@ export function formatTime(iso) {
   if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
   if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
   return d.toLocaleString('zh-CN', { hour12: false })
+}
+
+// usageQuery 只带非空参数：空串让后端走默认值，而不是被当成非法值 400。
+function usageQuery(params) {
+  const q = new URLSearchParams()
+  for (const k of ['from', 'to', 'repo', 'tier', 'bucket', 'group', 'limit']) {
+    if (params[k] !== undefined && params[k] !== null && params[k] !== '') q.set(k, params[k])
+  }
+  const s = q.toString()
+  return s ? '?' + s : ''
 }
 
 export function formatDuration(ms) {

@@ -25,7 +25,7 @@
 │   (Linear 事件)       (状态机/事件流)   (能力匹配/租约)      │        │
 │                            ▲                                │       │
 │  Integrations ─────────────┘                                │       │
-│   Linear OAuth · GitHub App · CloudRouter Token             │       │
+│   Linear · GitHub · GitLab/Gitea token · CloudRouter        │       │
 └─────────────────────────────────────────────────────────────┼───────┘
                                                               │
         ┌──────────────────────┬──────────────────────────────┘
@@ -42,6 +42,10 @@
 **Control Plane 无状态化**，状态全在 Postgres。Job Queue 用 Postgres（`SELECT ... FOR UPDATE SKIP LOCKED`）即可，此量级不需要引入 MQ。
 
 **Runner 是纯执行体**，不持久化业务状态，崩溃后任务由租约超时重新派发。
+
+**定时建单调度器（`internal/schedule`）：只往 Linear 建单，不进入执行管线。** 到点用属主
+的 Linear 凭据建一张单，之后那张单经 Webhook Ingress 回来，与人手工建的单走同一条路；
+调度器不写 tasks、不 import runner/task。详见 [features/scheduled-issue.md](features/scheduled-issue.md)。
 
 ---
 
@@ -83,7 +87,7 @@ PR 评论回流（§7）走的是 `review_feedback → queued`：webhook 只负�
 
 **③ 幂等。**
 Linear webhook 会重投递。用 `webhook_deliveries(delivery_id PK)` 去重表，先落库再处理。
-GitHub webhook 共用这张表（去重键加 `github:` 前缀，两平台的投递 ID 各自生成）。投递去重之外，PR 评论回流再按**意见**去重（`inline:<id>` / `issue:<id>` / `review:<id>`，记在任务事件流里）：同一条意见经不同投递到达、或二轮结束后旧投递姗姗来迟，都不会再开一轮。
+GitHub / GitLab / Gitea webhook 共用这张表（去重键加 `github:` / `gitlab:` / `gitea:` 前缀，各平台的投递 ID 各自生成）。投递去重之外，PR 评论回流再按**意见**去重（`inline:<id>` / `issue:<id>` / `review:<id>`，记在任务事件流里）：同一条意见经不同投递到达、或二轮结束后旧投递姗姗来迟，都不会再开一轮。
 
 ---
 
@@ -101,15 +105,28 @@ sessions(id, user_id, expires_at, created_at)
       -- id 是会话令牌的 sha256，明文只存在于 Cookie 里
 password_reset_tokens(token_hash, user_id, expires_at, used_at, created_at)
       -- 同样只存哈希；单次消费，认领语义同 webhook_deliveries
+personal_access_tokens(id, user_id, name, token_hash, prefix, created_at,
+                       last_used_at, expires_at, revoked_at, use_count)
+      -- 个人 API 令牌（PAT）。只存 SHA-256，明文只在签发响应里出现一次；软吊销。
+      -- 身份来源共三条，Bearer 优先于 Cookie：
+      --   ① LATHE_ADMIN_TOKEN（部署级应急通道，= 内置管理员，守卫 a.Token != ""）
+      --   ② Bearer lathe_pat_…（= 签发者本人，不提权不降权；查不到直接 401，不回落 Cookie）
+      --   ③ 会话 Cookie
+      -- 令牌管理只认 Cookie；停用/改密/找回/代重置都吊销该用户全部 PAT。
+      -- 详见 docs/features/personal-api-token.md
 smtp_settings(id=1, host, port, username, password_enc, from_addr, from_name,
               tls_mode,       -- starttls | tls | none
               verified_at, verify_error)
       -- 单行全局表。SMTP 是「系统怎么发信」而非「某人的凭据」，
       -- 因此不挂 user_id，也不并入 integrations
-integrations(id, user_id, kind, -- linear | linear_webhook | github
+integrations(id, user_id, kind, -- linear | linear_webhook | github | github_webhook
+                                -- | gitlab | gitlab_webhook | gitea | gitea_webhook（0052）
                                 -- 预留：linear_oauth | github_app | cloudrouter
-             external_account_id, token_ref, secret_enc, scopes, expires_at)
+             external_account_id, token_ref, secret_enc, scopes, expires_at,
+             base_url)          -- 自建 GitLab/Gitea 的实例地址（非密；gitlab/gitea 令牌必填，0051/0052）
 repos(id, user_id, provider_repo, default_branch, -- e.g. dev
+      vcs_provider,          -- github | gitlab | gitea（0050）：登记时钉死、之后不可改，任务经 repo_id 继承平台
+      vcs_base_url,          -- GitLab/Gitea 的实例地址：登记时从同平台凭据复制，GitHub 恒为 NULL
       branch_pattern,        -- fix/{key}-{slug}
       verify_profile_ref,    -- 见 §5
       dep_strategy)          -- pnpm-store | none
@@ -283,10 +300,18 @@ Linear: issue 指派给用户
               pr_open      推分支 → 开 PR → 回帖 Linear（含验证证据）
   ...人 review...
   PR 评论 → review_feedback → implementing(--resume 原 session) → 重新验证
+           （三个平台：GitHub / GitLab / Gitea。验签与信任判定各自实现在平台包里，
+             通过后统一构造 vcs.ReviewEvent，回流入口 ReviewIntake.AcceptReview 共用；
+             详见 docs/features/vcs-gitlab-gitea.md）
   合并 → merged → 回收 worktree
 ```
 
 失败任一步 → `failed`：**回帖说明原因 + 保留 worktree 现场 + 推送通知**（D4，不自动重试）。人工重试走 §6.5 的断点续跑。
+
+**通知是状态转移之后的副作用，永不参与判定。** 终态邮件与站外渠道（Slack / 飞书，
+[features/notify-channels.md](features/notify-channels.md)）都在转移落库之后才触发，
+不返回 error、不阻塞、独立超时、panic 兜底；站外渠道先写 outbox（`notify_deliveries`）
+再由后台 worker 投递，投递失败只落在那张旁路表里，状态机看不到它。
 
 **保留现场的边界**：现场留到「同 issue 的下一次尝试需要这个槽位」为止。`Create` 只在全新执行时调用（续跑复用现场），而唯一索引保证同 (repo, issue) 没有第二个活任务，因此建工作区时撞见的同名目录/分支必然是已终结任务的尸体 —— 直接回收再建（目录/分支/普通残留目录三种形态都处理），不报错卡死（#345/#466 的教训：尸体阻塞同 issue 重试）。回收动作落 WARN 日志，痕迹可查。
 
@@ -299,7 +324,8 @@ Linear: issue 指派给用户
 | **P0 闭环** | 单机单账号串行。状态机 + 持久化 + 幂等；`direct` 档；`light` 验证；失败三件套；~~worktree 自动回收~~（**表述不实**：P0 当时只做了「合并后回收」与「同名尸体按需回收」两个被动触发点，失败/取消的现场只增不减 —— TTL 收割机 2026-09-09 才交付，见 [08-debt-cleanup.md](./08-debt-cleanup.md) T6）。**刻意不做**：多节点、并发、Web UI |
 | **P1 验证基建（已交付 3/4）** | ~~红-绿复现证明~~（红立不起来 ⇒ blocked_spec，证据落 verifications 表）；~~§5.1 档位路由~~（diff 后定档 + 仓库级强制覆盖）；~~单机双通道并发~~（闸门在验证阶段按定档准入，light/heavy 独立配额）；per-task compose 隔离**未做**（红绿阶段目前在 git worktree 里跑，待目标仓库声明服务栈后补） |
 | **P1.5 账号体系（第一步已交付）** | 平台账号：开放注册、邮箱口令登录、两级角色、SMTP 找回密码、用户管理与统计。**数据仍共享**，凭据与仓库配置挂在内置管理员名下 |
-| ~~**P1.5 数据隔离（第二步）**~~ | 全链路 `owner_id`：任务/仓库/凭据按用户隔离（对非属主一律 404）；每用户专属 webhook 回调地址 `/webhooks/linear/{slug}`（旧路径兜底到内置管理员）；队列按属主解析凭据，环境变量只给超管兜底 ✅ |
+| ~~**P1.5 数据隔离（第二步）**~~ | 全链路 `owner_id`：任务/仓库/凭据按用户隔离（对非属主一律 404；P2 团队之后，读可见性 = 属主 ∪ 团队，凭据、执行身份、仓库配置写权限仍是属主）；每用户专属 webhook 回调地址 `/webhooks/linear/{slug}`（旧路径兜底到内置管理员）；队列按属主解析凭据，环境变量只给超管兜底 ✅ |
+| **P2 团队与角色（f12）** | 团队（owner/admin/member）+ 一次性邀请码 + 仓库属主把仓库共享到团队。**可见性 = 属主 ∪ 团队**：成员只读看共享仓库下的任务、事件流、验证证据与配置；**凭据、执行身份、仓库配置写权限仍是属主**，任务归属（`tasks.user_id`）不变，非属主写一律 404。角色矩阵与锁序见 [features/team-roles.md](./features/team-roles.md) |
 | **P2 产品化** | Linear OAuth + GitHub App + CloudRouter 绑定；租户配额 |
 | **P3 横向扩展** | 节点注册 + 心跳 + 能力声明；能力路由调度；跨节点仓库缓存与依赖 store |
 

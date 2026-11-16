@@ -98,7 +98,11 @@ func SettleReason(state string) string {
 	return fmt.Sprintf("任务已离开实现/验证阶段（状态：%s），这句话没有进入模型", state)
 }
 
-// ErrTaskNotFound 表示插话针对的任务行不存在。
+// ErrTaskNotFound 表示目标任务不存在，或存在但不属于当前用户。
+//
+// 两个消费方共用这一个哨兵：插话（interjections.go）与团队技能
+// （teamskills.go，任务没钉技能时据此回落）。两条路径都要求属主隔离，
+// 「不是你的」与「不存在」对外都必须是同一个 404。
 var ErrTaskNotFound = errors.New("store: 任务不存在")
 
 // withTaskLock 开一个事务，拿该任务的 advisory 锁并以 FOR SHARE 读出状态，

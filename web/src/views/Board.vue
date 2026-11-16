@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, inject } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, UnauthorizedError, stateLabel, stateTone, formatTime } from '../api'
-import { hasLinearToken } from '../auth'
+import { auth, hasLinearToken } from '../auth'
 import PreviewDialog from '../components/PreviewDialog.vue'
 import CostPanel from '../components/CostPanel.vue'
 import MetricsPanel from '../components/MetricsPanel.vue'
@@ -20,6 +20,8 @@ const router = useRouter()
 const PAGE_SIZE = 100
 const filter = ref(typeof route.query.state === 'string' ? route.query.state : '')
 const page = ref(Math.max(1, Number.parseInt(route.query.page) || 1))
+// 范围：'' = 我的（默认，行为不变）；'team' = 含我所在团队共享仓库里队友的任务（f12）
+const scope = ref(route.query.scope === 'team' ? 'team' : '')
 const pages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
 
 // 活跃状态：看板默认最关心这些
@@ -30,7 +32,12 @@ let timer = null
 async function load() {
   try {
     const [t, s] = await Promise.all([
-      api.tasks({ state: filter.value || undefined, limit: PAGE_SIZE, offset: (page.value - 1) * PAGE_SIZE }),
+      api.tasks({
+        state: filter.value || undefined,
+        limit: PAGE_SIZE,
+        offset: (page.value - 1) * PAGE_SIZE,
+        scope: scope.value || undefined,
+      }),
       api.stats(),
     ])
     tasks.value = t.tasks || []
@@ -54,6 +61,7 @@ function syncQuery() {
     query: {
       ...route.query,
       state: filter.value || undefined,
+      scope: scope.value || undefined,
       page: page.value > 1 ? String(page.value) : undefined,
     },
   })
@@ -61,6 +69,13 @@ function syncQuery() {
 
 function setFilter(v) {
   filter.value = v
+  page.value = 1
+  syncQuery()
+  load()
+}
+
+function setScope(v) {
+  scope.value = v
   page.value = 1
   syncQuery()
   load()
@@ -114,6 +129,11 @@ onUnmounted(() => clearInterval(timer))
       </button>
       <button :class="{ primary: filter === 'merged' }" :aria-pressed="filter === 'merged'" @click="setFilter('merged')">已合并</button>
     </div>
+    <div class="wrap" role="group" aria-label="范围">
+      <span class="dim">范围</span>
+      <button :class="{ primary: scope === '' }" :aria-pressed="scope === ''" @click="setScope('')">我的</button>
+      <button :class="{ primary: scope === 'team' }" :aria-pressed="scope === 'team'" @click="setScope('team')">含团队</button>
+    </div>
   </div>
 
   <CostPanel />
@@ -137,6 +157,7 @@ onUnmounted(() => clearInterval(timer))
           <td>
             <RouterLink :to="`/tasks/${t.id}`" class="mono">{{ t.externalKey }}</RouterLink>
             <div class="faint mono">{{ t.providerRepo }}</div>
+            <span v-if="auth.user && t.userId !== auth.user.id" class="badge">队友创建</span>
           </td>
           <td>
             <span class="badge" :class="stateTone(t.state)">{{ stateLabel(t.state) }}</span>
@@ -150,7 +171,7 @@ onUnmounted(() => clearInterval(timer))
           </td>
           <td>
             <!-- 有 worktree 才能起预览；queued/triaging 还没建，merged 已回收 -->
-            <button v-if="t.worktreePath" @click="previewTask = t">预览</button>
+            <button v-if="t.worktreePath && (!auth.user || t.userId === auth.user.id)" @click="previewTask = t">预览</button>
             <span v-else class="faint">—</span>
           </td>
           <td class="dim">{{ formatTime(t.updatedAt) }}</td>

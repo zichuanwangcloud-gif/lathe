@@ -274,7 +274,7 @@ func TestInterjectRedactsAtSingleSubmitPoint(t *testing.T) {
 		p := newPipeline(t, m, &fakeLinear{issue: demoIssue()}, &fakeGitHub{}, ag, &fakeNotifier{})
 		p.Interjections = ij
 		tk, _ := m.Get(context.Background(), taskID)
-		_, _ = p.runAgent(&runCtx{ctx: context.Background(), tk: tk, wt: &Worktree{Path: t.TempDir()}}, "fix-1", "FIX", "s", true)
+		_, _, _ = p.runAgent(&runCtx{ctx: context.Background(), tk: tk, wt: &Worktree{Path: t.TempDir()}}, "fix-1", "FIX", "s", true)
 		assertClean(t, "④ 补投 prompt", ag.calls[0].Prompt)
 	})
 
