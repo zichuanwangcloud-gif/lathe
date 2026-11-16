@@ -9,6 +9,10 @@
 
 ### Added
 
+- Slack / 飞书通知渠道：任务失败、阻塞提问、等待放行、PR 已开、PRD 待签字可按事件开关
+  推送到个人配置的 Slack incoming webhook 或飞书自定义机器人（含签名校验）；webhook URL
+  与密钥 AES-256-GCM 加密入库、保存时发测试消息；失败重试至多 5 次且不影响任务状态机。
+  新增迁移 0056（`notify_channels`）、0057（`notify_deliveries`），不新增环境变量。
 - **仓库可选代码平台（GitHub / GitLab / Gitea），支持自建实例；GitHub 行为不变**
   （docs/features/vcs-gitlab-gitea.md）。仓库登记时选平台（登记后不可改），GitLab/Gitea
   的实例地址取自个人设置里该平台凭据的「实例地址」并固定到仓库上；PR/MR 开到仓库所在

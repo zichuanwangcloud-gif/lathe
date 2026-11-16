@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zichuanwangcloud-gif/lathe/internal/notify"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
@@ -702,6 +703,7 @@ func (p *MergePoller) failRebaseFollowup(ctx context.Context, succ *task.Task, s
 			detail = "前驱已更新，但本任务的代码平台凭据不可用（未配置或实例与仓库登记的不一致），rebase 跟进未执行。"
 		}
 		p.Pipeline.mailTerminal(ctx, failed, detail)
+		p.Pipeline.chatTerminal(ctx, failed, notify.EventFailed)
 		// 跨任务失败记忆（§3.6 第 16 条）。这条路径没有 runCtx、调不了
 		// fail()，所以在这里单独补一次 —— 否则「自动 rebase 撞冲突」这类
 		// 失败就是记忆里的一个黑洞：它恰恰是最该被记住的一类（同一个栈

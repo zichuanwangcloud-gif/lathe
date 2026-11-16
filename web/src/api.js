@@ -261,6 +261,17 @@ export const api = {
   deleteIntegration: (kind) =>
     request(`/api/integrations/${kind}`, { method: 'DELETE' }),
 
+  // 站外通知渠道（Slack / 飞书，f09）
+  notifyChannels: () => request('/api/notify/channels'),
+  saveNotifyChannel: (kind, body) =>
+    request(`/api/notify/channels/${kind}`, { method: 'PUT', body: JSON.stringify(body) }),
+  testNotifyChannel: (kind) =>
+    request(`/api/notify/channels/${kind}/test`, { method: 'POST' }),
+  deleteNotifyChannel: (kind) =>
+    request(`/api/notify/channels/${kind}`, { method: 'DELETE' }),
+  notifyDeliveries: (limit = 10) => request(`/api/notify/deliveries?limit=${limit}`),
+  retryDelivery: (id) =>
+    request(`/api/notify/deliveries/${id}/retry`, { method: 'POST' }),
   // 个人 API 令牌（PAT）。签发需带 currentPassword；明文只在 createPAT 的响应里出现一次。
   pats: () => request('/api/pat'),
   createPAT: (body) => request('/api/pat', { method: 'POST', body: JSON.stringify(body) }),

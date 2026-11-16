@@ -3,6 +3,7 @@ import { ref, computed, onMounted, inject } from 'vue'
 import { api, UnauthorizedError, formatTime } from '../api'
 import { auth, refresh } from '../auth'
 import { confirmDialog } from '../confirm'
+import NotifyChannels from '../components/NotifyChannels.vue'
 import PersonalTokens from '../components/PersonalTokens.vue'
 import YunxiaoConnection from '../components/YunxiaoConnection.vue'
 
@@ -396,6 +397,9 @@ onMounted(load)
       >清除</button>
     </form>
   </div>
+
+  <!-- 站外通知渠道（Slack / 飞书）：webhook URL 本身即凭据，同样加密存储，只显示 https://<host>/… -->
+  <NotifyChannels />
 </template>
 
 <style scoped>
