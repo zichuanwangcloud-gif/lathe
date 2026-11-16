@@ -129,11 +129,29 @@ func (f *fakeClients) GitHub(ctx context.Context) (GitHubAPI, error) {
 	return f.gh, nil
 }
 
-type fakeNotifier struct{ msgs []string }
+// fakeNotifier 记录推送的通知，供断言「该推的推了、不该推的没推」。
+//
+// 必须并发安全：生产里多条流水线同时跑（cmd/lathe/queue.go 的 worker 池），
+// 失败路径的 Notify 会并发打到同一个实例上。不加锁的 append 会让 -race 判红，
+// 而报出来的栈指向的是假件自己的 append —— 真正的生产代码没错。见
+// fakenotifier_race_test.go 的 TestFakeNotifierConcurrentNotify。
+type fakeNotifier struct {
+	mu   sync.Mutex
+	msgs []string
+}
 
 func (f *fakeNotifier) Notify(ctx context.Context, m string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.msgs = append(f.msgs, m)
 	return nil
+}
+
+// messages 返回已记录消息的副本（在锁内拷贝，调用方拿到的切片与后续写入无关）。
+func (f *fakeNotifier) messages() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.msgs...)
 }
 
 // fakeVerifications 记录落库的验证步骤，供断言红-绿证据链完整。
@@ -380,8 +398,8 @@ func TestPipelineHappyPath(t *testing.T) {
 	if len(lin.comments) != 1 || !strings.Contains(lin.comments[0], "pull/42") {
 		t.Errorf("应回帖 PR 链接，实际: %v", lin.comments)
 	}
-	if len(no.msgs) != 0 {
-		t.Errorf("成功不应推送失败通知: %v", no.msgs)
+	if len(no.messages()) != 0 {
+		t.Errorf("成功不应推送失败通知: %v", no.messages())
 	}
 }
 
@@ -540,8 +558,8 @@ func TestPipelineVerificationFailurePreservesScene(t *testing.T) {
 	if _, statErr := os.Stat(*final.WorktreePath); statErr != nil {
 		t.Errorf("② 失败任务必须保留现场，工作区却不在了: %v", statErr)
 	}
-	if len(no.msgs) != 1 {
-		t.Errorf("③ 应推送 1 条通知，实际 %v", no.msgs)
+	if len(no.messages()) != 1 {
+		t.Errorf("③ 应推送 1 条通知，实际 %v", no.messages())
 	}
 
 	if len(gh.params) != 0 {
@@ -599,8 +617,8 @@ func TestPipelineHeavyRedNotProven(t *testing.T) {
 	if final.WorktreePath == nil {
 		t.Error("工作区路径应已落库，供人接手或任务恢复")
 	}
-	if len(no.msgs) != 0 {
-		t.Errorf("blocked_spec 不是失败，不应推送失败通知: %v", no.msgs)
+	if len(no.messages()) != 0 {
+		t.Errorf("blocked_spec 不是失败，不应推送失败通知: %v", no.messages())
 	}
 }
 
@@ -644,8 +662,8 @@ func TestPipelineHeavyNoReproTestIsFailure(t *testing.T) {
 	if len(gh.params) != 0 {
 		t.Error("不应开 PR")
 	}
-	if len(no.msgs) != 1 {
-		t.Errorf("应推送失败通知: %v", no.msgs)
+	if len(no.messages()) != 1 {
+		t.Errorf("应推送失败通知: %v", no.messages())
 	}
 }
 
@@ -706,8 +724,8 @@ func TestPipelineHeavyReproEnvErrorFailsFast(t *testing.T) {
 	if len(gh.params) != 0 {
 		t.Error("不应开 PR")
 	}
-	if len(no.msgs) != 1 {
-		t.Errorf("应推送失败通知: %v", no.msgs)
+	if len(no.messages()) != 1 {
+		t.Errorf("应推送失败通知: %v", no.messages())
 	}
 }
 
@@ -921,8 +939,8 @@ func TestPipelineIssueFetchFailure(t *testing.T) {
 	if len(ag.calls) != 0 {
 		t.Error("拉不到 issue 就不该调 agent")
 	}
-	if len(no.msgs) != 1 {
-		t.Errorf("仍应推送通知: %v", no.msgs)
+	if len(no.messages()) != 1 {
+		t.Errorf("仍应推送通知: %v", no.messages())
 	}
 }
 

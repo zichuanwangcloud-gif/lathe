@@ -600,7 +600,7 @@ func TestRebaseFollowupConflictFailsPreservesSceneNoCascade(t *testing.T) {
 			t.Errorf("失败回帖应能看出是自动 rebase / 冲突相关，实际: %s", body)
 		}
 	}
-	if len(notifier.msgs) == 0 {
+	if len(notifier.messages()) == 0 {
 		t.Error("应推送失败通知")
 	}
 
