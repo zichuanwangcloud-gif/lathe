@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 )
 
 // 预览资源一律打这两个标签：容器与镜像的发现、清理、跨重启归属
@@ -288,6 +290,11 @@ type Manager struct {
 	agent          AgentRunner
 	agentChannel   string
 	settingSources string
+
+	// Usage 落每次推荐 agent 运行的用量账本（f03，agent_runs）。为 nil 时不记账。
+	// 导出字段而不是加进 SetRecommender 的参数：那个签名有既有调用方与测试。
+	// 预览不需要知道属主与仓库 —— store 从任务行上取。
+	Usage agent.UsageRecorder
 }
 
 // NewManager 用真实 docker CLI 构造 Manager。

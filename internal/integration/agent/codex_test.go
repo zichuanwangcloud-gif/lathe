@@ -245,6 +245,41 @@ func TestCodexParseCollectsTurnUsage(t *testing.T) {
 	}
 }
 
+// f03 × f06 接缝：收集到的 usage 汇总进 Result.Usage，费用保持未知。
+func TestCodexResultCarriesUsage(t *testing.T) {
+	p1, p2 := readTestdata(t, "codex_probe1.jsonl"), readTestdata(t, "codex_probe2.jsonl")
+	cases := []struct {
+		name        string
+		stream      string
+		wantPresent bool
+		wantIn      int64
+		wantOut     int64
+	}{
+		{"给定 probe1+probe2 两条 turn.completed 断言 token 逐条相加且 Present",
+			p1 + p2, true, 11 + 61, 3 + 12},
+		{"给定只有 turn.failed 断言 Usage 未知（Present=false）不是 0",
+			strings.Join([]string{codexThreadLine, codexTurnFailLine}, "\n"), false, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, _, _, _, err := parseCodexForTest(tc.stream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res == nil {
+				t.Fatal("got nil Result")
+			}
+			if res.Usage.Present != tc.wantPresent || res.Usage.InputTokens != tc.wantIn || res.Usage.OutputTokens != tc.wantOut {
+				t.Errorf("Usage got present=%v in=%d out=%d, want present=%v in=%d out=%d",
+					res.Usage.Present, res.Usage.InputTokens, res.Usage.OutputTokens, tc.wantPresent, tc.wantIn, tc.wantOut)
+			}
+			if res.CostKnown {
+				t.Error("CostKnown got true, want false（codex 不报费用）")
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------- 参数
 
 func TestCodexBuildArgs(t *testing.T) {

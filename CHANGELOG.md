@@ -17,6 +17,49 @@
   codex 子进程同样走环境变量白名单与显式工作目录，并隔离个人 `~/.codex` 与 `~/.agents/skills`。
   任务详情页显示驱动徽标（codex 的费用显示为「未知」），系统设置页显示 codex 是否启用。
   新增 `GET /api/agent-drivers`；新增环境变量 `LATHE_CODEX_HOME`、`LATHE_CODEX_BIN`。
+- **用量统计**（docs/features/usage-stats.md）：按任务、仓库、验证档位、阶段与时间范围
+  聚合 token、费用、时长；新增 `/usage` 页面、`GET /api/usage`、`GET /api/tasks/{id}/usage`、
+  管理员 `GET /api/admin/usage`（migration 0038–0040）。每次 agent 运行（分诊、实现、修复、
+  PR review 续跑、PRD 规划/复核、预览推荐，含失败/被杀/超时的运行）记一行 `agent_runs`，
+  历史 result 事件回填；费用未知（如 codex 不报费用、进程被杀前没给结果）记为「未知」，
+  不记成 $0。任务详情页的成本/耗时徽章改为标注「最近一轮」。外部数据库需 PostgreSQL ≥ 15。
+- **任务详情页执行日志改为回放视图**（docs/features/run-replay.md）：每步显示相对任务/阶段
+  起点的时间（悬停为入库时间，粒度约 ±200ms），≥30s 的间隔插「静默」分隔线；阶段 chip
+  过滤（带条数与失败数）、只看失败 / 隐藏思考 / 只看工具调用；失败一键定位（第一个 / 上一个 /
+  下一个，超过 200 个失败也能走到底），失败卡片「在日志中定位」，`#ev-<id>` 深链接可分享；
+  工具输出折叠时不再渲染正文，长输出先显示前 40 行。验证区按「运行 → 轮次」显示红绿证明条
+  （「红：改动前确实失败」直接写出含义），重试后两次运行不再混在一起；完整验证日志可按块查看
+  （经过脱敏，被后一次运行覆盖的日志不提供入口）。
+- 新增 `GET /api/tasks/{id}/events/summary`、`GET /api/tasks/{id}/verifications/{vid}/log`；
+  `GET /api/tasks/{id}/events` 支持 `paged` / `before` / `phase` / `kind` / `failures`
+  （不带这些参数时响应与旧版完全相同）。
+- `make ui-test`：前端纯函数测试（`node --test`，不引入依赖）与 `v-html` 全量白名单守卫。
+- **个人 API 令牌（PAT）**：个人设置页可签发/命名/吊销带过期时间的令牌，请求带
+  `Authorization: Bearer lathe_pat_…`，权限严格等于本人（管理员签的才是管理员权限）。
+  库里只存 SHA-256，明文只在创建时显示一次；记录最后使用时间；签发需输入当前密码；
+  账号停用、修改/找回/被重置密码后其全部令牌立即失效。令牌管理只能用浏览器登录态发起。
+  `LATHE_ADMIN_TOKEN` 行为不变。迁移 0044。详见 `docs/features/personal-api-token.md`。
+- **收件箱**：`/inbox` 把等你处理的事集中到一个页面，包括需求待补充、等你放行、
+  review 停车、前驱阻塞、失败待处置，以及 PRD 的待回答 / 待批准 / 待逐节确认 / 运行失败。
+  每项一键跳到处理页，顶栏显示未读计数，失败事项可以忽略。事项从现有状态实时派生，
+  新表 `inbox_marks` 只存已读/忽略（迁移 0035）；另给 `tasks` 加了 `(user_id, state)`
+  索引（迁移 0036，CONCURRENTLY）。新增接口 `GET /api/inbox`、`GET /api/inbox/count`、
+  `POST /api/inbox/items/{key}/read|unread|dismiss`、`POST /api/inbox/read-all`。
+  收件箱里的失败原因先经与失败记忆同一套两层脱敏再展示（docs/features/inbox.md）。
+- **云效（Projex）工作项作为任务来源**（[docs/features/tracker-yunxiao.md](docs/features/tracker-yunxiao.md)）：
+  指派给我 / 打上触发标签即接单，也可按工作项 ID 手动开跑；分诊读正文与评论（富文本转纯文本），
+  单子不明确时在云效回帖提问并停下，PR 开出后回帖链接；可选的状态同步（开跑 / PR 已开 / 已合并
+  三个时刻按配置的状态名推进，失败不影响任务）与取消联动（云效改到配置的「取消」状态 → 取消在途任务）。
+  webhook `/webhooks/yunxiao/{slug}` 按用户验签、载荷只取 id 回源拉权威数据、按快照边沿检测防重复接单；
+  令牌与 webhook 密钥 AES-256-GCM 加密存储、界面只显示掩码。出站请求有守卫：接入点只能是中心版或管理员
+  登记的 Region 域名，拨号期拒绝内网地址，不跟随重定向，错误信息不回显上游响应体。
+  迁移 0053–0055。Linear 与内置工单行为不变。
+
+### Fixed
+
+- 终态任务的执行日志只加载前 400 条且不提示还有更多；现在先显示最后一页，可按需加载更早的。
+- `implement-reentry` 阶段（resume 失败后开新会话重入实现）的事件被数据库约束拒收、整批丢弃
+  （迁移 0041）。之前已丢失的事件无法补回。
 
 ### Changed
 

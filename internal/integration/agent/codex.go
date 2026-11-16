@@ -300,9 +300,8 @@ type codexParseState struct {
 	failedMsg string
 	completed int
 	failed    int
-	// usages 按 turn 收集 turn.completed.usage 的原文（不导出、不进 Result）。
-	// f03（用量统计）合入后，在构造 Result 处加一行 Usage = UsageFromCodex(usages)，
-	// 解析器不用改（f06 PRD §4.1）。
+	// usages 按 turn 收集 turn.completed.usage 的原文；构造 Result 时经
+	// turnUsages 解码、UsageFromCodex 汇总进 Result.Usage（f03 × f06 接缝）。
 	usages []json.RawMessage
 }
 
@@ -397,6 +396,20 @@ func (s *codexParseState) parse(r io.Reader, h parseHooks) (*Result, error) {
 	return s.result(), nil
 }
 
+// turnUsages 把收集到的 usage 原文解码成 CodexUsage；解不开的条目跳过
+// （不当 0 计入 —— 一条都解不开时 Usage.Present=false，即「未知」）。
+func (s *codexParseState) turnUsages() []CodexUsage {
+	out := make([]CodexUsage, 0, len(s.usages))
+	for _, raw := range s.usages {
+		var u CodexUsage
+		if err := json.Unmarshal(raw, &u); err != nil {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
 func (s *codexParseState) turnMeta() *codexTurnMeta {
 	return &codexTurnMeta{NumTurns: s.completed + s.failed, DurationMS: time.Since(s.start).Milliseconds()}
 }
@@ -418,8 +431,11 @@ func (s *codexParseState) result() *Result {
 		Subtype:   "success",
 		Text:      s.lastText,
 		NumTurns:  s.completed + s.failed,
-		// codex 不报费用：CostUSD 保持 0，result 条目 body 写「费用未知」。
+		// codex 不报费用：CostUSD 保持 0、CostKnown 保持 false（账本落 NULL =「未知」），
+		// result 条目 body 写「费用未知」。
 		CostUSD: 0,
+		// token 用量：各条 turn.completed.usage 逐条相加（f03 的 UsageFromCodex）。
+		Usage: UsageFromCodex(s.turnUsages()),
 	}
 	if res.IsError {
 		res.Subtype = "error_turn_failed"

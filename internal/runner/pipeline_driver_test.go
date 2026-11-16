@@ -109,9 +109,9 @@ func (e errRunner) Run(ctx context.Context, p agent.RunParams) (*agent.Result, e
 
 // ---------------------------------------------------------------- 夹具
 
+// greetTest 与 pipeline_test.go 共用（同一包里只声明一次）。
 const (
 	triageOK   = `{"actionable":true,"kind":"fix","reason":"有现象和期望行为","question":""}`
-	greetTest  = "package main\n\nimport \"testing\"\n\nfunc TestGreet(t *testing.T) {\n\tif greet() != \"hello\" {\n\t\tt.Fatalf(\"got %q\", greet())\n\t}\n}\n"
 	greetRight = "package main\n\nfunc greet() string { return \"hello\" }\n"
 	greetWrong = "package main\n\nfunc greet() string { return \"wrong\" }\n"
 )
