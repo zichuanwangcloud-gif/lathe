@@ -32,6 +32,9 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/secret"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs/gitea"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs/gitlab"
 	"github.com/zichuanwangcloud-gif/lathe/internal/webui"
 )
 
@@ -286,6 +289,19 @@ func serve(cfg config.Config) error {
 		Deliveries: st,
 		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
 	})
+	// GitLab / Gitea 同形：/webhooks/{gitlab,gitea}/{slug}，同一个用户随机段，
+	// 各平台各自的密钥；信任判定用属主自己的平台令牌查成员/协作者关系。
+	vcsResolver := &vcsWebhookResolver{users: users, factory: factory}
+	mux.Handle("POST /webhooks/gitlab/{slug}", &httpapi.GitLabWebhook{
+		Resolver:   vcsResolver,
+		Deliveries: st,
+		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
+	})
+	mux.Handle("POST /webhooks/gitea/{slug}", &httpapi.GiteaWebhook{
+		Resolver:   vcsResolver,
+		Deliveries: st,
+		Reviews:    &runner.ReviewIntake{Tasks: task.NewMachine(st.Pool()), Workspaces: q},
+	})
 
 	// 云效工作项回调（f08）：/webhooks/yunxiao/{slug}，与 Linear/GitHub 共用
 	// 用户的随机段、按用户的云效 webhook 密钥验签。没有无 slug 的兜底路径
@@ -473,6 +489,8 @@ func serve(cfg config.Config) error {
 			Channel:   cfg.ImplementChannel,
 			// 与流水线同一份配置：规划 agent 也只加载目标仓库的配置
 			SettingSources: cfg.SettingSources,
+			// GitLab/Gitea 仓库的规划检出按 PRD 属主取代码平台鉴权
+			GitAuth: prdGitAuth{f: factory},
 			// 用量账本（f03）：规划/复核的每次尝试各记一行
 			Usage: st,
 		},
@@ -707,6 +725,59 @@ func (r *githubWebhookResolver) ResolveGitHub(ctx context.Context, slug string) 
 		return nil, fmt.Errorf("该用户尚未配置 GitHub webhook 签名密钥")
 	}
 	return &httpapi.GitHubWebhookTarget{OwnerID: u.ID, Secret: secret}, nil
+}
+
+// vcsWebhookResolver 把 GitLab/Gitea 回调路径里的 slug 解析成投递目标。
+//
+// 与 githubWebhookResolver 同一立场：没有空 slug 兜底；密钥取该用户该平台的
+// webhook 凭据，未配置即拒绝路由（404）。成员/协作者查询客户端用属主自己的
+// 平台令牌构造；令牌没配时留空，handler 按「无法确认成员关系」一律拒绝（fail-closed）。
+type vcsWebhookResolver struct {
+	users   *store.Users
+	factory *creds.Factory
+}
+
+func (r *vcsWebhookResolver) ResolveVCSWebhook(ctx context.Context, p vcs.Provider, slug string) (*httpapi.VCSWebhookTarget, error) {
+	if slug == "" {
+		return nil, fmt.Errorf("缺少回调地址随机段")
+	}
+	var secretKind, tokenKind string
+	switch p {
+	case vcs.ProviderGitLab:
+		secretKind, tokenKind = store.KindGitLabWebhook, store.KindGitLab
+	case vcs.ProviderGitea:
+		secretKind, tokenKind = store.KindGiteaWebhook, store.KindGitea
+	default:
+		return nil, fmt.Errorf("未知代码平台 %q", p)
+	}
+	u, err := r.users.ByWebhookSlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	if u.Disabled() {
+		return nil, fmt.Errorf("账号已停用")
+	}
+	prov := r.factory.ProviderFor(u.ID)
+	secret, _, err := prov.Token(ctx, secretKind)
+	if err != nil || secret == "" {
+		return nil, fmt.Errorf("该用户尚未配置 %s webhook 密钥", p.DisplayName())
+	}
+	target := &httpapi.VCSWebhookTarget{OwnerID: u.ID, Secret: secret}
+	token, base, _, terr := prov.TokenWithBaseURL(ctx, tokenKind)
+	if terr != nil || base == "" {
+		return target, nil
+	}
+	switch p {
+	case vcs.ProviderGitLab:
+		if c, err := gitlab.New(base, token); err == nil {
+			target.GitLab = c
+		}
+	case vcs.ProviderGitea:
+		if c, err := gitea.New(base, token); err == nil {
+			target.Gitea = c
+		}
+	}
+	return target, nil
 }
 
 // agentRouter 装配任务流水线的 agent 驱动：按任务钉死的 agent_driver 分派

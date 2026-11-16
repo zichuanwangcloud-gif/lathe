@@ -14,6 +14,7 @@ import (
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
 	"github.com/zichuanwangcloud-gif/lathe/internal/tracker"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // syncingTracker 是实现了 tracker.StatusSyncer 的假 tracker（云效形态）。
@@ -167,7 +168,7 @@ func TestMergePollerStatusSync(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := mp.handleMerged(ctx, fresh); err != nil {
+		if err := mp.handleMerged(ctx, fresh, vcs.GitAuth{}); err != nil {
 			t.Fatalf("handleMerged: %v", err)
 		}
 		after, _ := m.Get(ctx, tk.ID)

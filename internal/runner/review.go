@@ -9,6 +9,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/github"
 	"github.com/zichuanwangcloud-gif/lathe/internal/task"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // review.go 是 PR 评论回流（docs/02-design.md §7）的 runner 侧：
@@ -87,8 +88,19 @@ type ReviewIntake struct {
 // 返回 (ReviewIgnored, nil) 而不是错误 —— 仓库 webhook 会投来与 Lathe 无关
 // 的 PR 的事件，这是常态。终态任务（merged/failed/cancelled）在这里就被
 // 挡下，不会走到转移那一步；即使走到了，转移表也会拒绝。
-func (in *ReviewIntake) AcceptReview(ctx context.Context, ownerID int64, ev *github.ReviewEvent, deliveryID string) (ReviewOutcome, error) {
-	tasks, err := in.Tasks.TasksByPR(ctx, ownerID, ev.Repo, ev.PRNumber)
+//
+// ev.Provider 必填：空串或未知值返回错误（fail-closed 且可见 —— handler 把
+// 原因落进投递记录），既不当 github 猜，也不悄悄 ignored。任务按
+// (属主, 平台, 路径, 编号) 查找，挡住「GitHub webhook 带着 GitLab 仓库的
+// 路径与编号投进来」这类跨平台串扰。
+func (in *ReviewIntake) AcceptReview(ctx context.Context, ownerID int64, ev *vcs.ReviewEvent, deliveryID string) (ReviewOutcome, error) {
+	if ev == nil {
+		return ReviewOutcome{}, errors.New("runner: review 事件为空")
+	}
+	if !ev.Provider.Valid() {
+		return ReviewOutcome{}, fmt.Errorf("runner: review 事件缺少或带了未知的代码平台 %q", ev.Provider)
+	}
+	tasks, err := in.Tasks.TasksByVCSPR(ctx, ownerID, string(ev.Provider), ev.Repo, ev.PRNumber)
 	if err != nil {
 		return ReviewOutcome{}, err
 	}
@@ -208,7 +220,7 @@ func raceIgnored(taskID int64, err error) (ReviewOutcome, bool) {
 	return ReviewOutcome{}, false
 }
 
-func reviewPayloadOf(ev *github.ReviewEvent) map[string]any {
+func reviewPayloadOf(ev *vcs.ReviewEvent) map[string]any {
 	m := map[string]any{
 		"key":    ev.Key,
 		"author": ev.Author,

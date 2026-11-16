@@ -13,6 +13,7 @@ import (
 
 	"github.com/zichuanwangcloud-gif/lathe/internal/integration/agent"
 	"github.com/zichuanwangcloud-gif/lathe/internal/store"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // 编排层的测试。全部用内存假实现，不连 Postgres —— 这一层要验的是
@@ -182,7 +183,7 @@ type fakeWorktrees struct {
 	createErr      error
 }
 
-func (f *fakeWorktrees) EnsureMirror(context.Context, string, string) (string, error) {
+func (f *fakeWorktrees) EnsureMirror(context.Context, string, string, vcs.GitAuth) (string, error) {
 	return "/mirrors/acme", nil
 }
 
@@ -255,7 +256,7 @@ func newService(st *fakeStore, ag *fakeAgent, wt *fakeWorktrees) *Service {
 	return &Service{
 		Store: st, Agent: ag, Worktrees: wt,
 		Channel:  "strong",
-		CloneURL: func(r string) string { return "git@example.com:" + r + ".git" },
+		CloneURL: func(r RepoInfo) string { return "git@example.com:" + r.ProviderRepo + ".git" },
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	gh "github.com/google/go-github/v66/github"
+	"github.com/zichuanwangcloud-gif/lathe/internal/vcs"
 )
 
 // webhook.go 是 PR 评论回流（docs/02-design.md §7）的 GitHub 侧：
@@ -225,6 +226,30 @@ func describeAssociation(a string) string {
 	return a
 }
 
+// VCS 把（已经通过 Actionable 判定的）事件转成平台中立的 vcs.ReviewEvent，
+// 交给 runner.ReviewIntake.AcceptReview。Provider 填 github；信任字段
+// （AuthorAssociation/AuthorType）不带过去 —— 信任判定只在本包里发生。
+func (e *ReviewEvent) VCS() *vcs.ReviewEvent {
+	if e == nil {
+		return nil
+	}
+	return &vcs.ReviewEvent{
+		Provider:    vcs.ProviderGitHub,
+		Event:       e.Event,
+		Action:      e.Action,
+		Repo:        e.Repo,
+		PRNumber:    e.PRNumber,
+		PRAuthor:    e.PRAuthor,
+		Key:         e.Key,
+		Author:      e.Author,
+		Body:        e.Body,
+		Path:        e.Path,
+		Line:        e.Line,
+		URL:         e.URL,
+		ReviewState: e.ReviewState,
+	}
+}
+
 // 载荷里关心的字段。
 type webhookUser struct {
 	Login string `json:"login"`
@@ -317,12 +342,8 @@ func ParseReviewWebhook(eventType string, body []byte) (*ReviewEvent, error) {
 	return ev, nil
 }
 
-// ReviewFeedback 是一个 PR 上全部可能需要处理的意见。
-type ReviewFeedback struct {
-	// PRAuthor 是开 PR 的账号（Lathe 在该 PR 上的身份），调用方据此排除自身。
-	PRAuthor string
-	Comments []ReviewComment
-}
+// ReviewFeedback 是一个 PR 上全部可能需要处理的意见（vcs.ReviewFeedback 的别名）。
+type ReviewFeedback = vcs.ReviewFeedback
 
 // maxFeedbackPages 是每类意见最多翻的页数（每页 100 条）。一个 PR 上
 // 千条以上的意见已不是自动化二轮能处理的规模，截断比无界翻页更安全。

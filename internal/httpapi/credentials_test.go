@@ -16,7 +16,11 @@ type fakeVerifier struct {
 	calls   []string
 }
 
-func (f *fakeVerifier) Verify(ctx context.Context, kind, token string) VerifyResult {
+func (f *fakeVerifier) Verify(ctx context.Context, req VerifyRequest) VerifyResult {
+	kind, token := req.Kind, req.Token
+	if req.BaseURL != "" {
+		token += "@" + req.BaseURL
+	}
 	f.calls = append(f.calls, kind+":"+token)
 	if r, ok := f.results[kind]; ok {
 		return r
