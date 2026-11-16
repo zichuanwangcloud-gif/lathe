@@ -9,6 +9,13 @@
 
 ### Added
 
+- **定时建单**（`docs/features/scheduled-issue.md`）：每日 / 每周 / 每 N 小时三种规则，
+  到点用属主自己的 Linear 令牌在 Linear 建单（指派给自己或打接单标签），之后走正常的
+  接单 → 分诊 → 验证 → PR，调度器本身不建任务、不碰代码。同一计划时刻多节点只建一次
+  （`(规则, 计划时刻)` 唯一约束 + 执行租约 + 预生成的 issue UUID）；错过的时刻在补偿
+  窗口内合并补一次，窗口外记「跳过」；运行记录、派生任务与连续 5 次失败自动暂停在
+  「定时建单」页可见。新增迁移 0059、0060，新增环境变量 `LATHE_SCHEDULER_ENABLED`、
+  `LATHE_SCHEDULE_CATCHUP_WINDOW`，新增接口 `/api/schedules*` 与 `GET /api/linear/teams`
 - Slack / 飞书通知渠道：任务失败、阻塞提问、等待放行、PR 已开、PRD 待签字可按事件开关
   推送到个人配置的 Slack incoming webhook 或飞书自定义机器人（含签名校验）；webhook URL
   与密钥 AES-256-GCM 加密入库、保存时发测试消息；失败重试至多 5 次且不影响任务状态机。
@@ -113,6 +120,8 @@
 
 ### Fixed
 
+- **Linear 客户端错误信息截断改为按 rune，不再产生非法 UTF-8**：原来按字节切 500，
+  多字节字符被切断后，这串错误一旦落库就是 SQLSTATE 22021
 - **模糊任务问过一次问题后永远提交不了评审**：状态机里有
   `awaiting_answers → drafting` 这条边，但没有任何代码走它 —— 一轮跑完有问题就挂起，
   人答完落库时状态仍是 `awaiting_answers`，而提交评审要求 `drafting`。现在每轮落库时

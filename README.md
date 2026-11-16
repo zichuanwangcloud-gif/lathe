@@ -25,6 +25,7 @@ Lathe 的核心不是"调用 agent 写代码"，而是**证明改动有效**：b
 | [docs/09-ci.md](docs/09-ci.md) | CI 门禁与发布流水线 |
 | [docs/10-prd-template.md](docs/10-prd-template.md) | 模糊任务 PRD 模板与填写规范 |
 | [docs/11-branching-release.md](docs/11-branching-release.md) | 分支管理与发版规范（贡献者必读） |
+| [docs/features/scheduled-issue.md](docs/features/scheduled-issue.md) | 定时建单：到点在 Linear 建单，之后走正常接单流程 |
 | [docs/features/personal-api-token.md](docs/features/personal-api-token.md) | 个人 API 令牌（PAT）：设计、接口、安全边界与验收结果 |
 | [docs/features/inbox.md](docs/features/inbox.md) | 收件箱：待人处理事项聚合 |
 
@@ -111,6 +112,9 @@ LATHE_BASE_URL=https://lathe.example.com ./bin/lathe serve
 # 8.（可选）在「系统设置」页填「标签驱动接单」的标签名（如 lathe:go）：
 #    填上之后，issue 被打上这个标签就接单，不必改指派人。留空表示关闭。
 #
+# 9.（可选）在「定时建单」页配置每日 / 每周 / 每 N 小时的规则：到点用你的
+#    Linear 令牌在 Linear 上建一张单（指派给你或打接单标签），之后走正常的
+#    接单 → 分诊 → 验证 → PR。前提是第 5–7 步的 Linear 令牌、webhook 与仓库都已配好。
 # 9.（可选）云效任务来源：「设置」页的云效卡片里有回调地址
 #    /webhooks/yunxiao/<同一个随机段>。在云效项目 → 设置 → 自动化规则用 Webhook 模板
 #    新建两条规则（触发「字段变更」与「状态变更」），Body 选【工作项数据】，
@@ -200,6 +204,8 @@ docker pull ghcr.io/zichuanwangcloud-gif/lathe:0.2.0
 | `LATHE_CODEX_BIN` | codex 二进制名或路径，默认 `codex`。只在配了 `LATHE_CODEX_HOME` 时校验（找不到启动报错） |
 | `LATHE_NODE_NAME` | 节点名（事件 actor 前缀、管理界面运行时面板），默认主机名 |
 | `LATHE_PNPM_STORE` | 验证器跑前端步骤时共享的 pnpm store 目录，默认 `/opt/lathe/.pnpm-store` |
+| `LATHE_SCHEDULER_ENABLED` | 定时建单调度器总开关，默认 `true`，只认 `true` / `false`（写成 `yes` 等启动直接报错）。设 `false` 时调度器不启动、规则不会到点建单；规则 API 照常可用，「立即运行」返回 503 |
+| `LATHE_SCHEDULE_CATCHUP_WINDOW` | 定时建单的补偿窗口，默认 `6h`，范围 `0`–`168h`（越界或非法时长启动直接报错；同样**不支持 `d`**，写 `168h` 不能写 `7d`）。认领时迟到超过准点宽限（2 个 tick，60s）的那次：迟到 ≤ 窗口就补建一次（停机期间错过的多次合并成一次），否则记一条「跳过」。`0` 表示只准点触发 |
 | `LATHE_MIGRATE_TIMEOUT` | `migrate` 子命令的超时，默认 `10m`。大表上的 `CREATE INDEX CONCURRENTLY` 可能跑很久，慢了就调大 |
 
 云效（Projex）任务来源**没有环境变量**：连接只能在「设置」页按人配置，Region 版实例域名
