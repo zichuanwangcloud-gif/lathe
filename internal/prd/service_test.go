@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -678,5 +679,121 @@ func TestNeutralDirDefaultIsOutsideAnyProject(t *testing.T) {
 	}
 	if !strings.HasPrefix(dir, os.TempDir()) {
 		t.Errorf("默认中立目录 got %q, want 位于 %q 之下", dir, os.TempDir())
+	}
+}
+
+// ---------------------------------------------------------------- f03 用量账本
+
+// fakeUsage 实现 agent.UsageRecorder，只把记录追加进切片（纯内存，不连库）。
+type fakeUsage struct {
+	mu   sync.Mutex
+	recs []agent.RunRecord
+	err  error
+}
+
+func (f *fakeUsage) RecordAgentRun(_ context.Context, r agent.RunRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recs = append(f.recs, r)
+	return f.err
+}
+
+// planSpec 是直接驱动 runAgent 的规划轮参数：输出必须是 "OK" 才算合规。
+func planSpec(prdID int64) runSpec {
+	return runSpec{prdID: prdID, phase: store.PRDPhasePlan, prompt: "规划", repo: newFakeStore().repo,
+		accept: func(text string) error {
+			if text != "OK" {
+				return errors.New("不是 OK")
+			}
+			return nil
+		}}
+}
+
+// AC-2c：规划 / 复核的每次尝试（首跑、超时收尾、每次修正）各记一行；
+// 记账在 runOnce 翻译错误之前，拿的是原始 res/err。
+func TestRunAgentRecordsUsagePerAttempt(t *testing.T) {
+	timeout := fmt.Errorf("agent: 执行超时（上限 15m0s），进程树已回收: %w", context.DeadlineExceeded)
+	garbage := make([]*agent.Result, maxRepairs+1)
+	for i := range garbage {
+		garbage[i] = ok("garbage")
+	}
+	type want struct {
+		phase  string
+		resume bool
+		status string
+	}
+	cases := []struct {
+		name     string
+		review   bool
+		ag       *fakeAgent
+		want     []want
+		wantCost float64 // 首条 Result.CostUSD（非 0 时断言）
+	}{
+		{"规划一次过", false, &fakeAgent{results: []*agent.Result{ok("OK")}},
+			[]want{{"plan", false, "success"}}, 0},
+		{"首跑超时 → 收尾成功", false, &fakeAgent{errs: []error{timeout}, results: []*agent.Result{nil, ok("OK")}},
+			[]want{{"plan", false, "killed"}, {"plan", true, "success"}}, 0},
+		{"两次修正后仍不合规", false, &fakeAgent{results: garbage},
+			append([]want{{"plan", false, "success"}}, repeatWant(want{"plan", true, "success"}, maxRepairs)...), 0},
+		{"CLI 报失败", false, &fakeAgent{results: []*agent.Result{{IsError: true, CostUSD: 0.4, Subtype: "error_max_turns", CostKnown: true}}},
+			[]want{{"plan", false, "error"}}, 0.4},
+		{"对抗复核", true, &fakeAgent{results: []*agent.Result{ok(`{"findings":[],"verdict":"没洞"}`)}},
+			[]want{{"plan-review", false, "success"}}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newFakeStore()
+			st.row.Document = json.RawMessage(reviewableDoc)
+			svc := newService(st, tc.ag, &fakeWorktrees{})
+			u := &fakeUsage{}
+			svc.Usage = u
+			if tc.review {
+				if _, err := svc.RunReview(context.Background(), st.row.ID, st.row.UserID); err != nil {
+					t.Fatalf("复核失败: %v", err)
+				}
+			} else {
+				_, _, _ = svc.runAgent(context.Background(), planSpec(st.row.ID))
+			}
+			if len(u.recs) != len(tc.want) {
+				t.Fatalf("记录数 got %d, want %d", len(u.recs), len(tc.want))
+			}
+			for i, r := range u.recs {
+				got := want{r.Phase, r.Resume, store.RunStatus(r.Result, r.Err)}
+				if got != tc.want[i] {
+					t.Errorf("第 %d 条 (Phase,Resume,status) got %+v, want %+v", i, got, tc.want[i])
+				}
+				if r.Kind != "prd" || r.PRDID != st.row.ID || r.TaskID != 0 {
+					t.Errorf("第 %d 条 Kind/PRDID/TaskID got %s/%d/%d, want prd/%d/0", i, r.Kind, r.PRDID, r.TaskID, st.row.ID)
+				}
+				if r.StartedAt.IsZero() || r.EndedAt.Before(r.StartedAt) {
+					t.Errorf("第 %d 条 StartedAt/EndedAt got %v/%v, want 非零且 Ended≥Started", i, r.StartedAt, r.EndedAt)
+				}
+				if i > 0 && !r.StartedAt.After(u.recs[i-1].StartedAt) {
+					t.Errorf("第 %d 条 StartedAt 没有严格递增", i)
+				}
+			}
+			if tc.wantCost != 0 && (u.recs[0].Result == nil || u.recs[0].Result.CostUSD != tc.wantCost) {
+				t.Errorf("首条 Result got %+v, want CostUSD=%v（记账在翻译错误之前）", u.recs[0].Result, tc.wantCost)
+			}
+		})
+	}
+}
+
+func repeatWant[T any](v T, n int) []T {
+	out := make([]T, n)
+	for i := range out {
+		out[i] = v
+	}
+	return out
+}
+
+// AC-3：记账失败不影响规划轮。
+func TestRunAgentUsageFailureIsNonFatal(t *testing.T) {
+	st := newFakeStore()
+	svc := newService(st, &fakeAgent{results: []*agent.Result{ok("OK")}}, &fakeWorktrees{})
+	svc.Usage = &fakeUsage{err: errors.New("boom")}
+	res, _, err := svc.runAgent(context.Background(), planSpec(st.row.ID))
+	if err != nil || res == nil || res.Text != "OK" {
+		t.Errorf("runAgent got res=%v err=%v, want 成功（记账失败只告警）", res, err)
 	}
 }
