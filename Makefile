@@ -1,4 +1,4 @@
-.PHONY: help all build test test-ci test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev clean hooks release-check
+.PHONY: help all build test test-ci test-race lint run migrate dev-infra dev-infra-down clean-test-db ui ui-deps ui-dev ui-test clean hooks release-check
 
 BIN_DIR    := bin
 CTRL_BIN   := $(BIN_DIR)/lathe
@@ -25,6 +25,20 @@ ui: ## 构建管理界面并同步到内嵌目录
 
 ui-deps: ## 安装前端依赖（首次或依赖变更后执行）
 	cd web && pnpm install --ignore-scripts
+
+ui-test: ## 前端纯函数测试 + v-html 白名单守卫（node --test，不引入依赖）
+	node --test web/src/replay.test.js
+	# v-html 全量白名单（docs/features/run-replay.md AC-7）：只允许已登记的
+	# DOMPurify markdown 渲染点。多一行、少一行都失败；新增合法渲染点时在
+	# 同一个 PR 里改 web/src/testdata/v-html-allowlist.txt，让改动进 diff 接受评审。
+	@if find web/src -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' -o -name '*.html' \) | grep -q .; then \
+		echo "web/src 出现了 .ts/.tsx/.jsx/.html 文件：请扩展 v-html 守卫的 --include"; exit 1; fi
+	@grep -rn --include='*.vue' --include='*.js' --exclude='*.test.js' --exclude-dir=testdata 'v-html' web/src \
+		| sed -E 's/^([^:]*):[0-9]+:[[:space:]]*/\1 /; s/[[:space:]]+$$//' | LC_ALL=C sort > /tmp/lathe-vhtml-got.$$$$; \
+	LC_ALL=C sort web/src/testdata/v-html-allowlist.txt > /tmp/lathe-vhtml-want.$$$$; \
+	if diff -u --label want /tmp/lathe-vhtml-want.$$$$ --label got /tmp/lathe-vhtml-got.$$$$; then \
+		echo "→ v-html 白名单一致"; rm -f /tmp/lathe-vhtml-*.$$$$; \
+	else echo "v-html 白名单不一致（got/want 见上方 diff）"; rm -f /tmp/lathe-vhtml-*.$$$$; exit 1; fi
 
 ui-dev: ## 前端热重载（需另起 make run）
 	cd web && node_modules/.bin/vite

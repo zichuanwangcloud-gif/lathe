@@ -82,9 +82,24 @@ export const api = {
     return request(`/api/tasks${qs ? '?' + qs : ''}`)
   },
   task: (id) => request(`/api/tasks/${id}`),
-  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0
-  taskEvents: (id, after = 0, limit = 200) =>
-    request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`),
+  // 执行日志增量轮询（docs/04 §3.3）：after 传上次的 last_id，首轮传 0。
+  // opts（回放，docs/features/run-replay.md §3.2.1）：{before, phase, kind, failures}；
+  // 带 opts 时一律附 paged=1，响应多 first_id/has_more。before 与 after 互斥。
+  taskEvents: (id, after = 0, limit = 200, opts) => {
+    if (!opts) return request(`/api/tasks/${id}/events?after=${after}&limit=${limit}`)
+    const q = new URLSearchParams({ paged: '1', limit: String(limit) })
+    if (opts.before != null) q.set('before', String(opts.before))
+    else q.set('after', String(after || 0))
+    if (opts.phase?.length) q.set('phase', [].concat(opts.phase).join(','))
+    if (opts.kind?.length) q.set('kind', [].concat(opts.kind).join(','))
+    if (opts.failures) q.set('failures', '1')
+    return request(`/api/tasks/${id}/events?${q}`)
+  },
+  // 执行日志汇总：各阶段条数/失败数、失败列表、首末失败（不受内存窗口影响）
+  taskEventsSummary: (id) => request(`/api/tasks/${id}/events/summary`),
+  // 完整验证日志按块读取（经服务端脱敏）；offset 只传 0 或上一块的 nextOffset
+  verificationLog: (id, vid, { part = 0, offset = 0, limit = 65536 } = {}) =>
+    request(`/api/tasks/${id}/verifications/${vid}/log?part=${part}&offset=${offset}&limit=${limit}`),
   stats: () => request('/api/stats'),
   // 成本聚合独立于 /api/stats：看板每 5 秒轮询那个端点，而成本是决策视图、
   // 不需要 5 秒新鲜度（后端注释里有完整理由）。
